@@ -62,3 +62,7 @@ pip install nonebot-plugin-personification
 ## 📄 开源许可
 
 本项目采用 [MIT](LICENSE) 许可协议。
+
+## 💡 鸣谢
+
+- [nonebot_plugin_random_reply](https://github.com/Alpaca4610/nonebot_plugin_random_reply): 灵感来源
