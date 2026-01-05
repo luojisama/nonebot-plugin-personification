@@ -1,16 +1,15 @@
 [project]
-name = "nonebot-plugin-personification"
+name = "nonebot-plugin-shiro-personification"
 version = "0.1.0"
 description = "实现拟人化的群聊回复，支持好感度系统和自主回复决策"
 readme = "README.md"
 requires-python = ">=3.9"
 authors = [
-    { name = "luojisama" },
+    { name = "luojisama", email = "2534316454@qq.com" },
 ]
 license = { text = "MIT" }
 keywords = ["nonebot", "nonebot2", "plugin", "openai", "personification"]
 classifiers = [
-    "Framework :: NoneBot",
     "Programming Language :: Python :: 3",
     "License :: OSI Approved :: MIT License",
     "Operating System :: OS Independent",
