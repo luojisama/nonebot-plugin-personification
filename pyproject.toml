@@ -1,0 +1,31 @@
+[project]
+name = "nonebot-plugin-personification"
+version = "0.1.0"
+description = "实现拟人化的群聊回复，支持好感度系统和自主回复决策"
+readme = "README.md"
+requires-python = ">=3.9"
+authors = [
+    { name = "AuthorName", email = "author@example.com" },
+]
+dependencies = [
+    "nonebot2>=2.2.0",
+    "nonebot-adapter-onebot>=2.4.0",
+    "openai>=1.0.0",
+    "pydantic>=2.0.0",
+]
+
+[project.optional-dependencies]
+htmlrender = [
+    "nonebot-plugin-htmlrender>=0.2.0",
+]
+signin = [
+    "nonebot-plugin-sign-in>=0.1.0",
+]
+
+[tool.nonebot]
+plugins = ["nonebot_plugin_personification"]
+plugin_dirs = ["nonebot_plugin_personification"]
+
+[build-system]
+requires = ["pdm-backend"]
+build-backend = "pdm.backend"
