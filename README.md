@@ -12,7 +12,7 @@
 
 - [nonebot-adapter-onebot](https://github.com/nonebot/adapter-onebot): OneBot V11 适配器
 - [nonebot-plugin-htmlrender](https://github.com/kexue-go/nonebot-plugin-htmlrender): (可选) Markdown 转图片支持
-- [nonebot-plugin-sign-in](https://github.com/LanMiao-Labs/nonebot-plugin-sign-in): (可选) 好感度系统关联插件
+- [nonebot-plugin-shiro-signin](https://github.com/luojisama/nonebot-plugin-shiro-signin): (可选) 好感度系统关联插件
 
 ## 💿 安装
 
