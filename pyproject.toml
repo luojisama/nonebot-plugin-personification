@@ -5,7 +5,7 @@ description = "实现拟人化的群聊回复，支持好感度系统和自主�
 readme = "README.md"
 requires-python = ">=3.9"
 authors = [
-    { name = "AuthorName", email = "author@example.com" },
+    { name = "luojisama" },
 ]
 dependencies = [
     "nonebot2>=2.2.0",

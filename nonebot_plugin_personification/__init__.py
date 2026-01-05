@@ -45,7 +45,7 @@ __plugin_meta__ = PluginMetadata(
     description="实现拟人化的群聊回复，支持好感度系统和自主回复决策",
     usage="在白名单群聊中根据概率随机回复，支持根据好感度改变态度",
     type="application",
-    homepage="https://github.com/yourusername/nonebot-plugin-personification",
+    homepage="https://github.com/luojisama/nonebot-plugin-personification",
     config=Config,
     supported_adapters={"~onebot.v11"},
 )
