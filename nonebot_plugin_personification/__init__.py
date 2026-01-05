@@ -3,6 +3,7 @@ import time
 from typing import Dict, List
 from pathlib import Path
 from nonebot import on_message, on_command, get_plugin_config, logger, get_driver
+from nonebot.typing import T_State
 from nonebot.adapters.onebot.v11 import Bot, GroupMessageEvent, Message, MessageSegment, MessageEvent, PokeNotifyEvent, Event
 from nonebot.params import CommandArg
 from nonebot.permission import SUPERUSER
@@ -22,15 +23,11 @@ except ImportError:
 # 尝试导入签到插件的工具函数
 try:
     try:
-        from nonebot_plugin_sign_in.utils import get_user_data, update_user_data
-        from nonebot_plugin_sign_in.config import get_level_name
+        from plugin.sign_in.utils import get_user_data, update_user_data
+        from plugin.sign_in.config import get_level_name
     except ImportError:
-        try:
-            from plugin.sign_in.utils import get_user_data, update_user_data
-            from plugin.sign_in.config import get_level_name
-        except ImportError:
-            from ..sign_in.utils import get_user_data, update_user_data
-            from ..sign_in.config import get_level_name
+        from ..sign_in.utils import get_user_data, update_user_data
+        from ..sign_in.config import get_level_name
     SIGN_IN_AVAILABLE = True
 except ImportError:
     SIGN_IN_AVAILABLE = False
@@ -142,16 +139,31 @@ async def sticker_chat_rule(event: GroupMessageEvent) -> bool:
 sticker_chat_matcher = on_message(rule=Rule(sticker_chat_rule), priority=101, block=False)
 
 @sticker_chat_matcher.handle()
-async def _(bot: Bot, event: GroupMessageEvent):
-    # 只有当文件夹中有表情包时才触发
+async def _(bot: Bot, event: GroupMessageEvent, state: T_State):
+    # 随机选择一种水群模式 (三种模式概率各 1/3)
+    mode = random.choice(["text_only", "sticker_only", "mixed"])
+    
     sticker_dir = Path(plugin_config.personification_sticker_path)
+    available_stickers = []
     if sticker_dir.exists() and sticker_dir.is_dir():
-        stickers = [f for f in sticker_dir.iterdir() if f.suffix.lower() in [".jpg", ".png", ".gif", ".webp", ".jpeg"]]
-        if stickers:
-            random_sticker = random.choice(stickers)
-            logger.info(f"拟人插件：触发随机水群表情包 {random_sticker.name}")
-            # 使用绝对路径并转换为 file:// 协议，以确保在 Linux/Windows 上都有更好的兼容性
+        available_stickers = [f for f in sticker_dir.iterdir() if f.suffix.lower() in [".jpg", ".png", ".gif", ".webp", ".jpeg"]]
+
+    if mode == "sticker_only":
+        if available_stickers:
+            random_sticker = random.choice(available_stickers)
+            logger.info(f"拟人插件：触发水群 [单独表情包] {random_sticker.name}")
             await sticker_chat_matcher.finish(MessageSegment.image(f"file:///{random_sticker.absolute()}"))
+        else:
+            mode = "text_only" # 如果没表情包，退化为纯文本
+
+    # 文本模式和混合模式需要调用 AI
+    if mode in ["text_only", "mixed"]:
+        # 通过 state 传递参数给 handle_reply
+        state["is_random_chat"] = True
+        state["force_mode"] = mode
+        # 这里不需要手动调用 handle_reply，因为 sticker_chat_matcher 本身就会触发 handle_reply (如果优先级和 block 设置正确)
+        # 但是由于我们想要复用逻辑，且两个 matcher 是独立的，我们还是手动调用，但要确保参数匹配
+        await handle_reply(bot, event, state)
 
 # 注册戳一戳处理器
 async def poke_rule(event: PokeNotifyEvent) -> bool:
@@ -180,13 +192,17 @@ poke_notice_matcher = on_notice(rule=Rule(poke_notice_rule), priority=10, block=
 
 @reply_matcher.handle()
 @poke_notice_matcher.handle()
-async def handle_reply(bot: Bot, event: Event):
+async def handle_reply(bot: Bot, event: Event, state: T_State):
     # 如果是通知事件，需要特殊处理
     is_poke = False
     user_id = ""
     group_id = 0
     message_content = ""
     sender_name = ""
+    
+    # 从 state 获取可能的参数
+    is_random_chat = state.get("is_random_chat", False)
+    force_mode = state.get("force_mode", None)
 
     if isinstance(event, PokeNotifyEvent):
         is_poke = True
@@ -199,17 +215,24 @@ async def handle_reply(bot: Bot, event: Event):
         user_id = str(event.user_id)
         message_content = event.get_plaintext().strip()
         sender_name = event.sender.card or event.sender.nickname or user_id
+        
+        # 如果是随机水群触发，修改提示词
+        if is_random_chat:
+            message_content = f"[你观察到群里正在聊天，你决定主动插话分享一些想法。当前群员 {sender_name} 刚刚说了: {message_content}]"
     else:
         return
 
     # 如果没配置 API KEY，直接跳过
     if not plugin_config.personification_api_key:
+        logger.warning("拟人插件：未配置 API Key，跳过回复")
         return
 
     user_name = sender_name
     
     if not message_content and not is_poke:
         return
+
+    logger.info(f"拟人插件：正在处理来自 {user_name} ({user_id}) 的消息...")
 
     # 1. 获取好感度与态度
     attitude_desc = "态度普通，像平常一样交流。"
@@ -272,9 +295,15 @@ async def handle_reply(bot: Bot, event: Event):
         "4. 回复必须精简，禁止废话。"
     )
 
+    # 获取表情包列表（如果启用了）
+    available_stickers = []
+    sticker_dir = Path(plugin_config.personification_sticker_path)
+    if sticker_dir.exists() and sticker_dir.is_dir():
+        available_stickers = [f.stem for f in sticker_dir.iterdir() if f.suffix.lower() in [".jpg", ".png", ".gif", ".webp", ".jpeg"]]
+
     # 4. 构建消息历史
     messages = [
-         {"role": "system", "content": f"{system_prompt}\n\n当前表情包库中已加载表情包，你可以根据氛围决定是否发送，但请勿在回复中直接输出任何文件名。"}
+         {"role": "system", "content": f"{system_prompt}\n\n当前表情包库中有以下表情包文件名供参考: {', '.join(available_stickers[:20]) if available_stickers else '暂无'}"}
      ]
     messages.extend(chat_histories[group_id])
 
@@ -293,11 +322,13 @@ async def handle_reply(bot: Bot, event: Event):
         
         reply_content = response.choices[0].message.content.strip()
         
-        # 移除 AI 回复中可能包含的 [表情:xxx] 标签
+        # 移除 AI 回复中可能包含的 [表情:xxx] 或 [发送了表情包: xxx] 标签
         import re
-        reply_content = re.sub(r'\[表情:[^\]]+\]', '', reply_content).strip()
-        # 移除末尾可能残留的表情包文件名（通常是 32 位 MD5 乱码）
-        reply_content = re.sub(r'\s*[a-fA-F0-9]{32}$', '', reply_content).strip()
+        reply_content = re.sub(r'\[表情:[^\]]*\]', '', reply_content)
+        reply_content = re.sub(r'\[发送了表情包:[^\]]*\]', '', reply_content).strip()
+        
+        # 移除 AI 可能吐出的长串十六进制乱码 (例如：766E51F799FC83269D0C9F71409599EF)
+        reply_content = re.sub(r'[A-F0-9]{16,}', '', reply_content).strip()
         
         # 5. 处理 AI 的回复决策
         if "[NO_REPLY]" in reply_content:
@@ -388,7 +419,17 @@ async def handle_reply(bot: Bot, event: Event):
         # 7. 决定是否发送表情包
         sticker_segment = None
         sticker_name = ""
-        if random.random() < plugin_config.personification_sticker_probability:
+        
+        # 根据模式决定是否选择表情包
+        should_get_sticker = False
+        if force_mode == "mixed":
+            should_get_sticker = True
+        elif force_mode == "text_only":
+            should_get_sticker = False
+        elif random.random() < plugin_config.personification_sticker_probability:
+            should_get_sticker = True
+
+        if should_get_sticker:
             sticker_dir = Path(plugin_config.personification_sticker_path)
             if sticker_dir.exists() and sticker_dir.is_dir():
                 stickers = [f for f in sticker_dir.iterdir() if f.suffix.lower() in [".jpg", ".png", ".gif", ".webp", ".jpeg"]]
