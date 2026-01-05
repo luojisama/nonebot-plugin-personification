@@ -272,15 +272,9 @@ async def handle_reply(bot: Bot, event: Event):
         "4. 回复必须精简，禁止废话。"
     )
 
-    # 获取表情包列表（如果启用了）
-    available_stickers = []
-    sticker_dir = Path(plugin_config.personification_sticker_path)
-    if sticker_dir.exists() and sticker_dir.is_dir():
-        available_stickers = [f.stem for f in sticker_dir.iterdir() if f.suffix.lower() in [".jpg", ".png", ".gif", ".webp", ".jpeg"]]
-
     # 4. 构建消息历史
     messages = [
-         {"role": "system", "content": f"{system_prompt}\n\n当前表情包库中有以下表情包文件名供参考: {', '.join(available_stickers[:20]) if available_stickers else '暂无'}"}
+         {"role": "system", "content": f"{system_prompt}\n\n当前表情包库中已加载表情包，你可以根据氛围决定是否发送，但请勿在回复中直接输出任何文件名。"}
      ]
     messages.extend(chat_histories[group_id])
 
@@ -302,6 +296,8 @@ async def handle_reply(bot: Bot, event: Event):
         # 移除 AI 回复中可能包含的 [表情:xxx] 标签
         import re
         reply_content = re.sub(r'\[表情:[^\]]+\]', '', reply_content).strip()
+        # 移除末尾可能残留的表情包文件名（通常是 32 位 MD5 乱码）
+        reply_content = re.sub(r'\s*[a-fA-F0-9]{32}$', '', reply_content).strip()
         
         # 5. 处理 AI 的回复决策
         if "[NO_REPLY]" in reply_content:
