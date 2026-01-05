@@ -24,16 +24,17 @@ classifiers = [
     "Topic :: Communications :: Chat",
 ]
 
-[project.urls]
-"Homepage" = "https://github.com/luojisama/nonebot-plugin-personification"
-"Bug Tracker" = "https://github.com/luojisama/nonebot-plugin-personification/issues"
-"Repository" = "https://github.com/luojisama/nonebot-plugin-personification"
 dependencies = [
     "nonebot2>=2.2.0",
     "nonebot-adapter-onebot>=2.4.0",
     "openai>=1.0.0",
     "pydantic>=2.0.0",
 ]
+
+[project.urls]
+"Homepage" = "https://github.com/luojisama/nonebot-plugin-personification"
+"Bug Tracker" = "https://github.com/luojisama/nonebot-plugin-personification/issues"
+"Repository" = "https://github.com/luojisama/nonebot-plugin-personification"
 
 [project.optional-dependencies]
 htmlrender = [
