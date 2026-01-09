@@ -11,7 +11,6 @@ license = { text = "MIT" }
 keywords = ["nonebot", "nonebot2", "plugin", "openai", "personification", "chatgpt"]
 classifiers = [
     "Development Status :: 4 - Beta",
-    "Framework :: NoneBot2",
     "Intended Audience :: Developers",
     "License :: OSI Approved :: MIT License",
     "Operating System :: OS Independent",
