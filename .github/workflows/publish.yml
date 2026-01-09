@@ -1,9 +1,8 @@
 name: Publish to PyPI
 
 on:
-  push:
-    tags:
-      - 'v*'
+  release:
+    types: [published]
 
 jobs:
   publish:
@@ -21,10 +20,10 @@ jobs:
         uses: pdm-project/setup-pdm@v4
         with:
           python-version: "3.9"
-          cache: false
 
       - name: Build package
         run: pdm build
 
-      - name: Publish package
-        run: pdm publish --no-build
+      - name: Publish package to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+
