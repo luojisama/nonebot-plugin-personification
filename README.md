@@ -1,4 +1,4 @@
-# nonebot-plugin-personification
+# nonebot-plugin-shiro-personification
 
 ✨ 实现拟人化的群聊回复，支持好感度系统和自主回复决策 ✨
 
@@ -11,19 +11,20 @@
 在使用本项目之前，请确保已安装以下插件：
 
 - [nonebot-adapter-onebot](https://github.com/nonebot/adapter-onebot): OneBot V11 适配器
+- [nonebot-plugin-apscheduler](https://github.com/nonebot/plugin-apscheduler): 任务调度支持
 - [nonebot-plugin-htmlrender](https://github.com/kexue-go/nonebot-plugin-htmlrender): (可选) Markdown 转图片支持
-- [nonebot-plugin-shiro-signin](https://github.com/luojisama/nonebot-plugin-shiro-signin): (可选) 好感度系统关联插件
+- [nonebot-plugin-sign-in](https://github.com/luojisama/nonebot-plugin-sign-in): (可选) 好感度系统关联插件
 
 ## 💿 安装
 
 使用 nb-cli 安装：
 ```bash
-nb plugin install nonebot-plugin-personification
+nb plugin install nonebot-plugin-shiro-personification
 ```
 
 或者使用 pip 安装：
 ```bash
-pip install nonebot-plugin-personification
+pip install nonebot-plugin-shiro-personification
 ```
 
 ## ⚙️ 配置

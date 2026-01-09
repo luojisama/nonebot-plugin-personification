@@ -6,9 +6,14 @@ class Config(BaseModel):
     personification_probability: float = 0.5   # 默认回复概率 0-1
     
     # API 相关配置
+    personification_api_type: str = "openai"  # 可选 openai, gemini, gemini_official
     personification_api_url: str = "https://api.openai.com/v1"
     personification_api_key: str = ""
-    personification_model: str = "gpt-3.5-turbo"
+    personification_model: str = "gpt-4o-mini"
+    
+    # Gemini 官方格式专用配置 (Thinking 模型)
+    personification_thinking_budget: int = 0  # 思考预算 (token 数)，0 表示不启用
+    personification_include_thoughts: bool = True
     
     # 提示词配置
     personification_system_prompt: str = "你是一个群聊成员，性格活泼，说话幽默。你可以根据当前语境决定是否回复，如果不回复请只输出 [NO_REPLY]。"

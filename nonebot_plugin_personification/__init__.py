@@ -1,8 +1,9 @@
 import random
 import time
-from typing import Dict, List
+import re
+from typing import Dict, List, Optional
 from pathlib import Path
-from nonebot import on_message, on_command, get_plugin_config, logger, get_driver
+from nonebot import on_message, on_command, get_plugin_config, logger, get_driver, require, get_bots
 from nonebot.typing import T_State
 from nonebot.adapters.onebot.v11 import Bot, GroupMessageEvent, Message, MessageSegment, MessageEvent, PokeNotifyEvent, Event
 from nonebot.params import CommandArg
@@ -11,6 +12,16 @@ from nonebot.plugin import PluginMetadata
 from nonebot.rule import Rule
 from nonebot.exception import FinishedException
 from openai import AsyncOpenAI
+
+require("nonebot_plugin_apscheduler")
+from nonebot_plugin_apscheduler import scheduler
+
+# 尝试导入空间发布函数
+try:
+    from nonebot_plugin_account_manager import publish_qzone_shuo
+    ACCOUNT_MANAGER_AVAILABLE = True
+except ImportError:
+    ACCOUNT_MANAGER_AVAILABLE = False
 
 from .config import Config
 
@@ -22,12 +33,8 @@ except ImportError:
 
 # 尝试导入签到插件的工具函数
 try:
-    try:
-        from plugin.sign_in.utils import get_user_data, update_user_data
-        from plugin.sign_in.config import get_level_name
-    except ImportError:
-        from ..sign_in.utils import get_user_data, update_user_data
-        from ..sign_in.config import get_level_name
+    from nonebot_plugin_sign_in.utils import get_user_data, update_user_data
+    from nonebot_plugin_sign_in.config import get_level_name
     SIGN_IN_AVAILABLE = True
 except ImportError:
     SIGN_IN_AVAILABLE = False
@@ -41,10 +48,14 @@ __plugin_meta__ = PluginMetadata(
     name="群聊拟人",
     description="实现拟人化的群聊回复，支持好感度系统和自主回复决策",
     usage="在白名单群聊中根据概率随机回复，支持根据好感度改变态度",
-    type="application",
+    type="library",
     homepage="https://github.com/luojisama/nonebot-plugin-personification",
     config=Config,
-    supported_adapters={"~onebot.v11"},
+    supported_adapters={"nonebot.adapters.onebot.v11"},
+    extra={
+        "author": "luojisama",
+        "version": "0.1.3",
+    },
 )
 
 plugin_config = get_plugin_config(Config)
@@ -180,13 +191,19 @@ poke_matcher = on_message(rule=Rule(poke_rule), priority=100, block=False)
 from nonebot import on_notice
 
 async def poke_notice_rule(event: PokeNotifyEvent) -> bool:
+    # 打印调试信息，确认事件是否到达
+    logger.info(f"收到戳一戳事件: target_id={event.target_id}, self_id={event.self_id}")
     if event.target_id != event.self_id:
         return False
     group_id = str(event.group_id)
     if group_id not in plugin_config.personification_whitelist:
+        logger.info(f"群 {group_id} 不在白名单 {plugin_config.personification_whitelist}")
         return False
     # 使用配置的概率响应
-    return random.random() < plugin_config.personification_poke_probability
+    prob = plugin_config.personification_poke_probability
+    res = random.random() < prob
+    logger.info(f"戳一戳响应判定: 概率={prob}, 结果={res}")
+    return res
 
 poke_notice_matcher = on_notice(rule=Rule(poke_notice_rule), priority=10, block=False)
 
@@ -210,15 +227,47 @@ async def handle_reply(bot: Bot, event: Event, state: T_State):
         group_id = event.group_id
         message_content = "[你被对方戳了戳，你感到有点疑惑和好奇，想知道对方要做什么]"
         sender_name = "戳戳怪"
+        logger.info(f"拟人插件：检测到来自 {user_id} 的戳一戳")
     elif isinstance(event, GroupMessageEvent):
         group_id = event.group_id
         user_id = str(event.user_id)
-        message_content = event.get_plaintext().strip()
+        
+        # 提取文本和图片
+        message_text = ""
+        image_urls = []
+        import httpx
+        import base64
+        
+        for seg in event.message:
+            if seg.type == "text":
+                message_text += seg.data.get("text", "")
+            elif seg.type == "image":
+                url = seg.data.get("url")
+                if url:
+                    try:
+                        # 尝试将图片转换为 base64 以提高 AI 兼容性 (特别是 Gemini)
+                        async with httpx.AsyncClient() as client:
+                            resp = await client.get(url, timeout=10)
+                            if resp.status_code == 200:
+                                mime_type = resp.headers.get("Content-Type", "image/jpeg")
+                                base64_data = base64.b64encode(resp.content).decode("utf-8")
+                                image_urls.append(f"data:{mime_type};base64,{base64_data}")
+                            else:
+                                # 如果下载失败，保留原 URL 作为备选
+                                image_urls.append(url)
+                    except Exception as e:
+                        logger.warning(f"下载图片失败，保留原 URL: {e}")
+                        image_urls.append(url)
+        
+        message_content = message_text.strip()
         sender_name = event.sender.card or event.sender.nickname or user_id
         
         # 如果是随机水群触发，修改提示词
         if is_random_chat:
             message_content = f"[你观察到群里正在聊天，你决定主动插话分享一些想法。当前群员 {sender_name} 刚刚说了: {message_content}]"
+            # 水群触发时，如果是图片消息，也把图片带上
+            if image_urls and not message_text.strip():
+                message_content = f"[你观察到群里 {sender_name} 发送了一张图片，你决定评价一下或以此展开话题]"
     else:
         return
 
@@ -262,7 +311,15 @@ async def handle_reply(bot: Bot, event: Event, state: T_State):
     if group_id not in chat_histories:
         chat_histories[group_id] = []
     
-    chat_histories[group_id].append({"role": "user", "content": f"{user_name}: {message_content}"})
+    # 构建当前消息内容
+    if image_urls:
+        current_user_content = [{"type": "text", "text": f"{user_name}: {message_content}"}]
+        for url in image_urls:
+            current_user_content.append({"type": "image_url", "image_url": {"url": url}})
+        chat_histories[group_id].append({"role": "user", "content": current_user_content})
+    else:
+        chat_histories[group_id].append({"role": "user", "content": f"{user_name}: {message_content}"})
+    
     # 限制上下文长度
     if len(chat_histories[group_id]) > plugin_config.personification_history_len:
         chat_histories[group_id] = chat_histories[group_id][-plugin_config.personification_history_len:]
@@ -291,8 +348,9 @@ async def handle_reply(bot: Bot, event: Event, state: T_State):
         "   - **关于 [NO_REPLY] 标记的使用规则**：\n"
         "     - **严禁**因个人心情不好、讨厌对方或简单的意见不合而使用该标记。\n"
         "     - **仅当**对方发送了**严重的恶意人身攻击、极端侮辱性言论、或包含违规色情内容**时，才允许输出 [NO_REPLY]。\n"
-        "     - 触发后该用户将被拉黑，请务必审慎判定，不要滥用权力。\n"
-        "4. 回复必须精简，禁止废话。"
+        "   - 触发后该用户将被拉黑，请务必审慎判定，不要滥用权力。\n"
+        "4. **图片与表情包识别**：你现在可以看见对方发送的图片和表情包了。请结合图片内容进行回复，如果对方只发了图片，你可以评价图片或以此展开话题。\n"
+        "5. 回复必须精简，禁止废话。"
     )
 
     # 获取表情包列表（如果启用了）
@@ -309,19 +367,79 @@ async def handle_reply(bot: Bot, event: Event, state: T_State):
 
     # 4. 调用 AI API
     try:
+        # 1. 智能处理 API URL
+        api_url = plugin_config.personification_api_url.strip()
+        api_type = plugin_config.personification_api_type.lower()
+        
+        # 自动识别 Gemini 类型并切换到官方 OpenAI 兼容接口
+        if api_type == "gemini" and "api.openai.com" in api_url:
+            api_url = "https://generativelanguage.googleapis.com/v1beta/openai/"
+            logger.info(f"拟人插件：检测到 Gemini 类型，自动切换至官方兼容接口: {api_url}")
+        
+        # 根据指南要求：自动补全 /v1 后缀 (针对非 Gemini 官方地址)
+        if "generativelanguage.googleapis.com" not in api_url:
+            if not api_url.endswith(("/v1", "/v1/")):
+                api_url = api_url.rstrip("/") + "/v1"
+                logger.info(f"拟人插件：根据 OpenAI 规范自动补全 URL 后缀 -> {api_url}")
+
         client = AsyncOpenAI(
             api_key=plugin_config.personification_api_key,
-            base_url=plugin_config.personification_api_url
+            base_url=api_url,
+            timeout=60.0
         )
         
-        response = await client.chat.completions.create(
-            model=plugin_config.personification_model,
-            messages=messages,
-            timeout=30
-        )
+        try:
+            response = await client.chat.completions.create(
+                model=plugin_config.personification_model,
+                messages=messages,
+            )
+        except Exception as e:
+            # 捕获常见的 API 错误并进行人性化处理
+            error_msg = str(e)
+            
+            # 检查是否返回了 HTML (通常是中转站错误或 502/504)
+            if "<!DOCTYPE html>" in error_msg or "<html>" in error_msg.lower():
+                logger.error(f"拟人插件：API 返回了 HTML 错误页面，可能是中转平台故障或地址填写错误。URL: {api_url}")
+                return
+
+            # 如果包含图片且报错，尝试降级到纯文本
+            error_str = error_msg.lower()
+            is_vision_error = any(kw in error_str for kw in ["vision", "content", "image", "mimetype", "inlinedata", "400"])
+            
+            if image_urls and is_vision_error:
+                logger.warning(f"拟人插件：视觉模型调用失败，正在尝试降级至纯文本模式... 错误原因: {e}")
+                fallback_messages = []
+                for msg in messages:
+                    if isinstance(msg["content"], list):
+                        text_content = "".join([item["text"] for item in msg["content"] if item["type"] == "text"])
+                        fallback_messages.append({"role": msg["role"], "content": text_content})
+                    else:
+                        fallback_messages.append(msg)
+                
+                response = await client.chat.completions.create(
+                    model=plugin_config.personification_model,
+                    messages=fallback_messages,
+                    timeout=30.0
+                )
+            else:
+                logger.error(f"拟人插件：API 调用发生错误: {e}")
+                return
         
-        reply_content = response.choices[0].message.content.strip()
-        
+        # 增加对响应对象的类型检查，防止某些非标 API 返回字符串
+        if isinstance(response, str):
+            logger.warning(f"拟人插件：API 返回了字符串而非对象: {response}")
+            reply_content = response.strip()
+        else:
+            try:
+                reply_content = response.choices[0].message.content.strip()
+            except (AttributeError, IndexError, TypeError) as e:
+                logger.error(f"拟人插件：解析响应对象失败: {e}, 原始响应: {response}")
+                # 如果确实解析不了，尝试把整个响应转为字符串，或者抛出异常
+                if hasattr(response, "__str__"):
+                    reply_content = str(response).strip()
+                else:
+                    raise ValueError(f"无法从响应中提取内容: {response}")
+
         # 移除 AI 回复中可能包含的 [表情:xxx] 或 [发送了表情包: xxx] 标签
         import re
         reply_content = re.sub(r'\[表情:[^\]]*\]', '', reply_content)
@@ -343,11 +461,11 @@ async def handle_reply(bot: Bot, event: Event, state: T_State):
                     # 个人扣除
                     penalty = round(random.uniform(0, 0.3), 2)
                     user_data = get_user_data(user_id)
-                    current_fav = user_data.get("favorability", 0.0)
-                    new_fav = max(0.0, current_fav - penalty)
+                    current_fav = float(user_data.get("favorability", 0.0))
+                    new_fav = round(max(0.0, current_fav - penalty), 2)
                     
                     # 增加拉黑次数统计
-                    current_blacklist_count = user_data.get("blacklist_count", 0) + 1
+                    current_blacklist_count = int(user_data.get("blacklist_count", 0)) + 1
                     is_perm = False
                     if current_blacklist_count >= 25:
                         is_perm = True
@@ -357,11 +475,11 @@ async def handle_reply(bot: Bot, event: Event, state: T_State):
                     # 群聊扣除: 扣多 (0.5)
                     group_key = f"group_{group_id}"
                     group_data = get_user_data(group_key)
-                    g_current_fav = group_data.get("favorability", 100.0)
-                    g_new_fav = max(0.0, g_current_fav - 0.5)
+                    g_current_fav = float(group_data.get("favorability", 100.0))
+                    g_new_fav = round(max(0.0, g_current_fav - 0.5), 2)
                     update_user_data(group_key, favorability=g_new_fav)
                     
-                    penalty_desc = f"\n个人好感度：-{penalty} (当前：{new_fav})\n群聊好感度：-0.50 (当前：{g_new_fav:.2f})\n累计拉黑次数：{current_blacklist_count}/25"
+                    penalty_desc = f"\n个人好感度：-{penalty:.2f} (当前：{new_fav:.2f})\n群聊好感度：-0.50 (当前：{g_new_fav:.2f})\n累计拉黑次数：{current_blacklist_count}/25"
                     if is_perm:
                         penalty_desc += "\n⚠️ 该用户已触发 25 次拉黑，已自动加入永久黑名单。"
                     
@@ -398,18 +516,18 @@ async def handle_reply(bot: Bot, event: Event, state: T_State):
                         daily_count = 0.0
                     
                     if daily_count < 10.0:
-                        g_current_fav = group_data.get("favorability", 100.0)
-                        g_new_fav = g_current_fav + 0.1
-                        daily_count += 0.1
+                        g_current_fav = float(group_data.get("favorability", 100.0))
+                        g_new_fav = round(g_current_fav + 0.1, 2)
+                        daily_count = round(float(daily_count) + 0.1, 2)
                         update_user_data(group_key, favorability=g_new_fav, daily_fav_count=daily_count, last_update=today)
-                        logger.info(f"AI 觉得群 {group_id} 氛围良好，好感度 +0.1 (今日已加: {daily_count}/10)")
+                        logger.info(f"AI 觉得群 {group_id} 氛围良好，好感度 +0.10 (今日已加: {daily_count:.2f}/10.00)")
                         
                         # 通知管理员
                         for admin_id in superusers:
                             try:
                                 await bot.send_private_msg(
                                     user_id=int(admin_id),
-                                    message=f"【群好感变动】\n群：{group_id}\n事件：AI 觉得氛围良好 ✨\n变动：+0.1\n当前好感：{g_new_fav:.2f}\n今日进度：{daily_count}/10"
+                                    message=f"【群好感变动】\n群：{group_id}\n事件：AI 觉得氛围良好 ✨\n变动：+0.10\n当前好感：{g_new_fav:.2f}\n今日进度：{daily_count:.2f}/10.00"
                                 )
                             except Exception as e:
                                 logger.error(f"发送好感增加通知失败: {e}")
@@ -457,19 +575,6 @@ async def handle_reply(bot: Bot, event: Event, state: T_State):
         else:
             await bot.send(event, reply_content)
 
-        # 8. 如果是戳一戳触发，有 30% 概率戳回去
-        if is_poke and random.random() < 0.3:
-            try:
-                # 稍微延迟一下再戳回去
-                import asyncio
-                await asyncio.sleep(random.uniform(0.5, 1.0))
-                # 使用 MessageSegment.poke 发送戳一戳消息（某些实现支持，V11 标准通常是这个）
-                # 这里的 user_id 是发件人 ID
-                await bot.send(event, MessageSegment.poke(int(user_id)))
-                logger.info(f"拟人插件：已戳回去给用户 {user_id}")
-            except Exception as e:
-                logger.error(f"戳回去失败: {e}")
-
     except FinishedException:
         raise
     except Exception as e:
@@ -514,7 +619,7 @@ async def _(bot: Bot, event: GroupMessageEvent):
         </div>
         <div style="flex: 1; background: white; padding: 10px; border-radius: 10px; border: 1px solid {border_color}; text-align: center;">
             <div style="font-size: 0.8em; color: #999;">今日增长</div>
-            <div style="font-size: 1.4em; font-weight: bold; color: {text_color};">{daily_count:.1f}/10.0</div>
+            <div style="font-size: 1.4em; font-weight: bold; color: {text_color};">{daily_count:.2f}/10.00</div>
         </div>
     </div>
 
@@ -543,7 +648,7 @@ async def _(bot: Bot, event: GroupMessageEvent):
             f"群号：{group_id}\n"
             f"当前好感：{favorability:.2f}\n"
             f"当前等级：{status}\n"
-            f"今日增长：{daily_count:.1f} / 10.0\n"
+            f"今日增长：{daily_count:.2f} / 10.00\n"
             f"✨ 你的热情会让 AI 更有温度~"
         )
         await group_fav_query.finish(msg)
@@ -687,18 +792,195 @@ async def _(bot: Bot, event: MessageEvent):
 </div>
 """
     
-    pic = None
     if md_to_pic:
         try:
             pic = await md_to_pic(md, width=400)
+            await perm_blacklist_list.finish(MessageSegment.image(pic))
         except FinishedException:
             raise
         except Exception as e:
             logger.error(f"渲染永久黑名单图片失败: {e}")
     
-    if pic:
-        await perm_blacklist_list.finish(MessageSegment.image(pic))
+    # 退化方案
+    msg = "🚫 永久黑名单列表 🚫\n"
+    for item in blacklisted_items:
+        msg += f"\n- {item['id']} ({item['count']}次拉黑 / 好感:{item['fav']:.2f})"
+    await perm_blacklist_list.finish(msg)
+
+# --- AI 周记功能 ---
+
+def filter_sensitive_content(text: str) -> str:
+    """过滤敏感词汇（简单正则方案）"""
+    # 敏感词库（示例，建议根据实际需求扩展）
+    sensitive_patterns = [
+        r"政治", r"民主", r"政府", r"主席", r"书记", r"国家",  # 政治相关（示例）
+        r"色情", r"做爱", r"淫秽", r"成人", r"福利姬", r"裸",  # 色情相关（示例）
+        # 可以继续添加更多敏感词模式
+    ]
+    
+    filtered_text = text
+    for pattern in sensitive_patterns:
+        filtered_text = re.sub(pattern, "**", filtered_text, flags=re.IGNORECASE)
+    
+    # 过滤掉过短的消息（通常是杂音）
+    if len(filtered_text.strip()) < 2:
+        return ""
+        
+    return filtered_text
+
+async def get_recent_chat_context(bot: Bot) -> str:
+    """随机获取两个群的最近聊天记录作为周记素材"""
+    try:
+        # 获取群列表
+        group_list = await bot.get_group_list()
+        if not group_list:
+            return ""
+        
+        # 随机选择两个群（如果有的话）
+        sample_size = min(2, len(group_list))
+        selected_groups = random.sample(group_list, sample_size)
+        
+        context_parts = []
+        for group in selected_groups:
+            group_id = group["group_id"]
+            group_name = group.get("group_name", str(group_id))
+            
+            try:
+                # 获取最近 50 条消息
+                messages = await bot.get_group_msg_history(group_id=group_id, count=50)
+                if messages and "messages" in messages:
+                    msg_list = messages["messages"]
+                    chat_text = ""
+                    for m in msg_list:
+                        sender_name = m.get("sender", {}).get("nickname", "未知")
+                        # 提取纯文本内容
+                        raw_msg = m.get("message", "")
+                        content = ""
+                        if isinstance(raw_msg, list):
+                            content = "".join([seg["data"]["text"] for seg in raw_msg if seg["type"] == "text"])
+                        elif isinstance(raw_msg, str):
+                            content = re.sub(r"\[CQ:[^\]]+\]", "", raw_msg)
+                        
+                        # 执行内容过滤
+                        safe_content = filter_sensitive_content(content)
+                        
+                        if safe_content.strip():
+                            chat_text += f"{sender_name}: {safe_content.strip()}\n"
+                    
+                    if chat_text:
+                        context_parts.append(f"【群聊：{group_name} 的最近记录】\n{chat_text}")
+            except Exception as e:
+                logger.warning(f"获取群 {group_id} 历史记录失败: {e}")
+                continue
+                
+        return "\n\n".join(context_parts)
+    except Exception as e:
+        logger.error(f"获取聊天上下文失败: {e}")
+        return ""
+
+async def generate_ai_diary(bot: Bot) -> str:
+    """让 AI 根据聊天记录生成一段周记"""
+    system_prompt = load_prompt()
+    chat_context = await get_recent_chat_context(bot)
+    
+    # 基础人设要求
+    base_requirements = (
+        "1. 语气必须完全符合你的人设（绪山真寻：变成女初中生的宅男，语气笨拙、弱气、容易害羞）。\n"
+        "2. 字数严格限制在 200 字以内。\n"
+        "3. 直接输出日记内容，不要包含日期或其他无关文字。\n"
+        "4. 严禁涉及任何政治、色情、暴力等违规内容。\n"
+        "5. 严禁包含任何图片描述、[图片] 占位符或多媒体标记，只能是纯文字内容。"
+    )
+
+    async def call_ai(prompt: str) -> Optional[str]:
+        try:
+            client = AsyncOpenAI(
+                api_key=plugin_config.personification_api_key,
+                base_url=plugin_config.personification_api_url
+            )
+            response = await client.chat.completions.create(
+                model=plugin_config.personification_model,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": prompt}
+                ],
+                timeout=30
+            )
+            if response and response.choices and response.choices[0].message.content:
+                return response.choices[0].message.content.strip()
+            return None
+        except Exception as e:
+            logger.warning(f"AI 生成尝试失败: {e}")
+            return None
+
+    # 尝试方案 A：结合群聊素材生成
+    if chat_context:
+        rich_prompt = (
+            "任务：请以日记的形式写一段简短的周记，记录你这一周在群里看到的趣事。\n"
+            "素材：以下是最近群里的聊天记录（已脱敏），你可以参考其中的话题：\n"
+            f"{chat_context}\n\n"
+            f"要求：\n{base_requirements}"
+        )
+        result = await call_ai(rich_prompt)
+        if result:
+            return result
+        logger.warning("拟人插件：带素材的 AI 生成失败（可能是触发了 API 安全拦截），尝试保底模式...")
+
+    # 尝试方案 B：保底模式（不带素材，降低被拦截概率）
+    basic_prompt = (
+        "任务：请以日记的形式写一段简短的周记，记录你这一周的心情。\n"
+        f"要求：\n{base_requirements}"
+    )
+    result = await call_ai(basic_prompt)
+    return result or ""
+
+async def auto_post_diary():
+    """定时任务：每周发送一次说说"""
+    if not ACCOUNT_MANAGER_AVAILABLE:
+        logger.warning("拟人插件：未找到 account_manager 插件，无法自动发送说说。")
+        return
+        
+    bots = get_bots()
+    if not bots:
+        logger.warning("拟人插件：未找到有效的 Bot 实例，跳过自动说说发布。")
+        return
+    
+    # 获取第一个 Bot 实例
+    bot = list(bots.values())[0]
+    
+    diary_content = await generate_ai_diary(bot)
+    if not diary_content:
+        return
+        
+    logger.info(f"拟人插件：正在自动发布周记说说...")
+    success, msg = await publish_qzone_shuo(diary_content, bot.self_id)
+    if success:
+        logger.info("拟人插件：每周说说发布成功！")
     else:
-        # 文本回退
-        msg = "🚫 永久黑名单列表：\n" + "\n".join([f"- {i['id']} (拉黑: {i['count']}次)" for i in blacklisted_items])
-        await perm_blacklist_list.finish(msg)
+        logger.error(f"拟人插件：每周说说发布失败：{msg}")
+
+# 每周日晚上 21:00 发送
+try:
+    scheduler.add_job(auto_post_diary, "cron", day_of_week="sun", hour=21, minute=0, id="ai_weekly_diary", replace_existing=True)
+    logger.info("拟人插件：已成功注册 AI 每周说说定时任务 (周日 21:00)")
+except Exception as e:
+    logger.error(f"拟人插件：注册定时任务失败: {e}")
+
+manual_diary_cmd = on_command("发个说说", permission=SUPERUSER, priority=5, block=True)
+
+@manual_diary_cmd.handle()
+async def handle_manual_diary(bot: Bot):
+    if not ACCOUNT_MANAGER_AVAILABLE:
+        await manual_diary_cmd.finish("未找到 account_manager 插件，无法发布说说。")
+        
+    await manual_diary_cmd.send("正在生成 AI 周记并发布，请稍候...")
+    
+    diary_content = await generate_ai_diary(bot)
+    if not diary_content:
+        await manual_diary_cmd.finish("AI 生成周记失败，请检查网络或 API 配置。")
+        
+    success, msg = await publish_qzone_shuo(diary_content, bot.self_id)
+    if success:
+        await manual_diary_cmd.finish(f"✅ AI 说说发布成功！\n\n内容：\n{diary_content}")
+    else:
+        await manual_diary_cmd.finish(f"❌ 发布失败：{msg}")
