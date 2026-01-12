@@ -14,30 +14,45 @@ from nonebot.exception import FinishedException
 from openai import AsyncOpenAI
 
 require("nonebot_plugin_apscheduler")
+require("nonebot_plugin_localstore")
+
 from nonebot_plugin_apscheduler import scheduler
+import nonebot_plugin_localstore as localstore
+
+# 获取插件数据目录
+data_dir = localstore.get_plugin_data_dir()
+# 表情包目录默认为数据目录下的 stickers
+default_sticker_path = data_dir / "stickers"
+default_sticker_path.mkdir(parents=True, exist_ok=True)
 
 # 尝试导入空间发布函数
+ACCOUNT_MANAGER_AVAILABLE = False
 try:
+    require("nonebot_plugin_account_manager")
     from nonebot_plugin_account_manager import publish_qzone_shuo
     ACCOUNT_MANAGER_AVAILABLE = True
-except ImportError:
-    ACCOUNT_MANAGER_AVAILABLE = False
+except (ImportError, RuntimeError):
+    pass
 
 from .config import Config
 
 # 尝试导入 htmlrender
+md_to_pic = None
 try:
+    require("nonebot_plugin_htmlrender")
     from nonebot_plugin_htmlrender import md_to_pic
-except ImportError:
-    md_to_pic = None
+except (ImportError, RuntimeError):
+    pass
 
 # 尝试导入签到插件的工具函数
+SIGN_IN_AVAILABLE = False
 try:
+    require("nonebot_plugin_sign_in")
     from nonebot_plugin_sign_in.utils import get_user_data, update_user_data
     from nonebot_plugin_sign_in.config import get_level_name
     SIGN_IN_AVAILABLE = True
-except ImportError:
-    SIGN_IN_AVAILABLE = False
+except (ImportError, RuntimeError):
+    pass
 
 if SIGN_IN_AVAILABLE:
     logger.info("拟人插件：已成功关联签到插件，好感度系统已激活。")
@@ -154,7 +169,7 @@ async def _(bot: Bot, event: GroupMessageEvent, state: T_State):
     # 随机选择一种水群模式 (三种模式概率各 1/3)
     mode = random.choice(["text_only", "sticker_only", "mixed"])
     
-    sticker_dir = Path(plugin_config.personification_sticker_path)
+    sticker_dir = Path(plugin_config.personification_sticker_path) if plugin_config.personification_sticker_path else default_sticker_path
     available_stickers = []
     if sticker_dir.exists() and sticker_dir.is_dir():
         available_stickers = [f for f in sticker_dir.iterdir() if f.suffix.lower() in [".jpg", ".png", ".gif", ".webp", ".jpeg"]]

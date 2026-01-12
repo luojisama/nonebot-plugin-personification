@@ -39,7 +39,7 @@ class Config(BaseModel):
     personification_history_len: int = 50
 
     # 表情包配置
-    personification_sticker_path: Optional[str] = "data/stickers"  # 表情包文件夹路径
+    personification_sticker_path: Optional[str] = None            # 表情包文件夹路径，默认为插件数据目录下的 stickers
     personification_sticker_probability: float = 0.2              # 发送表情包概率
 
     # 戳一戳配置
