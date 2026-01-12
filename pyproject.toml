@@ -1,6 +1,6 @@
 [project]
 name = "nonebot-plugin-shiro-personification"
-version = "0.1.4"
+version = "0.1.5"
 description = "实现拟人化的群聊回复，支持好感度系统和自主回复决策"
 readme = "README.md"
 requires-python = ">=3.9"
@@ -41,7 +41,7 @@ htmlrender = [
     "nonebot-plugin-htmlrender>=0.2.0",
 ]
 signin = [
-    "nonebot-plugin-sign-in>=0.1.0",
+    "nonebot-plugin-shiro-signin>=0.1.0",
 ]
 
 [tool.nonebot]

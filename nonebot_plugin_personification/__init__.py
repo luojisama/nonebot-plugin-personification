@@ -3,7 +3,7 @@ import time
 import re
 from typing import Dict, List, Optional
 from pathlib import Path
-from nonebot import on_message, on_command, get_plugin_config, logger, get_driver, require, get_bots
+from nonebot import on_message, on_command, logger, get_driver, require, get_bots
 from nonebot.typing import T_State
 from nonebot.adapters.onebot.v11 import Bot, GroupMessageEvent, Message, MessageSegment, MessageEvent, PokeNotifyEvent, Event
 from nonebot.params import CommandArg
@@ -17,39 +17,50 @@ require("nonebot_plugin_apscheduler")
 require("nonebot_plugin_localstore")
 
 from nonebot_plugin_apscheduler import scheduler
-import nonebot_plugin_localstore as localstore
+import nonebot_plugin_localstore
+
+# 尝试 require 其他可选插件
+try:
+    require("nonebot_plugin_account_manager")
+except (ImportError, RuntimeError):
+    pass
+
+try:
+    require("nonebot_plugin_htmlrender")
+except (ImportError, RuntimeError):
+    pass
+
+try:
+    require("nonebot_plugin_shiro_signin")
+except (ImportError, RuntimeError):
+    pass
+
+from .config import Config, config, get_level_name
 
 # 获取插件数据目录
-data_dir = localstore.get_plugin_data_dir()
+data_dir = nonebot_plugin_localstore.get_plugin_data_dir()
 # 表情包目录默认为数据目录下的 stickers
 default_sticker_path = data_dir / "stickers"
 default_sticker_path.mkdir(parents=True, exist_ok=True)
 
-# 尝试导入空间发布函数
+# 尝试导入可选依赖
 ACCOUNT_MANAGER_AVAILABLE = False
 try:
-    require("nonebot_plugin_account_manager")
     from nonebot_plugin_account_manager import publish_qzone_shuo
     ACCOUNT_MANAGER_AVAILABLE = True
 except (ImportError, RuntimeError):
     pass
 
-from .config import Config
-
-# 尝试导入 htmlrender
 md_to_pic = None
 try:
-    require("nonebot_plugin_htmlrender")
     from nonebot_plugin_htmlrender import md_to_pic
 except (ImportError, RuntimeError):
     pass
 
-# 尝试导入签到插件的工具函数
 SIGN_IN_AVAILABLE = False
 try:
-    require("nonebot_plugin_sign_in")
-    from nonebot_plugin_sign_in.utils import get_user_data, update_user_data
-    from nonebot_plugin_sign_in.config import get_level_name
+    from nonebot_plugin_shiro_signin.utils import get_user_data, update_user_data
+    from nonebot_plugin_shiro_signin.config import config as sign_in_config
     SIGN_IN_AVAILABLE = True
 except (ImportError, RuntimeError):
     pass
@@ -63,23 +74,22 @@ __plugin_meta__ = PluginMetadata(
     name="群聊拟人",
     description="实现拟人化的群聊回复，支持好感度系统和自主回复决策",
     usage="在白名单群聊中根据概率随机回复，支持根据好感度改变态度",
-    type="library",
+    type="application",
     homepage="https://github.com/luojisama/nonebot-plugin-personification",
     config=Config,
     supported_adapters={"nonebot.adapters.onebot.v11"},
     extra={
         "author": "luojisama",
-        "version": "0.1.3",
+        "version": "0.1.5",
     },
 )
 
-plugin_config = get_plugin_config(Config)
 superusers = get_driver().config.superusers
 
 def load_prompt() -> str:
     """加载提示词，支持从路径或直接字符串，兼容 Windows/Linux"""
     # 1. 优先检查专门的路径配置项
-    target_path = plugin_config.personification_prompt_path or plugin_config.personification_system_path
+    target_path = config.personification_prompt_path or config.personification_system_path
     if target_path:
         # 处理可能的双引号和转义字符
         raw_path = target_path.strip('"').strip("'")
@@ -99,7 +109,7 @@ def load_prompt() -> str:
             logger.warning(f"拟人插件：路径文件不存在，请检查 .env.prod 配置。尝试路径: {raw_path}")
 
     # 2. 检查 system_prompt 本身是否是一个存在的路径
-    content = plugin_config.personification_system_prompt
+    content = config.personification_system_prompt
     if content and len(content) < 260:
         try:
             raw_path = content.strip('"').strip("'")
@@ -126,7 +136,7 @@ async def personification_rule(event: GroupMessageEvent) -> bool:
     user_id = str(event.user_id)
     
     # 检查是否在白名单中
-    if group_id not in plugin_config.personification_whitelist:
+    if group_id not in config.personification_whitelist:
         return False
     
     # 检查是否在永久黑名单中
@@ -149,7 +159,7 @@ async def personification_rule(event: GroupMessageEvent) -> bool:
         return True
         
     # 根据概率决定是否触发
-    return random.random() < plugin_config.personification_probability
+    return random.random() < config.personification_probability
 
 # 注册消息处理器，优先级设为 100，不阻断其他插件
 reply_matcher = on_message(rule=Rule(personification_rule), priority=100, block=False)
@@ -157,10 +167,10 @@ reply_matcher = on_message(rule=Rule(personification_rule), priority=100, block=
 # 注册表情包水群处理器
 async def sticker_chat_rule(event: GroupMessageEvent) -> bool:
     group_id = str(event.group_id)
-    if group_id not in plugin_config.personification_whitelist:
+    if group_id not in config.personification_whitelist:
         return False
     # 概率与随机回复一致
-    return random.random() < plugin_config.personification_probability
+    return random.random() < config.personification_probability
 
 sticker_chat_matcher = on_message(rule=Rule(sticker_chat_rule), priority=101, block=False)
 
@@ -169,7 +179,7 @@ async def _(bot: Bot, event: GroupMessageEvent, state: T_State):
     # 随机选择一种水群模式 (三种模式概率各 1/3)
     mode = random.choice(["text_only", "sticker_only", "mixed"])
     
-    sticker_dir = Path(plugin_config.personification_sticker_path) if plugin_config.personification_sticker_path else default_sticker_path
+    sticker_dir = Path(config.personification_sticker_path) if config.personification_sticker_path else default_sticker_path
     available_stickers = []
     if sticker_dir.exists() and sticker_dir.is_dir():
         available_stickers = [f for f in sticker_dir.iterdir() if f.suffix.lower() in [".jpg", ".png", ".gif", ".webp", ".jpeg"]]
@@ -196,10 +206,10 @@ async def poke_rule(event: PokeNotifyEvent) -> bool:
     if event.target_id != event.self_id:
         return False
     group_id = str(event.group_id)
-    if group_id not in plugin_config.personification_whitelist:
+    if group_id not in config.personification_whitelist:
         return False
     # 使用配置的概率响应
-    return random.random() < plugin_config.personification_poke_probability
+    return random.random() < config.personification_poke_probability
 
 poke_matcher = on_message(rule=Rule(poke_rule), priority=100, block=False)
 # 注意：v11 的戳一戳通常是 Notify 事件，但在一些实现中可能作为消息
@@ -211,11 +221,11 @@ async def poke_notice_rule(event: PokeNotifyEvent) -> bool:
     if event.target_id != event.self_id:
         return False
     group_id = str(event.group_id)
-    if group_id not in plugin_config.personification_whitelist:
-        logger.info(f"群 {group_id} 不在白名单 {plugin_config.personification_whitelist}")
+    if group_id not in config.personification_whitelist:
+        logger.info(f"群 {group_id} 不在白名单 {config.personification_whitelist}")
         return False
     # 使用配置的概率响应
-    prob = plugin_config.personification_poke_probability
+    prob = config.personification_poke_probability
     res = random.random() < prob
     logger.info(f"戳一戳响应判定: 概率={prob}, 结果={res}")
     return res
@@ -287,7 +297,7 @@ async def handle_reply(bot: Bot, event: Event, state: T_State):
         return
 
     # 如果没配置 API KEY，直接跳过
-    if not plugin_config.personification_api_key:
+    if not config.personification_api_key:
         logger.warning("拟人插件：未配置 API Key，跳过回复")
         return
 
@@ -311,14 +321,14 @@ async def handle_reply(bot: Bot, event: Event, state: T_State):
             user_data = get_user_data(user_id)
             favorability = user_data.get("favorability", 0.0)
             level_name = get_level_name(favorability)
-            attitude_desc = plugin_config.personification_favorability_attitudes.get(level_name, attitude_desc)
+            attitude_desc = config.personification_favorability_attitudes.get(level_name, attitude_desc)
             
             # 获取群聊好感度
             group_key = f"group_{group_id}"
             group_data = get_user_data(group_key)
             group_favorability = group_data.get("favorability", 100.0)
             group_level = get_level_name(group_favorability)
-            group_attitude = plugin_config.personification_favorability_attitudes.get(group_level, "")
+            group_attitude = config.personification_favorability_attitudes.get(group_level, "")
         except Exception as e:
             logger.error(f"获取好感度数据失败: {e}")
 
@@ -336,8 +346,8 @@ async def handle_reply(bot: Bot, event: Event, state: T_State):
         chat_histories[group_id].append({"role": "user", "content": f"{user_name}: {message_content}"})
     
     # 限制上下文长度
-    if len(chat_histories[group_id]) > plugin_config.personification_history_len:
-        chat_histories[group_id] = chat_histories[group_id][-plugin_config.personification_history_len:]
+    if len(chat_histories[group_id]) > config.personification_history_len:
+        chat_histories[group_id] = chat_histories[group_id][-config.personification_history_len:]
 
     # 3. 构建 Prompt
     base_prompt = load_prompt()
@@ -370,7 +380,7 @@ async def handle_reply(bot: Bot, event: Event, state: T_State):
 
     # 获取表情包列表（如果启用了）
     available_stickers = []
-    sticker_dir = Path(plugin_config.personification_sticker_path)
+    sticker_dir = Path(config.personification_sticker_path) if config.personification_sticker_path else default_sticker_path
     if sticker_dir.exists() and sticker_dir.is_dir():
         available_stickers = [f.stem for f in sticker_dir.iterdir() if f.suffix.lower() in [".jpg", ".png", ".gif", ".webp", ".jpeg"]]
 
@@ -383,8 +393,8 @@ async def handle_reply(bot: Bot, event: Event, state: T_State):
     # 4. 调用 AI API
     try:
         # 1. 智能处理 API URL
-        api_url = plugin_config.personification_api_url.strip()
-        api_type = plugin_config.personification_api_type.lower()
+        api_url = config.personification_api_url.strip()
+        api_type = config.personification_api_type.lower()
         
         # 自动识别 Gemini 类型并切换到官方 OpenAI 兼容接口
         if api_type == "gemini" and "api.openai.com" in api_url:
@@ -398,14 +408,14 @@ async def handle_reply(bot: Bot, event: Event, state: T_State):
                 logger.info(f"拟人插件：根据 OpenAI 规范自动补全 URL 后缀 -> {api_url}")
 
         client = AsyncOpenAI(
-            api_key=plugin_config.personification_api_key,
+            api_key=config.personification_api_key,
             base_url=api_url,
             timeout=60.0
         )
         
         try:
             response = await client.chat.completions.create(
-                model=plugin_config.personification_model,
+                model=config.personification_model,
                 messages=messages,
             )
         except Exception as e:
@@ -432,7 +442,7 @@ async def handle_reply(bot: Bot, event: Event, state: T_State):
                         fallback_messages.append(msg)
                 
                 response = await client.chat.completions.create(
-                    model=plugin_config.personification_model,
+                    model=config.personification_model,
                     messages=fallback_messages,
                     timeout=30.0
                 )
@@ -465,7 +475,7 @@ async def handle_reply(bot: Bot, event: Event, state: T_State):
         
         # 5. 处理 AI 的回复决策
         if "[NO_REPLY]" in reply_content:
-            duration = plugin_config.personification_blacklist_duration
+            duration = config.personification_blacklist_duration
             user_blacklist[user_id] = time.time() + duration
             logger.info(f"AI 决定不回复群 {group_id} 中 {user_name}({user_id}) 的消息，将其拉黑 {duration} 秒")
             
@@ -559,11 +569,11 @@ async def handle_reply(bot: Bot, event: Event, state: T_State):
             should_get_sticker = True
         elif force_mode == "text_only":
             should_get_sticker = False
-        elif random.random() < plugin_config.personification_sticker_probability:
+        elif random.random() < config.personification_sticker_probability:
             should_get_sticker = True
 
         if should_get_sticker:
-            sticker_dir = Path(plugin_config.personification_sticker_path)
+            sticker_dir = Path(config.personification_sticker_path) if config.personification_sticker_path else default_sticker_path
             if sticker_dir.exists() and sticker_dir.is_dir():
                 stickers = [f for f in sticker_dir.iterdir() if f.suffix.lower() in [".jpg", ".png", ".gif", ".webp", ".jpeg"]]
                 if stickers:
@@ -754,9 +764,9 @@ async def _(bot: Bot, event: MessageEvent):
         await perm_blacklist_list.finish("签到插件未就绪，无法操作。")
         
     try:
-        from plugin.sign_in.utils import load_data
+        from nonebot_plugin_shiro_signin.utils import load_data
     except ImportError:
-        from ..sign_in.utils import load_data
+        await perm_blacklist_list.finish("无法加载签到插件的数据模块。")
         
     data = load_data()
     blacklisted_items = []
@@ -910,11 +920,11 @@ async def generate_ai_diary(bot: Bot) -> str:
     async def call_ai(prompt: str) -> Optional[str]:
         try:
             client = AsyncOpenAI(
-                api_key=plugin_config.personification_api_key,
-                base_url=plugin_config.personification_api_url
+                api_key=config.personification_api_key,
+                base_url=config.personification_api_url
             )
             response = await client.chat.completions.create(
-                model=plugin_config.personification_model,
+                model=config.personification_model,
                 messages=[
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": prompt}
