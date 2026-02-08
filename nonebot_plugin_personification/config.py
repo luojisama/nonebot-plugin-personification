@@ -46,6 +46,9 @@ class Config(BaseModel):
     # 戳一戳配置
     personification_poke_probability: float = 0.3                 # 戳一戳响应概率
 
+    # 模型联网功能开关
+    personification_web_search: bool = True
+
     # 拉黑时长 (单位: 秒)，默认 30 分钟
     personification_blacklist_duration: int = 1800
 
