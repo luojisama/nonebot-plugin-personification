@@ -1,7 +1,7 @@
 [project]
 name = "nonebot-plugin-shiro-personification"
-version = "0.1.6"
-description = "实现拟人化的群聊回复，支持好感度系统和自主回复决策"
+version = "0.1.7"
+description = "实现拟人化的群聊回复，支持好感度系统、自主回复决策及YAML剧本模式"
 readme = "README.md"
 requires-python = ">=3.9"
 authors = [
@@ -34,6 +34,7 @@ dependencies = [
     "aiofiles>=23.0.0",
     "httpx>=0.24.0",
     "Pillow>=9.0.0",
+    "PyYAML>=6.0",
 ]
 
 [project.urls]

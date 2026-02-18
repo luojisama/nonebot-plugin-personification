@@ -3,6 +3,7 @@ import time
 from pathlib import Path
 from typing import List, Dict, Optional
 import nonebot_plugin_localstore as localstore
+from nonebot.adapters.onebot.v11 import GroupMessageEvent, MessageEvent
 
 data_dir = localstore.get_plugin_data_dir()
 DATA_PATH = data_dir / "whitelist.json"
@@ -58,6 +59,14 @@ def set_group_enabled(group_id: str, enabled: bool):
         configs[group_id] = {}
         
     configs[group_id]["enabled"] = enabled
+    save_group_configs(configs)
+
+def set_group_schedule_enabled(group_id: str, enabled: bool):
+    configs = load_group_configs()
+    if group_id not in configs:
+        configs[group_id] = {}
+        
+    configs[group_id]["schedule_enabled"] = enabled
     save_group_configs(configs)
 
 # --- 白名单管理 ---
@@ -159,3 +168,9 @@ def update_request_status(group_id: str, status: str, operator_id: str = None) -
 def get_request_info(group_id: str) -> Optional[dict]:
     requests = load_requests()
     return requests.get(group_id)
+
+def get_user_name(event: MessageEvent) -> str:
+    """获取用户昵称，优先群名片"""
+    if isinstance(event, GroupMessageEvent):
+        return event.sender.card or event.sender.nickname or str(event.user_id)
+    return event.sender.nickname or str(event.user_id)

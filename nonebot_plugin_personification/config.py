@@ -37,7 +37,7 @@ class Config(BaseModel):
     }
 
     # 聊天记录参考长度
-    personification_history_len: int = 50
+    personification_history_len: int = 200
 
     # 表情包配置
     personification_sticker_path: Optional[str] = None            # 表情包文件夹路径，默认为插件数据目录下的 stickers
@@ -49,8 +49,17 @@ class Config(BaseModel):
     # 模型联网功能开关
     personification_web_search: bool = True
 
-    # 拉黑时长 (单位: 秒)，默认 30 分钟
-    personification_blacklist_duration: int = 1800
+    # 作息模拟全局开关
+    personification_schedule_global: bool = False
+
+    # 主动发送消息配置
+    personification_proactive_enabled: bool = True       # 是否开启主动发送消息
+    personification_proactive_threshold: float = 60.0    # 触发主动消息的好感度阈值
+    personification_proactive_daily_limit: int = 3       # 每日主动发送消息次数上限
+    personification_proactive_interval: int = 30         # 主动消息检查间隔（分钟）
+
+    # 黑名单配置
+    personification_blacklist_duration: int = 300        # 临时黑名单时长（秒）
 
     # 好感度等级定义
     # (阈值, 等级名称)
