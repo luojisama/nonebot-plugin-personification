@@ -115,7 +115,7 @@ __plugin_meta__ = PluginMetadata(
 superusers = get_driver().config.superusers
 
 def load_prompt(group_id: str = None) -> Union[str, Dict[str, Any]]:
-    """加载提示词，支持从路径或直接字符串，兼容 Windows/Linux，优先使用群组特定配置"""
+    """加载提示词，支持从路径 or 直接字符串，兼容 Windows/Linux，优先使用群组特定配置"""
     content = None
     
     # 0. 检查群组特定配置
@@ -434,11 +434,6 @@ async def call_ai_api(messages: List[Dict], tools: Optional[List[Dict]] = None, 
                     call_params["tools"] = tools
                     call_params["tool_choice"] = "auto"
                 
-                # 兼容 gemini-official 模式 (虽然已经在上面处理了，这里是防止 config 错配)
-                if api_type == "gemini_official":
-                     # 如果用户配置错了，强制回退到 openai 兼容模式调用 gemini
-                     pass
-
                 try:
                     completion = await client.chat.completions.create(**call_params)
                     msg = completion.choices[0].message
@@ -487,269 +482,499 @@ async def call_ai_api(messages: List[Dict], tools: Optional[List[Dict]] = None, 
         return None
 
 def split_text_into_segments(text: str) -> List[str]:
-    """将回复文本拆分为多个段落，模拟人类分段发送"""
-    segments = []
-    # 按照换行符拆分
-    parts = text.split('\n')
+    """将长文本拆分为多个短句，模拟人类分段发送"""
+    # 正则：匹配 句号、问号、感叹号、换行符，以及省略号
+    pattern = r'([。！？!?\n]+|[…]{1,2}|[.]{3,6})'
     
-    current_segment = ""
+    parts = re.split(pattern, text)
+    segments = []
+    buffer = ""
+    
     for part in parts:
-        part = part.strip()
         if not part:
             continue
             
-        # 如果当前段落加上新部分超过一定长度，或者是独立的句子（以标点结尾），则拆分
-        if len(current_segment) + len(part) > 20 or (current_segment and current_segment[-1] in ['。', '！', '？', '!', '?', '~']):
-            if current_segment:
-                segments.append(current_segment)
-            current_segment = part
+        if re.match(pattern, part):
+            buffer += part
+            segments.append(buffer)
+            buffer = ""
         else:
-            if current_segment:
-                current_segment += "\n" + part
-            else:
-                current_segment = part
-                
-    if current_segment:
-        segments.append(current_segment)
+            if buffer:
+                segments.append(buffer)
+                buffer = ""
+            buffer = part
+            
+    if buffer:
+        segments.append(buffer)
         
     return segments
 
-async def _process_yaml_response_logic(bot: Bot, event: GroupMessageEvent, group_id: str, user_id: str, user_name: str, level_name: str, yaml_data: Dict[str, Any], chat_history: List[Dict]):
-    """
-    处理基于 YAML 状态机的回复逻辑
-    """
-    try:
-        # 1. 获取当前状态
-        current_status = bot_statuses.get(group_id, "default")
+async def _buffer_timer(key: str, bot: Bot):
+    # 等待 7 秒（用户输入缓冲，收到新消息会重置此时钟）
+    delay = 7.0
+    await asyncio.sleep(delay)
+    
+    # 时间到，开始处理
+    if key in _msg_buffer:
+        data = _msg_buffer.pop(key)
+        events = data["events"]
+        state = data["state"]
         
-        # 2. 查找匹配的 input 规则
-        matched_response = None
-        new_status = current_status
-        
-        inputs = yaml_data.get("input", [])
-        if not inputs:
-            logger.warning(f"YAML 模板没有 input 规则")
-            return
-            
-        # 获取用户消息
-        user_msg = event.get_plaintext().strip()
-        
-        for rule in inputs:
-            # 检查状态匹配
-            rule_status = rule.get("status", "default")
-            # 支持列表或字符串
-            if isinstance(rule_status, list):
-                if current_status not in rule_status:
-                    continue
-            elif rule_status != current_status and rule_status != "*":
-                continue
-                
-            # 检查关键词匹配 (match)
-            match_keywords = rule.get("match", [])
-            if match_keywords:
-                is_match = False
-                for keyword in match_keywords:
-                    if keyword in user_msg:
-                        is_match = True
-                        break
-                if not is_match:
-                    continue
-            
-            # 找到匹配规则
-            matched_response = rule
-            break
-            
-        if not matched_response:
-            # 如果没有匹配的规则，是否回退到 AI?
-            # 这里简单处理：如果没有匹配，尝试使用 default 状态的 fallback 或者交给 AI
-            # 暂时策略：交给 AI (return 这里的函数，让外层继续)
+        if not events:
             return
 
-        # 3. 执行回复
-        response_template = matched_response.get("response", "")
-        if isinstance(response_template, list):
-            response_template = random.choice(response_template)
+        # 拼接消息
+        combined_message = Message()
+        # 使用第一个事件作为基础
+        first_event = events[0]
+        
+        for i, ev in enumerate(events):
+            if isinstance(ev, MessageEvent):
+                if i > 0:
+                     combined_message.append(MessageSegment.text(" "))
+                combined_message.extend(ev.message)
+        
+        # 将拼接后的消息放入 state
+        state["concatenated_message"] = combined_message
+        
+        try:
+            await _process_response_logic(bot, first_event, state)
+        except Exception as e:
+            logger.error(f"拟人插件：处理拼接消息失败: {e}")
+
+def extract_xml_content(text: str, tag: str) -> Optional[str]:
+    """提取 XML 标签内容，支持多行，支持属性"""
+    pattern = f"<{tag}.*?>(.*?)</\s*{tag}\s*>"
+    match = re.search(pattern, text, re.DOTALL | re.IGNORECASE)
+    if match:
+        return match.group(1).strip()
+    return None
+
+def parse_yaml_response(response: str) -> Dict[str, Any]:
+    """解析 YAML 模板定义的 AI 回复格式"""
+    result = {
+        "status": extract_xml_content(response, "status"),
+        "think": extract_xml_content(response, "think"),
+        "action": extract_xml_content(response, "action"),
+        "messages": []
+    }
+    
+    output_content = extract_xml_content(response, "output")
+    if not output_content:
+        output_content = response
+
+    if output_content:
+        msg_pattern = r'<message(.*?)>(.*?)</\s*message\s*>'
+        matches = finditer = re.finditer(msg_pattern, output_content, re.DOTALL | re.IGNORECASE)
+        for match in matches:
+            attrs = match.group(1)
+            content = match.group(2).strip()
             
-        # 替换变量
-        response_text = response_template.replace("{user}", user_name)
-        
-        # 更新状态
-        if "set_status" in matched_response:
-            new_status = matched_response["set_status"]
-            bot_statuses[group_id] = new_status
-            logger.info(f"拟人插件：状态变更为 {new_status}")
+            quote_id = None
+            quote_match = re.search(r'quote=["\']([^"\']*)["\']', attrs)
+            if quote_match:
+                quote_id = quote_match.group(1)
             
-        # 发送回复
-        await bot.send(event, response_text)
-        
-        # 记录历史
-        chat_histories[group_id].append({"role": "user", "content": user_msg})
-        chat_histories[group_id].append({"role": "assistant", "content": response_text})
-
-    except Exception as e:
-        logger.error(f"YAML 逻辑处理失败: {e}")
-
-# --- 主消息处理器 ---
-chat_handler = on_message(priority=99, block=False)
-@chat_handler.handle()
-async def _(bot: Bot, event: GroupMessageEvent):
-    group_id = str(event.group_id)
-    user_id = str(event.user_id)
-    raw_msg = event.get_plaintext().strip()
-    
-    # 0. 检查黑名单
-    if user_id in user_blacklist:
-        if time.time() < user_blacklist[user_id]:
-            logger.debug(f"用户 {user_id} 在黑名单中，忽略消息")
-            return
-        else:
-            del user_blacklist[user_id]
+            sticker_url = extract_xml_content(content, "sticker")
+            if sticker_url:
+                content = re.sub(r'<sticker.*?>.*?</\s*sticker\s*>', '', content, flags=re.DOTALL | re.IGNORECASE).strip()
             
-    # 1. 白名单检查
-    whitelist = load_whitelist()
-    if not is_group_whitelisted(group_id, config.personification_whitelist):
-        return
-
-    # 2. 检查是否提及 bot 或概率触发
-    is_mentioned = to_me(event)
-    should_reply = False
-    
-    if is_mentioned:
-        should_reply = True
-        # 移除 @bot 部分，避免干扰
-        # raw_msg 这里其实已经去不掉 @ 了，因为是 plaintext。
-        # 但通常 AI 能理解。
-    elif random.random() < config.personification_probability:
-        should_reply = True
-        
-    # 主动消息触发逻辑 (如果没被提及也没随机触发，检查是否主动插话)
-    if not should_reply and config.personification_proactive_enabled:
-         # 检查是否休息时间
-         if is_rest_time():
-             # 检查好感度
-             if SIGN_IN_AVAILABLE:
-                 group_key = f"group_{group_id}"
-                 group_data = get_user_data(group_key)
-                 fav = float(group_data.get("favorability", 100.0))
-                 if fav >= config.personification_proactive_threshold:
-                     # 检查每日限额
-                     # 这里简单用随机概率模拟频率控制，避免每次都发
-                     # 实际应该记录发送次数，这里简化处理：降低概率
-                     if random.random() < 0.05: # 5% 概率主动插话
-                         should_reply = True
-                         logger.info(f"拟人插件：触发主动插话 (好感度 {fav})")
-
-    if not should_reply:
-        return
-
-    # 3. 消息去重
-    if is_msg_processed(event.message_id):
-        return
-
-    # 4. 获取上下文
-    if group_id not in chat_histories:
-        chat_histories[group_id] = []
-        
-    # 添加用户消息到历史
-    # 处理图片
-    content_list = []
-    has_image = False
-    image_urls = []
-    
-    for seg in event.message:
-        if seg.type == "text":
-            text = seg.data["text"].strip()
-            if text:
-                content_list.append({"type": "text", "text": text})
-        elif seg.type == "image":
-            has_image = True
-            url = seg.data.get("url")
-            if url:
-                image_urls.append(url)
-                content_list.append({"type": "image_url", "image_url": {"url": url}})
-                
-    if not content_list:
-        return # 空消息
-
-    chat_histories[group_id].append({"role": "user", "content": content_list})
-    
-    # 保持历史记录长度
-    if len(chat_histories[group_id]) > config.personification_history_len:
-        chat_histories[group_id] = chat_histories[group_id][-config.personification_history_len:]
-
-    # 5. 准备 Prompt
-    # 获取用户昵称
-    user_name = get_user_name(event)
-    
-    # 获取好感度等级
-    level_name = "陌生"
-    favorability = 0.0
-    group_attitude = ""
-    
-    if SIGN_IN_AVAILABLE:
-        # 获取个人好感
-        user_data = get_user_data(user_id)
-        favorability = float(user_data.get("favorability", 0.0))
-        # 获取群好感
-        group_key = f"group_{group_id}"
-        group_data = get_user_data(group_key)
-        group_fav = float(group_data.get("favorability", 100.0))
-        
-        # 综合评定：以群好感为主，个人为辅？或者取平均？
-        # 这里逻辑：主要看个人，但群氛围影响态度
-        level_name = get_level_name(favorability)
-        
-        # 群氛围描述
-        if group_fav < 20:
-            group_attitude = "群里氛围很差，大家都在吵架，你感到很压抑。"
-        elif group_fav > 150:
-            group_attitude = "群里氛围超级好，大家都是好朋友，你感到非常开心。"
+            result["messages"].append({
+                "quote": quote_id,
+                "text": content,
+                "sticker": sticker_url
+            })
             
-    # 获取态度描述
-    attitude_desc = config.personification_favorability_attitudes.get(level_name, "")
-    
-    # 获取用户画像 (如果可用)
-    user_persona = ""
-    # 这里可以尝试从 redis 或其他地方获取 analysis 插件的结果，暂时留空
-    
-    # 加载系统 Prompt
-    base_prompt = load_prompt(group_id)
-    
-    # 如果是 YAML 模式，转入 YAML 逻辑处理
-    if isinstance(base_prompt, dict):
-         await _process_yaml_response_logic(
-             bot, event, group_id, user_id, user_name, level_name, base_prompt, chat_histories[group_id]
-         )
-         return
+    return result
 
-    # 文本 Prompt 组装
-    # 整合态度
-    attitude_desc = attitude_desc or "态度普通，像平常一样交流。"
-    combined_attitude = f"你对该用户的个人态度是：{attitude_desc}"
-    if group_attitude:
-        combined_attitude += f"\n当前群聊整体氛围带给你的感受是：{group_attitude}"
+async def _process_yaml_response_logic(
+    bot: Bot, 
+    event: Event, 
+    group_id: str, 
+    user_id: str, 
+    user_name: str, 
+    level_name: str, 
+    prompt_config: Dict[str, Any], 
+    chat_history: List[Dict],
+    trigger_reason: str = ""
+):
+    """处理基于 YAML 模板的新版响应逻辑"""
     
-    # 联网说明
-    web_search_hint = ""
-    if config.personification_web_search:
-        web_search_hint = "你现在拥有联网搜索能力，可以获取最新的实时信息、新闻和知识来回答用户。"
-
-    # 获取时间
-    now = datetime.now(timezone(timedelta(hours=9))) # 东京时间
+    # 1. 准备上下文变量
+    now = datetime.now(timezone(timedelta(hours=9)))
     week_days = ["星期一", "星期二", "星期三", "星期四", "星期五", "星期六", "星期日"]
     weekday_str = week_days[now.weekday()]
     current_time_str = f"{now.year}年{now.month:02d}月{now.day:02d}日 {now.hour:02d}:{now.minute:02d}:{now.second:02d} ({weekday_str}) [东京时间]"
+    
+    current_status = bot_statuses.get(group_id)
+    if not current_status:
+        current_status = prompt_config.get("status", "").strip()
+        if not current_status:
+             current_status = '心情: "平静"\n状态: "正在潜水"\n记忆: ""\n动作: "发呆"'
+        bot_statuses[group_id] = current_status
 
-    # 作息模拟
+    history_new_text = ""
+    recent_msgs = chat_history[:-1] if len(chat_history) > 1 else [] 
+    
+    for msg in recent_msgs:
+        role = msg["role"]
+        content = msg["content"]
+        
+        text_content = ""
+        if isinstance(content, list):
+             for item in content:
+                 if item["type"] == "text":
+                     text_content += item["text"]
+                 elif item["type"] == "image_url":
+                     text_content += "[图片]"
+        else:
+             text_content = str(content)
+             
+        if role == "user":
+            history_new_text += f"{text_content}\n"
+        elif role == "assistant":
+            clean_content = re.sub(r' \[发送了表情包:.*?\]', '', text_content)
+            history_new_text += f"[我]: {clean_content}\n"
+            
+    if not history_new_text:
+        history_new_text = "(无最近消息)"
+
+    last_msg = chat_history[-1]
+    history_last_text = ""
+    if isinstance(last_msg["content"], list):
+         for item in last_msg["content"]:
+             if item["type"] == "text":
+                 history_last_text += item["text"]
+             elif item["type"] == "image_url":
+                 history_last_text += "[图片]"
+    else:
+         history_last_text = str(last_msg["content"])
+
+    input_template = prompt_config.get("input", "")
+    
+    input_text = input_template.replace("{trigger_reason}", trigger_reason)
+    input_text = input_text.replace("{time}", current_time_str)
+    input_text = input_text.replace("{history_new}", history_new_text)
+    input_text = input_text.replace("{history_last}", history_last_text)
+    input_text = input_text.replace("{status}", current_status)
+    input_text = input_text.replace("{long_memory('guild')}", "(暂无长期记忆)")
+    
+    system_prompt = prompt_config.get("system", "")
+    
     group_config = get_group_config(group_id)
     schedule_enabled = group_config.get("schedule_enabled", False)
     global_schedule_enabled = config.personification_schedule_global
     
-    schedule_prompt_part = ""
     if schedule_enabled or global_schedule_enabled:
         schedule_prompt_part = get_schedule_prompt_injection()
+        system_prompt += f"\n\n{schedule_prompt_part}"
+    
+    user_content = input_text
+    
+    last_msg = chat_history[-1]
+    last_images = []
+    if isinstance(last_msg["content"], list):
+        for item in last_msg["content"]:
+            if item["type"] == "image_url":
+                img_url_obj = item.get("image_url", {})
+                if isinstance(img_url_obj, dict):
+                     url = img_url_obj.get("url")
+                     if url:
+                         last_images.append(url)
+                elif isinstance(img_url_obj, str):
+                     last_images.append(img_url_obj)
+
+    if last_images:
+        user_content = [{"type": "text", "text": input_text}]
+        for img_url in last_images:
+            user_content.append({"type": "image_url", "image_url": {"url": img_url}})
+
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_content}
+    ]
+    
+    reply_content = await call_ai_api(messages)
+    
+    if not reply_content:
+        logger.warning("拟人插件 (YAML): 未能获取到 AI 回复内容")
+        return
+
+    parsed = parse_yaml_response(reply_content)
+    
+    if parsed["status"]:
+        bot_statuses[group_id] = parsed["status"]
+        logger.info(f"拟人插件: 更新状态为: {parsed['status']}")
+        
+    if parsed["think"]:
+        logger.debug(f"拟人插件: 思考过程: {parsed['think']}")
+
+    if parsed["action"]:
+        action_text = parsed["action"]
+        logger.info(f"拟人插件: 执行动作: {action_text}")
+        if "戳一戳" in action_text:
+            try:
+                await bot.send(event, MessageSegment.poke(int(user_id)))
+            except Exception as e:
+                logger.warning(f"拟人插件: 发送戳一戳失败: {e}")
+
+    if parsed["messages"]:
+        for msg in parsed["messages"]:
+            text = msg["text"]
+            sticker_url = msg["sticker"]
+            
+            if text:
+                segments = split_text_into_segments(text)
+                for seg in segments:
+                    if seg.strip():
+                        await bot.send(event, seg)
+                        await asyncio.sleep(random.uniform(1.0, 3.0))
+            
+            if sticker_url:
+                try:
+                    if sticker_url.startswith("http"):
+                        await bot.send(event, MessageSegment.image(sticker_url))
+                    else:
+                        sticker_dir = Path(config.personification_sticker_path or (store.get_plugin_data_dir() / "stickers"))
+                        target_file = None
+                        if sticker_dir.exists():
+                             possible = sticker_dir / sticker_url
+                             if possible.exists():
+                                 target_file = possible
+                             else:
+                                 for f in sticker_dir.iterdir():
+                                     if f.stem == sticker_url:
+                                         target_file = f
+                                         break
+                        
+                        if target_file:
+                             await bot.send(event, MessageSegment.image(f"file:///{target_file.absolute()}"))
+                        else:
+                             logger.warning(f"拟人插件: 找不到表情包 {sticker_url}")
+                except Exception as e:
+                    logger.error(f"发送表情包失败: {e}")
+    
     else:
-        schedule_prompt_part = "- **作息指令**：你必须时刻感知当前时间。如果现在是晚上/周末/假期，严禁声称自己在上课/工作。"
+        clean_reply = re.sub(r'<status.*?>.*?</\s*status\s*>', '', reply_content, flags=re.DOTALL | re.IGNORECASE)
+        clean_reply = re.sub(r'<think.*?>.*?</\s*think\s*>', '', clean_reply, flags=re.DOTALL | re.IGNORECASE)
+        clean_reply = re.sub(r'</?\s*output.*?>', '', clean_reply, flags=re.IGNORECASE)
+        clean_reply = re.sub(r'</?\s*message.*?>', '', clean_reply, flags=re.IGNORECASE)
+        clean_reply = clean_reply.strip()
+        if clean_reply:
+             await bot.send(event, clean_reply)
+             
+    assistant_text = ""
+    if parsed["messages"]:
+        assistant_text = " ".join([m["text"] for m in parsed["messages"] if m["text"]])
+    else:
+        assistant_text = clean_reply
+        
+    chat_history.append({"role": "assistant", "content": assistant_text})
+
+async def _process_response_logic(bot: Bot, event: Event, state: T_State):
+    if hasattr(event, "message_id"):
+        if is_msg_processed(event.message_id):
+            return
+
+    is_poke = False
+    user_id = ""
+    group_id = 0
+    message_content = ""
+    sender_name = ""
+    trigger_reason = ""
+    image_urls = []
+    
+    is_random_chat = state.get("is_random_chat", False)
+    force_mode = state.get("force_mode", None)
+
+    if isinstance(event, PokeNotifyEvent):
+        is_poke = True
+        user_id = str(event.user_id)
+        group_id = str(event.group_id)
+        message_content = "[你被对方戳了戳，你感到有点疑惑和好奇，想知道对方要做什么]"
+        sender_name = "戳戳怪"
+        logger.info(f"拟人插件：检测到来自 {user_id} 的戳一戳")
+    elif isinstance(event, MessageEvent):
+        user_id = str(event.user_id)
+        if isinstance(event, GroupMessageEvent):
+            group_id = str(event.group_id)
+            sender_name = event.sender.nickname or event.sender.card or user_id
+        else:
+            group_id = f"private_{user_id}"
+            sender_name = event.sender.nickname or user_id
+        
+        message_text = ""
+        source_message = state.get("concatenated_message", event.message)
+        for seg in source_message:
+            if seg.type == "text":
+                message_text += seg.data.get("text", "")
+            elif seg.type == "face":
+                face_id = seg.data.get("id", "")
+                message_text += f"[表情id:{face_id}]"
+            elif seg.type == "mface":
+                summary = seg.data.get("summary", "表情包")
+                message_text += f"[{summary}]"
+            elif seg.type == "image":
+                url = seg.data.get("url")
+                file_name = seg.data.get("file", "").lower()
+                if url:
+                    try:
+                        async with httpx.AsyncClient() as client:
+                            resp = await client.get(url, timeout=10)
+                            if resp.status_code == 200:
+                                mime_type = resp.headers.get("Content-Type", "image/jpeg")
+                                if "image/gif" in mime_type or file_name.endswith(".gif"):
+                                    continue
+                                
+                                try:
+                                    img_obj = Image.open(BytesIO(resp.content))
+                                    w, h = img_obj.size
+                                    if w <= 1280 and h <= 1280:
+                                        message_text += "[发送了一个表情包]"
+                                    else:
+                                        message_text += "[发送了一张图片]"
+                                except Exception:
+                                     message_text += "[发送了一张图片]"
+
+                                base64_data = base64.b64encode(resp.content).decode("utf-8")
+                                image_urls.append(f"data:{mime_type};base64,{base64_data}")
+                            else:
+                                if not file_name.endswith(".gif"):
+                                    message_text += "[发送了一张图片]"
+                                    image_urls.append(url)
+                    except Exception as e:
+                        logger.warning(f"下载图片失败，保留原 URL: {e}")
+                        if not file_name.endswith(".gif"):
+                            message_text += "[发送了一张图片]"
+                            image_urls.append(url)
+        
+        reply = getattr(event, "reply", None)
+        if reply:
+            reply_msg = getattr(reply, "message", None) or (reply.get("message") if isinstance(reply, dict) else None)
+            if reply_msg:
+                message_text += "\n[引用内容]: "
+                try:
+                    if isinstance(reply_msg, (list, tuple, Message)):
+                        for seg in reply_msg:
+                            seg_type = getattr(seg, "type", None) or (seg.get("type") if isinstance(seg, dict) else None)
+                            data = getattr(seg, "data", None) or (seg.get("data") if isinstance(seg, dict) else {})
+                            if seg_type == "text":
+                                message_text += data.get("text", "")
+                            elif seg_type == "image":
+                                url = data.get("url")
+                                if url:
+                                    message_text += "[图片]"
+                                    image_urls.append(url)
+                except Exception:
+                     pass
+
+        message_content = message_text.strip()
+        base_prompt = load_prompt(group_id)
+        is_yaml_mode = isinstance(base_prompt, dict)
+        
+        if is_yaml_mode:
+            if is_poke:
+                trigger_reason = "对方戳了戳你。"
+            elif is_random_chat:
+                trigger_reason = "你正在【潜水】观察群聊。这只是群员之间的普通对话，并非对你说话。除非话题非常吸引你或者你被提及，否则请保持沉默并回复 [SILENCE]。"
+            else:
+                trigger_reason = f"对方（{sender_name}）正在【主动】与你搭话，请认真回复。"
+            if image_urls and not message_content:
+                message_content = "[发送了一张图片]"
+        else:
+            if image_urls and not message_content:
+                if is_random_chat:
+                    message_content = f"[你观察到群里 {sender_name} 发送了一张图片，这只是群员间的交流，你决定是否要评价一下]"
+                else:
+                    message_content = f"[对方发送了一张图片，是在对你说话]"
+            elif is_random_chat:
+                message_content = f"[提示：当前为【随机插话模式】。群员 {sender_name} 正在和别人聊天，内容是: {message_content}。如果话题与你无关，请务必回复 [SILENCE]]"
+            else:
+                message_content = f"[提示：对方正在【直接】对你说话：{message_content}]"
+    else:
+        return
+
+    if not config.personification_api_key:
+        return
+
+    user_name = sender_name
+    if not message_content and not is_poke and not image_urls:
+        return
+
+    if group_id not in chat_histories:
+        chat_histories[group_id] = []
+
+    user_persona = ""
+    try:
+        persona_data_path = Path("data/user_persona/data.json")
+        if persona_data_path.exists():
+            async with aiofiles.open(persona_data_path, mode="r", encoding="utf-8") as f:
+                persona_json = json.loads(await f.read())
+                personas = persona_json.get("personas", {})
+                if user_id in personas:
+                    user_persona = personas[user_id].get("data", "")
+    except Exception:
+        pass
+
+    attitude_desc = "态度普通，像平常一样交流。"
+    level_name = "未知"
+    group_favorability = 100.0
+    group_attitude = ""
+    
+    if SIGN_IN_AVAILABLE:
+        try:
+            user_data = get_user_data(user_id)
+            favorability = user_data.get("favorability", 0.0)
+            level_name = get_level_name(favorability)
+            attitude_desc = config.personification_favorability_attitudes.get(level_name, attitude_desc)
+            group_key = f"group_{group_id}"
+            group_data = get_user_data(group_key)
+            group_favorability = group_data.get("favorability", 100.0)
+            group_level = get_level_name(group_favorability)
+            group_attitude = config.personification_favorability_attitudes.get(group_level, "")
+        except Exception:
+            pass
+
+    safe_user_name = user_name.replace(":", "：").replace("\n", " ").strip()
+    safe_user_name = f"{safe_user_name}({user_id})"
+    msg_prefix = f"[{safe_user_name}]: "
+    
+    if image_urls:
+        current_user_content = [{"type": "text", "text": f"{msg_prefix}{message_content}"}]
+        for url in image_urls:
+            current_user_content.append({"type": "image_url", "image_url": {"url": url}})
+        chat_histories[group_id].append({"role": "user", "content": current_user_content})
+    else:
+        chat_histories[group_id].append({"role": "user", "content": f"{msg_prefix}{message_content}"})
+    
+    limit = 50 if str(group_id).startswith("private_") else 20
+    if len(chat_histories[group_id]) > limit:
+        chat_histories[group_id] = chat_histories[group_id][-limit:]
+
+    base_prompt = load_prompt(group_id)
+    if isinstance(base_prompt, dict):
+         if not trigger_reason and is_poke:
+             trigger_reason = "对方戳了戳你。"
+         await _process_yaml_response_logic(
+             bot, event, group_id, user_id, user_name, level_name, base_prompt, chat_histories[group_id],
+             trigger_reason=trigger_reason
+         )
+         return
+    
+    combined_attitude = f"你对该用户的个人态度是：{attitude_desc}"
+    if group_attitude:
+        combined_attitude += f"\n当前群聊整体氛围带给你的感受是：{group_attitude}"
+    
+    web_search_hint = "你现在拥有联网搜索能力，可以获取最新的实时信息、新闻和知识来回答用户。" if config.personification_web_search else ""
+    now = datetime.now(timezone(timedelta(hours=9)))
+    week_days = ["星期一", "星期二", "星期三", "星期四", "星期五", "星期六", "星期日"]
+    weekday_str = week_days[now.weekday()]
+    current_time_str = f"{now.year}年{now.month:02d}月{now.day:02d}日 {now.hour:02d}:{now.minute:02d}:{now.second:02d} ({weekday_str}) [东京时间]"
+
+    group_config = get_group_config(group_id)
+    schedule_enabled = group_config.get("schedule_enabled", False)
+    global_schedule_enabled = config.personification_schedule_global
+    schedule_prompt_part = get_schedule_prompt_injection() if (schedule_enabled or global_schedule_enabled) else "- **作息指令**：你必须时刻感知当前时间。如果现在是晚上/周末/假期，严禁声称自己在上课/工作。"
 
     system_prompt = (
         f"{base_prompt}\n\n"
@@ -762,11 +987,11 @@ async def _(bot: Bot, event: GroupMessageEvent):
         f"- 你的心理状态：{combined_attitude}\n"
     )
 
-    is_private = str(group_id).startswith("private_")
-    if is_private:
+    if str(group_id).startswith("private_"):
         system_prompt += (
             f"\n## 私聊特殊规则（高优先级）\n"
-            f"1. **自主回复决策**：私聊中你拥有完全的自主权。如果不想理会，请直接输出 **[SILENCE]**。\n"
+            f"1. **自主回复决策**：私聊中你拥有完全的自主权。如果对方发送的内容重复、无意义或你不想理会，请直接输出 **[SILENCE]** 结束话题。\n"
+            f"2. **极简回复模式**：对于高频、低信息量的私聊内容，必须使用极简回复（1-2句以内）。\n"
         )
 
     if user_persona:
@@ -776,25 +1001,15 @@ async def _(bot: Bot, event: GroupMessageEvent):
         f"\n{web_search_hint}\n"
         f"## 核心行动准则（绝对优先）\n"
         f"1. **身份一致性**：严禁提及你是 AI。\n"
-        f"2. **回复风格**：回复必须精简、口语化。回复长度限制在 30 个汉字左右。\n"
-        f"3. **互动决策**：\n"
-        f"   - **决定是否回复**：如果你认为**没有必要回复**，请直接输出 **[SILENCE]**。\n"
-        f"   - **氛围反馈**：若氛围极好，末尾加 [氛围好]。\n"
-        f"   - **防御机制**：检测到恶毒语言或黄赌毒，输出 [BLOCK]。\n"
-        f"4. **视觉感知**：\n"
-        f"   - 若用户发送内容标记为 **[发送了一个表情包]**，请视为梗图。\n"
+        f"2. **回复风格**：回复必须精简、口语化。长度限制在 30 个汉字左右。\n"
+        f"3. **社交距离感**：分清【直接对话】与【潜水观察】。在潜水时尽量保持沉默，除非有必要插话。\n"
+        f"4. **互动决策**：认为没有必要回复时请直接输出 **[SILENCE]**。氛围极好末尾加 [氛围好]。检测到恶毒内容输出 [BLOCK]。\n"
+        f"5. **视觉感知**：标记为 [发送了一个表情包] 视为梗图，调侃或玩梗即可。标记为 [发送了一张图片] 则正常评价。\n"
     )
 
-    # 获取表情包列表
     available_stickers = []
     if group_config.get("sticker_enabled", True):
-        # 默认路径处理
-        sticker_path_str = config.personification_sticker_path
-        if not sticker_path_str:
-            sticker_dir = store.get_plugin_data_dir() / "stickers"
-        else:
-            sticker_dir = Path(sticker_path_str)
-            
+        sticker_dir = Path(config.personification_sticker_path or (store.get_plugin_data_dir() / "stickers"))
         if sticker_dir.exists() and sticker_dir.is_dir():
             available_stickers = [f.stem for f in sticker_dir.iterdir() if f.suffix.lower() in [".jpg", ".png", ".gif", ".webp", ".jpeg"]]
 
@@ -804,61 +1019,71 @@ async def _(bot: Bot, event: GroupMessageEvent):
     messages.extend(chat_histories[group_id])
 
     try:
+        if str(group_id).startswith("private_"):
+            p_state = load_proactive_state()
+            if user_id not in p_state: p_state[user_id] = {}
+            p_state[user_id]["last_interaction"] = time.time()
+            save_proactive_state(p_state)
+
         reply_content = await call_ai_api(messages)
-
         if not reply_content:
-            logger.warning("拟人插件：未能获取到 AI 回复内容")
-            return
+            if image_urls:
+                fallback_messages = []
+                for msg in messages:
+                    if isinstance(msg.get("content"), list):
+                        text_content = "".join([item["text"] for item in msg["content"] if item["type"] == "text"])
+                        fallback_messages.append({"role": msg["role"], "content": text_content})
+                    else:
+                        fallback_messages.append(msg)
+                reply_content = await call_ai_api(fallback_messages)
+            if not reply_content: return
 
-        # 清理标签
         reply_content = re.sub(r'\[表情:[^\]]*\]', '', reply_content)
-        reply_content = re.sub(r'\[发送了表情包:[^\]]*\]', '', reply_content).strip()
+        reply_content = re.sub(r'\[发送了表情包:[^\]]*\]', '', reply_content)
         reply_content = re.sub(r'[A-F0-9]{16,}', '', reply_content).strip()
         
-        if "[SILENCE]" in reply_content:
-            logger.info(f"AI 决定结束与群 {group_id} 中 {user_name} 的对话 (SILENCE)")
-            return
+        if "[SILENCE]" in reply_content: return
 
         if "[BLOCK]" in reply_content or "[NO_REPLY]" in reply_content:
-            duration = config.personification_blacklist_duration
-            user_blacklist[user_id] = time.time() + duration
-            logger.info(f"AI 决定拉黑群 {group_id} 中 {user_name}，时长 {duration} 秒")
-            # 扣除好感度逻辑略
+            user_blacklist[user_id] = time.time() + config.personification_blacklist_duration
+            if SIGN_IN_AVAILABLE:
+                penalty = round(random.uniform(0, 0.3), 2)
+                user_data = get_user_data(user_id)
+                new_fav = round(max(0.0, float(user_data.get("favorability", 0.0)) - penalty), 2)
+                current_blacklist_count = int(user_data.get("blacklist_count", 0)) + 1
+                update_user_data(user_id, favorability=new_fav, blacklist_count=current_blacklist_count, is_perm_blacklisted=(current_blacklist_count >= 25))
+                if not str(group_id).startswith("private_"):
+                    group_key = f"group_{group_id}"
+                    g_data = get_user_data(group_key)
+                    update_user_data(group_key, favorability=round(max(0.0, float(g_data.get("favorability", 100.0)) - 0.5), 2))
             return
 
-        # 氛围好逻辑
         if "[氛围好]" in reply_content:
             reply_content = reply_content.replace("[氛围好]", "").strip()
-            # 加分逻辑略
+            if SIGN_IN_AVAILABLE and not str(group_id).startswith("private_"):
+                group_key = f"group_{group_id}"
+                g_data = get_user_data(group_key)
+                today = time.strftime("%Y-%m-%d")
+                daily_count = float(g_data.get("daily_fav_count", 0.0)) if g_data.get("last_update") == today else 0.0
+                if daily_count < 10.0:
+                    update_user_data(group_key, favorability=round(float(g_data.get("favorability", 100.0)) + 0.1, 2), daily_fav_count=round(daily_count + 0.1, 2), last_update=today)
 
-        # 表情包决策
         sticker_segment = None
         sticker_name = ""
-        should_get_sticker = False
         if group_config.get("sticker_enabled", True):
-             if random.random() < config.personification_sticker_probability:
-                should_get_sticker = True
-        
-        if should_get_sticker and available_stickers:
-            # 重新获取目录
-            if not config.personification_sticker_path:
-                sticker_dir = store.get_plugin_data_dir() / "stickers"
-            else:
-                sticker_dir = Path(config.personification_sticker_path)
-                
-            stickers = [f for f in sticker_dir.iterdir() if f.suffix.lower() in [".jpg", ".png", ".gif", ".webp", ".jpeg"]]
-            if stickers:
-                random_sticker = random.choice(stickers)
-                sticker_name = random_sticker.stem
-                sticker_segment = MessageSegment.image(f"file:///{random_sticker.absolute()}")
+            if force_mode == "mixed" or (not force_mode and random.random() < config.personification_sticker_probability):
+                sticker_dir = Path(config.personification_sticker_path or (store.get_plugin_data_dir() / "stickers"))
+                if sticker_dir.exists():
+                    stickers = [f for f in sticker_dir.iterdir() if f.suffix.lower() in [".jpg", ".png", ".gif", ".webp", ".jpeg"]]
+                    if stickers:
+                        random_sticker = random.choice(stickers)
+                        sticker_name = random_sticker.stem
+                        sticker_segment = MessageSegment.image(f"file:///{random_sticker.absolute()}")
 
-        # 记录回复
         assistant_content = reply_content
-        if sticker_name:
-            assistant_content += f" [发送了表情包: {sticker_name}]"
+        if sticker_name: assistant_content += f" [发送了表情包: {sticker_name}]"
         chat_histories[group_id].append({"role": "assistant", "content": assistant_content})
 
-        # 发送
         final_reply = reply_content.strip()
         if final_reply:
             segments = split_text_into_segments(final_reply)
@@ -866,78 +1091,406 @@ async def _(bot: Bot, event: GroupMessageEvent):
                 if not seg.strip(): continue
                 await bot.send(event, seg)
                 if i < len(segments) - 1 or sticker_segment:
-                    await asyncio.sleep(random.uniform(3.0, 5.0))
+                    await asyncio.sleep(random.uniform(2.0, 4.0))
 
         if sticker_segment:
             await bot.send(event, sticker_segment)
 
-    except Exception as e:
-        logger.error(f"拟人插件 API 调用失败: {e}")
+    except FinishedException: raise
+    except Exception as e: logger.error(f"拟人插件 API 调用失败: {e}")
 
 # --- 管理命令 ---
-# 群好感查询
 group_fav_query = on_command("群好感", aliases={"群好感度"}, priority=5, block=True)
 @group_fav_query.handle()
 async def _(bot: Bot, event: GroupMessageEvent):
-    if not SIGN_IN_AVAILABLE:
-        await group_fav_query.finish("签到插件未就绪，无法查询好感度。")
-    
+    if not SIGN_IN_AVAILABLE: await group_fav_query.finish("签到插件未就绪。")
     group_id = event.group_id
     group_key = f"group_{group_id}"
     data = get_user_data(group_key)
     favorability = data.get("favorability", 100.0)
-    level = get_level_name(favorability)
-    await group_fav_query.finish(f"当前群好感度：{favorability:.2f} ({level})")
+    daily_count = data.get("daily_fav_count", 0.0)
+    status = get_level_name(favorability)
+    
+    md = f"""
+<div style="padding: 20px; background-color: #fff5f8; border-radius: 15px; border: 2px solid #ffb6c1; font-family: 'Microsoft YaHei', sans-serif;">
+    <h1 style="color: #ff69b4; text-align: center; margin-bottom: 20px;">🌸 群聊好感度详情 🌸</h1>
+    <div style="background: white; padding: 15px; border-radius: 12px; border: 1px solid #ffb6c1; margin-bottom: 15px;">
+        <p style="margin: 5px 0; color: #666;">群号: <strong style="color: #d147a3;">{group_id}</strong></p>
+        <p style="margin: 5px 0; color: #666;">当前等级: <strong style="color: #d147a3; font-size: 1.2em;">{status}</strong></p>
+    </div>
+    <div style="display: flex; gap: 10px; margin-bottom: 15px;">
+        <div style="flex: 1; background: white; padding: 10px; border-radius: 10px; border: 1px solid #ffb6c1; text-align: center;">
+            <div style="font-size: 0.8em; color: #999;">好感分值</div>
+            <div style="font-size: 1.4em; font-weight: bold; color: #d147a3;">{favorability:.2f}</div>
+        </div>
+        <div style="flex: 1; background: white; padding: 10px; border-radius: 10px; border: 1px solid #ffb6c1; text-align: center;">
+            <div style="font-size: 0.8em; color: #999;">今日增长</div>
+            <div style="font-size: 1.4em; font-weight: bold; color: #d147a3;">{daily_count:.2f}/10.00</div>
+        </div>
+    </div>
+</div>
+"""
+    pic = await md_to_pic(md, width=450) if md_to_pic else None
+    if pic: await group_fav_query.finish(MessageSegment.image(pic))
+    else: await group_fav_query.finish(f"📊 群聊好感度\n群号：{group_id}\n当前好感：{favorability:.2f}\n当前等级：{status}")
 
-# 设置群好感
 set_group_fav = on_command("设置群好感", permission=SUPERUSER, priority=5, block=True)
 @set_group_fav.handle()
 async def _(bot: Bot, event: MessageEvent, args: Message = CommandArg()):
-    if not SIGN_IN_AVAILABLE:
-        await set_group_fav.finish("签到插件未就绪。")
-    
-    args_str = args.extract_plain_text().split()
-    if len(args_str) < 2:
-        await set_group_fav.finish("用法：设置群好感 [群号] [数值]")
-    
-    gid, val = args_str[0], float(args_str[1])
-    update_user_data(f"group_{gid}", favorability=val)
-    await set_group_fav.finish(f"已将群 {gid} 好感度设置为 {val}")
+    if not SIGN_IN_AVAILABLE: await set_group_fav.finish("签到插件未就绪。")
+    arg_str = args.extract_plain_text().strip()
+    parts = arg_str.split()
+    target_group, new_fav = "", 0.0
+    if len(parts) == 1 and isinstance(event, GroupMessageEvent):
+        target_group, new_fav = str(event.group_id), float(parts[0])
+    elif len(parts) >= 2:
+        target_group, new_fav = parts[0], float(parts[1])
+    if target_group:
+        update_user_data(f"group_{target_group}", favorability=new_fav)
+        await set_group_fav.finish(f"✅ 已将群 {target_group} 的好感度设置为 {new_fav:.2f}")
 
-# 设置人设
 set_persona = on_command("设置人设", permission=SUPERUSER, priority=5, block=True)
 @set_persona.handle()
 async def _(bot: Bot, event: MessageEvent, args: Message = CommandArg()):
     raw_text = args.extract_plain_text().strip()
-    if not raw_text:
-        await set_persona.finish("请提供提示词！")
-    
-    # 简单处理：如果是群聊，默认设置本群
-    target_group = str(event.group_id) if isinstance(event, GroupMessageEvent) else ""
-    # 解析参数逻辑略，直接设置
-    if target_group:
-        set_group_prompt(target_group, raw_text)
-        await set_persona.finish("人设已更新。")
+    parts = raw_text.split(maxsplit=1)
+    target_group_id, prompt = None, None
+    if len(parts) == 2 and parts[0].isdigit():
+        target_group_id, prompt = parts[0], parts[1]
+    elif isinstance(event, GroupMessageEvent):
+        target_group_id, prompt = str(event.group_id), raw_text
+    if target_group_id and prompt:
+        set_group_prompt(target_group_id, prompt)
+        await set_persona.finish(f"已更新群 {target_group_id} 的人设。")
 
-# 开启/关闭拟人
-toggle_personification = on_command("拟人开启", aliases={"拟人关闭"}, permission=SUPERUSER, priority=5, block=True)
-@toggle_personification.handle()
+view_persona = on_command("查看人设", permission=SUPERUSER, priority=5, block=True)
+@view_persona.handle()
 async def _(bot: Bot, event: GroupMessageEvent):
-    cmd = event.get_plaintext().strip()
-    enable = "开启" in cmd
-    set_group_enabled(str(event.group_id), enable)
-    await toggle_personification.finish(f"已{'开启' if enable else '关闭'}本群拟人功能。")
+    prompt = load_prompt(str(event.group_id))
+    nodes = [{"type": "node", "data": {"name": "当前生效人设", "uin": str(bot.self_id), "content": str(prompt)}}]
+    try: await bot.call_api("send_group_forward_msg", group_id=event.group_id, messages=nodes)
+    except Exception: await view_persona.finish(f"当前生效人设：\n{prompt}")
 
-# 开启/关闭作息
-toggle_schedule = on_command("拟人作息", permission=SUPERUSER, priority=5, block=True)
-@toggle_schedule.handle()
-async def _(bot: Bot, event: GroupMessageEvent, args: Message = CommandArg()):
-    arg = args.extract_plain_text().strip()
-    if "开启" in arg:
-        set_group_schedule_enabled(str(event.group_id), True)
-        await toggle_schedule.finish("已开启本群作息模拟。")
-    elif "关闭" in arg:
-        set_group_schedule_enabled(str(event.group_id), False)
-        await toggle_schedule.finish("已关闭本群作息模拟。")
-    else:
-        await toggle_schedule.finish("用法：拟人作息 开启/关闭")
+reset_persona = on_command("重置人设", permission=SUPERUSER, priority=5, block=True)
+@reset_persona.handle()
+async def _(bot: Bot, event: GroupMessageEvent):
+    set_group_prompt(str(event.group_id), None)
+    await reset_persona.finish("已重置本群人设为默认配置。")
+
+enable_personification = on_command("开启拟人", permission=SUPERUSER, priority=5, block=True)
+@enable_personification.handle()
+async def _(bot: Bot, event: GroupMessageEvent):
+    set_group_enabled(str(event.group_id), True)
+    await enable_personification.finish("本群拟人功能已开启。")
+
+disable_personification = on_command("关闭拟人", permission=SUPERUSER, priority=5, block=True)
+@disable_personification.handle()
+async def _(bot: Bot, event: GroupMessageEvent):
+    set_group_enabled(str(event.group_id), False)
+    await disable_personification.finish("本群拟人功能已关闭。")
+
+enable_stickers = on_command("开启表情包", permission=SUPERUSER, priority=5, block=True)
+@enable_stickers.handle()
+async def _(bot: Bot, event: GroupMessageEvent):
+    set_group_sticker_enabled(str(event.group_id), True)
+    await enable_stickers.finish("本群表情包功能已开启。")
+
+disable_stickers = on_command("关闭表情包", permission=SUPERUSER, priority=5, block=True)
+@disable_stickers.handle()
+async def _(bot: Bot, event: GroupMessageEvent):
+    set_group_sticker_enabled(str(event.group_id), False)
+    await disable_stickers.finish("本群表情包功能已关闭。")
+
+enable_schedule = on_command("拟人作息", permission=SUPERUSER, priority=5, block=True)
+@enable_schedule.handle()
+async def _(bot: Bot, event: MessageEvent, args: Message = CommandArg()):
+    status = args.extract_plain_text().strip()
+    if "全局" in status:
+        config.personification_schedule_global = "开启" in status
+        save_plugin_runtime_config()
+        await enable_schedule.finish(f"拟人作息模拟已全局{'开启' if config.personification_schedule_global else '关闭'}。")
+    elif isinstance(event, GroupMessageEvent):
+        set_group_schedule_enabled(str(event.group_id), status == "开启")
+        await enable_schedule.finish(f"本群作息模拟功能已{status}。")
+
+view_config = on_command("拟人配置", permission=SUPERUSER, priority=5, block=True)
+@view_config.handle()
+async def _(bot: Bot, event: GroupMessageEvent):
+    group_id = str(event.group_id)
+    group_config = get_group_config(group_id)
+    global_conf = f"API: {config.personification_api_type}\n模型: {config.personification_model}\n概率: {config.personification_probability}\n联网: {config.personification_web_search}"
+    group_conf = f"当前群: {group_id}\n拟人: {group_config.get('enabled', '默认')}\n表情包: {group_config.get('sticker_enabled', True)}\n作息: {group_config.get('schedule_enabled', False)}"
+    nodes = [{"type": "node", "data": {"name": "全局/群配置", "uin": str(bot.self_id), "content": f"{global_conf}\n\n{group_conf}"}}]
+    try: await bot.call_api("send_group_forward_msg", group_id=event.group_id, messages=nodes)
+    except Exception: await view_config.finish(f"{global_conf}\n\n{group_conf}")
+
+@scheduler.scheduled_job("cron", hour=23, minute=59, id="personification_daily_fav_report")
+async def daily_group_fav_report():
+    if not SIGN_IN_AVAILABLE: return
+    try:
+        data, today, report_lines, total_increase = load_data(), datetime.now().strftime("%Y-%m-%d"), [], 0.0
+        for uid, udata in data.items():
+            if uid.startswith("group_") and not uid.startswith("group_private_") and udata.get("last_update") == today:
+                daily_count = float(udata.get("daily_fav_count", 0.0))
+                if daily_count > 0:
+                    report_lines.append(f"群 {uid[6:]}: +{daily_count:.2f} (当前: {udata.get('favorability', 0.0):.2f})")
+                    total_increase += daily_count
+        if report_lines:
+            summary = f"📊 【每日群聊好感度统计】\n日期: {today}\n总增长: {total_increase:.2f}\n\n" + "\n".join(report_lines)
+            for b in get_bots().values():
+                for su in superusers: await b.send_private_msg(user_id=int(su), message=summary)
+    except Exception: pass
+
+perm_blacklist_add = on_command("永久拉黑", permission=SUPERUSER, priority=5, block=True)
+@perm_blacklist_add.handle()
+async def _(bot: Bot, event: MessageEvent, args: Message = CommandArg()):
+    if not SIGN_IN_AVAILABLE: await perm_blacklist_add.finish("签到插件未就绪。")
+    target_id = args.extract_plain_text().strip()
+    for seg in event.get_message():
+        if seg.type == "at": target_id = str(seg.data["qq"])
+    if target_id:
+        update_user_data(target_id, is_perm_blacklisted=True)
+        await perm_blacklist_add.finish(f"✅ 已将用户 {target_id} 加入永久黑名单。")
+
+perm_blacklist_del = on_command("取消永久拉黑", permission=SUPERUSER, priority=5, block=True)
+@perm_blacklist_del.handle()
+async def _(bot: Bot, event: MessageEvent, args: Message = CommandArg()):
+    if not SIGN_IN_AVAILABLE: await perm_blacklist_del.finish("签到插件未就绪。")
+    target_id = args.extract_plain_text().strip()
+    for seg in event.get_message():
+        if seg.type == "at": target_id = str(seg.data["qq"])
+    if target_id:
+        update_user_data(target_id, is_perm_blacklisted=False)
+        await perm_blacklist_del.finish(f"✅ 已将用户 {target_id} 从永久黑名单中移除。")
+
+perm_blacklist_list = on_command("永久黑名单列表", permission=SUPERUSER, priority=5, block=True)
+@perm_blacklist_list.handle()
+async def _(bot: Bot, event: MessageEvent):
+    if not SIGN_IN_AVAILABLE: await perm_blacklist_list.finish("签到插件未就绪。")
+    data = load_data()
+    items = [{"id": uid, "count": ud.get('blacklist_count', 0), "fav": ud.get('favorability', 0.0)} for uid, ud in data.items() if not uid.startswith("group_") and ud.get("is_perm_blacklisted", False)]
+    if not items: await perm_blacklist_list.finish("目前没有永久黑名单用户。")
+    msg = "🚫 永久黑名单列表 🚫\n" + "\n".join([f"- {i['id']} ({i['count']}次 / {i['fav']:.2f})" for i in items])
+    await perm_blacklist_list.finish(msg)
+
+async def auto_post_diary():
+    if not QZONE_PUBLISH_AVAILABLE: return
+    bots = get_bots()
+    if not bots: return
+    bot = list(bots.values())[0]
+    diary = await generate_ai_diary(bot)
+    if diary: await publish_qzone_shuo(diary, bot.self_id)
+
+try:
+    scheduler.add_job(auto_post_diary, "cron", day_of_week="sun", hour=21, minute=0, id="ai_weekly_diary", replace_existing=True)
+except Exception: pass
+
+manual_diary_cmd = on_command("发个说说", permission=SUPERUSER, priority=5, block=True)
+@manual_diary_cmd.handle()
+async def handle_manual_diary(bot: Bot):
+    if not QZONE_PUBLISH_AVAILABLE: await manual_diary_cmd.finish("功能未就绪。")
+    diary = await generate_ai_diary(bot)
+    if diary:
+        success, msg = await publish_qzone_shuo(diary, bot.self_id)
+        await manual_diary_cmd.finish(f"{'✅' if success else '❌'} {msg if not success else '发布成功'}")
+
+def save_plugin_runtime_config():
+    path = Path("data/user_persona/runtime_config.json")
+    data = {"web_search": config.personification_web_search, "schedule_global": config.personification_schedule_global, "proactive_enabled": config.personification_proactive_enabled}
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f: json.dump(data, f, indent=4)
+    except Exception: pass
+
+def load_plugin_runtime_config():
+    path = Path("data/user_persona/runtime_config.json")
+    if path.exists():
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                config.personification_web_search = data.get("web_search", config.personification_web_search)
+                config.personification_schedule_global = data.get("schedule_global", config.personification_schedule_global)
+                config.personification_proactive_enabled = data.get("proactive_enabled", config.personification_proactive_enabled)
+        except Exception: pass
+
+load_plugin_runtime_config()
+
+web_search_cmd = on_command("拟人联网", permission=SUPERUSER, priority=5, block=True)
+@web_search_cmd.handle()
+async def _(bot: Bot, event: MessageEvent, arg: Message = CommandArg()):
+    action = arg.extract_plain_text().strip()
+    if action in ["开启", "关闭"]:
+        config.personification_web_search = (action == "开启")
+        save_plugin_runtime_config()
+        await web_search_cmd.finish(f"功能已{action}。")
+
+proactive_msg_switch_cmd = on_command("拟人主动消息", permission=SUPERUSER, priority=5, block=True)
+@proactive_msg_switch_cmd.handle()
+async def _(bot: Bot, event: MessageEvent, arg: Message = CommandArg()):
+    action = arg.extract_plain_text().strip()
+    if action in ["开启", "关闭"]:
+        config.personification_proactive_enabled = (action == "开启")
+        save_plugin_runtime_config()
+        await proactive_msg_switch_cmd.finish(f"功能已{action}。")
+
+clear_context_cmd = on_command("清除记忆", aliases={"清除上下文", "重置记忆"}, permission=SUPERUSER, priority=5, block=True)
+@clear_context_cmd.handle()
+async def _(bot: Bot, event: MessageEvent, arg: Message = CommandArg()):
+    args_text = arg.extract_plain_text().strip()
+    if args_text == "全局":
+        chat_histories.clear()
+        await clear_context_cmd.finish("已清除全局记忆。")
+    target_id = args_text if args_text.isdigit() else (str(event.group_id) if isinstance(event, GroupMessageEvent) else f"private_{event.user_id}")
+    if target_id in chat_histories:
+        del chat_histories[target_id]
+        await clear_context_cmd.finish(f"已清除 {target_id} 的记忆。")
+
+PROACTIVE_STATE_PATH = Path("data/personification/proactive_state.json")
+def load_proactive_state():
+    if PROACTIVE_STATE_PATH.exists():
+        try:
+            with open(PROACTIVE_STATE_PATH, "r", encoding="utf-8") as f: return json.load(f)
+        except Exception: return {}
+    return {}
+def save_proactive_state(data: dict):
+    PROACTIVE_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with open(PROACTIVE_STATE_PATH, "w", encoding="utf-8") as f: json.dump(data, f, ensure_ascii=False, indent=4)
+
+async def check_proactive_messaging(target_user_id: Optional[str] = None, bypass_checks: bool = False):
+    if not bypass_checks and (not config.personification_proactive_enabled or not SIGN_IN_AVAILABLE or not is_rest_time()): return
+    bots = get_bots()
+    if not bots: return
+    bot = list(bots.values())[0]
+    all_data, proactive_state, today_str, current_ts = load_data(), load_proactive_state(), datetime.now().strftime("%Y-%m-%d"), time.time()
+    if not target_user_id:
+        candidates = [uid for uid, ud in all_data.items() if not uid.startswith("group_") and float(ud.get("favorability", 0.0)) >= config.personification_proactive_threshold and not ud.get("is_perm_blacklisted", False) and (current_ts - proactive_state.get(uid, {}).get("last_interaction", 0) > config.personification_proactive_interval * 60) and (proactive_state.get(uid, {}).get("last_date") != today_str or proactive_state.get(uid, {}).get("count", 0) < config.personification_proactive_daily_limit)]
+        if not candidates: return
+        target_user_id = random.choice(candidates)
+    try:
+        ud = get_user_data(target_user_id)
+        base = load_prompt()
+        prompt = f"{base}\n\n当前：{get_activity_status()}\n目标：{target_user_id}(好感:{ud.get('favorability', 0)})\n任务：生成一条私聊开启话题，20字以内，符合人设。"
+        reply = await call_ai_api([{"role": "system", "content": prompt}], temperature=0.9)
+        if reply:
+            reply = re.sub(r'<.*?>', '', reply).strip()
+            if reply and "[SILENCE]" not in reply:
+                await bot.send_private_msg(user_id=int(target_user_id), message=reply)
+                ps = load_proactive_state()
+                u_ps = ps.get(target_user_id, {})
+                count = u_ps.get("count", 0) if u_ps.get("last_date") == today_str else 0
+                ps[target_user_id] = {"last_date": today_str, "count": count + 1, "last_interaction": time.time()}
+                save_proactive_state(ps)
+    except Exception: pass
+
+try:
+    scheduler.add_job(check_proactive_messaging, "interval", minutes=max(5, config.personification_proactive_interval), id="personification_proactive_messaging", replace_existing=True)
+except Exception: pass
+
+# 核心消息处理器
+reply_matcher = on_message(rule=Rule(personification_rule), priority=100, block=True)
+@reply_matcher.handle()
+async def _(bot: Bot, event: MessageEvent, state: T_State):
+    user_id = str(event.user_id)
+    group_id = str(event.group_id) if isinstance(event, GroupMessageEvent) else f"private_{user_id}"
+    key = f"{group_id}_{user_id}"
+    if key in _msg_buffer:
+        if "timer_task" in _msg_buffer[key]: _msg_buffer[key]["timer_task"].cancel()
+        _msg_buffer[key]["events"].append(event)
+    else: _msg_buffer[key] = {"events": [event], "state": state}
+    _msg_buffer[key]["timer_task"] = asyncio.create_task(_buffer_timer(key, bot))
+
+async def personification_rule(event: MessageEvent, state: T_State) -> bool:
+    uid = str(event.user_id)
+    if SIGN_IN_AVAILABLE and get_user_data(uid).get("is_perm_blacklisted"): return False
+    if uid in user_blacklist:
+        if time.time() < user_blacklist[uid]: return False
+        del user_blacklist[uid]
+    if isinstance(event, GroupMessageEvent):
+        gid = str(event.group_id)
+        if not is_group_whitelisted(gid, config.personification_whitelist): return False
+        is_mentioned = event.to_me
+        if not is_mentioned:
+            prompt = load_prompt(gid)
+            if isinstance(prompt, dict):
+                names = [str(prompt.get("name", ""))] + [str(n) for n in prompt.get("nick_name", []) if n]
+                msg = event.get_plaintext()
+                is_mentioned = any(n in msg for n in names if n)
+        if is_mentioned:
+            state["is_random_chat"] = False
+            return True
+        prob = config.personification_probability * (0.2 if not is_rest_time() else 1.0)
+        if random.random() < prob:
+            state["is_random_chat"] = True
+            return True
+    return isinstance(event, PrivateMessageEvent)
+
+async def handle_reply(bot: Bot, event: Event, state: T_State):
+    await _process_response_logic(bot, event, state)
+
+# 表情包水群
+async def sticker_chat_rule(event: GroupMessageEvent) -> bool:
+    if event.to_me: return False
+    gid = str(event.group_id)
+    return is_group_whitelisted(gid, config.personification_whitelist) and random.random() < config.personification_probability
+
+sticker_chat_matcher = on_message(rule=Rule(sticker_chat_rule), priority=101, block=True)
+@sticker_chat_matcher.handle()
+async def _(bot: Bot, event: GroupMessageEvent, state: T_State):
+    gid = str(event.group_id)
+    gc = get_group_config(gid)
+    mode = random.choice(["text_only", "sticker_only", "mixed"]) if gc.get("sticker_enabled", True) else "text_only"
+    if mode == "sticker_only":
+        sd = Path(config.personification_sticker_path or (store.get_plugin_data_dir() / "stickers"))
+        ss = [f for f in sd.iterdir() if f.suffix.lower() in [".jpg", ".png", ".gif", ".webp", ".jpeg"]] if sd.exists() else []
+        if ss: await bot.send(event, MessageSegment.image(f"file:///{random.choice(ss).absolute()}"))
+        else: mode = "text_only"
+    if mode in ["text_only", "mixed"]:
+        state["is_random_chat"], state["force_mode"] = True, mode
+        await _process_response_logic(bot, event, state)
+
+# 戳一戳
+async def poke_notice_rule(event: PokeNotifyEvent) -> bool:
+    if event.target_id != event.self_id: return False
+    gid = str(event.group_id)
+    return is_group_whitelisted(gid, config.personification_whitelist) and random.random() < config.personification_poke_probability
+
+poke_notice_matcher = on_notice(rule=Rule(poke_notice_rule), priority=10, block=False)
+@poke_notice_matcher.handle()
+async def _(bot: Bot, event: PokeNotifyEvent, state: T_State):
+    await _process_response_logic(bot, event, state)
+
+# 白名单申请
+apply_whitelist = on_command("申请白名单", priority=5, block=True)
+@apply_whitelist.handle()
+async def _(bot: Bot, event: GroupMessageEvent):
+    gid = str(event.group_id)
+    if is_group_whitelisted(gid, config.personification_whitelist): await apply_whitelist.finish("已在白名单中。")
+    gn = (await bot.get_group_info(group_id=int(gid))).get("group_name", "未知")
+    if not add_request(gid, str(event.user_id), gn): await apply_whitelist.finish("申请审核中。")
+    msg = f"收到白名单申请：\n群：{gn}({gid})\n申请人：{event.user_id}\n同意白名单 {gid}"
+    for su in superusers:
+        try: await bot.send_private_msg(user_id=int(su), message=msg)
+        except Exception: pass
+    await apply_whitelist.finish("申请已提交。")
+
+agree_whitelist = on_command("同意白名单", permission=SUPERUSER, priority=5, block=True)
+@agree_whitelist.handle()
+async def _(bot: Bot, event: MessageEvent, args: Message = CommandArg()):
+    gid = args.extract_plain_text().strip()
+    if add_group_to_whitelist(gid):
+        update_request_status(gid, "approved", str(event.user_id))
+        await agree_whitelist.send(f"已同意群 {gid}。")
+        try: await bot.send_group_msg(group_id=int(gid), message="拟人功能已激活！")
+        except Exception: pass
+
+add_whitelist = on_command("添加白名单", permission=SUPERUSER, priority=5, block=True)
+@add_whitelist.handle()
+async def _(bot: Bot, event: MessageEvent, args: Message = CommandArg()):
+    gid = args.extract_plain_text().strip()
+    if add_group_to_whitelist(gid): await add_whitelist.finish(f"已添加群 {gid}。")
+
+remove_whitelist = on_command("移除白名单", permission=SUPERUSER, priority=5, block=True)
+@remove_whitelist.handle()
+async def _(args: Message = CommandArg()):
+    gid = args.extract_plain_text().strip()
+    if remove_group_from_whitelist(gid): await remove_whitelist.finish(f"已移除群 {gid}。")

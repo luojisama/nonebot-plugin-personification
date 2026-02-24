@@ -14,7 +14,7 @@
 - [nonebot-plugin-apscheduler](https://github.com/nonebot/plugin-apscheduler): 任务调度支持
 - [nonebot-plugin-localstore](https://github.com/nonebot/plugin-localstore): 本地数据存储
 - [nonebot-plugin-htmlrender](https://github.com/kexue-go/nonebot-plugin-htmlrender): (可选) Markdown 转图片支持
-- [nonebot-plugin-sign-in](https://github.com/luojisama/nonebot-plugin-sign-in): (可选) 好感度系统关联插件
+- [nonebot-plugin-shiro-signin](https://github.com/luojisama/nonebot-plugin-shiro-signin): (可选) 好感度系统关联插件
 
 ## 💿 安装
 
