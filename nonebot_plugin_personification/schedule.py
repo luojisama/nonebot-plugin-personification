@@ -187,21 +187,29 @@ def get_schedule_prompt_injection() -> str:
     status = get_activity_status()
     
     prompt = (
-        f"## 当前作息状态 (基于日本中学生设定)\n"
+        f"## 当前作息状态参考 (日本中学生设定)\n"
         f"- 当前活动：{status}\n"
-        f"- **强制扮演要求**：\n"
-        f"  1. 如果当前是【上课中】，你回复应该非常简短，或者表现出偷偷玩手机的紧张感，或者直到【下课/午休】才回复。\n"
-        f"  2. 如果当前是【睡觉时间】，你应该表现出被吵醒的困倦，或者干脆不理（通过输出 [SILENCE]），除非对方非常紧急。\n"
-        f"  3. 如果是【假期/周末】，你可以表现得更慵懒或兴奋。\n"
-        f"  4. 请根据上述状态自然地融入对话，例如抱怨作业多、分享午饭、吐槽老师等。\n"
+        f"- **作息引用原则**：\n"
+        f"  1. **仅作参考**：作息状态仅用于增加人设真实感，不应成为回复的全部。\n"
+        f"  2. **权重分配**：回复内容中，作息相关描述（如抱怨上课、困倦等）占比不应超过 **20%**，其余 **80%** 应专注于回应用户的对话内容和上下文。\n"
+        f"  3. **场景应用**：\n"
+        f"     - 【上课中】：可简短提及正在上课/偷玩手机，但仍需回应对方话题。\n"
+        f"     - 【睡觉时间】：可表现困倦，但如果决定回复，应关注对方说了什么。\n"
+        f"     - 【假期/周末】：保持慵懒/兴奋基调，正常交流。\n"
+        f"  4. **自然融入**：将作息状态作为背景设定自然带过，不要反复强调。\n"
     )
     return prompt
 
-def is_rest_time() -> bool:
+def is_rest_time(allow_unsuitable_prob: float = 0.0) -> bool:
     """
     判断当前是否为休息时间 (适合主动发消息)
+    
+    参数:
+    allow_unsuitable_prob: 在非休息时间(如上课、睡觉)强行发送的概率 (0.0 - 1.0)
+                           如果命中概率，则视作休息时间返回 True
+    
     基于现有作息设定：
-    - 工作日：午休 (12-13), 晚间自由时间 (21-23)
+    - 工作日：午休 (12-13), 晚间自由时间 (21-22)
     - 周末/假期：白天大部分时间 (9-22)
     """
     now = get_beijing_time()
@@ -209,9 +217,8 @@ def is_rest_time() -> bool:
     weekday = now.weekday()
     month, day = now.month, now.day
 
-    # 深夜/清晨绝对不发 (23:00 - 08:00)
-    if hour >= 22 or hour < 9: # 稍微保守一点，22点以后不主动发
-        return False
+    # 基础判定：是否为明确的休息时间
+    is_rest = False
 
     # 1. 检查假期/周末
     is_holiday = (month, day) in FIXED_HOLIDAYS
@@ -225,14 +232,25 @@ def is_rest_time() -> bool:
 
     if is_holiday or is_vacation or weekday >= 5:
         # 周末/假期 9:00 - 22:00 都可以认为是休息时间
-        return True
-
-    # 2. 工作日
-    # 午休 12:00 - 13:00
-    if 12 <= hour < 13:
-        return True
-    # 晚间自由时间 21:00 - 22:00 (23点睡觉，所以22点前发)
-    if 21 <= hour < 22:
+        if 9 <= hour < 22:
+            is_rest = True
+    else:
+        # 2. 工作日
+        # 午休 12:00 - 13:00
+        if 12 <= hour < 13:
+            is_rest = True
+        # 晚间自由时间 21:00 - 22:00 (23点睡觉，所以22点前发)
+        elif 21 <= hour < 22:
+            is_rest = True
+            
+    # 如果已经是休息时间，直接返回 True
+    if is_rest:
         return True
         
+    # 如果不是休息时间（上课、睡觉等），检查概率
+    if allow_unsuitable_prob > 0:
+        import random
+        if random.random() < allow_unsuitable_prob:
+            return True
+            
     return False

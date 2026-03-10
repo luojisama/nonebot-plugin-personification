@@ -100,3 +100,12 @@ pip install nonebot-plugin-shiro-personification
 ## 💡 鸣谢
 
 - [nonebot_plugin_random_reply](https://github.com/Alpaca4610/nonebot_plugin_random_reply): 灵感来源
+
+## Update 0.2.1
+
+- Migrate all latest features from local `personification` source.
+- Added commands: `拒绝白名单`, `学习群聊风格`, `查看群聊风格`, `测试主动消息`.
+- Added persistent group style and group chat history support.
+- Added command set for whitelist rejection, style learning/viewing, and proactive-message testing.
+- Runtime data paths now use `nonebot_plugin_localstore` with legacy path fallback.
+- `nonebot-plugin-shiro-signin` changed to optional dependency, related features auto-degrade when missing.
