@@ -42,10 +42,11 @@ from .config import Config
 from .utils import add_group_to_whitelist, remove_group_from_whitelist, is_group_whitelisted, add_request, update_request_status, get_group_config, set_group_prompt, set_group_sticker_enabled, set_group_enabled, set_group_schedule_enabled, record_group_msg, get_recent_group_msgs, set_group_style, get_group_style, clear_group_msgs
 from .schedule import get_beijing_time, get_schedule_prompt_injection, is_rest_time, get_activity_status
 
-# 尝试导入 htmlrender
+# 尝试加载并导入 htmlrender
 try:
+    require("nonebot_plugin_htmlrender")
     from nonebot_plugin_htmlrender import md_to_pic
-except ImportError:
+except Exception:
     md_to_pic = None
 
 # 尝试导入签到插件的工具函数
