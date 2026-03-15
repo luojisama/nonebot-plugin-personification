@@ -1,10 +1,10 @@
-# nonebot-plugin-shiro-personification
+# nonebot-plugin-personification
 
 ✨ 拟人化群聊回复插件，支持多 API 池、好感度系统、作息模拟、YAML 人设、主动私聊、联网搜索 ✨
 
 ## 📖 介绍
 
-`nonebot-plugin-shiro-personification` 是一个基于 NoneBot2 的拟人化群聊插件。插件支持多 API 池故障切换、好感度联动、群聊作息模拟、YAML/TXT 人设加载、主动私聊与联网搜索，能够在群聊中提供更自然、更贴近角色设定的回复体验。
+`nonebot-plugin-personification` 是一个基于 NoneBot2 的拟人化群聊插件。插件支持多 API 池故障切换、好感度联动、群聊作息模拟、YAML/TXT 人设加载、主动私聊与联网搜索，能够在群聊中提供更自然、更贴近角色设定的回复体验。
 
 ## 💿 安装
 
