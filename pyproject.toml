@@ -36,9 +36,9 @@ dependencies = [
 ]
 
 [project.urls]
-"Homepage" = "https://github.com/luojisama/nonebot-plugin-shiro-personification"
-"Bug Tracker" = "https://github.com/luojisama/nonebot-plugin-shiro-personification/issues"
-"Repository" = "https://github.com/luojisama/nonebot-plugin-shiro-personification"
+"Homepage" = "https://github.com/luojisama/nonebot-plugin-personification"
+"Bug Tracker" = "https://github.com/luojisama/nonebot-plugin-personification/issues"
+"Repository" = "https://github.com/luojisama/nonebot-plugin-personification"
 
 [project.optional-dependencies]
 signin = ["nonebot-plugin-shiro-signin>=0.1.0"]
