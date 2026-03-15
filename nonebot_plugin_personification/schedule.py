@@ -1,7 +1,7 @@
 from datetime import datetime, timedelta, timezone
 
-# Beijing Timezone (UTC+8)
-BEIJING_TZ = timezone(timedelta(hours=8))
+# Tokyo Timezone (UTC+9)
+TOKYO_TZ = timezone(timedelta(hours=9))
 
 # Japanese National Holidays (Fixed Date) - Simplified list
 # Note: Happy Mondays and Equinoxes are variable, but for simplicity we can hardcode common ones or use a library.
@@ -39,16 +39,21 @@ SCHOOL_EVENTS = [
     (3, 15, 15, "毕业典礼 (Graduation Ceremony)", "ceremony"),
 ]
 
+def get_tokyo_time() -> datetime:
+    """Get current time in Tokyo Timezone."""
+    return datetime.now(TOKYO_TZ)
+
+
 def get_beijing_time() -> datetime:
-    """Get current time in Beijing Timezone"""
-    return datetime.now(BEIJING_TZ)
+    """Backward-compatible alias. The plugin now uses Tokyo timezone."""
+    return get_tokyo_time()
 
 def get_activity_status() -> str:
     """
     Get the current activity status of a Japanese middle school student (Mahiro/Shiro)
-    based on Beijing Time.
+    based on Tokyo Time.
     """
-    now = get_beijing_time()
+    now = get_tokyo_time()
     month, day = now.month, now.day
     hour, minute = now.hour, now.minute
     weekday = now.weekday() # 0=Mon, 6=Sun
@@ -183,7 +188,7 @@ def _get_school_day_routine(hour: int) -> str:
 
 def get_schedule_prompt_injection() -> str:
     """Get the full prompt text to inject"""
-    now = get_beijing_time()
+    now = get_tokyo_time()
     status = get_activity_status()
     
     prompt = (
@@ -212,7 +217,7 @@ def is_rest_time(allow_unsuitable_prob: float = 0.0) -> bool:
     - 工作日：午休 (12-13), 晚间自由时间 (21-22)
     - 周末/假期：白天大部分时间 (9-22)
     """
-    now = get_beijing_time()
+    now = get_tokyo_time()
     hour = now.hour
     weekday = now.weekday()
     month, day = now.month, now.day
