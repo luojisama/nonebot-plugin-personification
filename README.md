@@ -101,6 +101,11 @@ pip install nonebot-plugin-shiro-personification
 
 - [nonebot_plugin_random_reply](https://github.com/Alpaca4610/nonebot_plugin_random_reply): 灵感来源
 
+## Update 0.3.1
+
+- 性能优化与稳定性提升。
+- 修复了一些已知问题。
+
 ## Update 0.2.1
 
 - Migrate all latest features from local `personification` source.
