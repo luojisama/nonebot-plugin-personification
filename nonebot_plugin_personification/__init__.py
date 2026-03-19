@@ -68,7 +68,7 @@ else:
 
 __plugin_meta__ = PluginMetadata(
     name="群聊拟人",
-    description="实现拟人化的群聊回复，支持好感度系统及自主回复决策",
+    description="实现拟人化的群聊回复，支持好感度系统、自主回复决策及YAML剧本模式",
     usage=(
         "🤖 基础功能：\n"
         "  - 自动回复：在白名单群聊中随机触发或艾特触发\n"
@@ -100,7 +100,12 @@ __plugin_meta__ = PluginMetadata(
     config=Config,
     type="application",
     homepage="https://github.com/luojisama/nonebot-plugin-shiro-personification",
-    supported_adapters={"nonebot.adapters.onebot.v11"},
+    supported_adapters={"~onebot.v11"},
+    extra={
+        "author": "luojisama",
+        "version": "0.3.1",
+        "pypi_test": "nonebot-plugin-shiro-personification",
+    },
 )
 
 plugin_config = get_plugin_config(Config)
