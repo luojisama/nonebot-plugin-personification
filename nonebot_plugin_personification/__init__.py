@@ -99,7 +99,7 @@ __plugin_meta__ = PluginMetadata(
     ),
     config=Config,
     type="application",
-    homepage="https://github.com/luojisama/nonebot-plugin-shiro-personification",
+    homepage="https://github.com/luojisama/nonebot-plugin-personification",
     supported_adapters={"~onebot.v11"},
     extra={
         "author": "luojisama",
