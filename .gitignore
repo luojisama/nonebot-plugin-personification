@@ -11,6 +11,8 @@ bin/
 build/
 develop-eggs/
 dist/
+.pdm-build/
+.tmp/
 eggs/
 lib/
 lib64/

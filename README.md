@@ -1,116 +1,108 @@
 # nonebot-plugin-shiro-personification
 
-✨ 实现拟人化的群聊回复，支持好感度系统、自主回复决策及 YAML 剧本模式 ✨
+基于 NoneBot2 和 OneBot V11 的拟人化聊天插件，围绕群聊与私聊上下文构建人设回复，支持 Agent 工具调用、风格学习、主动消息、贴图语义与运行时开关。
 
-## 📖 介绍
+## 特性
 
-这是一个基于 OpenAI API / Gemini API 的 NoneBot2 插件，旨在让机器人在群聊中表现得更像一个真正的成员。它能够根据上下文决定是否回复，支持基于好感度系统的动态态度调整，并引入了作息模拟和 YAML 剧本模式，让机器人拥有更丰富的生活感。
+- 群聊回复、插话、戳一戳响应、私聊上下文记忆
+- Agent 化工具调用：联网搜索、天气、时间、新闻、群信息、贴图分析、定时任务
+- 群聊风格学习、话题摘要、上下文压缩
+- 主动私聊、群空闲主动发话、周记/说说生成
+- 用户画像、自定义 skills、贴图库自动标注与语义选图
+- 白名单、永久黑名单、群配置、运行时开关
 
-## 📦 依赖项
+## 安装
 
-在使用本项目之前，请确保已安装以下插件：
-
-- [nonebot-adapter-onebot](https://github.com/nonebot/adapter-onebot): OneBot V11 适配器
-- [nonebot-plugin-apscheduler](https://github.com/nonebot/plugin-apscheduler): 任务调度支持
-- [nonebot-plugin-localstore](https://github.com/nonebot/plugin-localstore): 本地数据存储
-- [nonebot-plugin-htmlrender](https://github.com/kexue-go/nonebot-plugin-htmlrender): (可选) Markdown 转图片支持
-- [nonebot-plugin-shiro-signin](https://github.com/luojisama/nonebot-plugin-shiro-signin): (可选) 好感度系统关联插件
-
-## 💿 安装
-
-使用 nb-cli 安装：
 ```bash
 nb plugin install nonebot-plugin-shiro-personification
 ```
 
-或者使用 pip 安装：
+或：
+
 ```bash
 pip install nonebot-plugin-shiro-personification
 ```
 
-## ⚙️ 配置
+可选好感度联动：
 
-在 `.env` 文件中添加以下配置项：
+```bash
+pip install "nonebot-plugin-shiro-personification[signin]"
+```
+
+## 环境要求
+
+- Python `>=3.10`
+- NoneBot2
+- OneBot V11 适配器
+
+## 主要配置
+
+以下是最常用的配置项，完整字段见 [config.py](./nonebot_plugin_personification/config.py)。
 
 | 配置项 | 类型 | 默认值 | 说明 |
-|:-----|:----:|:----:|:----|
-| `personification_api_key` | `str` | `""` | OpenAI / Gemini API Key |
-| `personification_api_url` | `str` | `"https://api.openai.com/v1"` | API 基础路径 |
-| `personification_api_type` | `str` | `"openai"` | API 类型: `openai` / `gemini` / `gemini_official` |
-| `personification_model` | `str` | `"gpt-3.5-turbo"` | 使用的模型名称 (如 `gemini-1.5-flash`) |
-| `personification_whitelist` | `list` | `[]` | 启用插件的群号列表 |
-| `personification_probability` | `float` | `0.5` | 随机回复概率 (0-1) |
-| `personification_system_prompt` | `str` | (见代码) | 默认系统提示词 |
-| `personification_prompt_path` | `str` | `None` | 自定义人格设定文件路径 (支持 .txt 或 .yaml) |
-| `personification_history_len` | `int` | `50` | 上下文参考长度 |
-| `personification_sticker_path` | `str` | `"data/stickers"` | 表情包文件夹路径 |
-| `personification_poke_probability` | `float` | `0.3` | 戳一戳响应概率 |
-| `personification_schedule_global` | `bool` | `False` | 是否全局开启作息模拟 |
-| `personification_web_search` | `bool` | `False` | 是否开启联网搜索 (需模型支持) |
+| --- | --- | --- | --- |
+| `personification_api_type` | `str` | `openai` | 主模型类型，支持 `openai`、`gemini`、`anthropic`、`openai_codex` |
+| `personification_api_url` | `str` | `https://api.openai.com/v1` | 主模型接口地址 |
+| `personification_api_key` | `str` | `""` | 主模型密钥 |
+| `personification_model` | `str` | `gpt-4o-mini` | 主模型名称 |
+| `personification_api_pools` | `str/list` | `None` | 多 provider 池配置 |
+| `personification_system_prompt` | `str` | 内置默认值 | 基础人设提示词 |
+| `personification_prompt_path` | `str` | `None` | 人设文件路径，支持文本/YAML |
+| `personification_whitelist` | `list[str]` | `[]` | 启用群白名单 |
+| `personification_probability` | `float` | `0.5` | 群聊随机回复概率 |
+| `personification_history_len` | `int` | `200` | 上下文长度 |
+| `personification_sticker_path` | `str` | `data/stickers` | 贴图库路径 |
+| `personification_labeler_enabled` | `bool` | `True` | 是否自动标注新贴图 |
+| `personification_skills_path` | `str` | `None` | 自定义 skills 根目录 |
+| `personification_web_search` | `bool` | `True` | 保留的联网总开关 |
+| `personification_proactive_enabled` | `bool` | `True` | 主动私聊开关 |
+| `personification_group_idle_minutes` | `int` | `60` | 群空闲多久后允许主动发话 |
+| `personification_persona_enabled` | `bool` | `True` | 用户画像开关 |
+| `personification_data_dir` | `str` | `""` | 自定义数据目录 |
 
-## 🎉 功能特性
+## 命令概览
 
-### 1. 拟人化回复
-- **自主决策**：机器人会根据对话内容判断是否需要回复，甚至主动结束话题 ([SILENCE])。
-- **作息模拟**：模拟日本中学生的作息时间（上课、社团、睡觉等），在不同时间段有不同的响应状态。
-- **水群模式**：随机发送表情包、文本或混合内容，模拟真实群友。
+常用命令：
 
-### 2. 好感度系统
-- **动态态度**：结合 `nonebot-plugin-sign-in` 插件，根据用户的好感度等级（陌生 -> 挚友）调整回复语气。
-- **群氛围感知**：根据群聊整体的好感度水平，调整机器人的心情（压抑 vs 开心）。
+- `申请白名单`
+- `群好感` / `群好感度`
+- `查看配置`
+- `拟人开` / `拟人关`
+- `贴图开` / `贴图关`
+- `联网开关 [开/关]`
+- `主动私聊开关 [开/关]`
+- `拟人作息 [开启/关闭/全局开启/全局关闭]`
+- `学习群聊风格`
+- `查看群聊风格`
+- `清除上下文 [全局/@用户/用户ID]`
+- `永久拉黑 [用户ID/@用户]`
+- `取消永久拉黑 [用户ID/@用户]`
+- `查看永久黑名单`
+- `手动发说说`
 
-### 3. YAML 剧本模式
-- 支持通过 YAML 文件定义复杂的状态机逻辑。
-- 可根据关键词触发特定回复，并改变机器人内部状态。
+不同部署里还会根据可用能力启用用户画像、好友申请、贴图/工具调用相关命令。
 
-### 4. 视觉感知与表情包
-- **表情包发送**：支持配置本地表情包文件夹，随机发送表情包。
-- **视觉识别**：支持识别用户发送的表情包/图片（需模型支持 Vision）。
+## 说明
 
-## 📝 命令列表
+- `nonebot-plugin-shiro-signin` 为可选联动依赖，未安装时好感度相关能力会自动降级。
+- `nonebot-plugin-htmlrender` 已作为默认依赖声明；若运行环境缺失或导入失败，相关渲染能力会自动降级。
+- 数据默认存放在 `nonebot-plugin-localstore` 对应目录；未可用时会回退到 `data/personification`。
 
-**基础功能**
-- `申请白名单`：申请将当前群聊加入白名单
-- `群好感` / `群好感度`：查看当前群聊的整体好感
+## 更新
 
-**管理员命令 (SUPERUSER)**
-- `拟人配置`：查看当前拟人插件的全局及群组配置
-- `拟人开启/关闭`：开启或关闭当前群的拟人功能
-- `拟人作息 [开启/关闭]`：开启或关闭当前群的作息模拟
-- `开启/关闭表情包`：开启或关闭当前群的表情包功能
-- `拟人联网 [开启/关闭]`：切换 AI 联网搜索功能
-- `查看人设`：查看当前群生效的人设提示词
-- `设置人设 [群号] <提示词>`：设置指定群或当前群的人设
-- `重置人设`：重置当前群的人设为默认配置
-- `设置群好感 [群号] [分值]`：手动调整群好感
-- `永久拉黑 [用户ID/@用户]`：禁止用户与 AI 交互
-- `取消永久拉黑 [用户ID/@用户]`：移除永久黑名单
-- `永久黑名单列表`：查看所有被封禁的用户
-- `同意白名单 [群号]`：批准群聊加入白名单
-- `拒绝白名单 [群号]`：拒绝群聊加入白名单
-- `添加白名单 [群号]`：将指定群聊添加到白名单
-- `移除白名单 [群号]`：将群聊移出白名单
-- `清除记忆` / `清除上下文 [群号]`：清除当前群或指定群的短期对话上下文
-- `发个说说`：手动触发一次 AI 周记说说发布
+### 0.4.0
 
-## 📄 开源许可
+- 完整迁移本地 `personification` 开发版架构到在线版包。
+- 新增 Agent 工具调用、用户画像、自定义 skills、群摘要与上下文压缩。
+- 新增群空闲主动发话、好友申请判定、贴图库自动标注与语义选图。
+- 补齐 Anthropic、watchdog、filelock 等新版依赖。
+- 更新项目元数据、README 与发布配置，使其与当前源码一致。
 
-本项目采用 [MIT](LICENSE) 许可协议。
-
-## 💡 鸣谢
-
-- [nonebot_plugin_random_reply](https://github.com/Alpaca4610/nonebot_plugin_random_reply): 灵感来源
-
-## Update 0.3.1
+### 0.3.1
 
 - 性能优化与稳定性提升。
 - 修复了一些已知问题。
 
-## Update 0.2.1
+## License
 
-- Migrate all latest features from local `personification` source.
-- Added commands: `拒绝白名单`, `学习群聊风格`, `查看群聊风格`, `测试主动消息`.
-- Added persistent group style and group chat history support.
-- Added command set for whitelist rejection, style learning/viewing, and proactive-message testing.
-- Runtime data paths now use `nonebot_plugin_localstore` with legacy path fallback.
-- `nonebot-plugin-shiro-signin` changed to optional dependency, related features auto-degrade when missing.
+[MIT](./LICENSE)

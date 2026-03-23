@@ -1,64 +1,44 @@
-import json
 import time
-from pathlib import Path
 from typing import Dict, List, Optional
 
-import nonebot_plugin_localstore as localstore
-
-PRIMARY_DATA_DIR = localstore.get_plugin_data_dir() / "personification"
-LEGACY_DATA_DIR = Path("data/personification")
-
-DATA_PATH = PRIMARY_DATA_DIR / "whitelist.json"
-REQUESTS_PATH = PRIMARY_DATA_DIR / "requests.json"
-GROUP_CONFIG_PATH = PRIMARY_DATA_DIR / "group_config.json"
-CHAT_HISTORY_PATH = PRIMARY_DATA_DIR / "chat_history.json"
-
-LEGACY_DATA_PATH = LEGACY_DATA_DIR / "whitelist.json"
-LEGACY_REQUESTS_PATH = LEGACY_DATA_DIR / "requests.json"
-LEGACY_GROUP_CONFIG_PATH = LEGACY_DATA_DIR / "group_config.json"
-LEGACY_CHAT_HISTORY_PATH = LEGACY_DATA_DIR / "chat_history.json"
+from .core.data_store import get_data_store
 
 
-def _load_json(primary_path: Path, legacy_path: Path, default):
-    target = primary_path if primary_path.exists() else legacy_path
-    if not target.exists():
-        return default
-    try:
-        with open(target, "r", encoding="utf-8") as f:
-            content = f.read().strip()
-            return json.loads(content) if content else default
-    except Exception:
-        return default
+_WHITELIST_STORE = "whitelist"
+_REQUESTS_STORE = "requests"
+_GROUP_CONFIG_STORE = "group_config"
+_CHAT_HISTORY_STORE = "chat_history"
 
 
 def load_chat_history() -> Dict[str, dict]:
-    return _load_json(CHAT_HISTORY_PATH, LEGACY_CHAT_HISTORY_PATH, {})
+    data = get_data_store().load_sync(_CHAT_HISTORY_STORE)
+    return data if isinstance(data, dict) else {}
 
 
 def save_chat_history(data: Dict[str, dict]):
-    try:
-        CHAT_HISTORY_PATH.parent.mkdir(parents=True, exist_ok=True)
-        temp_path = CHAT_HISTORY_PATH.with_suffix(".tmp")
-        with open(temp_path, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=4)
-        if temp_path.exists():
-            temp_path.replace(CHAT_HISTORY_PATH)
-    except Exception:
-        pass
+    get_data_store().save_sync(_CHAT_HISTORY_STORE, data if isinstance(data, dict) else {})
 
 
 def record_group_msg(group_id: str, nickname: str, content: str, is_bot: bool = False) -> int:
     if not content.strip():
         return 0
 
-    try:
-        data = load_chat_history()
-        if group_id not in data:
-            data[group_id] = {"style": "", "messages": []}
-        if "messages" not in data[group_id]:
-            data[group_id]["messages"] = []
+    count = 0
 
-        data[group_id]["messages"].append(
+    def _mutate(current: object) -> Dict[str, dict]:
+        nonlocal count
+        data = current if isinstance(current, dict) else {}
+        group_data = data.get(group_id)
+        if not isinstance(group_data, dict):
+            group_data = {"style": "", "messages": []}
+            data[group_id] = group_data
+
+        messages = group_data.get("messages")
+        if not isinstance(messages, list):
+            messages = []
+            group_data["messages"] = messages
+
+        messages.append(
             {
                 "nickname": nickname,
                 "content": content,
@@ -66,176 +46,262 @@ def record_group_msg(group_id: str, nickname: str, content: str, is_bot: bool = 
                 "is_bot": is_bot,
             }
         )
+        if len(messages) > 200:
+            group_data["messages"] = messages[-200:]
+        count = len(group_data["messages"])
+        return data
 
-        count = len(data[group_id]["messages"])
-        if count > 200:
-            data[group_id]["messages"] = data[group_id]["messages"][-200:]
-            count = 200
-
-        save_chat_history(data)
+    try:
+        get_data_store().mutate_sync(_CHAT_HISTORY_STORE, _mutate)
         return count
-    except Exception:
+    except Exception as e:
+        print(f"Error recording group msg: {e}")
         return 0
 
 
 def clear_group_msgs(group_id: str):
-    data = load_chat_history()
-    if group_id in data:
-        data[group_id]["messages"] = []
-        save_chat_history(data)
+    def _mutate(current: object) -> Dict[str, dict]:
+        data = current if isinstance(current, dict) else {}
+        group_data = data.get(group_id)
+        if not isinstance(group_data, dict):
+            return data
+        group_data["messages"] = []
+        return data
+
+    get_data_store().mutate_sync(_CHAT_HISTORY_STORE, _mutate)
 
 
 def get_recent_group_msgs(group_id: str, limit: int = 200) -> List[Dict]:
     data = load_chat_history()
-    if group_id not in data or "messages" not in data[group_id]:
+    group_data = data.get(group_id)
+    if not isinstance(group_data, dict):
         return []
-    return data[group_id]["messages"][-limit:]
+    messages = group_data.get("messages")
+    if not isinstance(messages, list):
+        return []
+    return messages[-limit:]
 
 
 def set_group_style(group_id: str, style: str):
-    data = load_chat_history()
-    if group_id not in data:
-        data[group_id] = {"style": "", "messages": []}
-    data[group_id]["style"] = style
-    save_chat_history(data)
+    def _mutate(current: object) -> Dict[str, dict]:
+        data = current if isinstance(current, dict) else {}
+        group_data = data.get(group_id)
+        if not isinstance(group_data, dict):
+            group_data = {"style": "", "messages": []}
+            data[group_id] = group_data
+        group_data["style"] = style
+        return data
+
+    get_data_store().mutate_sync(_CHAT_HISTORY_STORE, _mutate)
 
 
 def get_group_style(group_id: str) -> str:
     data = load_chat_history()
-    return data.get(group_id, {}).get("style", "")
+    group_data = data.get(group_id)
+    if not isinstance(group_data, dict):
+        return ""
+    return str(group_data.get("style", "") or "")
+
+
+def get_group_topic_summary(group_id: str) -> str:
+    data = load_chat_history()
+    group_data = data.get(group_id)
+    if not isinstance(group_data, dict):
+        return ""
+    return str(group_data.get("topic_summary", "") or "")
+
+
+def set_group_topic_summary(group_id: str, summary: str, ts: float) -> None:
+    def _mutate(current: object) -> Dict[str, dict]:
+        data = current if isinstance(current, dict) else {}
+        group_data = data.get(group_id)
+        if not isinstance(group_data, dict):
+            group_data = {"style": "", "messages": []}
+            data[group_id] = group_data
+        group_data["topic_summary"] = summary
+        group_data["topic_summary_at"] = float(ts)
+        return data
+
+    get_data_store().mutate_sync(_CHAT_HISTORY_STORE, _mutate)
 
 
 def load_group_configs() -> Dict[str, dict]:
-    return _load_json(GROUP_CONFIG_PATH, LEGACY_GROUP_CONFIG_PATH, {})
+    data = get_data_store().load_sync(_GROUP_CONFIG_STORE)
+    return data if isinstance(data, dict) else {}
 
 
 def save_group_configs(data: Dict[str, dict]):
-    GROUP_CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
-    with open(GROUP_CONFIG_PATH, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=4)
+    get_data_store().save_sync(_GROUP_CONFIG_STORE, data if isinstance(data, dict) else {})
 
 
 def get_group_config(group_id: str) -> dict:
     configs = load_group_configs()
-    return configs.get(group_id, {})
+    return configs.get(group_id, {}) if isinstance(configs.get(group_id, {}), dict) else {}
 
 
 def set_group_prompt(group_id: str, prompt: Optional[str]):
-    configs = load_group_configs()
-    if group_id not in configs:
-        configs[group_id] = {}
+    def _mutate(current: object) -> Dict[str, dict]:
+        configs = current if isinstance(current, dict) else {}
+        group_config = configs.get(group_id)
+        if not isinstance(group_config, dict):
+            group_config = {}
+            configs[group_id] = group_config
 
-    if prompt is None:
-        if "custom_prompt" in configs[group_id]:
-            del configs[group_id]["custom_prompt"]
-    else:
-        configs[group_id]["custom_prompt"] = prompt
+        if prompt is None:
+            group_config.pop("custom_prompt", None)
+        else:
+            group_config["custom_prompt"] = prompt
+        return configs
 
-    save_group_configs(configs)
+    get_data_store().mutate_sync(_GROUP_CONFIG_STORE, _mutate)
 
 
 def set_group_sticker_enabled(group_id: str, enabled: bool):
-    configs = load_group_configs()
-    if group_id not in configs:
-        configs[group_id] = {}
-    configs[group_id]["sticker_enabled"] = enabled
-    save_group_configs(configs)
+    def _mutate(current: object) -> Dict[str, dict]:
+        configs = current if isinstance(current, dict) else {}
+        group_config = configs.get(group_id)
+        if not isinstance(group_config, dict):
+            group_config = {}
+            configs[group_id] = group_config
+        group_config["sticker_enabled"] = enabled
+        return configs
+
+    get_data_store().mutate_sync(_GROUP_CONFIG_STORE, _mutate)
 
 
 def set_group_enabled(group_id: str, enabled: bool):
-    configs = load_group_configs()
-    if group_id not in configs:
-        configs[group_id] = {}
-    configs[group_id]["enabled"] = enabled
-    save_group_configs(configs)
+    def _mutate(current: object) -> Dict[str, dict]:
+        configs = current if isinstance(current, dict) else {}
+        group_config = configs.get(group_id)
+        if not isinstance(group_config, dict):
+            group_config = {}
+            configs[group_id] = group_config
+        group_config["enabled"] = enabled
+        return configs
+
+    get_data_store().mutate_sync(_GROUP_CONFIG_STORE, _mutate)
 
 
 def set_group_schedule_enabled(group_id: str, enabled: bool):
-    configs = load_group_configs()
-    if group_id not in configs:
-        configs[group_id] = {}
-    configs[group_id]["schedule_enabled"] = enabled
-    save_group_configs(configs)
+    def _mutate(current: object) -> Dict[str, dict]:
+        configs = current if isinstance(current, dict) else {}
+        group_config = configs.get(group_id)
+        if not isinstance(group_config, dict):
+            group_config = {}
+            configs[group_id] = group_config
+        group_config["schedule_enabled"] = enabled
+        return configs
+
+    get_data_store().mutate_sync(_GROUP_CONFIG_STORE, _mutate)
 
 
 def load_whitelist() -> list:
-    return _load_json(DATA_PATH, LEGACY_DATA_PATH, [])
+    data = get_data_store().load_sync(_WHITELIST_STORE)
+    return data if isinstance(data, list) else []
 
 
 def save_whitelist(whitelist: list):
-    DATA_PATH.parent.mkdir(parents=True, exist_ok=True)
-    with open(DATA_PATH, "w", encoding="utf-8") as f:
-        json.dump(whitelist, f, ensure_ascii=False, indent=4)
+    get_data_store().save_sync(_WHITELIST_STORE, whitelist if isinstance(whitelist, list) else [])
 
 
 def add_group_to_whitelist(group_id: str) -> bool:
-    whitelist = load_whitelist()
-    if group_id in whitelist:
-        return False
-    whitelist.append(group_id)
-    save_whitelist(whitelist)
-    return True
+    added = False
+
+    def _mutate(current: object) -> list:
+        nonlocal added
+        whitelist = current if isinstance(current, list) else []
+        if group_id in whitelist:
+            return whitelist
+        whitelist.append(group_id)
+        added = True
+        return whitelist
+
+    get_data_store().mutate_sync(_WHITELIST_STORE, _mutate)
+    return added
 
 
 def remove_group_from_whitelist(group_id: str) -> bool:
-    whitelist = load_whitelist()
-    if group_id not in whitelist:
-        return False
-    whitelist.remove(group_id)
-    save_whitelist(whitelist)
-    return True
+    removed = False
+
+    def _mutate(current: object) -> list:
+        nonlocal removed
+        whitelist = current if isinstance(current, list) else []
+        if group_id not in whitelist:
+            return whitelist
+        whitelist.remove(group_id)
+        removed = True
+        return whitelist
+
+    get_data_store().mutate_sync(_WHITELIST_STORE, _mutate)
+    return removed
 
 
 def is_group_whitelisted(group_id: str, config_whitelist: list) -> bool:
     group_config = get_group_config(group_id)
     if "enabled" in group_config:
-        return group_config["enabled"]
+        return bool(group_config["enabled"])
     if group_id in config_whitelist:
         return True
     return group_id in load_whitelist()
 
 
 def load_requests() -> Dict[str, dict]:
-    return _load_json(REQUESTS_PATH, LEGACY_REQUESTS_PATH, {})
+    data = get_data_store().load_sync(_REQUESTS_STORE)
+    return data if isinstance(data, dict) else {}
 
 
 def save_requests(data: Dict[str, dict]):
-    REQUESTS_PATH.parent.mkdir(parents=True, exist_ok=True)
-    with open(REQUESTS_PATH, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=4)
+    get_data_store().save_sync(_REQUESTS_STORE, data if isinstance(data, dict) else {})
 
 
 def add_request(group_id: str, user_id: str, group_name: str) -> bool:
-    requests = load_requests()
-    if group_id in requests and requests[group_id].get("status") == "pending":
-        return False
+    added = False
 
-    requests[group_id] = {
-        "group_id": group_id,
-        "user_id": user_id,
-        "group_name": group_name,
-        "status": "pending",
-        "request_time": time.time(),
-        "update_time": time.time(),
-    }
-    save_requests(requests)
-    return True
+    def _mutate(current: object) -> Dict[str, dict]:
+        nonlocal added
+        requests = current if isinstance(current, dict) else {}
+        current_request = requests.get(group_id)
+        if isinstance(current_request, dict) and current_request.get("status") == "pending":
+            return requests
+
+        now = time.time()
+        requests[group_id] = {
+            "group_id": group_id,
+            "user_id": user_id,
+            "group_name": group_name,
+            "status": "pending",
+            "request_time": now,
+            "update_time": now,
+        }
+        added = True
+        return requests
+
+    get_data_store().mutate_sync(_REQUESTS_STORE, _mutate)
+    return added
 
 
 def update_request_status(group_id: str, status: str, operator_id: str = None) -> bool:
-    requests = load_requests()
-    if group_id not in requests:
-        return False
+    updated = False
 
-    requests[group_id]["status"] = status
-    requests[group_id]["update_time"] = time.time()
-    if operator_id:
-        requests[group_id]["operator_id"] = operator_id
+    def _mutate(current: object) -> Dict[str, dict]:
+        nonlocal updated
+        requests = current if isinstance(current, dict) else {}
+        request = requests.get(group_id)
+        if not isinstance(request, dict):
+            return requests
 
-    save_requests(requests)
-    return True
+        request["status"] = status
+        request["update_time"] = time.time()
+        if operator_id:
+            request["operator_id"] = operator_id
+        updated = True
+        return requests
+
+    get_data_store().mutate_sync(_REQUESTS_STORE, _mutate)
+    return updated
 
 
 def get_request_info(group_id: str) -> Optional[dict]:
     requests = load_requests()
-    return requests.get(group_id)
+    request = requests.get(group_id)
+    return request if isinstance(request, dict) else None

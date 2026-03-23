@@ -1,24 +1,24 @@
 [project]
 name = "nonebot-plugin-shiro-personification"
-version = "0.3.1"
-description = "实现拟人化的群聊回复，支持好感度系统、自主回复决策及YAML剧本模式"
+version = "0.4.0"
+description = "基于群聊与私聊上下文的人设回复插件，支持 Agent 工具调用、风格学习、主动消息与贴图能力。"
 readme = "README.md"
-requires-python = ">=3.9"
+requires-python = ">=3.10"
 authors = [
     { name = "luojisama", email = "2534316454@qq.com" },
 ]
 license = { text = "MIT" }
-keywords = ["nonebot", "nonebot2", "plugin", "openai", "personification", "chatgpt"]
+keywords = ["nonebot", "nonebot2", "plugin", "onebot", "personification", "chatbot"]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
     "License :: OSI Approved :: MIT License",
     "Operating System :: OS Independent",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.9",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
     "Topic :: Communications :: Chat",
 ]
 
@@ -29,24 +29,25 @@ dependencies = [
     "nonebot-plugin-localstore>=0.6.0",
     "nonebot-plugin-htmlrender>=0.2.0",
     "openai>=1.0.0",
+    "anthropic>=0.34.0",
+    "filelock>=3.16.0",
+    "watchdog>=4.0.0",
     "pydantic",
-    "aiofiles",
     "httpx",
     "Pillow",
     "PyYAML",
 ]
 
 [project.urls]
-"Homepage" = "https://github.com/luojisama/nonebot-plugin-shiro-personification"
-"Bug Tracker" = "https://github.com/luojisama/nonebot-plugin-shiro-personification/issues"
-"Repository" = "https://github.com/luojisama/nonebot-plugin-shiro-personification"
+"Homepage" = "https://github.com/luojisama/nonebot-plugin-personification"
+"Bug Tracker" = "https://github.com/luojisama/nonebot-plugin-personification/issues"
+"Repository" = "https://github.com/luojisama/nonebot-plugin-personification"
 
 [project.optional-dependencies]
 signin = ["nonebot-plugin-shiro-signin>=0.1.0"]
 
 [tool.nonebot]
 plugins = ["nonebot_plugin_personification"]
-plugin_dirs = ["nonebot_plugin_personification"]
 
 [build-system]
 requires = ["pdm-backend"]
