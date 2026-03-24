@@ -24,8 +24,10 @@ except Exception as e:
     ) from e
 
 try:
+    require("nonebot_plugin_htmlrender")
     from nonebot_plugin_htmlrender import md_to_pic
-except ImportError:
+except Exception as e:
+    logger.warning(f'拟人插件：加载 "nonebot_plugin_htmlrender" 失败，渲染能力将降级。{e}')
     md_to_pic = None
 
 from .config import Config
