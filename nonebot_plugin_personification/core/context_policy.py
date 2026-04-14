@@ -73,13 +73,13 @@ def looks_like_private_command(text: str) -> bool:
     plain = (text or "").strip()
     if not plain:
         return False
+    # 私聊命令只认显式前缀、CQ 指令或已注册白名单。
+    # 不再把普通短英文（hi/ok/yo）当作命令，避免吞掉自然聊天。
     if any(plain.startswith(prefix) for prefix in _PRIVATE_COMMAND_PREFIXES):
         return True
     if plain.startswith("[CQ:") or plain.startswith("CQ:"):
         return True
     if plain in _PRIVATE_COMMAND_KEYWORDS:
-        return True
-    if len(plain) <= 3 and re.fullmatch(r"[a-zA-Z]+", plain):
         return True
     return False
 
@@ -88,6 +88,18 @@ def _normalized_topic_key(text: Any) -> str:
     normalized = sanitize_history_text(text).lower()
     normalized = re.sub(r"[^\w\u4e00-\u9fff]+", "", normalized)
     return normalized[:80]
+
+
+def _token_similarity(left: str, right: str) -> float:
+    left_tokens = [token for token in re.split(r"\s+", sanitize_history_text(left).lower()) if token]
+    right_tokens = [token for token in re.split(r"\s+", sanitize_history_text(right).lower()) if token]
+    if not left_tokens or not right_tokens:
+        return 0.0
+    left_set = set(left_tokens)
+    right_set = set(right_tokens)
+    overlap = len(left_set & right_set)
+    total = max(len(left_set), len(right_set), 1)
+    return overlap / total
 
 
 def build_private_anti_loop_hint(history: List[Dict]) -> str:
@@ -104,15 +116,26 @@ def build_private_anti_loop_hint(history: List[Dict]) -> str:
     latest_user = user_keys[-1]
     repeated_user_topic = latest_user and sum(1 for key in user_keys[-3:-1] if key == latest_user) >= 1
     repeated_assistant_topic = len(assistant_keys) >= 2 and assistant_keys[-1] == assistant_keys[-2]
-    if not repeated_user_topic and not repeated_assistant_topic:
+    assistant_texts = [sanitize_history_text(msg.get("content", "")) for msg in recent if msg.get("role") == "assistant"]
+    repetitive_assistant_similarity = False
+    if len(assistant_texts) >= 3:
+        sims = [
+            _token_similarity(assistant_texts[-1], assistant_texts[-2]),
+            _token_similarity(assistant_texts[-2], assistant_texts[-3]),
+        ]
+        repetitive_assistant_similarity = all(sim >= 0.6 for sim in sims)
+    if not repeated_user_topic and not repeated_assistant_topic and not repetitive_assistant_similarity:
         return ""
 
-    return (
+    hint = (
         "## Anti-loop guard (high priority)\n"
         "- The latest turns are becoming repetitive around one topic.\n"
         "- Prioritize the newest user input and avoid repeating old points.\n"
         "- If there is no new information, reply in <= 12 Chinese characters or output [SILENCE].\n"
     )
+    if repetitive_assistant_similarity:
+        hint += "- 当前回复已出现明显重复，你必须换一个完全不同的角度或话题切入。\n"
+    return hint
 
 
 def stringify_history_content(content: Any) -> str:

@@ -1,9 +1,14 @@
+import asyncio
 from collections.abc import Callable, Iterable
+from pathlib import Path
 from typing import Any, Dict, Optional
 
 from nonebot import on_command
 from nonebot.adapters.onebot.v11 import Bot, GroupMessageEvent, Message, MessageEvent, PrivateMessageEvent
 from nonebot.params import CommandArg
+
+from ..skills.skillpacks.sticker_labeler.scripts.impl import StickerLabeler
+from ..skills.skillpacks.vision_caller.scripts.impl import build_vision_caller
 
 
 def register_style_context_matchers(
@@ -12,6 +17,7 @@ def register_style_context_matchers(
     handle_learn_style_command: Any,
     handle_view_style_command: Any,
     handle_clear_context_command: Any,
+    handle_full_reset_memory_command: Any,
     analyze_group_style_flow: Any,
     get_recent_group_msgs: Any,
     get_configured_api_providers: Any,
@@ -33,8 +39,10 @@ def register_style_context_matchers(
     resolve_clear_target: Any,
     clear_message_buffer: Any,
     clear_session_context: Any,
+    persona_store: Any,
     group_message_event_cls: Any,
     private_message_event_cls: Any,
+    message_segment_cls: Any,
     track_command_keywords: Callable[[str, Iterable[str] | None], None] | None = None,
 ) -> Dict[str, Any]:
     def _register_command(command: str, *, aliases: set[str] | None = None, **kwargs: Any) -> Any:
@@ -51,9 +59,23 @@ def register_style_context_matchers(
         priority=5,
         block=True,
     )
+    full_reset_memory_cmd = _register_command(
+        "完全清除记忆",
+        aliases={"彻底清除记忆", "清空全部记忆"},
+        permission=superuser_permission,
+        priority=5,
+        block=True,
+    )
     learn_style_cmd = _register_command(
         "学习群聊风格",
         aliases={"分析群聊风格"},
+        permission=superuser_permission,
+        priority=5,
+        block=True,
+    )
+    relabel_stickers_cmd = _register_command(
+        "重打标表情包",
+        aliases={"重新打标表情包", "重打标贴图"},
         permission=superuser_permission,
         priority=5,
         block=True,
@@ -107,6 +129,48 @@ def register_style_context_matchers(
             get_group_style=get_group_style,
         )
 
+    @relabel_stickers_cmd.handle()
+    async def _handle_relabel_stickers(bot: Bot, event: MessageEvent, args: Message = CommandArg()):
+        sticker_path = getattr(plugin_config, "personification_sticker_path", None)
+        if not sticker_path:
+            await relabel_stickers_cmd.finish("未配置表情包目录。")
+        vision_caller = build_vision_caller(plugin_config)
+        if vision_caller is None:
+            await relabel_stickers_cmd.finish("未配置可用的表情包打标模型。")
+
+        keyword = args.extract_plain_text().strip()
+        suffix = f"，筛选：{keyword}" if keyword else ""
+        await bot.send(event, f"已开始后台重打标表情包{suffix}。")
+
+        async def _run() -> None:
+            labeler = StickerLabeler(
+                Path(sticker_path),
+                logger=logger,
+                concurrency=max(1, int(getattr(plugin_config, "personification_labeler_concurrency", 3))),
+            )
+            try:
+                result = await labeler.relabel(
+                    vision_caller,
+                    force=True,
+                    keyword=keyword,
+                )
+                total = int(result.get("total", 0) or 0)
+                success = int(result.get("success", 0) or 0)
+                failed = int(result.get("failed", 0) or 0)
+                if total <= 0:
+                    text = "后台重打标完成，没有匹配到需要处理的表情包。"
+                else:
+                    text = f"后台重打标完成：共 {total} 张，成功 {success} 张，失败 {failed} 张。"
+                    failed_files = result.get("failed_files", []) or []
+                    if failed_files:
+                        text += f"\n失败：{', '.join(str(name) for name in failed_files[:8])}"
+                await bot.send(event, text)
+            except Exception as e:
+                logger.warning(f"[sticker labeler] 后台重打标失败: {e}")
+                await bot.send(event, f"后台重打标失败：{e}")
+
+        asyncio.create_task(_run())
+
     @clear_context_cmd.handle()
     async def _handle_clear_context(_bot: Bot, event: MessageEvent, arg: Message = CommandArg()):
         await handle_clear_context_command(
@@ -127,8 +191,20 @@ def register_style_context_matchers(
             clear_session_context=clear_session_context,
         )
 
+    @full_reset_memory_cmd.handle()
+    async def _handle_full_reset_memory(_bot: Bot, _event: MessageEvent):
+        await handle_full_reset_memory_command(
+            full_reset_memory_cmd,
+            persona_store=persona_store,
+            msg_buffer=msg_buffer,
+            get_driver=get_driver,
+            logger=logger,
+        )
+
     return {
         "clear_context_cmd": clear_context_cmd,
+        "full_reset_memory_cmd": full_reset_memory_cmd,
         "learn_style_cmd": learn_style_cmd,
+        "relabel_stickers_cmd": relabel_stickers_cmd,
         "view_style_cmd": view_style_cmd,
     }

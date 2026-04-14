@@ -7,8 +7,10 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict
 
+from ..plugin_data import get_plugin_data_dir
 from ..core.data_store import get_data_store
-from ..skills.tool_caller import ToolCaller
+from ..schedule import format_time_context, get_activity_status, get_current_local_time
+from ..skills.skillpacks.tool_caller.scripts.impl import ToolCaller
 
 
 DEFAULT_STATE = {
@@ -21,6 +23,9 @@ DEFAULT_STATE = {
 
 INNER_STATE_UPDATE_PROMPT = """你刚结束了一段对话，请根据对话内容简短更新你的内心状态。
 只输出 JSON，不要任何解释。
+
+当前时间：{current_time}
+当前时段：{time_period}
 
 当前状态：
 {current_state_json}
@@ -62,21 +67,8 @@ DIARY_STATE_UPDATE_PROMPT = """今天的日记如下：
 
 
 def get_personification_data_dir(plugin_config: Any | None = None) -> Path:
-    configured = ""
-    if plugin_config is not None:
-        configured = str(getattr(plugin_config, "personification_data_dir", "") or "").strip()
-    if configured:
-        return Path(configured)
-
-    try:
-        from nonebot_plugin_localstore import get_data_dir
-
-        try:
-            return Path(get_data_dir("personification"))
-        except TypeError:
-            return Path(get_data_dir()) / "personification"
-    except Exception:
-        return Path("data") / "personification"
+    _ = plugin_config
+    return get_plugin_data_dir()
 
 _STORE_NAME = "inner_state"
 
@@ -99,9 +91,63 @@ async def save_inner_state(data_dir: Path, state: dict) -> None:
 def _merge_state(current_state: Dict[str, Any], new_state: Dict[str, Any]) -> Dict[str, Any]:
     merged = copy.deepcopy(DEFAULT_STATE)
     merged.update(current_state or {})
+    now = datetime.now()
+    current_mood = str(merged.get("mood") or DEFAULT_STATE["mood"]).strip()
+    current_energy = str(merged.get("energy") or DEFAULT_STATE["energy"]).strip()
+    incoming_mood = str((new_state or {}).get("mood") or "").strip()
+    incoming_energy = str((new_state or {}).get("energy") or "").strip()
+
+    updated_at_raw = str(merged.get("updated_at") or "").strip()
+    hours_since_update = 0.0
+    if updated_at_raw:
+        try:
+            prev = datetime.strptime(updated_at_raw, "%Y-%m-%d %H:%M:%S")
+            hours_since_update = max(0.0, (now - prev).total_seconds() / 3600)
+        except Exception:
+            hours_since_update = 0.0
+
+    if incoming_mood and incoming_mood != current_mood and hours_since_update < 0.5:
+        new_state = dict(new_state or {})
+        new_state["mood"] = current_mood
+    elif incoming_mood and incoming_mood != current_mood and hours_since_update < 2:
+        new_state = dict(new_state or {})
+        new_state["mood"] = f"{current_mood}，但有些{incoming_mood}"
+
+    if incoming_energy:
+        if current_energy == "高" and incoming_energy == "低" and hours_since_update < 1:
+            new_state = dict(new_state or {})
+            new_state["energy"] = "中"
+        if current_energy == "低" and incoming_energy == "高" and hours_since_update < 1:
+            new_state = dict(new_state or {})
+            new_state["energy"] = "中"
+
     for key, value in (new_state or {}).items():
         merged[key] = value
-    merged["updated_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    relation = merged.get("relation_warmth")
+    if not isinstance(relation, dict):
+        relation = {}
+    clipped_relation: Dict[str, Any] = {}
+    for uid, score in relation.items():
+        try:
+            clipped_relation[str(uid)] = max(-1.0, min(1.0, float(score)))
+        except Exception:
+            continue
+    merged["relation_warmth"] = clipped_relation
+
+    pending = merged.get("pending_thoughts")
+    if isinstance(pending, list) and len(pending) > 8:
+        merged["pending_thoughts"] = pending[-8:]
+
+    hour = now.hour
+    if hour >= 23 or hour < 6:
+        if merged.get("energy") == "高":
+            merged["energy"] = "中"
+    elif 7 <= hour <= 11:
+        if merged.get("energy") == "低":
+            merged["energy"] = "中"
+
+    merged["updated_at"] = now.strftime("%Y-%m-%d %H:%M:%S")
     return merged
 
 
@@ -133,7 +179,14 @@ async def update_inner_state_after_chat(
                 "\n对话用户画像参考（用于更新 relation_warmth，不必照搬）：\n"
                 f"{persona_snippet}\n"
             )
+        datetime_now = get_current_local_time()
         prompt = INNER_STATE_UPDATE_PROMPT.replace(
+            "{current_time}",
+            f"{datetime_now.strftime('%Y-%m-%d %H:%M:%S')} [{format_time_context(datetime_now)}]",
+        ).replace(
+            "{time_period}",
+            get_activity_status(),
+        ).replace(
             "{current_state_json}",
             json.dumps(fresh_state, ensure_ascii=False, indent=2),
         ).replace(
@@ -164,26 +217,37 @@ async def update_state_from_diary(
     tool_caller: ToolCaller,
     logger: Any,
 ) -> None:
-    current_state = await load_inner_state(data_dir)
-    prompt = DIARY_STATE_UPDATE_PROMPT.replace(
-        "{diary_text}",
-        diary_text,
-    ).replace(
-        "{today}",
-        datetime.now().strftime("%Y-%m-%d"),
-    )
-    try:
-        response = await tool_caller.chat_with_tools(
-            messages=[{"role": "user", "content": prompt}],
-            tools=[],
-            use_builtin_search=False,
+    _ = data_dir
+    store = get_data_store()
+    async with store._alock(_STORE_NAME):
+        fresh_state = await asyncio.to_thread(store._read, _STORE_NAME)
+        if not isinstance(fresh_state, dict):
+            fresh_state = copy.deepcopy(DEFAULT_STATE)
+        else:
+            base = copy.deepcopy(DEFAULT_STATE)
+            base.update(fresh_state)
+            fresh_state = base
+
+        prompt = DIARY_STATE_UPDATE_PROMPT.replace(
+            "{diary_text}",
+            diary_text,
+        ).replace(
+            "{today}",
+            datetime.now().strftime("%Y-%m-%d"),
         )
-        updated_fields = json.loads(response.content or "{}")
-        if not isinstance(updated_fields, dict):
-            raise ValueError("diary state update is not a JSON object")
-        await save_inner_state(
-            data_dir,
-            _merge_state(current_state, updated_fields),
-        )
-    except Exception as e:
-        logger.warning(f"[inner_state] diary update failed: {e}")
+        try:
+            response = await tool_caller.chat_with_tools(
+                messages=[{"role": "user", "content": prompt}],
+                tools=[],
+                use_builtin_search=False,
+            )
+            updated_fields = json.loads(response.content or "{}")
+            if not isinstance(updated_fields, dict):
+                raise ValueError("diary state update is not a JSON object")
+            await asyncio.to_thread(
+                store._write,
+                _STORE_NAME,
+                _merge_state(fresh_state, updated_fields),
+            )
+        except Exception as e:
+            logger.warning(f"[inner_state] diary update failed: {e}")

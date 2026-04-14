@@ -69,6 +69,7 @@ from .web_grounding import (
     WEB_SEARCH_TOOL_OPENAI,
     build_grounding_context,
     do_web_search,
+    extract_forward_message_content,
     should_avoid_interrupting,
 )
 
@@ -126,6 +127,7 @@ __all__ = [
     "save_session_histories",
     "stringify_history_content",
     "do_web_search",
+    "extract_forward_message_content",
     "is_msg_processed",
     "call_ai_api",
     "normalize_api_type",

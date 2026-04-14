@@ -1,9 +1,10 @@
 import asyncio
 import json
+import threading
 import time
 from typing import Any, Dict, List, Optional
 
-from ..skills.tool_caller import (
+from ..skills.skillpacks.tool_caller.scripts.impl import (
     AnthropicToolCaller,
     GeminiToolCaller,
     OpenAICodexToolCaller,
@@ -14,6 +15,7 @@ from ..skills.tool_caller import (
 
 PROVIDER_FAILURE_STATE: Dict[str, Dict[str, Any]] = {}
 PROVIDER_ROTATION_CURSOR = 0
+_CURSOR_LOCK = threading.Lock()
 
 
 def normalize_api_type(api_type: Optional[str]) -> str:
@@ -82,8 +84,11 @@ def load_api_pool_config(plugin_config: Any, logger: Any) -> List[Dict[str, Any]
 
     parsed: Any = raw_config
     if isinstance(raw_config, str):
+        text = raw_config.strip()
+        if len(text) >= 2 and text[0] == text[-1] and text[0] in {"'", '"'}:
+            text = text[1:-1].strip()
         try:
-            parsed = json.loads(raw_config)
+            parsed = json.loads(text)
         except json.JSONDecodeError as e:
             logger.error(f"personification: failed to parse personification_api_pools: {e}")
             return []
@@ -122,6 +127,7 @@ def load_api_pool_config(plugin_config: Any, logger: Any) -> List[Dict[str, Any]
                 item.get("supports_native_search", api_type in {"gemini", "anthropic"}),
                 api_type in {"gemini", "anthropic"},
             ),
+            "supports_reasoning": item.get("supports_reasoning"),
         }
         if provider["enabled"]:
             providers.append(provider)
@@ -197,8 +203,9 @@ def get_provider_candidates(plugin_config: Any, logger: Any) -> List[Dict[str, A
     if len(available) <= 1:
         return available
 
-    cursor = PROVIDER_ROTATION_CURSOR % len(available)
-    PROVIDER_ROTATION_CURSOR = (PROVIDER_ROTATION_CURSOR + 1) % len(available)
+    with _CURSOR_LOCK:
+        cursor = PROVIDER_ROTATION_CURSOR % len(available)
+        PROVIDER_ROTATION_CURSOR = (PROVIDER_ROTATION_CURSOR + 1) % len(available)
     return available[cursor:] + available[:cursor]
 
 
@@ -232,6 +239,10 @@ def _build_provider_caller(provider: Dict[str, Any], plugin_config: Any):
         )
 
     thinking_mode = _get_thinking_mode(plugin_config)
+    supports_reasoning_raw = provider.get("supports_reasoning")
+    supports_reasoning: Optional[bool] = None
+    if supports_reasoning_raw is not None:
+        supports_reasoning = _to_bool(supports_reasoning_raw, None)
     common_kwargs = {
         "api_key": provider["api_key"],
         "base_url": provider["api_url"],
@@ -248,6 +259,7 @@ def _build_provider_caller(provider: Dict[str, Any], plugin_config: Any):
     return OpenAIToolCaller(
         **common_kwargs,
         timeout=_provider_timeout(provider),
+        supports_reasoning=supports_reasoning,
     )
 
 

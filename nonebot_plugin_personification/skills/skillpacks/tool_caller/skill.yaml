@@ -1,0 +1,15 @@
+name: tool_caller
+enabled: true
+category: infra
+entrypoint: scripts/main.py
+description: 模型网关参数规范化与 data_url 解析
+parameters:
+  type: object
+  properties:
+    api_type:
+      type: string
+      description: API 类型
+    base_url:
+      type: string
+      description: API 基础地址
+  required: []

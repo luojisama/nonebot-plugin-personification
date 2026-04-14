@@ -6,7 +6,7 @@ import re
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Optional
 
-from ..agent.inner_state import update_state_from_diary
+from ..agent.inner_state import load_inner_state, update_state_from_diary
 
 
 def filter_sensitive_content(text: str) -> str:
@@ -188,3 +188,63 @@ async def generate_ai_diary(
             logger=logger,
         )
     return result
+
+
+async def maybe_generate_proactive_qzone_post(
+    bot: Any,
+    *,
+    load_prompt: Callable[[], Any],
+    call_ai_api: Callable[..., Awaitable[Optional[str]]],
+    logger: Any,
+    data_dir: Optional[Path] = None,
+) -> str:
+    """根据近期聊天与内心状态决定是否主动发一条更日常的空间动态。"""
+    system_prompt = load_prompt()
+    chat_context = await get_recent_chat_context(bot, logger)
+    if not chat_context:
+        return ""
+
+    inner_state = {}
+    if data_dir is not None:
+        try:
+            inner_state = await load_inner_state(Path(data_dir))
+        except Exception as e:
+            logger.warning(f"[qzone] load inner_state failed: {e}")
+
+    mood = str((inner_state or {}).get("mood", "平静") or "平静")
+    energy = str((inner_state or {}).get("energy", "正常") or "正常")
+    pending = (inner_state or {}).get("pending_thoughts", [])
+    pending_lines = []
+    if isinstance(pending, list):
+        for item in pending[-4:]:
+            if not isinstance(item, dict):
+                continue
+            thought = str(item.get("thought", "") or "").strip()
+            if thought:
+                pending_lines.append(f"- {thought}")
+    pending_block = "\n".join(pending_lines) if pending_lines else "- 无明显挂念"
+
+    decision_prompt = (
+        "你现在在考虑要不要发一条 QQ 空间说说。\n"
+        "请基于最近聊天内容、当前心情和挂念，判断你此刻是不是真的有想发动态的冲动。\n\n"
+        f"当前心情：{mood}\n"
+        f"当前精力：{energy}\n"
+        f"最近挂念：\n{pending_block}\n\n"
+        f"最近聊天片段：\n{chat_context}\n\n"
+        "要求：\n"
+        "1. 如果没有明确想说的话，就输出 SKIP|原因。\n"
+        "2. 如果想发，输出 POST|正文。\n"
+        "3. 正文要像真人随手发的空间碎碎念，40-140 字，口语化，有生活感，不要像周报或总结。\n"
+        "4. 可以带一点吐槽、感慨、突然想到的念头，但不要列表、不要标题、不要 hashtag。\n"
+        "5. 不要为了发而发，不要重复最近已经说过很多遍的话题。"
+    )
+    result = await _generate_once(
+        system_prompt,
+        decision_prompt,
+        call_ai_api=call_ai_api,
+    )
+    if not result:
+        return ""
+    if result.startswith("POST|"):
+        return clean_generated_text(result.split("|", 1)[1]).strip()
+    return ""

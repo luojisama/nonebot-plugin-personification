@@ -46,6 +46,59 @@ def build_auto_post_diary_task(
     return _auto_post_diary
 
 
+def build_proactive_qzone_post_task(
+    *,
+    run_proactive_qzone_post: Callable[..., Awaitable[bool]],
+    qzone_publish_available: bool,
+    qzone_proactive_enabled: bool,
+    qzone_probability: float,
+    qzone_daily_limit: int,
+    qzone_min_interval_hours: float,
+    get_bots: Callable[[], dict[str, Any]],
+    get_now: Callable[[], Any],
+    update_qzone_cookie: Any,
+    maybe_generate_qzone_post: Callable[[Any], Awaitable[str]],
+    publish_qzone_shuo: Any,
+    logger: Any,
+) -> Callable[[], Awaitable[bool]]:
+    async def _proactive_qzone_post() -> bool:
+        return await run_proactive_qzone_post(
+            qzone_publish_available=qzone_publish_available,
+            qzone_proactive_enabled=qzone_proactive_enabled,
+            qzone_probability=qzone_probability,
+            qzone_daily_limit=qzone_daily_limit,
+            qzone_min_interval_hours=qzone_min_interval_hours,
+            get_bots=get_bots,
+            get_now=get_now,
+            update_qzone_cookie=update_qzone_cookie,
+            maybe_generate_qzone_post=maybe_generate_qzone_post,
+            publish_qzone_shuo=publish_qzone_shuo,
+            logger=logger,
+        )
+
+    return _proactive_qzone_post
+
+
+def build_maybe_generate_qzone_post_task(
+    *,
+    maybe_generate_proactive_qzone_post_flow: Callable[..., Awaitable[str]],
+    load_prompt: Callable[[], Any],
+    call_ai_api: Callable[..., Awaitable[str]],
+    logger: Any,
+    agent_data_dir: Any = None,
+) -> Callable[[Any], Awaitable[str]]:
+    async def _maybe_generate_qzone_post(bot: Any) -> str:
+        return await maybe_generate_proactive_qzone_post_flow(
+            bot,
+            load_prompt=load_prompt,
+            call_ai_api=call_ai_api,
+            logger=logger,
+            data_dir=agent_data_dir,
+        )
+
+    return _maybe_generate_qzone_post
+
+
 def build_daily_group_fav_report_task(
     *,
     run_daily_group_fav_report: Callable[..., Awaitable[int]],

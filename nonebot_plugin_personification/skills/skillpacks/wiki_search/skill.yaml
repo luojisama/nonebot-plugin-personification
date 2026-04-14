@@ -1,0 +1,7 @@
+name: wiki_search
+enabled: true
+category: search
+entrypoint: scripts/main.py
+description: 查询维基百科、萌娘百科与可选 Fandom Wiki，返回 1 到 3 个高相关候选、摘要与来源。
+tools:
+  - wiki_lookup

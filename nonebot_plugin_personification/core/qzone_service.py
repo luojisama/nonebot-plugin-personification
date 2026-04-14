@@ -51,8 +51,11 @@ def build_qzone_services(
     plugin_config: Any,
     logger: Any,
 ) -> tuple[bool, Callable[[str, str], Awaitable[tuple[bool, str]]], Callable[[Any], Awaitable[tuple[bool, str]]]]:
+    qzone_enabled = bool(getattr(plugin_config, "personification_qzone_enabled", False))
     async def update_qzone_cookie(bot: Any) -> tuple[bool, str]:
         """自动获取并刷新 Qzone Cookie，供定时任务或手动命令调用。"""
+        if not qzone_enabled:
+            return False, "Qzone 功能未启用"
         try:
             cookies_resp = await bot.get_cookies(domain="qzone.qq.com")
             cookie = str(cookies_resp.get("cookies", "") or "").strip()
@@ -69,6 +72,8 @@ def build_qzone_services(
             return False, str(e)
 
     async def publish_qzone_shuo(content: str, bot_id: str) -> tuple[bool, str]:
+        if not qzone_enabled:
+            return False, "Qzone 功能未启用"
         cookie = _get_cookie_from_config(plugin_config)
         if not cookie:
             return False, "未配置 Qzone Cookie"
@@ -144,4 +149,4 @@ def build_qzone_services(
         except Exception as e:
             return False, f"发生异常：{e}"
 
-    return True, publish_qzone_shuo, update_qzone_cookie
+    return qzone_enabled, publish_qzone_shuo, update_qzone_cookie

@@ -1,19 +1,25 @@
 from dataclasses import dataclass
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 from .blacklist_flow import (
     build_perm_blacklist_card_markdown,
     build_perm_blacklist_text,
     collect_perm_blacklist_items,
 )
-from .diary_flow import clean_generated_text, filter_sensitive_content, generate_ai_diary, get_recent_chat_context
+from .diary_flow import (
+    clean_generated_text,
+    filter_sensitive_content,
+    generate_ai_diary,
+    get_recent_chat_context,
+    maybe_generate_proactive_qzone_post,
+)
 from .proactive_flow import (
     build_group_idle_checker,
     build_proactive_checker,
     run_group_idle_topic,
     run_proactive_messaging,
 )
-from .runtime_switch_flow import apply_proactive_switch, apply_web_search_switch
+from .runtime_switch_flow import apply_global_switch, apply_proactive_switch, apply_tts_global_switch, apply_web_search_switch
 from .style_flow import analyze_group_style
 from .yaml_parser import extract_xml_content, parse_yaml_response
 
@@ -38,10 +44,12 @@ class FlowSetupDeps:
     agent_tool_caller: Any = None
     agent_data_dir: Any = None
     persona_store: Any = None
+    superusers: Optional[set[str]] = None
     get_recent_group_msgs: Any = None
     get_group_style: Any = None
     get_whitelisted_groups: Any = None
     record_group_msg: Any = None
+    build_grounding_context: Any = None
 
 
 def setup_flows(*, deps: FlowSetupDeps) -> Dict[str, Any]:
@@ -79,18 +87,25 @@ def setup_flows(*, deps: FlowSetupDeps) -> Dict[str, Any]:
         record_group_msg=deps.record_group_msg or (lambda group_id, nickname, content, is_bot=False: 0),
         logger=deps.logger,
         agent_data_dir=deps.agent_data_dir,
+        superusers=deps.superusers,
+        get_user_data=deps.get_user_data,
+        build_grounding_context=deps.build_grounding_context,
     )
     return {
         "check_proactive_messaging": check_proactive_messaging,
         "check_group_idle_topic": check_group_idle_topic,
         "apply_web_search_switch": apply_web_search_switch,
         "apply_proactive_switch": apply_proactive_switch,
+        "apply_global_switch": apply_global_switch,
+        "apply_tts_global_switch": apply_tts_global_switch,
     }
 
 
 __all__ = [
     "analyze_group_style",
+    "apply_global_switch",
     "apply_proactive_switch",
+    "apply_tts_global_switch",
     "apply_web_search_switch",
     "build_group_idle_checker",
     "build_perm_blacklist_card_markdown",
@@ -102,6 +117,7 @@ __all__ = [
     "filter_sensitive_content",
     "generate_ai_diary",
     "get_recent_chat_context",
+    "maybe_generate_proactive_qzone_post",
     "parse_yaml_response",
     "run_group_idle_topic",
     "run_proactive_messaging",

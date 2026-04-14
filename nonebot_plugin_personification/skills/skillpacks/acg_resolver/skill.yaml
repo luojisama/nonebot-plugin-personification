@@ -1,0 +1,21 @@
+name: acg_resolver
+enabled: true
+category: query
+entrypoint: scripts/main.py
+description: 对高歧义 ACG 实体做作品/角色/术语消解
+parameters:
+  type: object
+  properties:
+    query:
+      type: string
+      description: 待消解实体
+    image_context:
+      type: boolean
+      description: 是否结合当前图片上下文
+    images:
+      type: array
+      items:
+        type: string
+      description: 可选图片引用列表
+  required:
+    - query

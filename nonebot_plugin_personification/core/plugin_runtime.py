@@ -1,5 +1,7 @@
 import random
+from importlib import import_module
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Callable, Dict
 
 from ..config import Config
@@ -18,17 +20,24 @@ from ..handlers import (
     build_poke_rule,
     build_view_config_nodes,
     build_yaml_response_processor,
+    extract_forward_message_content,
     handle_add_whitelist_command,
     handle_agree_whitelist_command,
     handle_apply_whitelist_command,
     handle_background_style_analysis,
     handle_clear_context_command,
+    handle_full_reset_memory_command,
+    handle_global_switch_command,
     handle_group_fav_query_command,
     handle_group_feature_switch_command,
+    handle_install_remote_skill_command,
+    handle_personification_help_command,
     handle_learn_style_command,
     handle_manual_diary_command,
     handle_perm_blacklist_set_command,
     handle_proactive_switch_command,
+    handle_rebuild_plugin_knowledge_command,
+    handle_remote_skill_review_command,
     handle_record_message_event,
     handle_reject_whitelist_command,
     handle_remove_whitelist_command,
@@ -38,7 +47,9 @@ from ..handlers import (
     handle_set_group_fav_command,
     handle_set_persona_command,
     handle_sticker_chat_event,
+    handle_tts_global_switch_command,
     handle_view_config_command,
+    handle_view_plugin_knowledge_status_command,
     handle_view_persona_command,
     handle_view_style_command,
     handle_web_search_switch_command,
@@ -55,7 +66,14 @@ from ..handlers import (
     sticker_chat_rule as sticker_chat_rule_core,
 )
 from ..jobs import JobSetupDeps
-from ..schedule import get_activity_status, get_beijing_time, get_schedule_prompt_injection, is_rest_time
+from ..schedule import (
+    format_time_context,
+    get_activity_status,
+    get_current_local_time,
+    get_schedule_prompt_injection,
+    init_schedule_config,
+    is_rest_time,
+)
 from ..utils import (
     add_group_to_whitelist,
     add_request,
@@ -71,7 +89,9 @@ from ..utils import (
     set_group_prompt,
     set_group_schedule_enabled,
     set_group_sticker_enabled,
+    set_group_tts_enabled,
     set_group_style,
+    should_trigger_group_style_analysis,
     update_request_status,
 )
 from .context_cleanup import (
@@ -90,9 +110,17 @@ from .context_policy import (
     sanitize_session_messages,
 )
 from .data_store import init_data_store
+from .legacy_memory_migrator import LegacyMemoryMigrator
+from .knowledge_store import PluginKnowledgeStore
+from .background_intelligence import BackgroundIntelligence
+from .memory_curator import MemoryCurator
+from .memory_decay import MemoryDecayScheduler
+from .memory_store import init_memory_store
+from .time_ctx import init_time_context
 from .builtin_hooks import register_all_builtin_hooks
-from .plugin_meta import build_plugin_metadata
+from .plugin_meta import build_plugin_metadata, build_plugin_usage_text
 from .proactive_store import load_proactive_state, save_proactive_state, update_private_interaction_time
+from .profile_service import ProfileService
 from .qzone_service import build_qzone_services
 from .runtime_state import get_shared_http_client, schedule_disabled_override_prompt
 from .service_factory import (
@@ -108,9 +136,10 @@ from .service_factory import (
     build_sticker_cache,
     build_web_search_executor,
 )
+from .tts_service import TtsService
 from ..agent.inner_state import get_personification_data_dir
-from ..skills.tool_caller import build_tool_caller
-from ..skills.user_persona import PersonaStore
+from ..skills.skillpacks.tool_caller.scripts.impl import build_tool_caller
+from .persona_service import PersonaStore
 from .session_store import (
     GROUP_SESSION_PREFIX,
     PRIVATE_SESSION_PREFIX,
@@ -141,9 +170,7 @@ def _build_sign_in_fallbacks() -> tuple[bool, Any, Any, Any, Any]:
 def _get_scheduler() -> Any:
     """安全获取 APScheduler 实例，不可用时返回 None，不中断插件加载。"""
     try:
-        from nonebot_plugin_apscheduler import scheduler
-
-        return scheduler
+        return import_module("nonebot_plugin_apscheduler").scheduler
     except Exception:
         return None
 
@@ -197,8 +224,14 @@ class PluginRuntimeBundle:
     personification_rule: Any
     poke_rule: Any
     poke_notice_rule: Any
+    tts_service: Any = None
     tool_registry: Any = None
     persona_store: Any = None
+    memory_store: Any = None
+    profile_service: Any = None
+    memory_curator: Any = None
+    memory_decay_scheduler: Any = None
+    background_intelligence: Any = None
 
     def make_flow_setup_deps(self) -> FlowSetupDeps:
         return FlowSetupDeps(
@@ -211,7 +244,7 @@ class PluginRuntimeBundle:
             save_proactive_state=save_proactive_state,
             get_user_data=self.get_user_data,
             get_level_name=self.get_level_name,
-            get_now=get_beijing_time,
+            get_now=get_current_local_time,
             get_activity_status=get_activity_status,
             load_prompt=self.load_prompt,
             call_ai_api=self.call_ai_api,
@@ -220,10 +253,12 @@ class PluginRuntimeBundle:
             agent_tool_caller=self.reply_processor_deps.runtime.agent_tool_caller,
             agent_data_dir=get_personification_data_dir(self.plugin_config),
             persona_store=self.persona_store,
+            superusers=self.superusers,
             get_recent_group_msgs=get_recent_group_msgs,
             get_group_style=get_group_style,
             get_whitelisted_groups=self._get_whitelisted_groups,
             record_group_msg=record_group_msg,
+            build_grounding_context=self.reply_processor_deps.runtime.build_grounding_context,
         )
 
     def _get_whitelisted_groups(self) -> list[str]:
@@ -254,6 +289,12 @@ class PluginRuntimeBundle:
         from ..flows import generate_ai_diary
 
         return generate_ai_diary
+
+    @property
+    def maybe_generate_proactive_qzone_post_flow(self) -> Any:
+        from ..flows import maybe_generate_proactive_qzone_post
+
+        return maybe_generate_proactive_qzone_post
 
     @property
     def collect_perm_blacklist_items(self) -> Any:
@@ -288,7 +329,7 @@ class PluginRuntimeBundle:
         return JobSetupDeps(
             sign_in_available=self.sign_in_available,
             load_data=self.load_data,
-            get_now=get_beijing_time,
+            get_now=get_current_local_time,
             get_bots=self.get_bots,
             superusers=self.superusers,
             logger=self.logger,
@@ -298,26 +339,51 @@ class PluginRuntimeBundle:
             qzone_publish_available=self.qzone_publish_available,
             update_qzone_cookie=self.update_qzone_cookie,
             publish_qzone_shuo=self.publish_qzone_shuo,
+            maybe_generate_proactive_qzone_post_flow=self.maybe_generate_proactive_qzone_post_flow,
             check_proactive_messaging=check_proactive_messaging,
             proactive_interval_minutes=self.plugin_config.personification_proactive_interval,
+            proactive_enabled=bool(getattr(self.plugin_config, "personification_proactive_enabled", True)),
             check_group_idle_topic=check_group_idle_topic,
+            group_idle_enabled=bool(getattr(self.plugin_config, "personification_group_idle_enabled", False)),
             group_idle_check_interval_minutes=getattr(
                 self.plugin_config,
                 "personification_group_idle_check_interval",
                 15,
             ),
+            qzone_proactive_enabled=bool(
+                getattr(self.plugin_config, "personification_qzone_proactive_enabled", False)
+            ),
+            qzone_check_interval_minutes=int(
+                getattr(self.plugin_config, "personification_qzone_check_interval", 180)
+            ),
+            qzone_daily_limit=int(
+                getattr(self.plugin_config, "personification_qzone_daily_limit", 2)
+            ),
+            qzone_probability=float(
+                getattr(self.plugin_config, "personification_qzone_probability", 0.35)
+            ),
+            qzone_min_interval_hours=float(
+                getattr(self.plugin_config, "personification_qzone_min_interval_hours", 8.0)
+            ),
             agent_tool_caller=self.reply_processor_deps.runtime.agent_tool_caller,
             agent_data_dir=get_personification_data_dir(self.plugin_config),
+            background_intelligence=self.background_intelligence,
         )
 
     def make_matcher_setup_deps(
         self,
         *,
         generate_ai_diary: Any,
+        apply_global_switch: Any,
+        apply_tts_global_switch: Any,
         apply_web_search_switch: Any,
         apply_proactive_switch: Any,
-    ) -> MatcherSetupDeps:
+        start_knowledge_builder: Any,
+        get_knowledge_build_task: Any,
+        set_knowledge_build_task: Any,
+        ) -> MatcherSetupDeps:
         return MatcherSetupDeps(
+            runtime_bundle=self,
             personification_rule=self.personification_rule,
             poke_notice_rule=self.poke_notice_rule,
             record_msg_rule_core=record_msg_rule_core,
@@ -369,6 +435,7 @@ class PluginRuntimeBundle:
             handle_group_feature_switch_command=handle_group_feature_switch_command,
             set_group_enabled=set_group_enabled,
             set_group_sticker_enabled=set_group_sticker_enabled,
+            set_group_tts_enabled=set_group_tts_enabled,
             handle_schedule_switch_command=handle_schedule_switch_command,
             save_plugin_runtime_config=self.save_plugin_runtime_config,
             set_group_schedule_enabled=set_group_schedule_enabled,
@@ -382,6 +449,7 @@ class PluginRuntimeBundle:
             resolve_record_message=resolve_record_message,
             get_custom_title=self.reply_processor_deps.persona.get_custom_title,
             record_group_msg=record_group_msg,
+            should_trigger_group_style_analysis=should_trigger_group_style_analysis,
             handle_background_style_analysis=handle_background_style_analysis,
             analyze_group_style_flow=self.analyze_group_style_flow,
             set_group_style=set_group_style,
@@ -399,15 +467,27 @@ class PluginRuntimeBundle:
             publish_qzone_shuo=self.publish_qzone_shuo,
             handle_web_search_switch_command=handle_web_search_switch_command,
             handle_proactive_switch_command=handle_proactive_switch_command,
+            handle_remote_skill_review_command=handle_remote_skill_review_command,
+            handle_rebuild_plugin_knowledge_command=handle_rebuild_plugin_knowledge_command,
+            handle_view_plugin_knowledge_status_command=handle_view_plugin_knowledge_status_command,
+            handle_personification_help_command=handle_personification_help_command,
+            handle_install_remote_skill_command=handle_install_remote_skill_command,
+            build_plugin_usage_text=build_plugin_usage_text,
+            handle_global_switch_command=handle_global_switch_command,
+            handle_tts_global_switch_command=handle_tts_global_switch_command,
             apply_web_search_switch=apply_web_search_switch,
             apply_proactive_switch=apply_proactive_switch,
+            apply_global_switch=apply_global_switch,
+            apply_tts_global_switch=apply_tts_global_switch,
             handle_learn_style_command=handle_learn_style_command,
             handle_view_style_command=handle_view_style_command,
             handle_clear_context_command=handle_clear_context_command,
+            handle_full_reset_memory_command=handle_full_reset_memory_command,
             get_recent_group_msgs=get_recent_group_msgs,
             call_ai_api=self.call_ai_api,
             call_style_ai_api=self.call_style_ai_api or self.call_ai_api,
             get_group_style=get_group_style,
+            tts_service=self.tts_service,
             chat_histories=chat_histories,
             save_session_histories=save_session_histories,
             get_driver=self.get_driver,
@@ -418,6 +498,12 @@ class PluginRuntimeBundle:
             resolve_clear_target=resolve_clear_target,
             clear_message_buffer=clear_message_buffer,
             clear_session_context=clear_session_context,
+            persona_store=self.persona_store,
+            knowledge_store=self.reply_processor_deps.runtime.knowledge_store,
+            agent_tool_caller=self.reply_processor_deps.runtime.agent_tool_caller,
+            start_knowledge_builder=start_knowledge_builder,
+            get_knowledge_build_task=get_knowledge_build_task,
+            set_knowledge_build_task=set_knowledge_build_task,
         )
 
 
@@ -438,7 +524,9 @@ def build_plugin_runtime(
     message_segment_cls: Any,
     md_to_pic: Any,
 ) -> PluginRuntimeBundle:
-    init_data_store(plugin_config)
+    init_data_store(plugin_config, logger=logger)
+    init_schedule_config(plugin_config)
+    init_time_context(str(getattr(plugin_config, "personification_timezone", "Asia/Shanghai") or "Asia/Shanghai"))
     register_all_builtin_hooks()
 
     sign_in_available, get_user_data, update_user_data, load_data, get_level_name = _build_sign_in_fallbacks()
@@ -446,6 +534,8 @@ def build_plugin_runtime(
         plugin_config=plugin_config,
         logger=logger,
     )
+    data_dir = get_personification_data_dir(plugin_config)
+    knowledge_store = PluginKnowledgeStore(data_dir)
 
     if sign_in_available:
         logger.info("拟人插件：已加载签到插件，启用好感度与黑名单联动。")
@@ -459,6 +549,22 @@ def build_plugin_runtime(
     user_blacklist: Dict[str, float] = {}
     msg_buffer: Dict[str, Dict[str, Any]] = {}
     persona_store = None
+    memory_store = init_memory_store(plugin_config, logger=logger)
+    profile_service = ProfileService(memory_store)
+    memory_decay_scheduler = MemoryDecayScheduler(memory_store, logger=logger)
+    background_intelligence = BackgroundIntelligence(
+        plugin_config=plugin_config,
+        memory_store=memory_store,
+        memory_decay_scheduler=memory_decay_scheduler,
+        logger=logger,
+        migrator_factory=lambda: LegacyMemoryMigrator(memory_store, logger=logger),
+    )
+    memory_curator = MemoryCurator(
+        memory_store,
+        logger=logger,
+        background_intelligence=background_intelligence,
+    )
+    LegacyMemoryMigrator(memory_store, logger=logger).migrate_once()
 
     load_prompt = build_load_prompt(
         plugin_config=plugin_config,
@@ -471,8 +577,8 @@ def build_plugin_runtime(
         module_instance_id=module_instance_id,
     )
     build_grounding_context = build_grounding_context_builder(
-        web_search_enabled=plugin_config.personification_web_search,
-        get_now=get_beijing_time,
+        plugin_config=plugin_config,
+        get_now=get_current_local_time,
         logger=logger,
     )
     should_avoid_interrupting = build_interrupt_guard(
@@ -482,7 +588,7 @@ def build_plugin_runtime(
         ),
     )
     do_web_search = build_web_search_executor(
-        get_now=get_beijing_time,
+        get_now=get_current_local_time,
         logger=logger,
     )
     get_configured_api_providers = build_provider_reader(
@@ -528,7 +634,9 @@ def build_plugin_runtime(
     else:
         call_style_ai_api = call_ai_api
 
-    from ..skills.vision_caller import build_vision_caller as _build_vision_caller
+    from ..skills.skillpacks.vision_caller.scripts.impl import (
+        build_vision_caller as _build_vision_caller,
+    )
 
     vision_caller = _build_vision_caller(plugin_config)
     if getattr(plugin_config, "personification_persona_enabled", True):
@@ -582,16 +690,29 @@ def build_plugin_runtime(
             tool_caller=persona_tool_caller,
             history_max=int(getattr(plugin_config, "personification_persona_history_max", 30)),
             logger=logger,
+            profile_service=profile_service,
         )
     tool_registry, inner_state_updater, agent_tool_caller = build_agent_runtime_deps(
         plugin_config=plugin_config,
         logger=logger,
-        get_now=get_beijing_time,
+        get_now=get_current_local_time,
         persona_store=persona_store,
         vision_caller=vision_caller,
         scheduler=_get_scheduler(),
-        data_dir=get_personification_data_dir(plugin_config),
+        data_dir=data_dir,
         get_bots=get_bots,
+        knowledge_store=knowledge_store,
+        memory_store=memory_store,
+        profile_service=profile_service,
+        memory_curator=memory_curator,
+        background_intelligence=background_intelligence,
+    )
+    tts_service = TtsService(
+        plugin_config=plugin_config,
+        logger=logger,
+        get_http_client=lambda: get_shared_http_client(max_connections=20),
+        data_dir=data_dir,
+        style_planner=lambda messages: call_style_ai_api(messages),
     )
     save_plugin_runtime_config, load_plugin_runtime_config = build_runtime_config_io(
         plugin_config=plugin_config,
@@ -613,7 +734,13 @@ def build_plugin_runtime(
         load_proactive_state=load_proactive_state,
         is_rest_time=is_rest_time,
         probability=plugin_config.personification_probability,
+        group_chat_follow_probability=getattr(
+            plugin_config,
+            "personification_group_chat_follow_probability",
+            0.85,
+        ),
         looks_like_private_command=looks_like_private_command,
+        get_recent_group_msgs=get_recent_group_msgs,
     )
     poke_rule = build_poke_rule(
         poke_rule_core=poke_rule_core,
@@ -630,7 +757,8 @@ def build_plugin_runtime(
     )
 
     yaml_response_processor = build_yaml_response_processor(
-        get_beijing_time=get_beijing_time,
+        get_current_time=get_current_local_time,
+        format_time_context=format_time_context,
         bot_statuses=bot_statuses,
         get_group_config=get_group_config,
         plugin_config=plugin_config,
@@ -645,9 +773,15 @@ def build_plugin_runtime(
         build_private_session_id=build_private_session_id,
         build_group_session_id=build_group_session_id,
         append_session_message=append_session_message,
+        record_group_msg=record_group_msg,
         logger=logger,
+        user_blacklist=user_blacklist,
+        superusers=superusers,
         tool_registry=tool_registry,
         agent_tool_caller=agent_tool_caller,
+        tts_service=tts_service,
+        extract_forward_content=extract_forward_message_content,
+        memory_curator=memory_curator,
     )
 
     get_custom_title = build_custom_title_getter(logger=logger)
@@ -707,12 +841,14 @@ def build_plugin_runtime(
             module_instance_id=module_instance_id,
             process_yaml_response_logic=yaml_response_processor,
             plugin_config=plugin_config,
-            get_beijing_time=get_beijing_time,
+            get_current_time=get_current_local_time,
+            format_time_context=format_time_context,
             schedule_disabled_override_prompt=schedule_disabled_override_prompt,
             get_schedule_prompt_injection=get_schedule_prompt_injection,
             build_grounding_context=build_grounding_context,
             update_private_interaction_time=update_private_interaction_time,
             call_ai_api=call_ai_api,
+            save_plugin_runtime_config=save_plugin_runtime_config,
             user_blacklist=user_blacklist,
             record_group_msg=record_group_msg,
             split_text_into_segments=split_text_into_segments_core,
@@ -720,11 +856,17 @@ def build_plugin_runtime(
             get_sticker_files=get_sticker_files,
             get_http_client=lambda: get_shared_http_client(max_connections=20),
             get_whitelisted_groups=_get_whitelisted_groups,
+            tts_service=tts_service,
             tool_registry=tool_registry,
             inner_state_updater=inner_state_updater,
             agent_tool_caller=agent_tool_caller,
             persona_store=persona_store,
             vision_caller=vision_caller,
+            knowledge_store=knowledge_store,
+            memory_store=memory_store,
+            profile_service=profile_service,
+            memory_curator=memory_curator,
+            background_intelligence=background_intelligence,
         ),
         types=TypeDeps(
             poke_event_cls=poke_event_cls,
@@ -771,6 +913,12 @@ def build_plugin_runtime(
         personification_rule=personification_rule,
         poke_rule=poke_rule,
         poke_notice_rule=poke_notice_rule,
+        tts_service=tts_service,
         tool_registry=tool_registry,
         persona_store=persona_store,
+        memory_store=memory_store,
+        profile_service=profile_service,
+        memory_curator=memory_curator,
+        memory_decay_scheduler=memory_decay_scheduler,
+        background_intelligence=background_intelligence,
     )

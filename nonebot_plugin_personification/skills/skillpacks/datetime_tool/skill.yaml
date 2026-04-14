@@ -1,0 +1,12 @@
+name: datetime_tool
+enabled: true
+category: query
+entrypoint: scripts/main.py
+description: 提供当前时间与时段信息
+parameters:
+  type: object
+  properties:
+    timezone:
+      type: string
+      description: 时区名称，默认 Asia/Shanghai
+  required: []

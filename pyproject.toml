@@ -1,7 +1,7 @@
 [project]
 name = "nonebot-plugin-shiro-personification"
-version = "0.4.0"
-description = "基于群聊与私聊上下文的人设回复插件，支持 Agent 工具调用、风格学习、主动消息与贴图能力。"
+version = "0.5.0"
+description = "基于群聊与私聊上下文的人设回复插件，支持作息模拟、联网检索、风格学习、主动私聊、贴图、画像与 Agent 工具调用。"
 readme = "README.md"
 requires-python = ">=3.10"
 authors = [
@@ -42,9 +42,6 @@ dependencies = [
 "Homepage" = "https://github.com/luojisama/nonebot-plugin-personification"
 "Bug Tracker" = "https://github.com/luojisama/nonebot-plugin-personification/issues"
 "Repository" = "https://github.com/luojisama/nonebot-plugin-personification"
-
-[project.optional-dependencies]
-signin = ["nonebot-plugin-shiro-signin>=0.1.0"]
 
 [tool.nonebot]
 plugins = ["nonebot_plugin_personification"]

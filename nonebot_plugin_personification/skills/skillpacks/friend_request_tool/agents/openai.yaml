@@ -1,0 +1,3 @@
+display_name: friend_request_tool
+description: 兼容封装 friend_request_tool.py 的能力入口
+icon: package

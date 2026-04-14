@@ -1,0 +1,3 @@
+display_name: user_persona
+description: 兼容封装 user_persona.py 的能力入口
+icon: package

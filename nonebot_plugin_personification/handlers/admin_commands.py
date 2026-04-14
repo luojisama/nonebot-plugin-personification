@@ -95,7 +95,7 @@ async def handle_view_persona_command(
         {
             "type": "node",
             "data": {
-                "name": "当前生效人设",
+                "name": "人设聊天记录",
                 "uin": str(bot.self_id),
                 "content": prompt,
             },
@@ -105,8 +105,8 @@ async def handle_view_persona_command(
     try:
         await bot.call_api("send_group_forward_msg", group_id=int(group_id), messages=nodes)
     except Exception as e:
-        logger.error(f"发送人设转发消息失败: {e}")
-        await matcher.finish(f"当前生效人设（转发失败，转文本发送）：\n{prompt}")
+        logger.error(f"发送人设聊天记录失败: {e}")
+        await matcher.finish(f"当前生效人设（聊天记录发送失败，改为文本发送）：\n{prompt}")
 
 
 async def handle_reset_persona_command(
@@ -142,10 +142,15 @@ async def handle_view_config_command(
     build_view_config_nodes: Callable[..., list[dict]],
     plugin_config: Any,
     session_history_limit: int,
+    get_remote_skill_review_stats: Callable[[Any, Any], dict[str, int]],
     logger: Any,
 ) -> None:
     group_config = get_group_config(group_id)
     provider_names = ", ".join(provider["name"] for provider in get_configured_api_providers()) or "未配置"
+    remote_skill_stats = get_remote_skill_review_stats(
+        getattr(plugin_config, "personification_skill_sources", None),
+        logger,
+    )
     nodes = build_view_config_nodes(
         bot_self_id=str(bot.self_id),
         group_id=group_id,
@@ -153,10 +158,11 @@ async def handle_view_config_command(
         provider_names=provider_names,
         plugin_config=plugin_config,
         session_history_limit=session_history_limit,
+        remote_skill_stats=remote_skill_stats,
     )
 
     try:
         await bot.call_api("send_group_forward_msg", group_id=int(group_id), messages=nodes)
     except Exception as e:
-        logger.error(f"发送配置详情失败: {e}")
-        await matcher.finish(f"配置详情发送失败: {e}")
+        logger.error(f"发送配置聊天记录失败: {e}")
+        await matcher.finish(f"配置聊天记录发送失败: {e}")

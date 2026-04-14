@@ -20,8 +20,12 @@ async def analyze_group_style(
     allow_image_blocks = api_type != "openai_codex"
 
     for msg in msgs:
+        if msg.get("is_bot"):
+            continue
         nickname = str(msg.get("nickname", "未知"))
         content = str(msg.get("content", ""))
+        if not content.strip():
+            continue
         chat_content.append({"type": "text", "text": f"({nickname}): {content}\n"})
 
         images = msg.get("images") or []

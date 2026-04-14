@@ -1,12 +1,21 @@
 import asyncio
 import random
 import re
+import time
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Dict, List
 
+from ..core.message_relations import extract_send_message_id
+from ..core.message_parts import build_user_message_content
+from ..core.tts_service import extract_persona_tts_config
+
 from ..agent.action_executor import ActionExecutor
 from ..agent.loop import run_agent
-from ..skills.sticker_tool import reset_current_image_context, set_current_image_context
+from ..skills.skillpacks.sticker_tool.scripts.impl import (
+    reset_current_image_context,
+    set_current_image_context,
+)
+from ..utils import get_group_topic_summary
 
 
 _TRANSLATION_LINE_SUFFIX = r"\s*\d*(?:\s*[（(][^）)]*[）)])*\s*[：:]"
@@ -18,6 +27,82 @@ _TRANSLATION_TARGET_RE = re.compile(
     rf"^译文{_TRANSLATION_LINE_SUFFIX}",
     re.IGNORECASE | re.MULTILINE,
 )
+_STATUS_MAX_AGE_SECONDS = 30 * 60
+
+
+def _status_period_key(target_time: Any) -> str:
+    hour = int(getattr(target_time, "hour", 0) or 0)
+    if 0 <= hour < 6:
+        return "late_night"
+    if 6 <= hour < 9:
+        return "morning"
+    if 9 <= hour < 12:
+        return "forenoon"
+    if 12 <= hour < 14:
+        return "noon"
+    if 14 <= hour < 18:
+        return "afternoon"
+    if 18 <= hour < 22:
+        return "evening"
+    return "night"
+
+
+def _build_time_anchored_default_status(now: Any) -> str:
+    hour = int(getattr(now, "hour", 0) or 0)
+    if 0 <= hour < 6:
+        mood, state, action = "困", "深夜了，应该快睡着了", "揉眼睛"
+    elif 6 <= hour < 9:
+        mood, state, action = "懵", "刚起床，还没完全清醒", "伸懒腰"
+    elif 9 <= hour < 12:
+        mood, state, action = "平静", "上午时段，正慢慢进入状态", "发呆"
+    elif 12 <= hour < 14:
+        mood, state, action = "放松", "中午休息时间", "吃饭"
+    elif 14 <= hour < 18:
+        mood, state, action = "平静", "下午时段", "摸鱼"
+    elif 18 <= hour < 22:
+        mood, state, action = "悠闲", "晚上在家，比较放松", "休息"
+    else:
+        mood, state, action = "困", "夜深了，准备休息", "打哈欠"
+    return f'心情: "{mood}"\n状态: "{state}"\n记忆: ""\n动作: "{action}"'
+
+
+def _get_current_status(
+    group_id: str,
+    bot_statuses: Dict[str, Any],
+    prompt_config: Dict[str, Any],
+    now: Any,
+) -> str:
+    now_ts = time.time()
+    current_period = _status_period_key(now)
+    entry = bot_statuses.get(group_id)
+    if isinstance(entry, dict):
+        status_text = str(entry.get("status", "") or "").strip()
+        updated_at = float(entry.get("updated_at", 0) or 0)
+        previous_period = str(entry.get("period_key", "") or "")
+        if (
+            status_text
+            and now_ts - updated_at <= _STATUS_MAX_AGE_SECONDS
+            and (not previous_period or previous_period == current_period)
+        ):
+            return status_text
+    elif isinstance(entry, str):
+        status_text = entry.strip()
+        if status_text:
+            bot_statuses[group_id] = {
+                "status": status_text,
+                "updated_at": now_ts,
+                "period_key": current_period,
+            }
+            return status_text
+
+    base_status = str(prompt_config.get("status", "") or "").strip()
+    current_status = base_status or _build_time_anchored_default_status(now)
+    bot_statuses[group_id] = {
+        "status": current_status,
+        "updated_at": now_ts,
+        "period_key": current_period,
+    }
+    return current_status
 
 
 def _looks_like_translation_result(text: str) -> bool:
@@ -101,6 +186,25 @@ async def _send_translation_forward(bot: Any, event: Any, text: str) -> bool:
     return True
 
 
+def _strip_control_markers(text: str) -> str:
+    cleaned = str(text or "")
+    cleaned = (
+        cleaned.replace("[SILENCE]", "").replace("<SILENCE>", "")
+        .replace("[氛围好]", "").replace("<氛围好>", "")
+        .replace("[BLOCK]", "").replace("<BLOCK>", "")
+        .replace("[NO_REPLY]", "").replace("<NO_REPLY>", "")
+        .strip()
+    )
+    cleaned = re.sub(r'\[[^\]]*\]', '', cleaned)
+    cleaned = re.sub(r'<[^>]*>', '', cleaned)
+    return cleaned.strip()
+
+
+def _build_tts_user_hint(*, is_private: bool) -> str:
+    scene = "私聊" if is_private else "群聊"
+    return f"这是{scene}场景下的回复，请自然朗读，整体语速略快一点。"
+
+
 async def process_yaml_response_logic(
     bot: Any,
     event: Any,
@@ -112,8 +216,9 @@ async def process_yaml_response_logic(
     prompt_config: Dict[str, Any],
     chat_history: List[Dict[str, Any]],
     trigger_reason: str,
-    get_beijing_time: Callable[[], Any],
-    bot_statuses: Dict[str, str],
+    get_current_time: Callable[[], Any],
+    format_time_context: Callable[[Any | None], str],
+    bot_statuses: Dict[str, Any],
     get_group_config: Callable[[str], dict],
     plugin_config: Any,
     get_schedule_prompt_injection: Callable[[], str],
@@ -127,26 +232,35 @@ async def process_yaml_response_logic(
     build_private_session_id: Callable[[str], str],
     build_group_session_id: Callable[[str], str],
     append_session_message: Callable[..., None],
+    record_group_msg: Callable[..., Any] | None,
     logger: Any,
+    user_blacklist: Dict[str, float],
+    superusers: set[str] | None = None,
     tool_registry: Any = None,
     agent_tool_caller: Any = None,
     current_image_urls: List[str] | None = None,
+    tts_service: Any = None,
+    extract_forward_content: Callable[..., Any] = None,
+    memory_curator: Any = None,
 ) -> None:
     """处理基于 YAML 模板的新版响应逻辑。"""
-    now = get_beijing_time()
+    now = get_current_time()
     week_days = ["星期一", "星期二", "星期三", "星期四", "星期五", "星期六", "星期日"]
     weekday_str = week_days[now.weekday()]
     current_time_str = (
         f"{now.year}年{now.month:02d}月{now.day:02d}日 "
-        f"{now.hour:02d}:{now.minute:02d}:{now.second:02d} ({weekday_str}) [东京时间 JST/UTC+9]"
+        f"{now.hour:02d}:{now.minute:02d}:{now.second:02d} ({weekday_str}) "
+        f"[{format_time_context(now)}]"
     )
 
-    current_status = bot_statuses.get(group_id)
-    if not current_status:
-        current_status = prompt_config.get("status", "").strip()
-        if not current_status:
-            current_status = '心情: "平静"\n状态: "正在潜水"\n记忆: ""\n动作: "发呆"'
-        bot_statuses[group_id] = current_status
+    current_status = _get_current_status(group_id, bot_statuses, prompt_config, now)
+
+    forward_content = ""
+    if extract_forward_content is not None:
+        try:
+            forward_content = await extract_forward_content(bot, event, logger=logger)
+        except Exception as e:
+            logger.warning(f"拟人插件：提取转发消息内容失败: {e}")
 
     history_new_text = ""
     recent_msgs = chat_history[:-1] if len(chat_history) > 1 else []
@@ -228,9 +342,21 @@ async def process_yaml_response_logic(
     input_text = input_text.replace("{schedule_instruction}", schedule_instruction)
     input_text = input_text.replace("{long_memory('guild')}", "(暂无长期记忆)")
 
-    grounding_context = await build_grounding_context(history_last_text)
+    topic_hint = ""
+    if not is_private_session:
+        topic_hint = get_group_topic_summary(group_id)
+    grounding_context = await build_grounding_context(history_last_text, topic_hint)
     if grounding_context:
         input_text = f"{input_text}\n\n## 联网事实校验（自动注入）\n{grounding_context}\n"
+
+    if forward_content:
+        forward_content = forward_content[:2000] if len(forward_content) > 2000 else forward_content
+        input_text = (
+            f"{input_text}\n\n"
+            f"## 聊天记录内容（用户转发的聊天记录）\n"
+            f"{forward_content}\n"
+            f"（请理解并回应转发内容中的话题，如有需要可结合联网搜索验证信息）\n"
+        )
 
     if "{history_new}" not in input_template and "{history_last}" not in input_template:
         input_text = (
@@ -254,9 +380,18 @@ async def process_yaml_response_logic(
                     last_images.append(img_url_obj)
 
     if last_images:
-        user_content = [{"type": "text", "text": input_text}]
-        for img_url in last_images:
-            user_content.append({"type": "image_url", "image_url": {"url": img_url}})
+        user_content = build_user_message_content(
+            text=input_text,
+            image_urls=last_images,
+        )
+        system_prompt += (
+            "\n\n## 图片处理规则（重要）\n"
+            "1. 你正在看用户发送的图片，但你仍然是「你自己」，绝对不能代入图片中的角色。\n"
+            "2. 禁止以图片中角色的口吻说话，禁止扮演图片中的任何人物或角色。\n"
+            "3. 你应该以旁观者的身份描述或评论图片内容，而不是成为图片中的人。\n"
+            "4. 如果图片是动漫/游戏角色，你只是「看到」了这张图片，你不是那个角色。\n"
+            "5. 始终保持你自己的身份和人格，用你自己的语气来回应图片。\n"
+        )
 
     messages = [
         {"role": "system", "content": system_prompt},
@@ -304,18 +439,62 @@ async def process_yaml_response_logic(
     else:
         reply_content = await call_ai_api(messages)
     if not reply_content:
-        logger.warning("拟人插件 (YAML): 未能获取到 AI 回复内容")
+        if used_agent:
+            logger.warning("拟人插件 (YAML): Agent 执行完成但返回空文本，请检查上方 [agent] provider 日志")
+        else:
+            logger.warning("拟人插件 (YAML): 未能获取到 AI 回复内容")
         return
-    if used_agent and reply_content == "[NO_REPLY]":
+    if used_agent and reply_content in ("[NO_REPLY]", "<NO_REPLY>"):
         return
 
     parsed = parse_yaml_response(reply_content)
-    if "[SILENCE]" in reply_content:
+    has_block_marker = "[BLOCK]" in reply_content or "<BLOCK>" in reply_content
+
+    # 增加双重校验：如果 AI 输出虽然包含 [BLOCK]，但实际输出的内容表示它是客观事实/新闻，或者没有包含违规理由，则可以忽略拦截
+    think_content = parsed.get("think", "")
+    is_news_or_fact = False
+    if think_content:
+        # 如果模型思考过程中明确认为是新闻、事实、客观分享，则放行
+        if any(keyword in think_content for keyword in ["新闻", "实事", "客观", "事实", "突发事件", "分享", "报道"]):
+            is_news_or_fact = True
+
+    if has_block_marker and not is_news_or_fact:
+        reply_content = reply_content.replace("[BLOCK]", "").strip()
+        logger.warning(f"AI (YAML) 检测到高风险标记，当前仅跳过本轮回复: {group_id} {user_name}({user_id})")
+        notify_superusers = superusers or set()
+        if notify_superusers:
+            notify_msg = (
+                "拟人插件高风险提示\n"
+                f"群：{group_id}\n"
+                f"用户：{user_name}（{user_id}）\n"
+                f"拦截内容：{history_last_text[:80]}\n"
+                f"时间：{get_current_time().strftime('%Y-%m-%d %H:%M:%S')}\n"
+                "处理：已跳过本轮回复，未自动拉黑。"
+            )
+
+            async def _notify_superusers(
+                _bot: Any = bot,
+                _superusers: set[str] = notify_superusers,
+                _msg: str = notify_msg,
+            ) -> None:
+                for _su in _superusers:
+                    try:
+                        await _bot.send_private_msg(user_id=int(_su), message=_msg)
+                    except Exception as _e:
+                        logger.warning(f"[BLOCK] 通知管理员 {_su} 失败: {_e}")
+
+            asyncio.create_task(_notify_superusers())
+        return
+    if "[SILENCE]" in reply_content or "<SILENCE>" in reply_content:
         logger.info("AI (YAML) 决定保持沉默 (SILENCE)")
         return
 
     if parsed["status"]:
-        bot_statuses[group_id] = parsed["status"]
+        bot_statuses[group_id] = {
+            "status": parsed["status"],
+            "updated_at": time.time(),
+            "period_key": _status_period_key(get_current_time()),
+        }
         logger.info(f"拟人插件: 更新状态为: {parsed['status']}")
     if parsed["think"]:
         logger.debug(f"拟人插件: 思考过程: {parsed['think']}")
@@ -329,79 +508,125 @@ async def process_yaml_response_logic(
             except Exception as e:
                 logger.warning(f"拟人插件: 发送戳一戳失败: {e}")
 
-    clean_reply = ""
+    assistant_text = ""
+    stickers_sent: List[str] = []
     if parsed["messages"]:
-        for msg in parsed["messages"]:
-            text = msg["text"]
-            sticker_url = msg["sticker"]
-            if text:
-                text = text.replace("[SILENCE]", "").replace("[氛围好]", "").strip()
-
-            if text:
-                segments = re.split(r"([。！？\n])", text)
-                merged_segments = []
-                current_seg = ""
-                for s in segments:
-                    if s in "。！？\n":
-                        current_seg += s
-                        if current_seg.strip():
-                            merged_segments.append(current_seg)
-                        current_seg = ""
-                    else:
-                        current_seg += s
-                if current_seg.strip():
-                    merged_segments.append(current_seg)
-                if not merged_segments and text.strip():
-                    merged_segments = [text]
-
-                for seg in merged_segments:
-                    if seg.strip():
-                        await bot.send(event, seg)
-                        await asyncio.sleep(random.uniform(0.5, 2.0))
-
-            if sticker_url:
-                try:
-                    if sticker_url.startswith("http"):
-                        await bot.send(event, message_segment_cls.image(sticker_url))
-                    else:
-                        sticker_dir = Path(plugin_config.personification_sticker_path)
-                        target_file = None
-                        if sticker_dir.exists():
-                            possible = sticker_dir / sticker_url
-                            if possible.exists():
-                                target_file = possible
-                            else:
-                                for f in sticker_dir.iterdir():
-                                    if f.stem == sticker_url:
-                                        target_file = f
-                                        break
-                        if target_file:
-                            await bot.send(event, message_segment_cls.image(f"file:///{target_file.absolute()}"))
-                        else:
-                            logger.warning(f"拟人插件: 找不到表情包 {sticker_url}")
-                except Exception as e:
-                    logger.error(f"发送表情包失败: {e}")
+        text_parts = [_strip_control_markers(m["text"]) for m in parsed["messages"] if m["text"]]
+        stickers_sent = [str(m["sticker"]) for m in parsed["messages"] if m.get("sticker")]
+        assistant_text = sanitize_history_text(" ".join(text_parts).strip())
     else:
         clean_reply = reply_content
         for tag in ["status", "think", "action", "output", "message"]:
             clean_reply = re.sub(rf"<{tag}.*?>.*?</\s*{tag}\s*>", "", clean_reply, flags=re.DOTALL | re.IGNORECASE)
             clean_reply = re.sub(rf"</?\s*{tag}.*?>", "", clean_reply, flags=re.IGNORECASE)
-        clean_reply = clean_reply.replace("[SILENCE]", "").replace("[氛围好]", "").strip()
-        if clean_reply:
-            await bot.send(event, clean_reply)
-
-    assistant_text = ""
-    stickers_sent: List[str] = []
-    if parsed["messages"]:
-        text_parts = [m["text"] for m in parsed["messages"] if m["text"]]
-        stickers_sent = [str(m["sticker"]) for m in parsed["messages"] if m.get("sticker")]
-        assistant_text = sanitize_history_text(" ".join(text_parts).strip())
-    else:
+        clean_reply = _strip_control_markers(clean_reply)
         assistant_text = sanitize_history_text(clean_reply)
 
+    assistant_text = re.sub(r"^(根据你的描述|总的来说|总体来说)[，,:：\s]*", "", assistant_text).strip()
+    assistant_text = re.sub(r"^(如果你需要|如果需要的话)[，,:：\s]*", "", assistant_text).strip()
+    assistant_text = re.sub(r"(?:如果你需要|需要的话).*?$", "", assistant_text).strip()
+
     is_private_session = str(group_id).startswith(private_session_prefix)
+    sent_as_tts = False
+    sent_message_id = ""
+    if (
+        assistant_text
+        and not stickers_sent
+        and tts_service is not None
+        and tts_service.should_auto_tts(
+            is_private=is_private_session,
+            group_config=group_config,
+            text=assistant_text,
+            has_rich_content=False,
+        )
+    ):
+        try:
+            sent_as_tts = await tts_service.send_tts(
+                bot=bot,
+                event=event,
+                message_segment_cls=message_segment_cls,
+                text=assistant_text,
+                user_hint=_build_tts_user_hint(is_private=is_private_session),
+                is_private=is_private_session,
+                persona_tts=extract_persona_tts_config(prompt_config),
+                pause_range=(0.8, 1.5),
+            )
+        except Exception as e:
+            logger.warning(f"[tts] YAML 自动语音发送失败，回退文字: {e}")
+
+    if not sent_as_tts:
+        clean_reply = ""
+        if parsed["messages"]:
+            for msg in parsed["messages"]:
+                text = msg["text"]
+                sticker_url = msg["sticker"]
+                if text:
+                    text = _strip_control_markers(text)
+
+                if text:
+                    segments = re.split(r"([。！？\n])", text)
+                    merged_segments = []
+                    current_seg = ""
+                    for s in segments:
+                        if s in "。！？\n":
+                            current_seg += s
+                            if current_seg.strip():
+                                merged_segments.append(current_seg)
+                            current_seg = ""
+                        else:
+                            current_seg += s
+                    if current_seg.strip():
+                        merged_segments.append(current_seg)
+                    if not merged_segments and text.strip():
+                        merged_segments = [text]
+
+                    for seg in merged_segments:
+                        if seg.strip():
+                            send_result = await bot.send(event, seg)
+                            if not sent_message_id:
+                                sent_message_id = extract_send_message_id(send_result)
+                            await asyncio.sleep(random.uniform(0.4, 1.0))
+
+                if sticker_url:
+                    try:
+                        if sticker_url.startswith("http"):
+                            send_result = await bot.send(event, message_segment_cls.image(sticker_url))
+                            if not sent_message_id:
+                                sent_message_id = extract_send_message_id(send_result)
+                        else:
+                            sticker_dir = Path(plugin_config.personification_sticker_path)
+                            target_file = None
+                            if sticker_dir.exists():
+                                possible = sticker_dir / sticker_url
+                                if possible.exists():
+                                    target_file = possible
+                                else:
+                                    for f in sticker_dir.iterdir():
+                                        if f.stem == sticker_url:
+                                            target_file = f
+                                            break
+                            if target_file:
+                                send_result = await bot.send(event, message_segment_cls.image(f"file:///{target_file.absolute()}"))
+                                if not sent_message_id:
+                                    sent_message_id = extract_send_message_id(send_result)
+                            else:
+                                logger.warning(f"拟人插件: 找不到表情包 {sticker_url}")
+                    except Exception as e:
+                        logger.error(f"发送表情包失败: {e}")
+        else:
+            clean_reply = reply_content
+            for tag in ["status", "think", "action", "output", "message"]:
+                clean_reply = re.sub(rf"<{tag}.*?>.*?</\s*{tag}\s*>", "", clean_reply, flags=re.DOTALL | re.IGNORECASE)
+                clean_reply = re.sub(rf"</?\s*{tag}.*?>", "", clean_reply, flags=re.IGNORECASE)
+            clean_reply = _strip_control_markers(clean_reply)
+            if clean_reply:
+                send_result = await bot.send(event, clean_reply)
+                if not sent_message_id:
+                    sent_message_id = extract_send_message_id(send_result)
+
     session_id = build_private_session_id(user_id) if is_private_session else build_group_session_id(group_id)
     legacy_session_id = None if is_private_session else group_id
+    # YAML 模式同样只写回最终用户可见文本，避免 session 中保留未发送的原始模板输出。
     append_session_message(
         session_id,
         "assistant",
@@ -409,13 +634,42 @@ async def process_yaml_response_logic(
         legacy_session_id=legacy_session_id,
         scene="reply",
         sticker_sent=", ".join(stickers_sent) if stickers_sent else None,
+        speaker=str(getattr(bot, "self_id", "") or "bot"),
+        user_id=str(getattr(bot, "self_id", "") or "") or None,
+        source_kind="bot_reply",
+        group_id=None if is_private_session else group_id,
+        message_id=sent_message_id or None,
+        reply_to_msg_id=str(getattr(event, "message_id", "") or "") or None,
+        reply_to_user_id=None if is_private_session else user_id,
+        mentioned_ids=[],
+        is_at_bot=False,
     )
+    if memory_curator is not None:
+        memory_curator.schedule_capture(
+            summary=assistant_text,
+            user_id=user_id,
+            group_id="" if is_private_session else group_id,
+            topic_tags=[group_id] if not is_private_session else [],
+        )
+    if not is_private_session and record_group_msg is not None:
+        record_group_msg(
+            group_id,
+            str(getattr(bot, "self_id", "") or "bot"),
+            assistant_text,
+            is_bot=True,
+            user_id=str(getattr(bot, "self_id", "") or ""),
+            message_id=sent_message_id or None,
+            reply_to_msg_id=str(getattr(event, "message_id", "") or "") or None,
+            reply_to_user_id=user_id,
+            source_kind="bot_reply",
+        )
 
 
 def build_yaml_response_processor(
     *,
-    get_beijing_time: Callable[[], Any],
-    bot_statuses: Dict[str, str],
+    get_current_time: Callable[[], Any],
+    format_time_context: Callable[[Any | None], str],
+    bot_statuses: Dict[str, Any],
     get_group_config: Callable[[str], dict],
     plugin_config: Any,
     get_schedule_prompt_injection: Callable[[], str],
@@ -429,9 +683,15 @@ def build_yaml_response_processor(
     build_private_session_id: Callable[[str], str],
     build_group_session_id: Callable[[str], str],
     append_session_message: Callable[..., None],
+    record_group_msg: Callable[..., Any] | None,
     logger: Any,
+    user_blacklist: Dict[str, float],
+    superusers: set[str] | None = None,
     tool_registry: Any = None,
     agent_tool_caller: Any = None,
+    tts_service: Any = None,
+    extract_forward_content: Callable[..., Any] = None,
+    memory_curator: Any = None,
 ) -> Callable[..., Awaitable[None]]:
     async def _processor(
         bot: Any,
@@ -455,7 +715,8 @@ def build_yaml_response_processor(
             prompt_config=prompt_config,
             chat_history=chat_history,
             trigger_reason=trigger_reason,
-            get_beijing_time=get_beijing_time,
+            get_current_time=get_current_time,
+            format_time_context=format_time_context,
             bot_statuses=bot_statuses,
             get_group_config=get_group_config,
             plugin_config=plugin_config,
@@ -470,10 +731,16 @@ def build_yaml_response_processor(
             build_private_session_id=build_private_session_id,
             build_group_session_id=build_group_session_id,
             append_session_message=append_session_message,
+            record_group_msg=record_group_msg,
             logger=logger,
+            user_blacklist=user_blacklist,
+            superusers=superusers,
             tool_registry=tool_registry,
             agent_tool_caller=agent_tool_caller,
             current_image_urls=current_image_urls,
+            tts_service=tts_service,
+            extract_forward_content=extract_forward_content,
+            memory_curator=memory_curator,
         )
 
     return _processor

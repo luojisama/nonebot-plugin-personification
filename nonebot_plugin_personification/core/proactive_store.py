@@ -42,3 +42,37 @@ def update_private_interaction_time(
             },
         )
     return state
+
+
+def update_group_chat_active(
+    group_id: str,
+    *,
+    user_id: str = "",
+    topic: str = "",
+    active_minutes: int = 8,
+    proactive_state: Optional[Dict[str, Dict[str, Any]]] = None,
+) -> Dict[str, Dict[str, Any]]:
+    state = proactive_state if proactive_state is not None else load_proactive_state()
+    key = f"group_chat_active_{group_id}"
+    current = state.get(key, {})
+    if not isinstance(current, dict):
+        current = {}
+
+    now_ts = time.time()
+    current["until"] = now_ts + max(1, int(active_minutes)) * 60
+    current["updated_at"] = now_ts
+    if user_id:
+        current["last_user_id"] = str(user_id)
+    if topic:
+        current["topic"] = str(topic).strip()[:80]
+    state[key] = current
+
+    if proactive_state is None:
+        get_data_store().mutate_sync(
+            _STORE_NAME,
+            lambda current_state: {
+                **(current_state if isinstance(current_state, dict) else {}),
+                key: current,
+            },
+        )
+    return state

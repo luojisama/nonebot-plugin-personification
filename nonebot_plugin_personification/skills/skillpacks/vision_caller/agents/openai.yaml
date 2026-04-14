@@ -1,0 +1,3 @@
+display_name: vision_caller
+description: 兼容封装 vision_caller.py 的能力入口
+icon: package

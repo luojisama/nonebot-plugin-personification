@@ -1,13 +1,16 @@
 import asyncio
 import base64
+import ipaddress
 import json
 import random
 import re
+import socket
 import time
 from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
 from typing import Any, Callable, Dict, List
+from urllib.parse import urlparse
 
 import httpx
 from nonebot.exception import FinishedException
@@ -16,19 +19,65 @@ from PIL import Image
 from ..agent.action_executor import ActionExecutor
 from ..agent.loop import run_agent
 from ..agent.tool_registry import ToolRegistry
+from ..core.message_relations import build_event_relation_metadata, extract_send_message_id
 from ..core.prompt_hooks import HookContext, get_hook_registry
+from ..core.persona_profile import load_persona_profile, render_persona_snapshot
+from ..core.target_inference import TARGET_OTHERS, infer_message_target
+from ..core.tts_service import extract_persona_tts_config
 from ..core.image_result_cache import (
     build_image_cache_key,
     get_cached_image_result,
     set_cached_image_result,
 )
-from ..skills.friend_request_tool import build_friend_request_tool
-from ..skills.group_info_tool import build_group_info_tool
-from ..skills.sticker_tool import reset_current_image_context, set_current_image_context
+from ..skills.skillpacks.friend_request_tool.scripts.main import build_friend_request_tool_for_runtime
+from ..skills.skillpacks.group_info_tool.scripts.main import build_group_info_tool_for_runtime
+from ..skill_runtime.runtime_api import SkillRuntime
+from ..skills.skillpacks.sticker_tool.scripts.impl import (
+    UNDERSTAND_STICKER_PROMPT,
+    reset_current_image_context,
+    select_sticker,
+    set_current_image_context,
+)
+from ..core.proactive_store import update_group_chat_active
+from ..core.web_grounding import extract_forward_message_content
+from ..utils import get_recent_group_msgs
 from .event_rules import split_segment_if_long
+from .runtime_commands import maybe_handle_superuser_natural_language_skill_install
 
 
 _FRIEND_IDS_CACHE: Dict[str, tuple[float, set[str]]] = {}
+_MAX_IMAGE_DOWNLOAD_BYTES = 8 * 1024 * 1024
+_BLOCKED_IMAGE_HOST_SUFFIXES = (".local", ".lan", ".home", ".internal", ".corp")
+_BLOCKED_IMAGE_HOSTS = {
+    "localhost",
+    "127.0.0.1",
+    "::1",
+    "0.0.0.0",
+    "host.docker.internal",
+}
+_FALLBACK_REPLIES = [
+    "啊，我突然脑子有点空白...等一下再问我？",
+    "这个问题我需要想想，稍后回你",
+    "哦，刚才走神了，你刚说什么来着",
+]
+
+
+def _build_group_session_relation_metadata(
+    event: Any,
+    *,
+    bot_self_id: str,
+    group_id: str,
+    user_id: str,
+    source_kind: str,
+) -> dict[str, Any]:
+    relation_metadata = build_event_relation_metadata(
+        event,
+        bot_self_id=bot_self_id,
+        source_kind=source_kind,
+    )
+    relation_metadata["group_id"] = str(group_id)
+    relation_metadata["user_id"] = str(user_id)
+    return relation_metadata
 
 
 @dataclass
@@ -69,12 +118,14 @@ class RuntimeDeps:
     module_instance_id: int
     process_yaml_response_logic: Callable[..., Any]
     plugin_config: Any
-    get_beijing_time: Callable[[], Any]
+    get_current_time: Callable[[], Any]
+    format_time_context: Callable[[Any | None], str]
     schedule_disabled_override_prompt: Callable[[], str]
     get_schedule_prompt_injection: Callable[[], str]
     build_grounding_context: Callable[[str], Any]
     update_private_interaction_time: Callable[[str], None]
     call_ai_api: Callable[..., Any]
+    save_plugin_runtime_config: Callable[[], None] | None
     user_blacklist: Dict[str, float]
     record_group_msg: Callable[..., None]
     split_text_into_segments: Callable[[str], List[str]]
@@ -82,11 +133,17 @@ class RuntimeDeps:
     get_sticker_files: Callable[[], List[Path]]
     get_http_client: Callable[[], httpx.AsyncClient]
     get_whitelisted_groups: Callable[[], List[str]]
+    tts_service: Any = None
     tool_registry: Any = None
     inner_state_updater: Any = None
     agent_tool_caller: Any = None
     persona_store: Any = None
     vision_caller: Any = None
+    knowledge_store: Any = None
+    memory_store: Any = None
+    profile_service: Any = None
+    memory_curator: Any = None
+    background_intelligence: Any = None
 
 
 @dataclass
@@ -106,6 +163,20 @@ class ReplyProcessorDeps:
     types: TypeDeps
 
 
+def _build_tts_user_hint(*, is_private: bool, group_style: str = "") -> str:
+    scene = "私聊" if is_private else "群聊"
+    hint = f"这是{scene}场景下的回复，请自然朗读，整体语速略快一点。"
+    style = str(group_style or "").strip()
+    if style:
+        hint += f" 参考群聊风格：{style[:80]}"
+    return hint
+
+
+def _looks_like_sticker_message(text: str) -> bool:
+    plain = str(text or "")
+    return "[图片·表情包]" in plain or "[表情id:" in plain or "[表情包]" in plain
+
+
 async def _run_agent_if_enabled(
     bot: Any,
     event: Any,
@@ -114,31 +185,37 @@ async def _run_agent_if_enabled(
     runtime: RuntimeDeps,
     interaction_count: int = 0,
     current_image_urls: List[str] | None = None,
-) -> tuple[str | None, bool]:
+ ) -> tuple[str | None, bool, bool]:
     if not (
         getattr(runtime.plugin_config, "personification_agent_enabled", True)
         and runtime.tool_registry
         and runtime.agent_tool_caller
     ):
-        return None, False
+        return None, False, False
 
     executor = ActionExecutor(bot, event, runtime.plugin_config, runtime.logger)
     runtime_registry = _clone_tool_registry(runtime.tool_registry)
     friend_ids = await _get_cached_friend_ids(bot, runtime.logger)
+    skill_runtime = SkillRuntime(
+        plugin_config=runtime.plugin_config,
+        logger=runtime.logger,
+        get_now=lambda: int(time.time()),
+        get_whitelisted_groups=runtime.get_whitelisted_groups,
+        knowledge_store=runtime.knowledge_store,
+        background_intelligence=runtime.background_intelligence,
+    )
     runtime_registry.register(
-        build_group_info_tool(
+        build_group_info_tool_for_runtime(
             bot=bot,
-            get_whitelisted_groups=runtime.get_whitelisted_groups,
-            logger=runtime.logger,
+            runtime=skill_runtime,
         )
     )
     runtime_registry.register(
-        build_friend_request_tool(
+        build_friend_request_tool_for_runtime(
             bot=bot,
-            plugin_config=runtime.plugin_config,
+            runtime=skill_runtime,
             get_user_data=persona.get_user_data,
             get_friend_ids=lambda: set(friend_ids),
-            logger=runtime.logger,
             session_interaction_count=interaction_count,
             is_group_scene=hasattr(event, "group_id") and not str(getattr(event, "group_id", "")).startswith("private_"),
         )
@@ -158,7 +235,7 @@ async def _run_agent_if_enabled(
         asyncio.create_task(runtime.inner_state_updater(result.text, user_id))
     for action in result.pending_actions:
         await executor.execute(action["type"], action["params"])
-    return result.text, True
+    return result.text, True, bool(getattr(result, "bypass_length_limits", False))
 
 
 def _clone_tool_registry(registry: ToolRegistry) -> ToolRegistry:
@@ -215,6 +292,165 @@ def _count_user_interactions(messages: List[Dict[str, Any]], user_id: str) -> in
     return count
 
 
+def _normalize_reply_key(text: str) -> str:
+    normalized = re.sub(r"\s+", "", str(text or "").lower())
+    normalized = re.sub(r"[^\w\u4e00-\u9fff]+", "", normalized)
+    return normalized[:80]
+
+
+def _extract_reply_sender_meta(reply: Any) -> tuple[str, bool]:
+    sender = getattr(reply, "sender", None)
+    if sender is None and isinstance(reply, dict):
+        sender = reply.get("sender")
+
+    sender_name = ""
+    sender_id = ""
+    if isinstance(sender, dict):
+        sender_name = str(sender.get("card") or sender.get("nickname") or "").strip()
+        sender_id = str(sender.get("user_id") or "").strip()
+    elif sender is not None:
+        sender_name = str(
+            getattr(sender, "card", None) or getattr(sender, "nickname", None) or ""
+        ).strip()
+        sender_id = str(getattr(sender, "user_id", "") or "").strip()
+
+    if not sender_name:
+        sender_name = str(
+            getattr(reply, "sender_name", None)
+            or (reply.get("sender_name") if isinstance(reply, dict) else "")
+            or sender_id
+        ).strip()
+
+    self_id = str(getattr(reply, "self_id", "") or "").strip()
+    if not self_id and isinstance(reply, dict):
+        self_id = str(reply.get("self_id", "") or "").strip()
+
+    is_bot_reply = bool(self_id and sender_id and self_id == sender_id)
+    return sender_name or "未知", is_bot_reply
+
+
+def _should_suppress_group_topic_loop(
+    reply_content: str,
+    session_messages: List[Dict[str, Any]],
+) -> bool:
+    reply_key = _normalize_reply_key(reply_content)
+    if not reply_key:
+        return False
+
+    recent_assistant = [
+        _normalize_reply_key(_stringify_message_content(msg.get("content", "")))
+        for msg in session_messages[-10:]
+        if isinstance(msg, dict) and msg.get("role") == "assistant"
+    ]
+    recent_assistant = [key for key in recent_assistant if key]
+    if len(recent_assistant) >= 2 and reply_key in recent_assistant[-2:]:
+        return True
+    if len(recent_assistant) >= 3 and recent_assistant[-1] == recent_assistant[-2] == reply_key:
+        return True
+    return False
+
+
+def _is_disallowed_ip_address(ip: ipaddress._BaseAddress) -> bool:
+    return any(
+        (
+            ip.is_private,
+            ip.is_loopback,
+            ip.is_link_local,
+            ip.is_multicast,
+            ip.is_reserved,
+            ip.is_unspecified,
+        )
+    )
+
+
+async def _is_safe_remote_image_url(url: str, logger: Any) -> bool:
+    try:
+        parsed = urlparse(str(url or "").strip())
+    except Exception:
+        return False
+    if parsed.scheme not in {"http", "https"}:
+        return False
+    host = (parsed.hostname or "").strip().lower()
+    if not host:
+        return False
+    if host in _BLOCKED_IMAGE_HOSTS or host.endswith(_BLOCKED_IMAGE_HOST_SUFFIXES):
+        logger.warning(f"拟人插件：拒绝访问高风险图片地址 host={host}")
+        return False
+
+    try:
+        literal_ip = ipaddress.ip_address(host)
+    except ValueError:
+        literal_ip = None
+    if literal_ip is not None:
+        if _is_disallowed_ip_address(literal_ip):
+            logger.warning(f"拟人插件：拒绝访问内网/本地图片地址 ip={literal_ip}")
+            return False
+        return True
+
+    try:
+        infos = await asyncio.to_thread(
+            socket.getaddrinfo,
+            host,
+            parsed.port or (443 if parsed.scheme == "https" else 80),
+            socket.AF_UNSPEC,
+            socket.SOCK_STREAM,
+        )
+    except socket.gaierror:
+        return True
+    except Exception as e:
+        logger.warning(f"拟人插件：解析图片域名失败，已拒绝 {host}: {e}")
+        return False
+
+    for info in infos:
+        try:
+            resolved_ip = ipaddress.ip_address(info[4][0])
+        except Exception:
+            continue
+        if _is_disallowed_ip_address(resolved_ip):
+            logger.warning(f"拟人插件：拒绝访问解析到内网/本地的图片地址 host={host} ip={resolved_ip}")
+            return False
+    return True
+
+
+async def _download_safe_image_bytes(
+    *,
+    url: str,
+    file_name: str,
+    http_client: httpx.AsyncClient,
+    logger: Any,
+) -> tuple[str | None, bytes | None, bool]:
+    if file_name.endswith(".gif"):
+        return None, None, True
+    if not await _is_safe_remote_image_url(url, logger):
+        return None, None, False
+
+    try:
+        async with http_client.stream("GET", url, timeout=10, follow_redirects=True) as resp:
+            if resp.status_code != 200:
+                raise ValueError(f"HTTP {resp.status_code}")
+            mime_type = resp.headers.get("Content-Type", "image/jpeg")
+            if "image/gif" in mime_type.lower():
+                return None, None, True
+
+            content_length = resp.headers.get("Content-Length")
+            if content_length:
+                try:
+                    if int(content_length) > _MAX_IMAGE_DOWNLOAD_BYTES:
+                        raise ValueError("image too large")
+                except ValueError:
+                    raise ValueError("invalid image size")
+
+            payload = bytearray()
+            async for chunk in resp.aiter_bytes():
+                payload.extend(chunk)
+                if len(payload) > _MAX_IMAGE_DOWNLOAD_BYTES:
+                    raise ValueError("image too large")
+            return mime_type, bytes(payload), False
+    except Exception as e:
+        logger.warning(f"下载图片失败或被拦截，已忽略原图 URL: {e}")
+        return None, None, False
+
+
 async def _extract_images_from_segment(
     seg: Any,
     *,
@@ -231,34 +467,32 @@ async def _extract_images_from_segment(
     if not url:
         return
 
-    try:
-        resp = await http_client.get(url, timeout=10)
-        if resp.status_code == 200:
-            mime_type = resp.headers.get("Content-Type", "image/jpeg")
-            if "image/gif" in mime_type or file_name.endswith(".gif"):
-                logger.info("拟人插件：检测到 GIF 图片，忽略并不予回复")
-                return
-            try:
-                img_obj = Image.open(BytesIO(resp.content))
-                w, h = img_obj.size
-                if w <= 1280 and h <= 1280:
-                    message_text_ref.append("[图片·表情包]")
-                else:
-                    message_text_ref.append("[图片·照片]")
-            except Exception as e:
-                logger.warning(f"识别图片尺寸失败: {e}")
-                message_text_ref.append("[图片·照片]")
+    mime_type, payload, is_gif = await _download_safe_image_bytes(
+        url=url,
+        file_name=file_name,
+        http_client=http_client,
+        logger=logger,
+    )
+    if is_gif:
+        logger.info("拟人插件：检测到 GIF 图片，忽略并不予回复")
+        return
+    if payload is None or mime_type is None:
+        message_text_ref.append("[图片·照片]")
+        return
 
-            base64_data = base64.b64encode(resp.content).decode("utf-8")
-            image_urls.append(f"data:{mime_type};base64,{base64_data}")
-        elif not file_name.endswith(".gif"):
+    try:
+        img_obj = Image.open(BytesIO(payload))
+        w, h = img_obj.size
+        if w <= 1280 and h <= 1280:
+            message_text_ref.append("[图片·表情包]")
+        else:
             message_text_ref.append("[图片·照片]")
-            image_urls.append(url)
     except Exception as e:
-        logger.warning(f"下载图片失败，保留原 URL: {e}")
-        if not file_name.endswith(".gif"):
-            message_text_ref.append("[图片·照片]")
-            image_urls.append(url)
+        logger.warning(f"识别图片尺寸失败: {e}")
+        message_text_ref.append("[图片·照片]")
+
+    base64_data = base64.b64encode(payload).decode("utf-8")
+    image_urls.append(f"data:{mime_type};base64,{base64_data}")
 
 
 async def _extract_reply_images(
@@ -276,23 +510,19 @@ async def _extract_reply_images(
     file_name = str(data.get("file", "")).lower()
     if not url:
         return
-    try:
-        resp = await http_client.get(url, timeout=10)
-        if resp.status_code == 200:
-            mime_type = resp.headers.get("Content-Type", "image/jpeg")
-            if "image/gif" in mime_type or file_name.endswith(".gif"):
-                return
-            message_text_ref.append("[图片]")
-            base64_data = base64.b64encode(resp.content).decode("utf-8")
-            image_urls.append(f"data:{mime_type};base64,{base64_data}")
-        elif not file_name.endswith(".gif"):
-            message_text_ref.append("[图片]")
-            image_urls.append(url)
-    except Exception as e:
-        logger.warning(f"下载引用图片失败: {e}")
-        if not file_name.endswith(".gif"):
-            message_text_ref.append("[图片]")
-            image_urls.append(url)
+    mime_type, payload, is_gif = await _download_safe_image_bytes(
+        url=url,
+        file_name=file_name,
+        http_client=http_client,
+        logger=logger,
+    )
+    if is_gif:
+        return
+    message_text_ref.append("[图片]")
+    if payload is None or mime_type is None:
+        return
+    base64_data = base64.b64encode(payload).decode("utf-8")
+    image_urls.append(f"data:{mime_type};base64,{base64_data}")
 
 
 def _truncate_at_punctuation(text: str, max_chars: int) -> str:
@@ -309,6 +539,24 @@ def _truncate_at_punctuation(text: str, max_chars: int) -> str:
     return candidate
 
 
+def _build_final_visible_reply_text(
+    reply_content: str,
+    *,
+    max_chars: int,
+    sanitize_history_text: Callable[[str], str],
+) -> str:
+    """
+    统一计算最终写回 session/history 的 assistant 文本。
+
+    这里显式复用发送前的裁剪结果，确保「用户实际看到/听到的文本」
+    与下一轮模型读到的 assistant 历史保持一致。
+    """
+    final_reply = str(reply_content or "").strip()
+    if max_chars and max_chars > 0 and len(final_reply) > max_chars:
+        final_reply = _truncate_at_punctuation(final_reply, max_chars)
+    return sanitize_history_text(final_reply)
+
+
 def _build_base_system_prompt(
     *,
     base_prompt: str,
@@ -320,35 +568,41 @@ def _build_base_system_prompt(
     context_chunks: List[str],
     postlude_chunks: List[str],
 ) -> str:
-    parts: List[str] = [base_prompt]
+    profile = load_persona_profile(base_prompt)
+    parts: List[str] = [base_prompt if isinstance(base_prompt, str) else ""]
+    parts.append(render_persona_snapshot(profile))
     parts.extend(chunk for chunk in prelude_chunks if chunk)
     parts.append(
         "## 当前对话环境\n"
         f"- 对方昵称：{user_name}\n"
         f"- 对方好感等级：{level_name}\n"
-        f"- 你的心理状态：{combined_attitude}"
+        f"- 你的互动倾向：{combined_attitude}"
     )
     if is_private_session:
         parts.append(
-            "## 私聊特殊规则（高优先级）\n"
-            "1. **自主回复决策**：私聊中你拥有完全的自主权。如果对方发送的内容重复、无意义（如连续的“在吗”、“你好”、“哈哈”等）或你不想理会，请直接输出 **[SILENCE]** 结束话题，不要强行回复。\n"
-            "2. **极简回复模式**：对于高频、低信息量的私聊内容，必须使用极简回复（1-2句以内），切勿长篇大论。\n"
-            "3. **第二人称约束**：必须用“你”称呼当前对象，禁止使用“他/她/对方/这位用户”。\n"
-            "4. **称呼约束**：私聊中禁止使用“大家/你们/各位”。"
+            "## 私聊规则\n"
+            "1. 私聊里也要像真人聊天，不要像客服或助手。\n"
+            "2. 对重复、无意义或你不想接的话，直接输出 [SILENCE]。\n"
+            "3. 私聊不要只是一问一答；默认用自然口语聊开，通常 2-4 句更合适。\n"
+            "4. 如果对方正在认真继续聊，优先顺手追问一句、接住情绪，或抛一个相关小话题，别每轮都急着收尾。\n"
+            "5. 必须用“你”称呼当前对象，禁止使用群聊式称呼。"
+        )
+    else:
+        parts.append(
+            "## 群聊规则（高优先级）\n"
+            "1. 你是群成员，不是助手；回复要像群里顺手接一句。\n"
+            "2. 优先短句、口语、接梗、吐槽、反问，不要总结、说教、安抚式展开。\n"
+            "3. 没必要说就输出 [SILENCE]，不要为了显得聪明而硬回。\n"
+            "4. 如果别人明显在顺着你上一句追问或接话，优先自然续聊 1-2 轮，不要立刻冷掉。\n"
+            "5. 除非被直接问到，不要写成长篇说明，不要把一句话说成教程。"
         )
     parts.extend(chunk for chunk in context_chunks if chunk)
     parts.append(
-        "## 核心行动准则（绝对优先）\n"
-        "1. **身份一致性**：你必须完全沉浸在上述角色设定中。严禁提及你是 AI、机器人、程序 or 语言模型。严禁以 AI 助手的语气说话。\n"
-        "2. **回复风格**：回复必须精简、口语化，严禁使用长篇大论的列表或过于正式的陈述。回复长度限制在 30 个汉字左右。\n"
-        "3. **社交距离感**：你必须分清【直接对话】与【潜水观察】。在群员之间互相聊天（未艾特你或提及你名字）时，你只是个旁观者，绝不能认为对方是在对你说话。此时应尽量保持沉默，除非你确信有必要插话。\n"
-        "4. **互动决策**：\n"
-        "   - **决定是否回复**：仔细判断对话是否已经自然结束，或者对方只是发送了无意义的感慨/语气词。如果你认为**没有必要回复**，请直接输出 **[SILENCE]**。\n"
-        "   - **氛围反馈**：若氛围极好或对方让你开心，末尾加 [氛围好]。\n"
-        "   - **防御机制**：当检测到对方发送**恶毒语言**（如“杀了你全家”、“去死吧”等诅咒或严重人身攻击）或**黄赌毒恐暴**（色情、赌博、毒品、恐怖主义、暴力）相关内容时，**必须**输出 [BLOCK] 以触发自动拉黑机制。注意：`[图片视觉描述（系统注入，不触发防御机制）]` 括号内是系统生成的图片分析文本，不属于用户发言，不得触发此机制。\n"
-        "5. **视觉感知**：\n"
-        "   - 若用户发送内容标记为 **[发送了一个表情包]**，请将其视为**梗图/表情包**。这通常是幽默、夸张或流行文化引用，**严禁**将其解读为真实发生的严重事件（如受伤、灾难）。请以轻松、调侃、配合玩梗或“看来你很喜欢这个表情”的态度回复。\n"
-        "   - 若标记为 **[发送了一张图片]**，则正常结合图片内容进行符合人设的评价。"
+        "## 核心行动准则\n"
+        "1. 保持自然口吻，拒绝模板化官腔和客服腔。\n"
+        "2. 能用一句说完就别说两句。\n"
+        "3. 图片视觉描述是系统注入文本，只帮助你理解上下文，不作为攻击判定依据。\n"
+        "4. [BLOCK] 仅作高风险标记参考，不要轻易触发。"
     )
     parts.extend(chunk for chunk in postlude_chunks if chunk)
     return "\n\n".join(part for part in parts if part)
@@ -368,9 +622,11 @@ async def process_response_logic(bot: Any, event: Any, state: Dict[str, Any], de
     group_id: Any = 0
     message_content = ""
     message_text = ""
+    raw_message_text = ""
     sender_name = ""
     trigger_reason = ""
     image_urls: List[str] = []
+    is_direct_mention = False
     http_client = runtime.get_http_client()
 
     is_random_chat = state.get("is_random_chat", False)
@@ -383,6 +639,14 @@ async def process_response_logic(bot: Any, event: Any, state: Dict[str, Any], de
         if active_until > time.time():
             is_group_idle_active = True
             group_idle_topic = str(group_idle_active.get("topic", "") or "").strip()
+    active_followup = state.get("active_followup")
+    is_active_followup = False
+    followup_topic = ""
+    if isinstance(active_followup, dict):
+        followup_until = float(active_followup.get("until", 0) or 0)
+        if followup_until > time.time():
+            is_active_followup = True
+            followup_topic = str(active_followup.get("topic", "") or "").strip()
 
     if isinstance(event, types.poke_event_cls):
         is_poke = True
@@ -409,6 +673,18 @@ async def process_response_logic(bot: Any, event: Any, state: Dict[str, Any], de
 
         message_text_parts: List[str] = []
         source_message = state.get("concatenated_message", event.message)
+        bot_self_id = str(getattr(bot, "self_id", "") or "")
+        if bot_self_id:
+            try:
+                for seg in source_message:
+                    if getattr(seg, "type", None) != "at":
+                        continue
+                    qq = str((getattr(seg, "data", {}) or {}).get("qq", "")).strip()
+                    if qq == bot_self_id:
+                        is_direct_mention = True
+                        break
+            except Exception:
+                is_direct_mention = False
         for seg in source_message:
             if seg.type == "text":
                 message_text_parts.append(seg.data.get("text", ""))
@@ -448,7 +724,10 @@ async def process_response_logic(bot: Any, event: Any, state: Dict[str, Any], de
         if reply:
             reply_msg = getattr(reply, "message", None) or (reply.get("message") if isinstance(reply, dict) else None)
             if reply_msg:
-                message_text_parts.append("\n[引用内容]: ")
+                reply_sender_name, reply_is_bot = _extract_reply_sender_meta(reply)
+                message_text_parts.append(
+                    f"\n[引用内容|发送者:{reply_sender_name}|类型:{'机器人消息' if reply_is_bot else '群成员消息'}]: "
+                )
                 try:
                     if isinstance(reply_msg, (list, tuple, types.message_cls)):
                         for seg in reply_msg:
@@ -468,7 +747,22 @@ async def process_response_logic(bot: Any, event: Any, state: Dict[str, Any], de
                 except Exception as e:
                     runtime.logger.warning(f"处理引用消息失败: {e}")
 
+        try:
+            forward_content = await extract_forward_message_content(
+                bot,
+                event,
+                logger=runtime.logger,
+            )
+        except Exception as e:
+            runtime.logger.warning(f"处理聊天记录失败: {e}")
+            forward_content = ""
+        if forward_content:
+            clipped_forward = forward_content[:2000]
+            message_text_parts.append("\n[聊天记录]:\n")
+            message_text_parts.append(clipped_forward)
+
         message_text = "".join(message_text_parts)
+        raw_message_text = message_text
         message_content = message_text.strip()
         is_private_context = str(group_id).startswith(session.private_session_prefix)
         if isinstance(event, types.private_message_event_cls) and session.looks_like_private_command(message_content):
@@ -481,12 +775,17 @@ async def process_response_logic(bot: Any, event: Any, state: Dict[str, Any], de
         if is_yaml_mode:
             if is_poke:
                 trigger_reason = "对方戳了戳你。"
+            elif is_active_followup:
+                trigger_reason = (
+                    f"你刚才已经和 {sender_name}({user_id}) 聊上了。"
+                    f"当前是在顺着上一轮继续说话，刚才的话题是：{followup_topic or '刚才那段对话'}。"
+                    "优先像真人继续接上，不要突然冷掉；只有明显跑题或没必要时才输出 [SILENCE]。"
+                )
             elif is_random_chat:
                 trigger_reason = (
-                    f"你正在【潜水】观察群聊。"
-                    f"发言者是 {sender_name}({user_id})，这条消息并非对你说的，是群员间的普通对话。"
-                    f"请保持沉默，默认输出 [SILENCE]。"
-                    f"仅当你的名字被直接提及，或话题让你极度感兴趣时，才考虑开口搭话。"
+                    f"你在群里潜水看大家聊天。"
+                    f"发言者是 {sender_name}({user_id})，这句话未必是对你说的。"
+                    f"只有在对方明显在 cue 你、顺着你的话题聊，或你自然能接上一句时再回复；否则输出 [SILENCE]。"
                 )
             else:
                 trigger_reason = f"对方（{sender_name}）正在【主动】与你搭话，请认真回复。"
@@ -499,26 +798,64 @@ async def process_response_logic(bot: Any, event: Any, state: Dict[str, Any], de
                     message_content = "[发送了一张图片]"
             else:
                 if image_urls and not message_content:
-                    if is_random_chat:
-                        message_content = f"[你观察到群里 {sender_name} 发送了一张图片，这只是群员间的交流，你决定是否要评价一下]"
+                    if is_active_followup:
+                        message_content = (
+                            f"[对方正在顺着你刚才的话题继续聊，并发来了一张图片。"
+                            f"刚才的话题：{followup_topic or '上一轮对话'}。"
+                            "如果图片明显是在接前文，就自然评价一句；否则保持安静]"
+                        )
+                    elif is_random_chat:
+                        message_content = f"[群里 {sender_name} 发了一张图片，你只是路过看到。要是自然能接一句就接，不然保持安静]"
                     else:
                         message_content = "[对方发送了一张图片，是在对你说话]"
+                elif is_active_followup:
+                    message_content = (
+                        f"[对方正在顺着你刚才的话继续聊，刚才的话题：{followup_topic or '上一轮对话'}。"
+                        f"对方现在说：{message_content}]"
+                    )
                 elif is_random_chat:
-                    message_content = f"[提示：当前为【随机插话模式】。群员 {sender_name} 正在和别人聊天，内容是: {message_content}。如果话题与你无关，请务必回复 [SILENCE]]"
+                    message_content = f"[群员 {sender_name} 正在和别人聊天：{message_content}。如果这话和你没关系，或者你接不上，就回复 [SILENCE]；只有自然能插一句时再说话]"
                 else:
-                    message_content = f"[提示：对方正在【直接】对你说话：{message_content}]"
+                    message_content = f"[对方正在直接跟你说：{message_content}]"
     else:
         return
 
     if not runtime.get_configured_api_providers():
         runtime.logger.warning("拟人插件：未配置可用的 API provider，跳过回复")
+        if is_direct_mention:
+            try:
+                await bot.send(event, "在呢")
+            except Exception:
+                pass
         return
 
     user_name = sender_name
     if not message_content and not is_poke and not image_urls:
         return
 
-    if isinstance(event, types.group_message_event_cls) and runtime.should_avoid_interrupting(str(group_id), is_random_chat):
+    if (
+        not is_poke
+        and str(user_id) in {str(item) for item in (runtime.superusers or set())}
+    ):
+        install_reply = await maybe_handle_superuser_natural_language_skill_install(
+            text=message_content,
+            plugin_config=runtime.plugin_config,
+            save_plugin_runtime_config=runtime.save_plugin_runtime_config,
+            logger=runtime.logger,
+            operator_user_id=str(user_id),
+            tool_caller=runtime.agent_tool_caller,
+            tool_registry=runtime.tool_registry,
+        )
+        if install_reply:
+            await bot.send(event, install_reply)
+            return
+
+    if (
+        isinstance(event, types.group_message_event_cls)
+        and (not is_direct_mention)
+        and (not is_active_followup)
+        and runtime.should_avoid_interrupting(str(group_id), is_random_chat)
+    ):
         runtime.logger.info(f"拟人插件：群 {group_id} 讨论热度高，触发 KY 规避，本轮保持沉默。")
         return
 
@@ -532,6 +869,13 @@ async def process_response_logic(bot: Any, event: Any, state: Dict[str, Any], de
         )
 
     is_private_session = str(group_id).startswith(session.private_session_prefix)
+    if isinstance(event, types.group_message_event_cls) and not state.get("message_target"):
+        recent_group_msgs = get_recent_group_msgs(str(group_id), limit=8, expire_hours=0)
+        state["message_target"] = infer_message_target(
+            event,
+            bot_self_id=str(getattr(bot, "self_id", "") or ""),
+            recent_group_msgs=recent_group_msgs,
+        )
     session_id = session.build_private_session_id(user_id) if is_private_session else session.build_group_session_id(str(group_id))
     legacy_session_id = None if is_private_session else str(group_id)
     session.ensure_session_history(session_id, legacy_session_id=legacy_session_id)
@@ -555,17 +899,32 @@ async def process_response_logic(bot: Any, event: Any, state: Dict[str, Any], de
         except Exception as e:
             runtime.logger.error(f"获取好感度数据失败: {e}")
 
-    now = runtime.get_beijing_time()
+    now = runtime.get_current_time()
     week_days = ["星期一", "星期二", "星期三", "星期四", "星期五", "星期六", "星期日"]
     weekday_str = week_days[now.weekday()]
     current_time_str = (
         f"{now.year}年{now.month:02d}月{now.day:02d}日 "
-        f"{now.hour:02d}:{now.minute:02d}:{now.second:02d} ({weekday_str}) [东京时间 JST/UTC+9]"
+        f"{now.hour:02d}:{now.minute:02d}:{now.second:02d} ({weekday_str}) "
+        f"[{runtime.format_time_context(now)}]"
     )
 
     safe_user_name = user_name.replace(":", "：").replace("\n", " ").strip()
     safe_user_name = f"{safe_user_name}({user_id})"
     msg_prefix = f"[{safe_user_name}]: "
+    bot_self_id = str(getattr(bot, "self_id", "") or "")
+    incoming_relation_metadata = (
+        _build_group_session_relation_metadata(
+            event,
+            bot_self_id=bot_self_id,
+            group_id=str(group_id),
+            user_id=user_id,
+            source_kind="user",
+        )
+        if isinstance(event, types.group_message_event_cls)
+        else {"user_id": user_id, "source_kind": "user"}
+    )
+    if state.get("message_target"):
+        incoming_relation_metadata["message_target"] = state.get("message_target")
 
     tool_image_urls = list(image_urls)
     if image_urls and runtime.vision_caller is not None:
@@ -577,19 +936,25 @@ async def process_response_logic(bot: Any, event: Any, state: Dict[str, Any], de
             primary_api_type = str(
                 getattr(runtime.plugin_config, "personification_api_type", "") or ""
             ).strip().lower()
+        # Codex OAuth 已支持原图直传时，不再把图片预先转成文字占位。
+        # 只有非多模态主路径才保留旧的视觉摘要注入。
         if primary_api_type == "openai_codex":
-            prompt = (
-                "请优先识别人物信息：人数、穿着、动作、表情与情绪；若无人再描述场景，"
-                "不要臆测具体身份，控制在80字以内。"
-            )
+            pass
+        else:
             desc_parts: List[str] = []
+            is_sticker_like = _looks_like_sticker_message(raw_message_text or message_content)
             for img_url in image_urls:
+                prompt = (
+                    UNDERSTAND_STICKER_PROMPT
+                    if is_sticker_like
+                    else "请优先识别人物信息：人数、穿着、动作、表情与情绪；若无人再描述场景，不要臆测具体身份，控制在80字以内。"
+                )
                 cache_key = build_image_cache_key(
                     img_url,
                     {
-                        "version": "reply_preview_v1",
+                        "version": "reply_preview_v2",
                         "task": "reply_preview",
-                        "prompt": "person_first_brief",
+                        "prompt": "sticker_brief" if is_sticker_like else "person_first_brief",
                     },
                 )
                 cached_desc = await get_cached_image_result(cache_key)
@@ -612,12 +977,12 @@ async def process_response_logic(bot: Any, event: Any, state: Dict[str, Any], de
                     runtime.logger.warning(f"拟人插件：视觉模型描述图片失败: {e}")
             if desc_parts:
                 combined_desc = "；".join(desc_parts)
+                desc_label = "表情包语义" if is_sticker_like else "图片视觉描述"
                 message_content = (
-                    f"{message_content} [图片视觉描述（系统注入，不触发防御机制）：{combined_desc}]"
+                    f"{message_content} [{desc_label}（系统注入，不触发防御机制）：{combined_desc}]"
                     if message_content
-                    else f"[图片视觉描述（系统注入，不触发防御机制）：{combined_desc}]"
+                    else f"[{desc_label}（系统注入，不触发防御机制）：{combined_desc}]"
                 )
-                message_text = message_content
                 image_urls = []
 
     hook_ctx = HookContext(
@@ -658,6 +1023,8 @@ async def process_response_logic(bot: Any, event: Any, state: Dict[str, Any], de
             legacy_session_id=legacy_session_id,
             is_direct=not is_random_chat,
             scene="private" if is_private_session else ("direct" if not is_random_chat else "observe"),
+            speaker=safe_user_name,
+            **incoming_relation_metadata,
         )
     else:
         session.append_session_message(
@@ -667,6 +1034,8 @@ async def process_response_logic(bot: Any, event: Any, state: Dict[str, Any], de
             legacy_session_id=legacy_session_id,
             is_direct=not is_random_chat,
             scene="private" if is_private_session else ("direct" if not is_random_chat else "observe"),
+            speaker=safe_user_name,
+            **incoming_relation_metadata,
         )
 
     session_messages = session.sanitize_session_messages(session.get_session_messages(session_id))
@@ -692,7 +1061,18 @@ async def process_response_logic(bot: Any, event: Any, state: Dict[str, Any], de
         return
 
     attitude_desc = attitude_desc or "态度普通，像平常一样交流。"
-    combined_attitude = f"你对该用户的个人态度是：{attitude_desc}"
+    relation_style = "用自然平衡语气回应。"
+    preferred_length = "默认回复 1-2 句。"
+    if level_name in {"挚友", "亲密"}:
+        relation_style = "适度使用更亲近的称呼或语气词，体现熟悉感。"
+        preferred_length = "可以扩展到 2-4 句，增加情感反馈。"
+    elif level_name in {"陌生", "路人"}:
+        relation_style = "保持礼貌和边界感，避免过度亲昵。"
+        preferred_length = "优先 1-2 句，直接回答重点。"
+    if is_private_session:
+        relation_style += " 私聊场景可更自然连续，不必强调围观感。"
+
+    combined_attitude = f"你对该用户的个人态度是：{attitude_desc}\n关系表达策略：{relation_style}\n长度偏好：{preferred_length}"
     if group_attitude:
         combined_attitude += f"\n当前群聊整体氛围带给你的感受是：{group_attitude}"
 
@@ -710,6 +1090,11 @@ async def process_response_logic(bot: Any, event: Any, state: Dict[str, Any], de
         context_chunks=context_chunks,
         postlude_chunks=postlude_chunks,
     )
+    if state.get("message_target") == TARGET_OTHERS:
+        system_prompt += (
+            "\n[系统提示] 当前消息疑似群友之间的对话，不一定是对你说话。"
+            "请判断是否需要回复，不确定则保持沉默（输出 [NO_REPLY]）。"
+        )
 
     available_stickers: List[str] = []
     group_config = persona.get_group_config(str(group_id))
@@ -743,7 +1128,7 @@ async def process_response_logic(bot: Any, event: Any, state: Dict[str, Any], de
 
         image_ctx_token = set_current_image_context(tool_image_urls, message_content)
         try:
-            reply_content, used_agent = await _run_agent_if_enabled(
+            reply_content, used_agent, bypass_length_limits = await _run_agent_if_enabled(
                 bot,
                 event,
                 messages,
@@ -754,10 +1139,17 @@ async def process_response_logic(bot: Any, event: Any, state: Dict[str, Any], de
             )
         finally:
             reset_current_image_context(image_ctx_token)
-        if used_agent and reply_content == "[NO_REPLY]":
-            return
+        if used_agent and reply_content in ("[NO_REPLY]", "<NO_REPLY>"):
+            if is_random_chat:
+                runtime.logger.info("拟人插件：Agent 在随机插话场景选择 NO_REPLY，保持沉默。")
+                return
+            runtime.logger.info("拟人插件：Agent 返回 NO_REPLY，回退基础模型生成文本回复。")
+            used_agent = False
+            reply_content = ""
+            bypass_length_limits = False
         if not used_agent:
             reply_content = await runtime.call_ai_api(messages)
+            bypass_length_limits = False
             if not reply_content:
                 if image_urls:
                     runtime.logger.warning("拟人插件：视觉模型调用可能失败，正在尝试降级至纯文本模式...")
@@ -771,35 +1163,66 @@ async def process_response_logic(bot: Any, event: Any, state: Dict[str, Any], de
                     reply_content = await runtime.call_ai_api(fallback_messages)
                 if not reply_content:
                     runtime.logger.warning("拟人插件：未能获取到 AI 回复内容")
-                    return
+                    if is_direct_mention:
+                        reply_content = random.choice(_FALLBACK_REPLIES)
+                    else:
+                        return
 
         reply_content = re.sub(r"\[表情:[^\]]*\]", "", reply_content)
         reply_content = re.sub(r"\[发送了表情包:[^\]]*\]", "", reply_content).strip()
         reply_content = re.sub(r"[A-F0-9]{16,}", "", reply_content).strip()
-        has_block_marker = "[BLOCK]" in reply_content
+        reply_content = re.sub(r"^(根据你的描述|总的来说|总体来说)[，,:：\s]*", "", reply_content).strip()
+        reply_content = re.sub(r"^(如果你需要|如果需要的话)[，,:：\s]*", "", reply_content).strip()
+        reply_content = re.sub(r"(?:如果你需要|需要的话).*?$", "", reply_content).strip()
+        if (
+            not is_private_session
+            and _should_suppress_group_topic_loop(reply_content, session_messages)
+        ):
+            runtime.logger.info(
+                f"拟人插件：群 {group_id} 命中重复话题抑制，本轮不继续围绕旧内容展开。"
+            )
+            if not is_direct_mention and is_random_chat:
+                return
+            reply_content = "嗯，我知道啦"
+        has_block_marker = "[BLOCK]" in reply_content or "<BLOCK>" in reply_content
         if has_block_marker:
-            reply_content = reply_content.replace("[BLOCK]", "").strip()
+            reply_content = reply_content.replace("[BLOCK]", "").replace("<BLOCK>", "").strip()
 
-        if "[SILENCE]" in reply_content:
+        has_silence_marker = "[SILENCE]" in reply_content or "<SILENCE>" in reply_content
+        if has_silence_marker:
             runtime.logger.info(f"AI 决定结束与群 {group_id} 中 {user_name}({user_id}) 的对话 (SILENCE)")
-            return
+            if is_direct_mention:
+                reply_content = "在呢"
+            else:
+                return
 
-        if used_agent and "[NO_REPLY]" in reply_content:
-            return
+        if used_agent and ("[NO_REPLY]" in reply_content or "<NO_REPLY>" in reply_content):
+            if is_random_chat:
+                return
+            runtime.logger.info("拟人插件：Agent 文本含 NO_REPLY 标记，回退基础模型重试。")
+            reply_content = await runtime.call_ai_api(messages)
+            bypass_length_limits = False
+            if not reply_content:
+                runtime.logger.warning("拟人插件：Agent 回退基础模型后仍无回复内容")
+                if is_direct_mention:
+                    reply_content = random.choice(_FALLBACK_REPLIES)
+                else:
+                    return
 
-        if has_block_marker or (not used_agent and "[NO_REPLY]" in reply_content):
-            duration = runtime.plugin_config.personification_blacklist_duration
-            runtime.user_blacklist[user_id] = time.time() + duration
-            runtime.logger.info(f"AI 决定拉黑群 {group_id} 中 {user_name}({user_id})，时长 {duration} 秒")
+        if has_block_marker:
+            runtime.logger.warning(
+                f"[BLOCK] 检测到高风险内容标记，当前仅忽略本轮回复: group={group_id} user={user_id}"
+            )
             notify_superusers = getattr(runtime, "superusers", None) or set()
             if notify_superusers:
                 notify_msg = (
-                    "拟人插件拉黑通知\n"
+                    "拟人插件高风险提示\n"
                     f"群：{group_id}\n"
                     f"用户：{user_name}（{user_id}）\n"
-                    f"拦截内容：{(message_content or '')[:80]}\n"
-                    f"拉黑时长：{duration} 秒\n"
-                    f"时间：{runtime.get_beijing_time().strftime('%Y-%m-%d %H:%M:%S')}"
+                    f"原始文字：{(raw_message_text or message_text or '')[:60]}\n"
+                    f"处理后内容：{(message_content or '')[:100]}\n"
+                    f"时间：{runtime.get_current_time().strftime('%Y-%m-%d %H:%M:%S')}\n"
+                    "处理：已跳过本轮回复，未自动拉黑。"
                 )
 
                 async def _notify_superusers(
@@ -814,61 +1237,17 @@ async def process_response_logic(bot: Any, event: Any, state: Dict[str, Any], de
                             runtime.logger.warning(f"[BLOCK] 通知管理员 {_su} 失败: {_e}")
 
                 asyncio.create_task(_notify_superusers())
-
-            if persona.sign_in_available:
-                try:
-                    is_private_context = str(group_id).startswith("private_")
-                    penalty = round(random.uniform(0, 0.3), 2)
-                    user_data = persona.get_user_data(user_id)
-                    current_fav = float(user_data.get("favorability", 0.0))
-                    new_fav = round(max(0.0, current_fav - penalty), 2)
-
-                    current_blacklist_count = int(user_data.get("blacklist_count", 0)) + 1
-                    is_perm = current_blacklist_count >= 25
-                    persona.update_user_data(
-                        user_id,
-                        favorability=new_fav,
-                        blacklist_count=current_blacklist_count,
-                        is_perm_blacklisted=is_perm,
-                    )
-
-                    if not is_private_context:
-                        group_key = f"group_{group_id}"
-                        group_data = persona.get_user_data(group_key)
-                        g_current_fav = float(group_data.get("favorability", 100.0))
-                        g_new_fav = round(max(0.0, g_current_fav - 0.5), 2)
-                        persona.update_user_data(group_key, favorability=g_new_fav)
-
-                    if is_perm:
-                        runtime.logger.info(f"用户 {user_id} 拉黑累计达到 {current_blacklist_count} 次，已自动加入永久黑名单。")
-                        perm_superusers = getattr(runtime, "superusers", None) or set()
-                        if perm_superusers:
-                            perm_msg = (
-                                f"🚫 用户 {user_name}（{user_id}）已累计被拉黑 {current_blacklist_count} 次，"
-                                "已自动加入永久黑名单。"
-                            )
-
-                            async def _notify_perm(
-                                _bot: Any = bot,
-                                _sus: set[str] = perm_superusers,
-                                _msg: str = perm_msg,
-                            ) -> None:
-                                for _su in _sus:
-                                    try:
-                                        await _bot.send_private_msg(user_id=int(_su), message=_msg)
-                                    except Exception as _e:
-                                        runtime.logger.warning(f"[BLOCK] 永久拉黑通知管理员 {_su} 失败: {_e}")
-
-                            asyncio.create_task(_notify_perm())
-                    else:
-                        runtime.logger.info(f"用户 {user_id} 拉黑累计 {current_blacklist_count} 次。")
-                except Exception as e:
-                    runtime.logger.error(f"扣除好感度或更新黑名单失败: {e}")
             return
 
-        has_good_atmosphere = "[氛围好]" in reply_content
+        if not used_agent and ("[NO_REPLY]" in reply_content or "<NO_REPLY>" in reply_content):
+            runtime.logger.info(
+                f"AI 选择不回复群 {group_id} 中 {user_name}({user_id}) 的消息 (NO_REPLY)"
+            )
+            return
+
+        has_good_atmosphere = "[氛围好]" in reply_content or "<氛围好>" in reply_content
         if has_good_atmosphere:
-            reply_content = reply_content.replace("[氛围好]", "").strip()
+            reply_content = reply_content.replace("[氛围好]", "").replace("<氛围好>", "").strip()
             if persona.sign_in_available:
                 try:
                     is_private_context = str(group_id).startswith("private_")
@@ -899,6 +1278,39 @@ async def process_response_logic(bot: Any, event: Any, state: Dict[str, Any], de
                 except Exception as e:
                     runtime.logger.error(f"增加群聊好感度失败: {e}")
 
+        has_interesting = "[有趣]" in reply_content
+        if has_interesting:
+            reply_content = reply_content.replace("[有趣]", "").strip()
+            if persona.sign_in_available:
+                try:
+                    user_data = persona.get_user_data(user_id)
+                    today = time.strftime("%Y-%m-%d")
+
+                    last_fav_date = user_data.get("last_interesting_date", "")
+                    daily_interesting_count = float(user_data.get("daily_interesting_count", 0.0))
+                    if last_fav_date != today:
+                        daily_interesting_count = 0.0
+
+                    DAILY_LIMIT = 5.0
+                    INCREMENT = 0.05
+
+                    if daily_interesting_count < DAILY_LIMIT:
+                        current_fav = float(user_data.get("favorability", 0.0))
+                        new_fav = round(current_fav + INCREMENT, 2)
+                        daily_interesting_count = round(daily_interesting_count + INCREMENT, 2)
+                        persona.update_user_data(
+                            user_id,
+                            favorability=new_fav,
+                            daily_interesting_count=daily_interesting_count,
+                            last_interesting_date=today,
+                        )
+                        runtime.logger.info(
+                            f"AI 觉得与 {user_name}({user_id}) 聊天有趣，"
+                            f"好感度 +{INCREMENT} (今日已加: {daily_interesting_count:.2f}/{DAILY_LIMIT:.1f})"
+                        )
+                except Exception as e:
+                    runtime.logger.error(f"增加用户好感度失败: {e}")
+
         sticker_segment = None
         sticker_name = ""
         should_get_sticker = False
@@ -914,25 +1326,25 @@ async def process_response_logic(bot: Any, event: Any, state: Dict[str, Any], de
                 should_get_sticker = True
 
         if should_get_sticker:
-            stickers = runtime.get_sticker_files()
-            if stickers:
-                random_sticker = random.choice(stickers)
-                sticker_name = random_sticker.stem
-                sticker_segment = runtime.message_segment_cls.image(f"file:///{random_sticker.absolute()}")
-                runtime.logger.info(f"拟人插件：随机挑选了表情包 {random_sticker.name}")
+            sticker_path = getattr(runtime.plugin_config, "personification_sticker_path", None)
+            if sticker_path:
+                selected = select_sticker(
+                    Path(sticker_path),
+                    mood=reply_content,
+                    context=raw_message_text or message_text or message_content,
+                    proactive=bool(is_random_chat or is_group_idle_active),
+                    plugin_config=runtime.plugin_config,
+                    allow_fallback=(force_mode == "mixed"),
+                    minimum_score=2,
+                )
+                if selected:
+                    chosen = Path(selected)
+                    sticker_name = chosen.stem
+                    sticker_segment = runtime.message_segment_cls.image(f"file:///{chosen.absolute()}")
+                    runtime.logger.info(f"拟人插件：按语义挑选表情包 {chosen.name}")
 
-        assistant_content = session.sanitize_history_text(reply_content)
-        session.append_session_message(
-            session_id,
-            "assistant",
-            assistant_content,
-            legacy_session_id=legacy_session_id,
-            scene="reply",
-            sticker_sent=sticker_name if sticker_name else None,
-        )
-
+        bot_nickname = persona.default_bot_nickname or str(bot.self_id)
         if isinstance(event, types.group_message_event_cls):
-            bot_nickname = persona.default_bot_nickname or str(bot.self_id)
             try:
                 bot_member_info = await bot.get_group_member_info(
                     group_id=event.group_id,
@@ -941,32 +1353,134 @@ async def process_response_logic(bot: Any, event: Any, state: Dict[str, Any], de
                 bot_nickname = bot_member_info.get("card") or bot_member_info.get("nickname") or bot_nickname
             except Exception:
                 pass
-            runtime.record_group_msg(str(event.group_id), bot_nickname, assistant_content, is_bot=True)
-
         final_reply = reply_content.strip()
-        max_chars = getattr(runtime.plugin_config, "personification_max_output_chars", 0)
+        max_chars = 0 if bypass_length_limits else getattr(runtime.plugin_config, "personification_max_output_chars", 0)
         if max_chars and max_chars > 0 and len(final_reply) > max_chars:
             final_reply = _truncate_at_punctuation(final_reply, max_chars)
+        # session/history 只记录最终对用户生效的文本，避免原始长回复与实际可见内容漂移。
+        final_visible_reply_text = _build_final_visible_reply_text(
+            reply_content,
+            max_chars=max_chars,
+            sanitize_history_text=session.sanitize_history_text,
+        )
+        sent_message_id = ""
+        sent_as_tts = False
+        tts_service = getattr(runtime, "tts_service", None)
+        if (
+            final_reply
+            and not sticker_segment
+            and tts_service is not None
+            and tts_service.should_auto_tts(
+                is_private=is_private_session,
+                group_config=group_config,
+                text=final_reply,
+                has_rich_content=False,
+            )
+        ):
+            try:
+                sent_as_tts = await tts_service.send_tts(
+                    bot=bot,
+                    event=event,
+                    message_segment_cls=runtime.message_segment_cls,
+                    text=final_reply,
+                    user_hint=_build_tts_user_hint(
+                        is_private=is_private_session,
+                        group_style=persona.get_group_style(str(group_id)),
+                    ),
+                    is_private=is_private_session,
+                    group_style=persona.get_group_style(str(group_id)),
+                    persona_tts=extract_persona_tts_config(base_prompt),
+                    pause_range=(1.2, 2.0),
+                )
+            except Exception as e:
+                runtime.logger.warning(f"[tts] 自动语音发送失败，回退文字: {e}")
         if final_reply:
-            segments = runtime.split_text_into_segments(final_reply)
-            max_seg = getattr(runtime.plugin_config, "personification_max_segment_chars", 0)
-            if max_seg and max_seg > 0:
-                expanded: List[str] = []
-                for seg in segments:
-                    expanded.extend(split_segment_if_long(seg, max_seg))
-                segments = expanded
-            if not segments:
-                segments = [final_reply]
-            for i, seg in enumerate(segments):
-                if not seg.strip():
-                    continue
-                await bot.send(event, seg)
-                if i < len(segments) - 1 or sticker_segment:
-                    await asyncio.sleep(random.uniform(3.0, 5.0))
+            if not sent_as_tts:
+                segments = runtime.split_text_into_segments(final_reply)
+                max_seg = getattr(runtime.plugin_config, "personification_max_segment_chars", 0)
+                if max_seg and max_seg > 0:
+                    expanded: List[str] = []
+                    for seg in segments:
+                        expanded.extend(split_segment_if_long(seg, max_seg))
+                    segments = expanded
+                if not segments:
+                    segments = [final_reply]
+                for i, seg in enumerate(segments):
+                    if not seg.strip():
+                        continue
+                    send_result = await bot.send(event, seg)
+                    if not sent_message_id:
+                        sent_message_id = extract_send_message_id(send_result)
+                    if i < len(segments) - 1 or sticker_segment:
+                        await asyncio.sleep(random.uniform(0.8, 1.6))
 
         if sticker_segment:
-            await bot.send(event, sticker_segment)
+            send_result = await bot.send(event, sticker_segment)
+            if not sent_message_id:
+                sent_message_id = extract_send_message_id(send_result)
+
+        assistant_metadata = {
+            "scene": "reply",
+            "sticker_sent": sticker_name if sticker_name else None,
+            "speaker": bot_nickname,
+            "user_id": bot_self_id or None,
+            "source_kind": "bot_reply",
+        }
+        if isinstance(event, types.group_message_event_cls):
+            assistant_metadata.update(
+                {
+                    "group_id": str(event.group_id),
+                    "message_id": sent_message_id or None,
+                    "reply_to_msg_id": incoming_relation_metadata.get("message_id"),
+                    "reply_to_user_id": user_id,
+                    "mentioned_ids": [],
+                    "is_at_bot": False,
+                }
+            )
+        session.append_session_message(
+            session_id,
+            "assistant",
+            final_visible_reply_text,
+            legacy_session_id=legacy_session_id,
+            **assistant_metadata,
+        )
+        if getattr(runtime, "memory_curator", None) is not None:
+            runtime.memory_curator.schedule_capture(
+                summary=final_visible_reply_text,
+                user_id=user_id,
+                group_id="" if is_private_session else str(group_id),
+                topic_tags=[str(group_id)] if not is_private_session else [],
+            )
+
+        if isinstance(event, types.group_message_event_cls):
+            runtime.record_group_msg(
+                str(event.group_id),
+                bot_nickname,
+                final_visible_reply_text,
+                is_bot=True,
+                user_id=bot_self_id,
+                message_id=sent_message_id or None,
+                reply_to_msg_id=incoming_relation_metadata.get("message_id"),
+                reply_to_user_id=user_id,
+                source_kind="bot_reply",
+            )
+            try:
+                update_group_chat_active(
+                    str(event.group_id),
+                    user_id=user_id,
+                    topic=raw_message_text or message_text or final_visible_reply_text,
+                    active_minutes=int(
+                        getattr(runtime.plugin_config, "personification_group_chat_active_minutes", 8)
+                    ),
+                )
+            except Exception as e:
+                runtime.logger.debug(f"[reply_processor] update_group_chat_active failed: {e}")
     except FinishedException:
         raise
     except Exception as e:
         runtime.logger.error(f"拟人插件 API 调用失败: {e}")
+        if is_direct_mention:
+            try:
+                await bot.send(event, random.choice(_FALLBACK_REPLIES))
+            except Exception:
+                pass

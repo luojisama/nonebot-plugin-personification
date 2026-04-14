@@ -13,35 +13,25 @@ from .provider_router import (
     call_ai_api as call_ai_api_core,
     get_configured_api_providers as get_configured_api_providers_core,
 )
-from ..skills.datetime_tool import build_datetime_tool
-from ..skills.news import (
-    build_baike_tool,
-    build_daily_news_tool,
-    build_epic_games_tool,
-    build_exchange_rate_tool,
-    build_gold_price_tool,
-    build_history_today_tool,
-    build_joke_tool,
-    build_trending_tool,
-)
-from ..skills.sticker_tool import build_analyze_image_tool, build_select_sticker_tool
-from ..skills.tool_caller import build_tool_caller
-from ..skills.user_tasks import make_cancel_task_tool, make_create_task_tool
-from ..skills.weather import build_weather_tool
-from ..skills.web_search import build_web_search_tool
+from ..skills.skillpacks.tool_caller.scripts.impl import build_tool_caller
+from .tasks_service import make_cancel_task_tool, make_create_task_tool
+from ..skill_runtime.loader import load_builtin_skillpacks_sync
+from ..skill_runtime.runtime_api import SkillRuntime
+from .file_sender import build_file_sender
 from .runtime_config import (
+    get_runtime_config_path,
     load_plugin_runtime_config as load_plugin_runtime_config_core,
     save_plugin_runtime_config as save_plugin_runtime_config_core,
 )
 from .runtime_state import is_msg_processed as is_msg_processed_core
 from .session_store import init_session_store
+from ..utils import init_utils_config
 from .web_grounding import (
     build_grounding_context as build_grounding_context_core,
     do_web_search as do_web_search_core,
     should_avoid_interrupting as should_avoid_interrupting_core,
 )
 from .sticker_cache import get_sticker_files as get_sticker_files_core
-
 
 def build_load_prompt(
     *,
@@ -80,16 +70,30 @@ def build_msg_processed_checker(
 
 def build_grounding_context_builder(
     *,
-    web_search_enabled: bool,
+    plugin_config: Any,
     get_now: Callable[[], Any],
     logger: Any,
 ) -> Callable[[str], Awaitable[str]]:
-    async def _build_grounding_context(user_text: str) -> str:
+    from ..skills.skillpacks.wiki_search.scripts.main import resolve_wiki_runtime_config
+
+    wiki_enabled, fandom_enabled, fandom_wikis = resolve_wiki_runtime_config(plugin_config)
+
+    async def _build_grounding_context(user_text: str, context_hint: str = "") -> str:
         return await build_grounding_context_core(
             user_text,
-            web_search_enabled=web_search_enabled,
+            web_search_enabled=bool(
+                getattr(
+                    plugin_config,
+                    "personification_tool_web_search_enabled",
+                    getattr(plugin_config, "personification_web_search", False),
+                )
+            ),
+            context_hint=context_hint,
             get_now=get_now,
             logger=logger,
+            wiki_enabled=wiki_enabled,
+            wiki_fandom_enabled=fandom_enabled,
+            fandom_wikis=fandom_wikis,
         )
 
     return _build_grounding_context
@@ -117,9 +121,10 @@ def build_web_search_executor(
     get_now: Callable[[], Any],
     logger: Any,
 ) -> Callable[[str], Awaitable[str]]:
-    async def _do_web_search(query: str) -> str:
+    async def _do_web_search(query: str, context_hint: str = "") -> str:
         return await do_web_search_core(
             query,
+            context_hint=context_hint,
             get_now=get_now,
             logger=logger,
         )
@@ -154,7 +159,13 @@ def build_ai_api_caller(
             plugin_config=plugin_config,
             logger=logger,
             tools=tools,
-            use_builtin_search=False,
+            use_builtin_search=bool(
+                getattr(
+                    plugin_config,
+                    "personification_model_builtin_search_enabled",
+                    getattr(plugin_config, "personification_builtin_search", True),
+                )
+            ),
         )
         _ = max_tokens, temperature
         return response.content or None
@@ -167,11 +178,13 @@ def build_runtime_config_io(
     plugin_config: Any,
     logger: Any,
 ) -> Tuple[Callable[[], None], Callable[[], None]]:
+    runtime_path = get_runtime_config_path(plugin_config)
+
     def _save_plugin_runtime_config() -> None:
-        save_plugin_runtime_config_core(plugin_config, logger)
+        save_plugin_runtime_config_core(plugin_config, logger, path=runtime_path)
 
     def _load_plugin_runtime_config() -> None:
-        load_plugin_runtime_config_core(plugin_config, logger)
+        load_plugin_runtime_config_core(plugin_config, logger, path=runtime_path)
 
     return _save_plugin_runtime_config, _load_plugin_runtime_config
 
@@ -219,54 +232,142 @@ def build_agent_tool_registry(
     plugin_config: Any,
     logger: Any,
     get_now: Callable[[], Any],
+    tool_caller: Any = None,
     persona_store: Any = None,
     vision_caller: Any = None,
     scheduler: Any = None,
     data_dir: Any = None,
     get_bots: Callable[[], dict[str, Any]] | None = None,
+    knowledge_store: Any = None,
+    memory_store: Any = None,
+    profile_service: Any = None,
+    memory_curator: Any = None,
+    background_intelligence: Any = None,
 ) -> ToolRegistry:
     registry = ToolRegistry()
     skills_root_raw = getattr(plugin_config, "personification_skills_path", None)
     skills_root = Path(skills_root_raw) if skills_root_raw else None
+    use_skillpacks = bool(getattr(plugin_config, "personification_use_skillpacks", False))
 
-    registry.register(
-        build_web_search_tool(
-            skills_root=skills_root,
-            get_now=get_now,
+    if use_skillpacks:
+        file_sender = build_file_sender(get_bots=get_bots or (lambda: {}), logger=logger)
+        runtime = SkillRuntime(
+            plugin_config=plugin_config,
             logger=logger,
+            get_now=get_now,
+            scheduler=scheduler,
+            data_dir=data_dir,
+            persona_store=persona_store,
+            vision_caller=vision_caller,
+            file_sender=file_sender,
+            get_bots=get_bots,
+            tool_caller=tool_caller,
+            knowledge_store=knowledge_store,
+            memory_store=memory_store,
+            profile_service=profile_service,
+            memory_curator=memory_curator,
+            background_intelligence=background_intelligence,
         )
-    )
-    registry.register(build_weather_tool(skills_root, logger))
-    registry.register(
-        build_datetime_tool(
-            timezone_name=getattr(plugin_config, "personification_timezone", "Asia/Shanghai"),
-        )
-    )
+        try:
+            load_builtin_skillpacks_sync(runtime=runtime, registry=registry)
+        except Exception as e:
+            logger.warning(f"[skillpack] sync load failed: {e}")
 
-    sticker_path = getattr(plugin_config, "personification_sticker_path", None)
-    if sticker_path:
+    if not use_skillpacks:
+        from ..skills.skillpacks.web_search.scripts.impl import build_web_search_tool
+        from ..skills.skillpacks.weather.scripts.impl import build_weather_tool
+        from ..skills.skillpacks.datetime_tool.scripts.impl import build_datetime_tool
+        from ..skills.skillpacks.plugin_knowledge.scripts.impl import build_plugin_knowledge_tools
+        from ..skills.skillpacks.wiki_search.scripts.main import build_tools as build_wiki_tools
+        from ..skills.skillpacks.resource_collector.scripts.main import (
+            build_tools as build_resource_tools,
+        )
+        from ..skills.skillpacks.vision_analyze.scripts.main import build_tools as build_vision_tools
+        from ..skills.skillpacks.acg_resolver.scripts.main import build_tools as build_acg_tools
+        from ..skills.skillpacks.memory_palace.scripts.main import build_tools as build_memory_tools
+
+        legacy_runtime = SkillRuntime(
+            plugin_config=plugin_config,
+            logger=logger,
+            get_now=get_now,
+            scheduler=scheduler,
+            data_dir=data_dir,
+            persona_store=persona_store,
+            vision_caller=vision_caller,
+            tool_caller=tool_caller,
+            get_bots=get_bots,
+            knowledge_store=knowledge_store,
+            memory_store=memory_store,
+            profile_service=profile_service,
+            memory_curator=memory_curator,
+            background_intelligence=background_intelligence,
+        )
+
         registry.register(
-            build_select_sticker_tool(
-                Path(sticker_path),
-                plugin_config,
+            build_web_search_tool(
                 skills_root=skills_root,
+                get_now=get_now,
+                logger=logger,
+                plugin_config=plugin_config,
             )
         )
-    async def _image_web_search(query: str) -> str:
-        return await do_web_search_core(
-            query,
-            get_now=get_now,
-            logger=logger,
+        registry.register(build_weather_tool(skills_root, logger))
+        registry.register(
+            build_datetime_tool(
+                timezone_name=getattr(plugin_config, "personification_timezone", "Asia/Shanghai"),
+            )
+        )
+        for tool in build_plugin_knowledge_tools(legacy_runtime):
+            registry.register(tool)
+        for tool in build_wiki_tools(legacy_runtime):
+            registry.register(tool)
+        for tool in build_resource_tools(legacy_runtime):
+            registry.register(tool)
+        for tool in build_vision_tools(legacy_runtime):
+            registry.register(tool)
+        for tool in build_acg_tools(legacy_runtime):
+            registry.register(tool)
+        for tool in build_memory_tools(legacy_runtime):
+            registry.register(tool)
+
+    if not use_skillpacks:
+        from ..skills.skillpacks.sticker_tool.scripts.impl import (
+            build_analyze_image_tool,
+            build_select_sticker_tool,
         )
 
-    registry.register(
-        build_analyze_image_tool(
-            vision_caller,
-            _image_web_search,
+        sticker_path = getattr(plugin_config, "personification_sticker_path", None)
+        if sticker_path:
+            registry.register(
+                build_select_sticker_tool(
+                    Path(sticker_path),
+                    plugin_config,
+                    skills_root=skills_root,
+                )
+            )
+        async def _image_web_search(query: str) -> str:
+            return await do_web_search_core(
+                query,
+                get_now=get_now,
+                logger=logger,
+            )
+
+        registry.register(
+            build_analyze_image_tool(
+                vision_caller,
+                _image_web_search,
+            )
         )
-    )
     if persona_store is not None:
-        registry.register(_build_get_persona_tool(persona_store))
+        registry.register(
+            _build_get_persona_tool(
+                persona_store,
+                max_chars=max(
+                    0,
+                    int(getattr(plugin_config, "personification_persona_prompt_max_chars", 120) or 120),
+                ),
+            )
+        )
 
     # user_tasks 工具
     if scheduler is not None and data_dir is not None:
@@ -326,7 +427,18 @@ def build_agent_tool_registry(
         ))
 
     # 60s API 工具
-    if getattr(plugin_config, "personification_60s_enabled", True):
+    if (not use_skillpacks) and getattr(plugin_config, "personification_60s_enabled", True):
+        from ..skills.skillpacks.news.scripts.impl import (
+            build_baike_tool,
+            build_daily_news_tool,
+            build_epic_games_tool,
+            build_exchange_rate_tool,
+            build_gold_price_tool,
+            build_history_today_tool,
+            build_joke_tool,
+            build_trending_tool,
+        )
+
         _60s_base = str(
             getattr(plugin_config, "personification_60s_api_base", "https://60s.viki.moe") or ""
         ).strip().rstrip("/") or "https://60s.viki.moe"
@@ -344,9 +456,9 @@ def build_agent_tool_registry(
     return registry
 
 
-def _build_get_persona_tool(persona_store: Any) -> AgentTool:
+def _build_get_persona_tool(persona_store: Any, max_chars: int = 120) -> AgentTool:
     async def _handler(user_id: str) -> str:
-        text = persona_store.get_persona_text(str(user_id))
+        text = persona_store.get_persona_snippet(str(user_id), max_chars=max_chars)
         if not text:
             return f"用户 {user_id} 暂无画像数据。"
         return text
@@ -354,7 +466,7 @@ def _build_get_persona_tool(persona_store: Any) -> AgentTool:
     return AgentTool(
         name="get_user_persona",
         description=(
-            "查询指定用户的画像分析，包括职业推测、年龄推测、性别推测和人物描述。"
+            "查询指定用户的特征摘要。"
             "当你想了解某人的特征、判断话题是否适合对方时调用。"
             "user_id 是对方的 QQ 号。"
         ),
@@ -523,9 +635,15 @@ def build_agent_runtime_deps(
     scheduler: Any = None,
     data_dir: Any = None,
     get_bots: Callable[[], dict[str, Any]] | None = None,
+    knowledge_store: Any = None,
+    memory_store: Any = None,
+    profile_service: Any = None,
+    memory_curator: Any = None,
+    background_intelligence: Any = None,
 ) -> tuple[Any, Any, Any]:
     compress_tool_caller = _build_compress_tool_caller(plugin_config)
     init_session_store(plugin_config, compress_tool_caller)
+    init_utils_config(plugin_config)
 
     if not getattr(plugin_config, "personification_agent_enabled", True):
         return None, None, None
@@ -535,11 +653,17 @@ def build_agent_runtime_deps(
         plugin_config=plugin_config,
         logger=logger,
         get_now=get_now,
+        tool_caller=tool_caller,
         persona_store=persona_store,
         vision_caller=vision_caller,
         scheduler=scheduler,
         data_dir=data_dir,
         get_bots=get_bots,
+        knowledge_store=knowledge_store,
+        memory_store=memory_store,
+        profile_service=profile_service,
+        memory_curator=memory_curator,
+        background_intelligence=background_intelligence,
     )
     inner_state_updater = build_inner_state_updater(
         plugin_config=plugin_config,

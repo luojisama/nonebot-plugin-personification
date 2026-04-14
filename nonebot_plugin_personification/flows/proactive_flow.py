@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any, Awaitable, Callable, Dict, Iterable, Optional
 
 from ..agent.inner_state import DEFAULT_STATE, load_inner_state
-from ..skills.datetime_tool import get_current_datetime_info
+from ..skills.skillpacks.datetime_tool.scripts.impl import get_current_datetime_info
 from ..utils import get_group_topic_summary
 
 
@@ -54,6 +54,8 @@ SKIP|{{原因（给自己的备注，如"现在没什么想说的"）}}
 - 不要发"你好""在吗""最近怎么样"这类没有内容的开场白
 - 可以分享刚刚看到的有意思的事、某个想法、问一个具体的问题
 - 如果候选人的画像摘要提到了对方的兴趣、职业或最近话题，优先以此为切入点
+- 禁止使用的开场句式："最近怎么样"、"在吗"、"你好"、"有没有..."、"大家..."
+- 禁止任何以"哇"或"哎呀"开头的句子
 """
 
 GROUP_IDLE_TOPIC_PROMPT = """[角色设定]
@@ -74,6 +76,7 @@ GROUP_IDLE_TOPIC_PROMPT = """[角色设定]
 近期群聊话题：{context_hint}
 当前时段氛围：{time_flavor}
 
+{superuser_context}
 [任务]
 群里已经冷场了一段时间。作为群成员，主动说一句话来打破沉默。
 
@@ -83,6 +86,8 @@ GROUP_IDLE_TOPIC_PROMPT = """[角色设定]
 - 可以是反问、感慨、没头没尾的吐槽，不必是完整句子
 - 约三分之一概率带一点自我状态，如"刚睡醒""在摸鱼""有点饿"
 - 语气随意，像群里比较熟的人突然有句话想说
+- 禁止使用的开场句式："最近怎么样"、"在吗"、"你好"、"有没有..."、"大家..."
+- 禁止任何以"哇"或"哎呀"开头的句子
 
 [反例禁止这种风格]
  大家有没有什么有趣的事情想分享呀？
@@ -219,7 +224,61 @@ def _build_candidates(
     return candidates[:10]
 
 
-async def _get_friend_capable_bot(bots: Dict[str, Any], logger: Any) -> tuple[Any | None, set[str]]:
+def _build_fallback_candidates(
+    *,
+    friend_profiles: Dict[str, Dict[str, Any]],
+    proactive_state: Dict[str, Dict[str, Any]],
+    inner_state: dict,
+    now: datetime,
+    idle_hours: float,
+    persona_store: Any = None,
+    persona_snippet_max_chars: int = 80,
+) -> list[dict]:
+    candidates: list[dict] = []
+    now_ts = now.timestamp()
+    idle_seconds = max(0.0, float(idle_hours)) * 3600
+
+    for user_id, profile in friend_profiles.items():
+        user_state = _normalize_user_state(now, proactive_state.get(str(user_id), {}))
+        last_interaction = float(user_state.get("last_interaction", 0) or 0)
+        if not last_interaction:
+            continue
+        if idle_seconds and now_ts - last_interaction < idle_seconds:
+            continue
+
+        nickname = str(profile.get("nickname", "") or user_id)
+        persona_snippet = ""
+        if persona_store is not None:
+            persona_snippet = persona_store.get_persona_snippet(
+                str(user_id),
+                max_chars=max(1, int(persona_snippet_max_chars)),
+            )
+        candidates.append(
+            {
+                "user_id": str(user_id),
+                "nickname": nickname,
+                "favorability": float(profile.get("favorability", 65.0) or 65.0),
+                "last_chat": _format_last_chat(last_interaction),
+                "warmth": _find_relation_warmth(inner_state, nickname, str(user_id)),
+                "persona_snippet": persona_snippet,
+                "last_interaction_ts": last_interaction,
+            }
+        )
+
+    candidates.sort(
+        key=lambda item: (
+            bool(item.get("persona_snippet")),
+            float(item.get("last_interaction_ts", 0) or 0),
+        ),
+        reverse=True,
+    )
+    return candidates[:10]
+
+
+async def _get_friend_capable_bot(
+    bots: Dict[str, Any],
+    logger: Any,
+) -> tuple[Any | None, Dict[str, Dict[str, Any]]]:
     for bot in bots.values():
         try:
             friends = await bot.get_friend_list()
@@ -227,14 +286,22 @@ async def _get_friend_capable_bot(bots: Dict[str, Any], logger: Any) -> tuple[An
             logger.warning(f"[proactive] get_friend_list failed: {e}")
             continue
 
-        friend_ids: set[str] = set()
+        friend_profiles: Dict[str, Dict[str, Any]] = {}
         if isinstance(friends, list):
             for item in friends:
                 if isinstance(item, dict) and item.get("user_id") is not None:
-                    friend_ids.add(str(item.get("user_id")))
-        return bot, friend_ids
+                    user_id = str(item.get("user_id"))
+                    friend_profiles[user_id] = {
+                        "nickname": str(
+                            item.get("remark")
+                            or item.get("nickname")
+                            or item.get("user_remark")
+                            or user_id
+                        ),
+                    }
+        return bot, friend_profiles
 
-    return None, set()
+    return None, {}
 
 
 def _format_candidates(candidates: Iterable[dict]) -> str:
@@ -244,8 +311,9 @@ def _format_candidates(candidates: Iterable[dict]) -> str:
             f"- {item['user_id']} | {item['nickname']} / 好感度{item['favorability']:.2f} "
             f"/ 上次聊天：{item['last_chat']} / 关系温度：{item['warmth']}"
         )
-        if item.get("persona_snippet"):
-            line += f"\n  画像摘要：{item['persona_snippet']}"
+        persona_snippet = str(item.get("persona_snippet", "") or "").strip()
+        if persona_snippet:
+            line += f" / 画像：{persona_snippet}"
         lines.append(line)
     return "\n".join(lines) if lines else "- 无可联系对象"
 
@@ -367,7 +435,7 @@ async def run_proactive_messaging(
     *,
     plugin_config: Any,
     sign_in_available: bool,
-    is_rest_time: Callable[[], bool],
+    is_rest_time: Callable[..., bool],
     get_bots: Callable[[], Dict[str, Any]],
     load_data: Callable[[], Dict[str, Dict[str, Any]]],
     load_proactive_state: Callable[[], Dict[str, Dict[str, Any]]],
@@ -388,17 +456,33 @@ async def run_proactive_messaging(
 
     if not getattr(plugin_config, "personification_proactive_enabled", True):
         return False
-    if not sign_in_available:
+    if not sign_in_available and not bool(
+        getattr(plugin_config, "personification_proactive_without_signin", True)
+    ):
         return False
-    if not is_rest_time():
+    allow_unsuitable_prob = float(
+        max(
+            0.0,
+            min(
+                1.0,
+                getattr(plugin_config, "personification_proactive_unsuitable_prob", 0.18),
+            ),
+        )
+    )
+    try:
+        rest_ok = bool(is_rest_time(allow_unsuitable_prob=allow_unsuitable_prob))
+    except TypeError:
+        rest_ok = bool(is_rest_time())
+    if not rest_ok:
         return False
 
     bots = get_bots() or {}
     if not bots:
         return False
-    bot, friend_ids = await _get_friend_capable_bot(bots, logger)
-    if bot is None or not friend_ids:
+    bot, friend_profiles = await _get_friend_capable_bot(bots, logger)
+    if bot is None or not friend_profiles:
         return False
+    friend_ids = set(friend_profiles)
 
     now = get_now()
     proactive_state = load_proactive_state() or {}
@@ -431,20 +515,33 @@ async def run_proactive_messaging(
         except Exception as e:
             logger.warning(f"[proactive] load inner_state failed: {e}")
 
-    all_user_data = load_data() or {}
-    candidates = _build_candidates(
-        all_user_data=all_user_data,
-        proactive_state=proactive_state,
-        inner_state=inner_state,
-        now=now,
-        threshold=float(getattr(plugin_config, "personification_proactive_threshold", 60.0)),
-        idle_hours=float(getattr(plugin_config, "personification_proactive_idle_hours", 24.0)),
-        friend_ids=friend_ids,
-        persona_store=persona_store,
-        persona_snippet_max_chars=int(
-            getattr(plugin_config, "personification_persona_snippet_max_chars", 150)
-        ),
+    persona_snippet_max_chars = int(
+        getattr(plugin_config, "personification_persona_snippet_max_chars", 150)
     )
+    idle_hours = float(getattr(plugin_config, "personification_proactive_idle_hours", 24.0))
+    if sign_in_available:
+        all_user_data = load_data() or {}
+        candidates = _build_candidates(
+            all_user_data=all_user_data,
+            proactive_state=proactive_state,
+            inner_state=inner_state,
+            now=now,
+            threshold=float(getattr(plugin_config, "personification_proactive_threshold", 60.0)),
+            idle_hours=idle_hours,
+            friend_ids=friend_ids,
+            persona_store=persona_store,
+            persona_snippet_max_chars=persona_snippet_max_chars,
+        )
+    else:
+        candidates = _build_fallback_candidates(
+            friend_profiles=friend_profiles,
+            proactive_state=proactive_state,
+            inner_state=inner_state,
+            now=now,
+            idle_hours=idle_hours,
+            persona_store=persona_store,
+            persona_snippet_max_chars=persona_snippet_max_chars,
+        )
     if not candidates:
         save_proactive_state(proactive_state)
         return False
@@ -493,6 +590,13 @@ async def run_proactive_messaging(
         save_proactive_state(proactive_state)
         return False
 
+    proactive_probability = float(
+        max(0.0, min(1.0, getattr(plugin_config, "personification_proactive_probability", 0.15)))
+    )
+    if random.random() > proactive_probability:
+        save_proactive_state(proactive_state)
+        return False
+
     await bot.send_private_msg(user_id=int(target_user_id), message=payload)
 
     user_state = _normalize_user_state(now, proactive_state.get(target_user_id, {}))
@@ -518,6 +622,9 @@ async def run_group_idle_topic(
     record_group_msg: Callable[[str, str, str, bool], int],
     logger: Any,
     agent_data_dir: Optional[Path] = None,
+    superusers: Optional[set[str]] = None,
+    get_user_data: Optional[Callable[[str], Any]] = None,
+    build_grounding_context: Optional[Callable[[str, str], Awaitable[str]]] = None,
 ) -> int:
     """
     扫描所有白名单群，对空闲群主动发起话题。
@@ -572,7 +679,13 @@ async def run_group_idle_topic(
     sent_count = 0
 
     async with _GROUP_IDLE_LOCK:
-        global_cooldown_seconds = float(idle_minutes) * 60.0 * 0.8
+        check_interval_minutes = max(
+            1,
+            int(
+                getattr(plugin_config, "personification_group_idle_check_interval", 15)
+            ),
+        )
+        global_cooldown_seconds = float(check_interval_minutes) * 60.0
         if (
             _last_group_idle_sent_at
             and now_ts - _last_group_idle_sent_at < global_cooldown_seconds
@@ -617,6 +730,12 @@ async def run_group_idle_topic(
             context_hint = topic_summary or recent_keywords
 
             time_flavor = _get_group_idle_time_flavor(now.hour)
+            grounding_hint = ""
+            if build_grounding_context is not None and context_hint and context_hint != "无":
+                try:
+                    grounding_hint = await build_grounding_context(context_hint, context_hint)
+                except Exception as e:
+                    logger.debug(f"[group_idle] build_grounding_context failed for group {group_id}: {e}")
 
             group_name = group_id
             try:
@@ -624,6 +743,10 @@ async def run_group_idle_topic(
                 group_name = info.get("group_name", group_id)
             except Exception:
                 pass
+
+            superuser_context = ""
+            if grounding_hint:
+                superuser_context = f"[联网话题参考]\n{grounding_hint}\n\n"
 
             datetime_info = get_current_datetime_info(timezone_name, now)
             user_prompt = GROUP_IDLE_TOPIC_PROMPT.format(
@@ -637,6 +760,7 @@ async def run_group_idle_topic(
                 idle_minutes=elapsed_minutes,
                 context_hint=context_hint,
                 time_flavor=time_flavor,
+                superuser_context=superuser_context,
             )
 
             try:
@@ -655,18 +779,37 @@ async def run_group_idle_topic(
                 logger.info(f"[group_idle] 群 {group_id} AI 返回空内容，跳过")
                 continue
 
+            proactive_probability = float(
+                max(0.0, min(1.0, getattr(plugin_config, "personification_proactive_probability", 0.15)))
+            )
+            if random.random() > proactive_probability:
+                continue
+
             try:
                 await bot.send_group_msg(group_id=int(group_id), message=topic)
                 sent_now = get_now()
                 sent_now_ts = sent_now.timestamp()
                 sent_today = sent_now.strftime("%Y-%m-%d")
-                record_group_msg(group_id, bot_nickname, topic, is_bot=True)
                 proactive_state[f"group_idle_active_{group_id}"] = {
                     "until": sent_now_ts + 12 * 60,
                     "topic": topic,
                 }
                 _increment_group_idle_count(group_id, proactive_state, sent_today, sent_now_ts)
                 _last_group_idle_sent_at = sent_now_ts
+                real_bot_nickname = bot_nickname
+                try:
+                    member_info = await bot.get_group_member_info(
+                        group_id=int(group_id),
+                        user_id=int(bot.self_id),
+                    )
+                    real_bot_nickname = str(
+                        member_info.get("card")
+                        or member_info.get("nickname")
+                        or bot_nickname
+                    ).strip() or bot_nickname
+                except Exception:
+                    pass
+                record_group_msg(group_id, real_bot_nickname, topic, is_bot=True)
                 sent_count += 1
                 logger.info(
                     f"[group_idle] 已向群 {group_name}({group_id}) 发送话题：{topic[:30]}"
@@ -742,6 +885,9 @@ def build_group_idle_checker(
     record_group_msg: Callable[[str, str, str, bool], int],
     logger: Any,
     agent_data_dir: Optional[Path] = None,
+    superusers: Optional[set[str]] = None,
+    get_user_data: Optional[Callable[[str], Any]] = None,
+    build_grounding_context: Optional[Callable[[str, str], Awaitable[str]]] = None,
 ) -> Callable[[], Awaitable[int]]:
     async def _check_group_idle_topic() -> int:
         return await run_group_idle_topic(
@@ -758,6 +904,9 @@ def build_group_idle_checker(
             record_group_msg=record_group_msg,
             logger=logger,
             agent_data_dir=agent_data_dir,
+            superusers=superusers,
+            get_user_data=get_user_data,
+            build_grounding_context=build_grounding_context,
         )
 
     return _check_group_idle_topic

@@ -1,0 +1,12 @@
+name: friend_request_tool
+enabled: true
+category: action
+entrypoint: scripts/main.py
+description: 好友申请门控与发送工具
+parameters:
+  type: object
+  properties:
+    user_id:
+      type: string
+      description: 目标用户ID
+  required: []

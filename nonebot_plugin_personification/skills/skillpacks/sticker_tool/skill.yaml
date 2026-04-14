@@ -1,0 +1,13 @@
+name: sticker_tool
+enabled: true
+category: action
+entrypoint: scripts/main.py
+description: 表情包选择与图片分析工具
+parameters:
+  type: object
+  properties:
+    action:
+      type: string
+      description: select/context
+  required:
+    - action

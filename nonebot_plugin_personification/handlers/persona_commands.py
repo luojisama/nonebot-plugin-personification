@@ -13,11 +13,12 @@ def setup_persona_matchers(
     *,
     persona_store: Any,
     whitelist_rule: Any,
+    superusers: set[str] | None,
     logger: Any,
 ) -> dict[str, Any]:
     view_cmd = on_command("查看画像", rule=whitelist_rule, priority=5, block=True)
     refresh_cmd = on_command("刷新画像", rule=whitelist_rule, priority=5, block=True)
-    msg_recorder = on_message(priority=99, block=False)
+    msg_recorder = on_message(rule=whitelist_rule, priority=99, block=False)
 
     driver_config = get_driver().config
 
@@ -34,6 +35,8 @@ def setup_persona_matchers(
     @view_cmd.handle()
     async def _view(bot: Bot, event: MessageEvent, args: Message = CommandArg()) -> None:
         target_id = _extract_target_id(event, args)
+        if not _can_access_target_persona(str(event.user_id), target_id, superusers):
+            await view_cmd.finish("只能查看自己的画像。")
         entry = persona_store.get_persona(target_id)
         if not entry:
             count = persona_store.get_history_count(target_id)
@@ -54,6 +57,8 @@ def setup_persona_matchers(
     @refresh_cmd.handle()
     async def _refresh(bot: Bot, event: MessageEvent, args: Message = CommandArg()) -> None:
         target_id = _extract_target_id(event, args)
+        if not _can_access_target_persona(str(event.user_id), target_id, superusers):
+            await refresh_cmd.finish("只能刷新自己的画像。")
         history_count = persona_store.get_history_count(target_id)
         if history_count == 0:
             await refresh_cmd.finish("当前没有任何聊天记录，无法刷新画像。")
@@ -87,6 +92,18 @@ def _extract_target_id(event: MessageEvent, args: Message) -> str:
     if arg_text.isdigit():
         return arg_text
     return str(event.user_id)
+
+
+def _can_access_target_persona(
+    operator_user_id: str,
+    target_user_id: str,
+    superusers: set[str] | None,
+) -> bool:
+    if operator_user_id == target_user_id:
+        return True
+    if not superusers:
+        return False
+    return operator_user_id in {str(item) for item in superusers}
 
 
 def _strip_markdown(text: str) -> str:

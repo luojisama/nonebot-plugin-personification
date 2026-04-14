@@ -7,6 +7,7 @@ def handle_record_message_event(
     resolve_record_message: Callable[..., Any],
     get_custom_title: Optional[Callable[[str], Optional[str]]] = None,
     record_group_msg: Callable[..., Any],
+    should_trigger_auto_analyze: Optional[Callable[[str, int], bool]] = None,
     logger: Any,
     create_background_task: Callable[[str], None],
     create_summary_task: Optional[Callable[[str], None]] = None,
@@ -16,6 +17,7 @@ def handle_record_message_event(
         event,
         get_custom_title=custom_title_getter,
         record_group_msg=record_group_msg,
+        should_trigger_auto_analyze=should_trigger_auto_analyze,
     )
     if group_id and create_summary_task is not None:
         create_summary_task(group_id)

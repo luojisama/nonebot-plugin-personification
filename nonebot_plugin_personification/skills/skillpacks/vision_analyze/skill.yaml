@@ -1,0 +1,18 @@
+name: vision_analyze
+enabled: true
+category: multimodal
+entrypoint: scripts/main.py
+description: 分析当前图片并输出场景、OCR、角色/作品候选与歧义提示
+parameters:
+  type: object
+  properties:
+    query:
+      type: string
+      description: 用户问题或分析目标
+    images:
+      type: array
+      items:
+        type: string
+      description: 图片 data URL、可访问 URL 或本地文件路径列表
+  required:
+    - query

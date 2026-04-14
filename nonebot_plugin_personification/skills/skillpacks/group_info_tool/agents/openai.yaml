@@ -1,0 +1,3 @@
+display_name: group_info_tool
+description: 兼容封装 group_info_tool.py 的能力入口
+icon: package

@@ -1,0 +1,18 @@
+name: vision_caller
+enabled: true
+category: action
+entrypoint: scripts/main.py
+description: 视觉调用器构建与单次图片描述
+parameters:
+  type: object
+  properties:
+    action:
+      type: string
+      description: build 或 describe
+    prompt:
+      type: string
+      description: describe 模式提示词
+    image_url:
+      type: string
+      description: describe 模式图片地址
+  required: []

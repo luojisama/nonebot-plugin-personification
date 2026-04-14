@@ -1,4 +1,8 @@
+import random
+import time
 from typing import Any, Callable, Dict, Iterable
+
+from ..core.data_store import get_data_store
 
 
 async def run_daily_group_fav_report(
@@ -119,3 +123,71 @@ async def run_auto_post_diary(
 
     logger.error(f"拟人插件：每周说说发布失败：{msg}")
     return False
+
+
+async def run_proactive_qzone_post(
+    *,
+    qzone_publish_available: bool,
+    qzone_proactive_enabled: bool,
+    qzone_probability: float,
+    qzone_daily_limit: int,
+    qzone_min_interval_hours: float,
+    get_bots: Callable[[], Dict[str, Any]],
+    get_now: Callable[[], Any],
+    update_qzone_cookie: Callable[..., Any],
+    maybe_generate_qzone_post: Callable[[Any], Any],
+    publish_qzone_shuo: Callable[..., Any],
+    logger: Any,
+) -> bool:
+    """按内心状态和近期聊天判断，是否主动发一条更日常的空间动态。"""
+    if not qzone_publish_available or not qzone_proactive_enabled:
+        return False
+    if random.random() > max(0.0, min(1.0, float(qzone_probability))):
+        return False
+
+    bots = get_bots()
+    if not bots:
+        return False
+    bot = list(bots.values())[0]
+    now = get_now()
+    today = now.strftime("%Y-%m-%d")
+    now_ts = time.time()
+
+    store = get_data_store()
+    state = store.load_sync("qzone_post_state")
+    if not isinstance(state, dict):
+        state = {}
+    if state.get("date") != today:
+        state = {"date": today, "count": 0, "last_post_at": float(state.get("last_post_at", 0) or 0)}
+
+    if int(state.get("count", 0) or 0) >= max(1, int(qzone_daily_limit)):
+        return False
+    min_interval_seconds = max(0.0, float(qzone_min_interval_hours)) * 3600
+    last_post_at = float(state.get("last_post_at", 0) or 0)
+    if min_interval_seconds and last_post_at and now_ts - last_post_at < min_interval_seconds:
+        return False
+
+    try:
+        cookie_ok, cookie_msg = await update_qzone_cookie(bot)
+    except Exception as e:
+        logger.warning(f"拟人插件：主动说说刷新 Cookie 失败（{e}），尝试使用旧 Cookie。")
+    else:
+        if not cookie_ok:
+            logger.warning(f"拟人插件：主动说说刷新 Cookie 失败（{cookie_msg}），尝试使用旧 Cookie。")
+
+    content = await maybe_generate_qzone_post(bot)
+    if not content:
+        return False
+
+    success, msg = await publish_qzone_shuo(content, bot.self_id)
+    if not success:
+        logger.error(f"拟人插件：主动说说发布失败：{msg}")
+        return False
+
+    state["date"] = today
+    state["count"] = int(state.get("count", 0) or 0) + 1
+    state["last_post_at"] = now_ts
+    state["last_content"] = content[:200]
+    store.save_sync("qzone_post_state", state)
+    logger.info("拟人插件：已根据当前状态主动发布一条空间说说。")
+    return True

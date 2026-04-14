@@ -1,0 +1,5 @@
+name: resource_collector
+enabled: true
+category: search
+entrypoint: scripts/main.py
+description: 先由 LLM 理解资源需求并生成搜索计划，再从互联网搜集资源并整理结果

@@ -1,0 +1,15 @@
+name: time_companion
+enabled: true
+category: companion
+entrypoint: scripts/main.py
+description: 时间陪伴与轻量节律建议
+parameters:
+  type: object
+  properties:
+    timezone:
+      type: string
+      description: 时区，默认 Asia/Shanghai
+    mood:
+      type: string
+      description: gentle/energetic/calm
+  required: []

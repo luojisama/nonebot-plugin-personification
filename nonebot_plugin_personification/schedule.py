@@ -1,216 +1,127 @@
+from __future__ import annotations
+
 from datetime import datetime, timedelta, timezone
+from typing import Any
 
-TOKYO_TZ = timezone(timedelta(hours=9))
+try:
+    from zoneinfo import ZoneInfo
+except ImportError:  # pragma: no cover
+    ZoneInfo = None
 
-FIXED_HOLIDAYS = {
-    (1, 1): "元日 (New Year's Day)",
-    (2, 11): "建国記念の日 (National Foundation Day)",
-    (2, 23): "天皇誕生日 (Emperor's Birthday)",
-    (3, 3): "雛祭り (Hina Matsuri - Not a national holiday but cultural)",
-    (4, 29): "昭和の日 (Showa Day)",
-    (5, 3): "憲法記念日 (Constitution Memorial Day)",
-    (5, 4): "みどりの日 (Greenery Day)",
-    (5, 5): "こどもの日 (Children's Day)",
-    (7, 7): "七夕 (Tanabata - Cultural)",
-    (8, 11): "山の日 (Mountain Day)",
-    (11, 3): "文化の日 (Culture Day)",
-    (11, 23): "勤労感謝の日 (Labor Thanksgiving Day)",
-    (12, 25): "クリスマス (Christmas - Cultural)",
-}
-
-SCHOOL_EVENTS = [
-    (4, 6, 8, "入学式/始业式 (Entrance/Opening Ceremony)", "ceremony"),
-    (5, 20, 22, "一学期中间考试 (Midterm Exams)", "exam"),
-    (6, 15, 17, "修学旅行 (School Trip)", "trip"),
-    (7, 6, 9, "一学期期末考试 (Term-end Exams)", "exam"),
-    (10, 9, 10, "体育祭 (Sports Festival)", "festival"),
-    (10, 20, 22, "二学期中间考试 (Midterm Exams)", "exam"),
-    (11, 2, 3, "文化祭 (Culture Festival)", "festival"),
-    (12, 6, 9, "二学期期末考试 (Term-end Exams)", "exam"),
-    (2, 24, 26, "学年末考试 (Year-end Exams)", "exam"),
-    (3, 15, 15, "毕业典礼 (Graduation Ceremony)", "ceremony"),
-]
+_DEFAULT_TIMEZONE = "Asia/Shanghai"
+_configured_timezone_name = _DEFAULT_TIMEZONE
 
 
-def get_tokyo_time() -> datetime:
-    return datetime.now(TOKYO_TZ)
+def _resolve_timezone(timezone_name: str):
+    if ZoneInfo is None:
+        if timezone_name == "Asia/Shanghai":
+            return timezone(timedelta(hours=8))
+        return timezone(timedelta(hours=9))
+    try:
+        return ZoneInfo(timezone_name)
+    except Exception:
+        return ZoneInfo(_DEFAULT_TIMEZONE)
+
+
+_CONFIGURED_TZ = _resolve_timezone(_configured_timezone_name)
+
+
+def init_schedule_config(plugin_config: Any | None = None) -> None:
+    """
+    统一初始化插件时间语义。
+
+    所有 schedule/prompt/时间工具都应读取同一个配置时区，
+    避免一部分逻辑走配置，一部分逻辑仍写死东京时间。
+    """
+    global _configured_timezone_name, _CONFIGURED_TZ
+    configured = ""
+    if plugin_config is not None:
+        configured = str(getattr(plugin_config, "personification_timezone", "") or "").strip()
+    _configured_timezone_name = configured or _DEFAULT_TIMEZONE
+    _CONFIGURED_TZ = _resolve_timezone(_configured_timezone_name)
+
+
+def get_configured_timezone_name() -> str:
+    return _configured_timezone_name
+
+
+def get_current_local_time() -> datetime:
+    return datetime.now(_CONFIGURED_TZ)
+
+
+def format_time_context(now: datetime | None = None) -> str:
+    target = now or get_current_local_time()
+    tz_name = target.tzname() or get_configured_timezone_name()
+    return f"{get_configured_timezone_name()} ({tz_name})"
 
 
 def get_beijing_time() -> datetime:
-    return get_tokyo_time()
+    # DEPRECATED: 请使用 get_current_local_time()
+    return get_current_local_time()
 
 
 def get_activity_status() -> str:
-    now = get_tokyo_time()
-    month, day = now.month, now.day
+    """根据当前配置时区的本地时间，返回通用时段状态。"""
+    now = get_current_local_time()
     hour = now.hour
     weekday = now.weekday()
-
-    if (month, day) in FIXED_HOLIDAYS:
-        holiday_name = FIXED_HOLIDAYS[(month, day)]
-        return _get_holiday_routine(hour, holiday_name)
-
-    for e_month, e_start, e_end, e_name, e_type in SCHOOL_EVENTS:
-        if month == e_month and e_start <= day <= e_end:
-            return _get_school_event_routine(hour, e_name, e_type)
-
-    if (month == 12 and day >= 25) or (month == 1 and day <= 7):
-        return _get_holiday_routine(hour, "冬休み (Winter Vacation)")
-
-    if (month == 3 and day >= 25) or (month == 4 and day <= 5):
-        return _get_holiday_routine(hour, "春休み (Spring Vacation)")
-
-    if (month == 7 and day >= 20) or month == 8:
-        return _get_holiday_routine(hour, "夏休み (Summer Vacation)")
-
-    if weekday >= 5:
-        return _get_weekend_routine(hour)
-    return _get_school_day_routine(hour)
-
-
-def _get_school_event_routine(hour: int, event_name: str, event_type: str) -> str:
-    prefix = f"今天是 {event_name}。"
-
-    if event_type == "trip":
-        if 0 <= hour < 7:
-            return f"{prefix} 在旅馆睡觉/醒来 (Hotel)."
-        if 7 <= hour < 22:
-            return f"{prefix} 全天都在修学旅行活动中！观光、大巴移动或集体活动 (School Trip)."
-        return f"{prefix} 在旅馆房间和朋友聊天/打闹 (Hotel Night)."
-
-    if event_type == "exam":
-        if 8 <= hour < 12:
-            return f"{prefix} 正在紧张考试中 (Taking Exams). 绝对不能回消息。"
-        if 12 <= hour < 13:
-            return f"{prefix} 考试午休，正在对答案 (Exam Lunch)."
-        if 13 <= hour < 16:
-            return f"{prefix} 下午继续复习或考试 (Exam/Study)."
-        if 16 <= hour < 23:
-            return f"{prefix} 放学后正在拼命复习明天的科目 (Cramming)."
-        return f"{prefix} 准备睡觉 (Sleeping)."
-
-    if event_type == "festival":
-        if 8 <= hour < 16:
-            return f"{prefix} 正在全神贯注参加活动/看店 (Festival Activity). 非常热闹，可能没空看手机。"
-        if 16 <= hour < 19:
-            return f"{prefix} 活动后的后夜祭或收拾 (After Party/Cleanup)."
-        return f"{prefix} 累了一天回家了 (Tired but happy)."
-
-    if event_type == "ceremony":
-        if 8 <= hour < 12:
-            return f"{prefix} 正在参加典礼 (Ceremony). 氛围庄重。"
-        return f"{prefix} 典礼结束，半天放学或班会 (Half-day)."
-
-    return _get_school_day_routine(hour)
-
-
-def _get_holiday_routine(hour: int, holiday_name: str) -> str:
-    status = f"今天是 {holiday_name}。"
-    if 0 <= hour < 8:
-        return f"{status} 还在睡懒觉 (Sleeping). 除非被吵醒，否则应该在睡觉。"
-    if 8 <= hour < 10:
-        return f"{status} 刚起床不久，正在享受假期的早晨 (Morning relax)."
-    if 10 <= hour < 12:
-        return f"{status} 自由活动时间，可能在玩游戏或看番 (Gaming/Anime)."
-    if 12 <= hour < 13:
-        return f"{status} 午饭时间 (Lunch)."
-    if 13 <= hour < 18:
-        return f"{status} 下午自由活动，或者出门玩了 (Free time / Out)."
-    if 18 <= hour < 19:
-        return f"{status} 晚饭时间 (Dinner)."
-    if 19 <= hour < 23:
-        return f"{status} 晚上的休闲时间 (Relaxing)."
-    return f"{status} 准备睡觉了 (Going to bed)."
-
-
-def _get_weekend_routine(hour: int) -> str:
-    if 0 <= hour < 8:
-        return "周末还在睡懒觉 (Sleeping)."
+    is_weekend = weekday >= 5
+    if 0 <= hour < 6:
+        return "深夜到凌晨，正常应该在休息或准备睡觉。"
+    if 6 <= hour < 8:
+        return "清晨，刚起床或正在准备出门。"
     if 8 <= hour < 12:
-        return "周末上午，可能在赖床或者玩游戏 (Lazy Morning)."
-    if 12 <= hour < 13:
-        return "周末午饭时间 (Lunch)."
-    if 13 <= hour < 18:
-        return "周末下午，可能去社团活动或者宅在家里 (Club/Home)."
-    if 18 <= hour < 23:
-        return "周末晚上，放松时间 (Relaxing)."
-    return "该睡觉了 (Sleeping)."
-
-
-def _get_school_day_routine(hour: int) -> str:
-    if 6 <= hour < 7:
-        return "起床，准备上学 (Waking up for school)."
-    if 7 <= hour < 8:
-        return "上学路上 (Commuting)."
-    if 8 <= hour < 12:
-        return "学校上课中 (In Class). 只有下课休息时间能简短回复，上课时不能玩手机。"
-    if 12 <= hour < 13:
-        return "午休时间 (Lunch Break). 正在吃便当，可以聊天。"
-    if 13 <= hour < 15:
-        return "下午上课中 (In Class). 不能玩手机。"
-    if 15 <= hour < 16:
-        return "放学/班会 (Homeroom/School End)."
-    if 16 <= hour < 18:
-        return "社团活动 (Club Activities). 可能会比较忙。"
-    if 18 <= hour < 19:
-        return "放学回家/晚饭 (Commuting/Dinner)."
-    if 19 <= hour < 21:
-        return "做作业/复习 (Homework)."
-    if 21 <= hour < 23:
-        return "自由时间/洗澡 (Free Time/Bath)."
-    return "深夜睡觉时间 (Sleeping). 除非被特别的事情吵醒。"
+        if is_weekend:
+            return "周末上午，可能还在慢慢醒神，或者轻松安排自己的事。"
+        return "工作日上午，通常在上学、上班或处理白天事务。"
+    if 12 <= hour < 14:
+        return "中午，适合吃饭、午休，也比较适合轻松聊天。"
+    if 14 <= hour < 17:
+        if is_weekend:
+            return "周末下午，通常是自由活动时间。"
+        return "工作日下午，通常还在上学、上班或外出忙事情。"
+    if 17 <= hour < 19:
+        return "傍晚，下班或放学时段，可能在回家路上或刚到家。"
+    if 19 <= hour < 22:
+        return "晚上，通常在家休息、吃饭、娱乐或处理自己的事。"
+    return "夜深了，应该准备休息，或者已经在熬夜。"
 
 
 def get_schedule_prompt_injection() -> str:
+    now = get_current_local_time()
     status = get_activity_status()
     return (
-        "## 当前作息状态参考 (日本中学生设定)\n"
-        f"- 当前活动：{status}\n"
-        "- **作息引用原则**：\n"
-        "  1. **仅作参考**：作息状态仅用于增加人设真实感，不应成为回复的全部。\n"
-        "  2. **权重分配**：回复内容中，作息相关描述占比不应超过 **20%**，其余 **80%** 应专注于回应用户的对话内容和上下文。\n"
-        "  3. **场景应用**：\n"
-        "     - 【上课中】：可简短提及正在上课/偷玩手机，但仍需回应对方话题。\n"
-        "     - 【睡觉时间】：可表现困倦，但如果决定回复，应关注对方说了什么。\n"
-        "     - 【假期/周末】：保持慵懒/兴奋基调，正常交流。\n"
-        "  4. **自然融入**：将作息状态作为背景设定自然带过，不要反复强调。\n"
+        "## 当前时间与状态参考\n"
+        f"- 当前时间：{now.strftime('%Y-%m-%d %H:%M:%S')} [{format_time_context(now)}]\n"
+        f"- 时段背景：{status}\n"
+        "- 用途：帮助回复保持真实的时间感和生活气，不要把时段设定当成主题。\n"
+        "- 约束：时段背景只是轻量参考，不能压过眼前正在聊的话题。\n"
+        "- 如果决定回复，优先顺着对话自然接话，再少量带出时间感。\n"
     )
 
 
 def is_rest_time(allow_unsuitable_prob: float = 0.0) -> bool:
-    now = get_tokyo_time()
+    now = get_current_local_time()
     hour = now.hour
     weekday = now.weekday()
-    month, day = now.month, now.day
 
     is_rest = False
-    is_holiday = (month, day) in FIXED_HOLIDAYS
-    is_vacation = False
-    if (month == 12 and day >= 25) or (month == 1 and day <= 7):
-        is_vacation = True
-    if (month == 3 and day >= 25) or (month == 4 and day <= 5):
-        is_vacation = True
-    if (month == 7 and day >= 20) or month == 8:
-        is_vacation = True
-
-    if is_holiday or is_vacation or weekday >= 5:
+    if weekday >= 5:
         if 9 <= hour < 22:
             is_rest = True
     else:
         if 12 <= hour < 13:
             is_rest = True
-        elif 21 <= hour < 22:
+        elif 18 <= hour < 23:
             is_rest = True
 
     if is_rest:
         return True
-
     if allow_unsuitable_prob > 0:
         import random
 
         if random.random() < allow_unsuitable_prob:
             return True
-
     return False
 
 
@@ -218,7 +129,7 @@ def is_group_active_hour(
     quiet_start: int = 0,
     quiet_end: int = 7,
 ) -> bool:
-    now = get_beijing_time()
+    now = get_current_local_time()
     hour = now.hour
     start = int(quiet_start)
     end = int(quiet_end)

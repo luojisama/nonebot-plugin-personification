@@ -1,0 +1,16 @@
+name: memory_palace
+enabled: true
+category: memory
+entrypoint: scripts/main.py
+description: 从双记忆系统中召回近期情节、人物印象、群聊上下文和长期主题
+parameters:
+  type: object
+  properties:
+    query:
+      type: string
+      description: 当前问题或回忆目标
+    scope:
+      type: string
+      description: auto/recent_episode/person/group/topic/self/future
+  required:
+    - query

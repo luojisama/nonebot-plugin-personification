@@ -23,7 +23,9 @@ def build_personification_rule(
     load_proactive_state: Callable[[], Dict[str, Dict[str, Any]]],
     is_rest_time: Callable[..., bool],
     probability: float,
+    group_chat_follow_probability: float,
     looks_like_private_command: Callable[[str], bool],
+    get_recent_group_msgs: Callable[[str, int], list[dict]] | None = None,
 ) -> Callable[[Event, T_State], Awaitable[bool]]:
     async def _rule(event: Event, state: T_State) -> bool:
         return await personification_rule_core(
@@ -41,7 +43,9 @@ def build_personification_rule(
             load_proactive_state=load_proactive_state,
             is_rest_time=is_rest_time,
             probability=probability,
+            group_chat_follow_probability=group_chat_follow_probability,
             looks_like_private_command=looks_like_private_command,
+            get_recent_group_msgs=get_recent_group_msgs,
         )
 
     return _rule

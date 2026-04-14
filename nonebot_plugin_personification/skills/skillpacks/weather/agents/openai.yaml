@@ -1,0 +1,3 @@
+display_name: weather
+description: 兼容封装 weather.py 的能力入口
+icon: package

@@ -84,3 +84,43 @@ def register_group_idle_topic_job(
         )
     except Exception as e:
         logger.error(f"拟人插件：注册群聊空闲发话任务失败: {e}")
+
+
+def register_proactive_qzone_job(
+    *,
+    scheduler: Any,
+    proactive_qzone_job: Any,
+    interval_minutes: int,
+    logger: Any,
+) -> None:
+    safe_interval = max(30, int(interval_minutes))
+    try:
+        scheduler.add_job(
+            proactive_qzone_job,
+            "interval",
+            minutes=safe_interval,
+            id="personification_proactive_qzone",
+            replace_existing=True,
+        )
+        logger.info(f"拟人插件：主动空间动态任务已注册，检测间隔 {safe_interval} 分钟")
+    except Exception as e:
+        logger.error(f"拟人插件：注册主动空间动态任务失败: {e}")
+
+
+def register_background_intelligence_job(
+    *,
+    scheduler: Any,
+    maintenance_job: Any,
+    logger: Any,
+) -> None:
+    try:
+        scheduler.add_job(
+            maintenance_job,
+            "interval",
+            minutes=15,
+            id="personification_background_intelligence",
+            replace_existing=True,
+        )
+        logger.info("拟人插件：后台智能维护任务已注册，间隔 15 分钟")
+    except Exception as e:
+        logger.error(f"拟人插件：注册后台智能维护任务失败: {e}")

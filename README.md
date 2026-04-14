@@ -1,15 +1,14 @@
 # nonebot-plugin-shiro-personification
 
-基于 NoneBot2 和 OneBot V11 的拟人化聊天插件，围绕群聊与私聊上下文构建人设回复，支持 Agent 工具调用、风格学习、主动消息、贴图语义与运行时开关。
+基于 NoneBot2 和 OneBot V11 的拟人化聊天插件，围绕群聊与私聊上下文构建人设回复，支持作息模拟、联网检索、风格学习、主动私聊、贴图、画像、长期记忆与 Agent 工具调用。
 
 ## 特性
 
-- 群聊回复、插话、戳一戳响应、私聊上下文记忆
-- Agent 化工具调用：联网搜索、天气、时间、新闻、群信息、贴图分析、定时任务
-- 群聊风格学习、话题摘要、上下文压缩
-- 主动私聊、群空闲主动发话、周记/说说生成
-- 用户画像、自定义 skills、贴图库自动标注与语义选图
-- 白名单、永久黑名单、群配置、运行时开关
+- 群聊回复、随机插话、戳一戳响应、私聊上下文记忆
+- Agent 工具调用：联网搜索、天气、时间、新闻、群信息、好友申请、定时任务
+- 用户画像、长期记忆、记忆宫殿、群聊风格学习、话题摘要与上下文压缩
+- 主动私聊、群空闲主动发话、Qzone 说说、远程 skill 审批与插件知识库
+- 贴图库自动标注、语义选图、视觉分析与 TTS 语音回复
 
 ## 安装
 
@@ -23,85 +22,62 @@ nb plugin install nonebot-plugin-shiro-personification
 pip install nonebot-plugin-shiro-personification
 ```
 
-可选好感度联动：
-
-```bash
-pip install "nonebot-plugin-shiro-personification[signin]"
-```
-
 ## 环境要求
 
 - Python `>=3.10`
 - NoneBot2
 - OneBot V11 适配器
 
-## 主要配置
+## 配置
 
-以下是最常用的配置项，完整字段见 [config.py](./nonebot_plugin_personification/config.py)。
+- 完整配置表见 [CONFIG.md](./CONFIG.md)，其中包含每一个配置项的示例写法、默认值与备注。
+- 插件数据目录固定使用 `nonebot-plugin-localstore` 的 `get_plugin_data_dir()` 结果，不再提供自定义数据目录配置。
 
-| 配置项 | 类型 | 默认值 | 说明 |
-| --- | --- | --- | --- |
-| `personification_api_type` | `str` | `openai` | 主模型类型，支持 `openai`、`gemini`、`anthropic`、`openai_codex` |
-| `personification_api_url` | `str` | `https://api.openai.com/v1` | 主模型接口地址 |
-| `personification_api_key` | `str` | `""` | 主模型密钥 |
-| `personification_model` | `str` | `gpt-4o-mini` | 主模型名称 |
-| `personification_api_pools` | `str/list` | `None` | 多 provider 池配置 |
-| `personification_system_prompt` | `str` | 内置默认值 | 基础人设提示词 |
-| `personification_prompt_path` | `str` | `None` | 人设文件路径，支持文本/YAML |
-| `personification_whitelist` | `list[str]` | `[]` | 启用群白名单 |
-| `personification_probability` | `float` | `0.5` | 群聊随机回复概率 |
-| `personification_history_len` | `int` | `200` | 上下文长度 |
-| `personification_sticker_path` | `str` | `data/stickers` | 贴图库路径 |
-| `personification_labeler_enabled` | `bool` | `True` | 是否自动标注新贴图 |
-| `personification_skills_path` | `str` | `None` | 自定义 skills 根目录 |
-| `personification_web_search` | `bool` | `True` | 保留的联网总开关 |
-| `personification_proactive_enabled` | `bool` | `True` | 主动私聊开关 |
-| `personification_group_idle_minutes` | `int` | `60` | 群空闲多久后允许主动发话 |
-| `personification_persona_enabled` | `bool` | `True` | 用户画像开关 |
-| `personification_data_dir` | `str` | `""` | 自定义数据目录 |
+## 常用命令
 
-## 命令概览
-
-常用命令：
-
-- `申请白名单`
-- `群好感` / `群好感度`
+- `拟人帮助`
 - `查看配置`
-- `拟人开` / `拟人关`
-- `贴图开` / `贴图关`
-- `联网开关 [开/关]`
-- `主动私聊开关 [开/关]`
+- `拟人开关 [开启/关闭]`
+- `拟人语音 [开启/关闭]`
+- `拟人联网 [开启/关闭]`
+- `拟人主动消息 [开启/关闭]`
+- `开启拟人` / `关闭拟人`
+- `开启表情包` / `关闭表情包`
 - `拟人作息 [开启/关闭/全局开启/全局关闭]`
 - `学习群聊风格`
-- `查看群聊风格`
-- `清除上下文 [全局/@用户/用户ID]`
+- `查看群聊风格 [群号]`
+- `查看画像` / `刷新画像`
+- `群好感` / `设置群好感 [群号] [数值]`
+- `清除记忆 [全局/@用户/用户ID]`
+- `完全清除记忆`
 - `永久拉黑 [用户ID/@用户]`
 - `取消永久拉黑 [用户ID/@用户]`
-- `查看永久黑名单`
-- `手动发说说`
+- `发个说说`
+- `/persona help`
 
-不同部署里还会根据可用能力启用用户画像、好友申请、贴图/工具调用相关命令。
+## 联动与兼容
 
-## 说明
-
-- `nonebot-plugin-shiro-signin` 为可选联动依赖，未安装时好感度相关能力会自动降级。
-- `nonebot-plugin-htmlrender` 已作为默认依赖声明；若运行环境缺失或导入失败，相关渲染能力会自动降级。
-- 数据默认存放在 `nonebot-plugin-localstore` 对应目录；未可用时会回退到 `data/personification`。
+- `nonebot-plugin-htmlrender` 作为默认依赖声明；不可用时相关渲染能力会自动降级，不影响主插件加载。
+- `nonebot-plugin-shiro-signin` 暂未发布，因此当前不会作为安装文档中的可选 extra 提供。
+- 未安装签到联动插件时，好感度、称号、黑名单等联动能力会自动降级，不影响主插件加载。
+- 依赖其他插件时统一使用 `require(...)` 声明，避免因普通 `import` 提前导入导致插件加载失败。
 
 ## 更新
+
+### 0.5.0
+
+- 完整迁移本地 `personification` 功能到发布包，补齐长期记忆、记忆宫殿、TTS、远程 skill 审批、插件知识库等能力。
+- 修复插件商店加载问题，避免 `nonebot_plugin_htmlrender` 因提前导入导致后续 `require()` 失败。
+- 统一改为使用 `nonebot-plugin-localstore` 的 `get_plugin_data_dir()` 管理插件数据目录。
+- 放宽 `pydantic` 依赖限制，并修正配置模型以兼容 `pydantic v1/v2`。
+- 增补完整配置文档，覆盖全部配置项、示例写法、默认值与备注。
+- 文档中明确说明签到联动插件暂未发布，相关能力仅保留兼容降级逻辑。
 
 ### 0.4.0
 
 - 完整迁移本地 `personification` 开发版架构到在线版包。
 - 新增 Agent 工具调用、用户画像、自定义 skills、群摘要与上下文压缩。
 - 新增群空闲主动发话、好友申请判定、贴图库自动标注与语义选图。
-- 补齐 Anthropic、watchdog、filelock 等新版依赖。
-- 更新项目元数据、README 与发布配置，使其与当前源码一致。
-
-### 0.3.1
-
-- 性能优化与稳定性提升。
-- 修复了一些已知问题。
 
 ## License
 

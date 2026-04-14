@@ -1,0 +1,12 @@
+name: user_tasks
+enabled: true
+category: stateful
+entrypoint: scripts/main.py
+description: 用户定时任务管理
+parameters:
+  type: object
+  properties:
+    operation:
+      type: string
+      description: create/cancel
+  required: []

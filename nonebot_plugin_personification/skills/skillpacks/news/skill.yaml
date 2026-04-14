@@ -1,0 +1,18 @@
+name: news
+enabled: true
+category: query
+entrypoint: scripts/main.py
+description: 新闻聚合与热搜资讯工具集
+parameters:
+  type: object
+  properties:
+    topic:
+      type: string
+      description: daily/trending/joke/history/epic/gold/baike/exchange
+    platform:
+      type: string
+      description: trending 模式的平台
+    keyword:
+      type: string
+      description: baike 模式关键词
+  required: []

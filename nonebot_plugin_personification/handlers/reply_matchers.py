@@ -27,6 +27,7 @@ def register_reply_matchers(
     message_cls: Any,
     message_segment_cls: Any,
     logger: Any,
+    finished_exception_cls: Any = None,
 ) -> Dict[str, Any]:
     reply_matcher = on_message(rule=Rule(personification_rule), priority=100, block=True)
     poke_notice_matcher = on_notice(rule=Rule(poke_notice_rule), priority=10, block=False)
@@ -41,6 +42,7 @@ def register_reply_matchers(
             message_cls=message_cls,
             message_segment_cls=message_segment_cls,
             logger=logger,
+            finished_exception_cls=finished_exception_cls,
         )
 
     @reply_matcher.handle()

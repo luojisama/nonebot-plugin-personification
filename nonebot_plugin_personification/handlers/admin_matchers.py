@@ -5,6 +5,8 @@ from nonebot import on_command
 from nonebot.adapters.onebot.v11 import Bot, GroupMessageEvent, Message, MessageEvent
 from nonebot.params import CommandArg
 
+from ..core.remote_skill_review import get_remote_skill_review_stats
+
 
 def register_admin_matchers(
     *,
@@ -32,6 +34,7 @@ def register_admin_matchers(
     handle_group_feature_switch_command: Any,
     set_group_enabled: Any,
     set_group_sticker_enabled: Any,
+    set_group_tts_enabled: Any,
     handle_schedule_switch_command: Any,
     plugin_config: Any,
     save_plugin_runtime_config: Any,
@@ -143,6 +146,8 @@ def register_admin_matchers(
 
     enable_stickers = _register_command("开启表情包", permission=superuser_permission, priority=5, block=True)
     disable_stickers = _register_command("关闭表情包", permission=superuser_permission, priority=5, block=True)
+    enable_tts = _register_command("开启语音回复", permission=superuser_permission, priority=5, block=True)
+    disable_tts = _register_command("关闭语音回复", permission=superuser_permission, priority=5, block=True)
 
     @enable_stickers.handle()
     async def _handle_enable_stickers(_bot: Bot, event: GroupMessageEvent):
@@ -162,6 +167,26 @@ def register_admin_matchers(
             setter=set_group_sticker_enabled,
             enabled=False,
             feature_name="表情包",
+        )
+
+    @enable_tts.handle()
+    async def _handle_enable_tts(_bot: Bot, event: GroupMessageEvent):
+        await handle_group_feature_switch_command(
+            enable_tts,
+            group_id=str(event.group_id),
+            setter=set_group_tts_enabled,
+            enabled=True,
+            feature_name="语音回复",
+        )
+
+    @disable_tts.handle()
+    async def _handle_disable_tts(_bot: Bot, event: GroupMessageEvent):
+        await handle_group_feature_switch_command(
+            disable_tts,
+            group_id=str(event.group_id),
+            setter=set_group_tts_enabled,
+            enabled=False,
+            feature_name="语音回复",
         )
 
     enable_schedule = _register_command("拟人作息", permission=superuser_permission, priority=5, block=True)
@@ -193,6 +218,7 @@ def register_admin_matchers(
             build_view_config_nodes=build_view_config_nodes,
             plugin_config=plugin_config,
             session_history_limit=session_history_limit,
+            get_remote_skill_review_stats=get_remote_skill_review_stats,
             logger=logger,
         )
 
@@ -206,6 +232,8 @@ def register_admin_matchers(
         "disable_personification": disable_personification,
         "enable_stickers": enable_stickers,
         "disable_stickers": disable_stickers,
+        "enable_tts": enable_tts,
+        "disable_tts": disable_tts,
         "enable_schedule": enable_schedule,
         "view_config": view_config,
     }

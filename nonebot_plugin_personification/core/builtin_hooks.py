@@ -3,9 +3,13 @@ from __future__ import annotations
 import time
 from typing import Any, Dict, List, Optional
 
-from ..skills.friend_request_tool import check_friend_request_gate
-from ..utils import get_group_topic_summary
+from ..skills.skillpacks.friend_request_tool.scripts.impl import check_friend_request_gate
+from ..utils import build_group_context_window, get_group_topic_summary
+from .context_policy import sanitize_history_text
+from .group_context import render_group_context_structured
+from .message_relations import extract_event_message_id, extract_reply_message_id
 from .prompt_hooks import HookContext, register_prompt_hook
+from .web_grounding import infer_grounding_intent
 
 
 _FRIEND_IDS_CACHE: Dict[str, tuple[float, set[str]]] = {}
@@ -38,6 +42,64 @@ def _count_user_interactions(messages: List[Dict[str, Any]], user_id: str) -> in
     return count
 
 
+def _normalized_topic_key(text: Any) -> str:
+    normalized = sanitize_history_text(text).lower()
+    normalized = "".join(ch for ch in normalized if ch.isalnum() or "\u4e00" <= ch <= "\u9fff")
+    return normalized[:80]
+
+
+def _is_meta_source_question(text: str) -> bool:
+    plain = sanitize_history_text(text)
+    if not plain:
+        return False
+    keywords = (
+        "什么意思",
+        "何意味",
+        "啥意思",
+        "什么情况",
+        "怎么回事",
+        "谁发的",
+        "谁触发的",
+        "为什么",
+        "怎么成机器人了",
+        "怎么变机器人了",
+        "怎么突然",
+        "哪来的",
+    )
+    return any(keyword in plain for keyword in keywords)
+
+
+def _format_recent_group_context(
+    group_id: str,
+    *,
+    limit: int = 6,
+    trigger_msg_id: str = "",
+    reply_to_msg_id: str = "",
+) -> str:
+    recent = build_group_context_window(
+        group_id,
+        limit=limit,
+        include_message_ids=[reply_to_msg_id],
+    )
+    if not recent:
+        return ""
+    return render_group_context_structured(recent, trigger_msg_id=trigger_msg_id)
+
+
+def _looks_like_domain_sensitive_chat(text: str) -> bool:
+    lowered = (text or "").strip().lower()
+    if not lowered:
+        return False
+    if infer_grounding_intent(lowered) == "game_anime":
+        return True
+    extra_keywords = (
+        "热搜", "热点", "热梗", "版本", "更新", "联动", "活动", "卡池",
+        "新番", "漫画", "动画", "番剧", "剧情", "角色", "配队", "强度",
+        "攻略", "boss", "副本", "电竞", "比赛", "赛程",
+    )
+    return any(keyword in lowered for keyword in extra_keywords)
+
+
 async def _get_cached_friend_ids(bot: Any, logger: Any, ttl_seconds: int = 300) -> set[str]:
     cache_key = str(getattr(bot, "self_id", "") or "default")
     now_ts = time.time()
@@ -65,34 +127,36 @@ async def _schedule_hook(ctx: HookContext) -> Optional[str]:
         group_config.get("schedule_enabled", False)
         or getattr(ctx.plugin_config, "personification_schedule_global", False)
     )
-    if schedule_active:
+    if not schedule_active:
         return (
-            "## 当前绝对时空（强制遵循）\n"
+            "## 当前时间信息\n"
             f"- 当前时间：{ctx.current_time_str}\n"
-            f"{ctx.runtime.get_schedule_prompt_injection()}"
+            "仅用于保持时间语义自然，比如早晚问候、作息口吻，不强制限制是否回复。"
         )
 
-    override = ctx.runtime.schedule_disabled_override_prompt()
-    parts = []
-    if override:
-        parts.append(override)
-    parts.append(
-        "## 当前时间信息（非作息约束）\n"
-        f"- 当前时间：{ctx.current_time_str}"
+    return (
+        "## 当前时间与状态参考\n"
+        f"- 当前时间：{ctx.current_time_str}\n"
+        f"{ctx.runtime.get_schedule_prompt_injection()}"
     )
-    return "\n\n".join(parts)
 
 
 async def _user_persona_hook(ctx: HookContext) -> Optional[str]:
     persona_store = getattr(ctx.runtime, "persona_store", None)
     if not persona_store:
         return None
-    user_persona = persona_store.get_persona_text(ctx.user_id)
+    max_chars = max(
+        0,
+        int(getattr(ctx.plugin_config, "personification_persona_prompt_max_chars", 120) or 120),
+    )
+    if max_chars <= 0:
+        return None
+    user_persona = persona_store.get_persona_snippet(ctx.user_id, max_chars=max_chars)
     if not user_persona:
         return None
     return (
-        "## 对方的用户画像（由分析插件提供）\n"
-        "以下是对该用户的专业分析，请你根据这些特征（如职业、性格、兴趣）来调整你的语气和话题侧重点：\n"
+        "## 互动印象参考\n"
+        "仅用于判断亲疏、话题偏好和语气轻重，不得当作确定事实，也不要主动复述成档案式描述：\n"
         f"{user_persona}"
     )
 
@@ -119,15 +183,65 @@ async def _group_style_hook(ctx: HookContext) -> Optional[str]:
     return "\n\n".join(parts) if parts else None
 
 
-async def _web_search_hook(ctx: HookContext) -> Optional[str]:
-    if not getattr(ctx.plugin_config, "personification_web_search", False):
+async def _recent_group_context_hook(ctx: HookContext) -> Optional[str]:
+    if ctx.is_private:
         return None
-    return "你现在拥有联网搜索能力，可以获取最新的实时信息、新闻和知识来回答用户。"
+    message_text = sanitize_history_text(ctx.message_text or ctx.message_content or "")
+    is_meta_question = _is_meta_source_question(message_text)
+
+    recent_block = _format_recent_group_context(
+        ctx.group_id,
+        limit=8 if is_meta_question else 6,
+        trigger_msg_id=extract_event_message_id(ctx.event),
+        reply_to_msg_id=extract_reply_message_id(ctx.event),
+    )
+    if not recent_block:
+        return None
+
+    block = (
+        "## 最近群聊原始上下文\n"
+        f"{recent_block}\n"
+        "理解规则：\n"
+        "- 优先根据回复关系、@提及和“当前消息”标记判断谁在和谁说话。\n"
+        "- 先分清最近几句里哪些是群成员自然发言，哪些是机器人播报、插件输出或系统口吻消息。\n"
+        "- 如果上一条明显是机器人播报，不要自动脑补成某个群成员本人在认真表达观点。"
+    )
+    if is_meta_question:
+        block += (
+            "\n- 当用户只说“什么意思 / 何意味 / 什么情况 / 为什么 / 谁发的 / 怎么成机器人了”这类短句时，"
+            "优先判断他是在问上一条消息的来源、触发原因、说话对象或上下文，不一定是在问正文内容本身。"
+        )
+    return block
+
+
+async def _web_search_hook(ctx: HookContext) -> Optional[str]:
+    if not bool(
+        getattr(
+            ctx.plugin_config,
+            "personification_tool_web_search_enabled",
+            getattr(ctx.plugin_config, "personification_web_search", False),
+        )
+    ):
+        return None
+    if ctx.is_random_chat:
+        return None
+    return (
+        "当对方明确在问实时信息、新闻、版本变动、近期事件、真假求证，或明确在找资料、壁纸、原画、设定图、官网、下载页、图片合集、教程、资源链接时，可以考虑调用联网或资源工具；"
+        "如果用户这句话很短、主语省略，但当前群里最近的话题很明确，可以把“最新一句 + 群里近期话题”一起理解后再查。"
+        "闲聊时不要主动表现出查资料的感觉。"
+    )
 
 
 async def _grounding_hook(ctx: HookContext) -> Optional[str]:
+    message_text = (ctx.message_text or ctx.message_content or "").strip()
+    if ctx.is_random_chat and len(message_text) < 18:
+        return None
+    topic_hint = ""
+    if not ctx.is_private:
+        topic_hint = get_group_topic_summary(ctx.group_id)
     grounding_context = await ctx.runtime.build_grounding_context(
-        ctx.message_text or ctx.message_content
+        message_text,
+        topic_hint,
     )
     if not grounding_context:
         return None
@@ -138,11 +252,60 @@ async def _grounding_hook(ctx: HookContext) -> Optional[str]:
     )
 
 
+async def _domain_focus_hook(ctx: HookContext) -> Optional[str]:
+    message_text = (ctx.message_text or ctx.message_content or "").strip()
+    if not _looks_like_domain_sensitive_chat(message_text):
+        return None
+    return (
+        "## 话题理解约束\n"
+        "- 当前话题更偏向热点、游戏、动漫或版本内容，先准确理解对方具体在问什么，再回答。\n"
+        "- 优先回应最新一句里的具体对象、角色、版本、剧情点或玩法问题，不要自顾自换成泛泛而谈。\n"
+        "- 如果你不确定作品归属、版本信息或剧情细节，先基于已知上下文谨慎回答；需要时优先联网或工具核实。\n"
+        "- 群聊里尽量像熟人顺口接一句，不要写成长分析，不要突然变成教程腔。"
+    )
+
+
 async def _anti_loop_hook(ctx: HookContext) -> Optional[str]:
     if not ctx.is_private:
         return None
     anti_loop_hint = ctx.session.build_private_anti_loop_hint(ctx.session_messages)
     return anti_loop_hint or None
+
+
+async def _group_anti_loop_hook(ctx: HookContext) -> Optional[str]:
+    if ctx.is_private:
+        return None
+    recent = [msg for msg in ctx.session_messages[-18:] if isinstance(msg, dict)]
+    if not recent:
+        return None
+
+    user_keys = [
+        _normalized_topic_key(msg.get("content", ""))
+        for msg in recent
+        if msg.get("role") == "user"
+    ]
+    assistant_keys = [
+        _normalized_topic_key(msg.get("content", ""))
+        for msg in recent
+        if msg.get("role") == "assistant"
+    ]
+    user_keys = [key for key in user_keys if key]
+    assistant_keys = [key for key in assistant_keys if key]
+    if not user_keys or not assistant_keys:
+        return None
+
+    latest_user = user_keys[-1]
+    repeated_user_topic = sum(1 for key in user_keys[-4:-1] if key == latest_user) >= 1
+    repeated_assistant_topic = len(assistant_keys) >= 2 and assistant_keys[-1] == assistant_keys[-2]
+    if not repeated_user_topic and not repeated_assistant_topic:
+        return None
+
+    return (
+        "## Group Anti-loop Guard\n"
+        "- 群聊里不要长期抓着同一个点反复展开。\n"
+        "- 如果同一话题你已经接过两轮，而对方没有明确追问新信息，这一轮只保留一句短反应，或者直接 [SILENCE]。\n"
+        "- 优先跟随最新一句的重心，不要继续延伸你上一轮自己的话。"
+    )
 
 
 async def _group_idle_hook(ctx: HookContext) -> Optional[str]:
@@ -171,10 +334,10 @@ async def _group_idle_hook(ctx: HookContext) -> Optional[str]:
 
     if ctx.message_content:
         ctx.message_content = (
-            "[提示：当前为【随机插话模式】。你刚刚在群里主动说过一句，当前仍处于短暂活跃期。"
+            "[提示：你刚刚在群里起过这个话头。"
             f"刚才的话题：{topic_hint}。"
-            f"群员 {ctx.user_name} 现在接着聊：{ctx.message_content}。"
-            "如果是在顺着你的话题聊，或你自然能接上一句，可以回复；若明显无关，请回复 [SILENCE]]"
+            f"{ctx.user_name} 现在在接着说：{ctx.message_content}。"
+            "如果明显是在顺着这个话题聊，就像普通群员一样自然接一句；若无关，就回复 [SILENCE]]"
         )
     return None
 
@@ -234,8 +397,11 @@ def register_all_builtin_hooks() -> None:
     register_prompt_hook("group_idle_active", _group_idle_hook, priority=45, phase="preprocess")
     register_prompt_hook("schedule", _schedule_hook, priority=10, phase="system_prelude")
     register_prompt_hook("anti_loop", _anti_loop_hook, priority=40, phase="system_context")
+    register_prompt_hook("group_anti_loop", _group_anti_loop_hook, priority=41, phase="system_context")
     register_prompt_hook("user_persona", _user_persona_hook, priority=20, phase="system_context")
     register_prompt_hook("group_style", _group_style_hook, priority=25, phase="system_context")
+    register_prompt_hook("recent_group_context", _recent_group_context_hook, priority=26, phase="system_context")
+    register_prompt_hook("domain_focus", _domain_focus_hook, priority=28, phase="system_context")
     register_prompt_hook("web_search", _web_search_hook, priority=30, phase="system_context")
     register_prompt_hook("grounding", _grounding_hook, priority=35, phase="system_postlude")
     register_prompt_hook("friend_request", _friend_request_hook, priority=50, phase="message")

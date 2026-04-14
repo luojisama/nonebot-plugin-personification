@@ -1,7 +1,9 @@
+import json
 import time
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 from .core.data_store import get_data_store
+from .core.db import connect_sync
 
 
 _WHITELIST_STORE = "whitelist"
@@ -9,94 +11,321 @@ _REQUESTS_STORE = "requests"
 _GROUP_CONFIG_STORE = "group_config"
 _CHAT_HISTORY_STORE = "chat_history"
 
+_plugin_config: Any = None
 
-def load_chat_history() -> Dict[str, dict]:
+
+def init_utils_config(plugin_config: Any) -> None:
+    global _plugin_config
+    _plugin_config = plugin_config
+
+
+def _get_message_expire_hours() -> float:
+    if _plugin_config is not None:
+        value = getattr(_plugin_config, "personification_message_expire_hours", 24.0)
+        try:
+            return max(0.0, float(value))
+        except (TypeError, ValueError):
+            return 24.0
+    return 24.0
+
+
+def _get_group_summary_expire_hours() -> float:
+    if _plugin_config is not None:
+        value = getattr(_plugin_config, "personification_group_summary_expire_hours", 4.0)
+        try:
+            return max(0.0, float(value))
+        except (TypeError, ValueError):
+            return 4.0
+    return 4.0
+
+
+def _get_group_style_auto_analyze_threshold() -> int:
+    if _plugin_config is not None:
+        value = getattr(_plugin_config, "personification_group_style_auto_analyze_threshold", 200)
+        try:
+            return max(1, int(value))
+        except (TypeError, ValueError):
+            return 200
+    return 200
+
+
+def _get_group_style_auto_analyze_min_new_messages() -> int:
+    if _plugin_config is not None:
+        value = getattr(_plugin_config, "personification_group_style_auto_analyze_min_new_messages", 50)
+        try:
+            return max(1, int(value))
+        except (TypeError, ValueError):
+            return 50
+    return 50
+
+
+def _get_group_style_auto_analyze_cooldown_hours() -> float:
+    if _plugin_config is not None:
+        value = getattr(_plugin_config, "personification_group_style_auto_analyze_cooldown_hours", 12.0)
+        try:
+            return max(0.0, float(value))
+        except (TypeError, ValueError):
+            return 12.0
+    return 12.0
+
+
+def _load_chat_meta() -> Dict[str, dict]:
     data = get_data_store().load_sync(_CHAT_HISTORY_STORE)
     return data if isinstance(data, dict) else {}
 
 
-def save_chat_history(data: Dict[str, dict]):
+def _save_chat_meta(data: Dict[str, dict]) -> None:
     get_data_store().save_sync(_CHAT_HISTORY_STORE, data if isinstance(data, dict) else {})
 
 
-def record_group_msg(group_id: str, nickname: str, content: str, is_bot: bool = False) -> int:
+def load_chat_history() -> Dict[str, dict]:
+    data = _load_chat_meta()
+    for group_id in list(data.keys()):
+        group_data = data.get(group_id)
+        if not isinstance(group_data, dict):
+            data[group_id] = {"style": "", "messages": []}
+            continue
+        group_data["messages"] = get_recent_group_msgs(group_id, limit=200, expire_hours=0)
+    return data
+
+
+def save_chat_history(data: Dict[str, dict]):
+    metadata: Dict[str, dict] = {}
+    for group_id, group_data in (data or {}).items():
+        if not isinstance(group_data, dict):
+            continue
+        metadata[str(group_id)] = {k: v for k, v in group_data.items() if k != "messages"}
+    _save_chat_meta(metadata)
+
+
+def _upsert_chat_meta(group_id: str, mutator: Any) -> Dict[str, dict]:
+    def _mutate(current: object) -> Dict[str, dict]:
+        data = current if isinstance(current, dict) else {}
+        group_data = data.get(group_id)
+        if not isinstance(group_data, dict):
+            group_data = {"style": ""}
+            data[group_id] = group_data
+        mutator(group_data)
+        return data
+
+    updated = get_data_store().mutate_sync(_CHAT_HISTORY_STORE, _mutate)
+    return updated if isinstance(updated, dict) else {}
+
+
+def record_group_msg(
+    group_id: str,
+    nickname: str,
+    content: str,
+    is_bot: bool = False,
+    **metadata: Any,
+) -> int:
     if not content.strip():
         return 0
 
-    count = 0
+    now_ts = float(metadata.pop("time", time.time()) or time.time())
+    safe_metadata = {key: value for key, value in metadata.items() if value is not None}
+    mentioned_ids = safe_metadata.get("mentioned_ids", [])
+    if not isinstance(mentioned_ids, list):
+        mentioned_ids = []
 
-    def _mutate(current: object) -> Dict[str, dict]:
-        nonlocal count
-        data = current if isinstance(current, dict) else {}
-        group_data = data.get(group_id)
-        if not isinstance(group_data, dict):
-            group_data = {"style": "", "messages": []}
-            data[group_id] = group_data
-
-        messages = group_data.get("messages")
-        if not isinstance(messages, list):
-            messages = []
-            group_data["messages"] = messages
-
-        messages.append(
-            {
-                "nickname": nickname,
-                "content": content,
-                "time": int(time.time()),
-                "is_bot": is_bot,
-            }
+    with connect_sync() as conn:
+        conn.execute(
+            """
+            INSERT INTO group_messages(
+                group_id, user_id, nickname, content, is_bot, reply_to_msg_id, reply_to_user_id,
+                mentioned_ids, is_at_bot, message_id, source_kind, timestamp
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                str(group_id),
+                str(safe_metadata.get("user_id", "") or ""),
+                str(nickname or ""),
+                str(content or ""),
+                1 if is_bot else 0,
+                safe_metadata.get("reply_to_msg_id"),
+                safe_metadata.get("reply_to_user_id"),
+                json.dumps(mentioned_ids, ensure_ascii=False),
+                1 if bool(safe_metadata.get("is_at_bot")) else 0,
+                str(safe_metadata.get("message_id", "") or "") or None,
+                str(safe_metadata.get("source_kind", "bot" if is_bot else "user") or "user"),
+                now_ts,
+            ),
         )
-        if len(messages) > 200:
-            group_data["messages"] = messages[-200:]
-        count = len(group_data["messages"])
-        return data
+        row = conn.execute(
+            "SELECT COUNT(1) AS cnt FROM group_messages WHERE group_id=?",
+            (str(group_id),),
+        ).fetchone()
+        conn.commit()
+        count = int(row["cnt"] if hasattr(row, "__getitem__") else row[0]) if row else 0
 
-    try:
-        get_data_store().mutate_sync(_CHAT_HISTORY_STORE, _mutate)
-        return count
-    except Exception as e:
-        print(f"Error recording group msg: {e}")
-        return 0
+    def _mutator(group_data: dict[str, Any]) -> None:
+        group_data["message_total_count"] = count
+
+    _upsert_chat_meta(str(group_id), _mutator)
+    return count
+
+
+def should_trigger_group_style_analysis(group_id: str, total_message_count: int) -> bool:
+    threshold = _get_group_style_auto_analyze_threshold()
+    if total_message_count < threshold:
+        return False
+
+    now_ts = time.time()
+    cooldown_seconds = _get_group_style_auto_analyze_cooldown_hours() * 3600
+    min_new_messages = _get_group_style_auto_analyze_min_new_messages()
+    triggered = False
+
+    def _mutator(group_data: dict[str, Any]) -> None:
+        nonlocal triggered
+        last_at = float(group_data.get("last_auto_analyze_at", 0) or 0)
+        last_count = int(group_data.get("last_auto_analyze_message_count", 0) or 0)
+        should_trigger = False
+        if last_at <= 0 or last_count <= 0:
+            should_trigger = True
+        elif total_message_count - last_count >= min_new_messages and now_ts - last_at >= cooldown_seconds:
+            should_trigger = True
+        if should_trigger:
+            group_data["last_auto_analyze_at"] = now_ts
+            group_data["last_auto_analyze_message_count"] = int(total_message_count)
+            triggered = True
+
+    _upsert_chat_meta(group_id, _mutator)
+    return triggered
 
 
 def clear_group_msgs(group_id: str):
-    def _mutate(current: object) -> Dict[str, dict]:
-        data = current if isinstance(current, dict) else {}
-        group_data = data.get(group_id)
-        if not isinstance(group_data, dict):
-            return data
-        group_data["messages"] = []
-        return data
-
-    get_data_store().mutate_sync(_CHAT_HISTORY_STORE, _mutate)
+    with connect_sync() as conn:
+        conn.execute("DELETE FROM group_messages WHERE group_id=?", (str(group_id),))
+        conn.commit()
 
 
-def get_recent_group_msgs(group_id: str, limit: int = 200) -> List[Dict]:
-    data = load_chat_history()
-    group_data = data.get(group_id)
-    if not isinstance(group_data, dict):
-        return []
-    messages = group_data.get("messages")
-    if not isinstance(messages, list):
-        return []
-    return messages[-limit:]
+def get_group_msg_by_message_id(group_id: str, message_id: str) -> Optional[Dict[str, Any]]:
+    normalized_group_id = str(group_id)
+    normalized_message_id = str(message_id or "").strip()
+    if not normalized_group_id or not normalized_message_id:
+        return None
+
+    with connect_sync() as conn:
+        row = conn.execute(
+            """
+            SELECT group_id, user_id, nickname, content, is_bot, reply_to_msg_id, reply_to_user_id,
+                   mentioned_ids, is_at_bot, message_id, source_kind, timestamp
+            FROM group_messages
+            WHERE group_id=? AND message_id=?
+            ORDER BY timestamp DESC
+            LIMIT 1
+            """,
+            (normalized_group_id, normalized_message_id),
+        ).fetchone()
+    if not row:
+        return None
+
+    raw_mentions = row["mentioned_ids"] if hasattr(row, "__getitem__") else row[7]
+    try:
+        mentioned_ids = json.loads(raw_mentions) if raw_mentions else []
+    except Exception:
+        mentioned_ids = []
+    return {
+        "group_id": row["group_id"],
+        "user_id": row["user_id"],
+        "nickname": row["nickname"],
+        "content": row["content"],
+        "time": float(row["timestamp"] or 0),
+        "is_bot": bool(row["is_bot"]),
+        "reply_to_msg_id": row["reply_to_msg_id"],
+        "reply_to_user_id": row["reply_to_user_id"],
+        "mentioned_ids": mentioned_ids if isinstance(mentioned_ids, list) else [],
+        "is_at_bot": bool(row["is_at_bot"]),
+        "message_id": row["message_id"],
+        "source_kind": row["source_kind"],
+    }
+
+
+def get_recent_group_msgs(group_id: str, limit: int = 200, expire_hours: Optional[float] = None) -> List[Dict]:
+    if expire_hours is None:
+        expire_hours = _get_message_expire_hours()
+
+    clauses = ["group_id=?"]
+    params: list[Any] = [str(group_id)]
+    if expire_hours > 0:
+        clauses.append("timestamp>=?")
+        params.append(time.time() - expire_hours * 3600)
+    params.append(max(1, int(limit)))
+
+    with connect_sync() as conn:
+        rows = conn.execute(
+            f"""
+            SELECT group_id, user_id, nickname, content, is_bot, reply_to_msg_id, reply_to_user_id,
+                   mentioned_ids, is_at_bot, message_id, source_kind, timestamp
+            FROM group_messages
+            WHERE {" AND ".join(clauses)}
+            ORDER BY timestamp DESC
+            LIMIT ?
+            """,
+            tuple(params),
+        ).fetchall()
+
+    messages: List[Dict[str, Any]] = []
+    for row in reversed(rows):
+        raw_mentions = row["mentioned_ids"] if hasattr(row, "__getitem__") else row[7]
+        try:
+            mentioned_ids = json.loads(raw_mentions) if raw_mentions else []
+        except Exception:
+            mentioned_ids = []
+        messages.append(
+            {
+                "group_id": row["group_id"],
+                "user_id": row["user_id"],
+                "nickname": row["nickname"],
+                "content": row["content"],
+                "time": float(row["timestamp"] or 0),
+                "is_bot": bool(row["is_bot"]),
+                "reply_to_msg_id": row["reply_to_msg_id"],
+                "reply_to_user_id": row["reply_to_user_id"],
+                "mentioned_ids": mentioned_ids if isinstance(mentioned_ids, list) else [],
+                "is_at_bot": bool(row["is_at_bot"]),
+                "message_id": row["message_id"],
+                "source_kind": row["source_kind"],
+            }
+        )
+    return messages
+
+
+def build_group_context_window(
+    group_id: str,
+    *,
+    limit: int = 6,
+    include_message_ids: Optional[list[str]] = None,
+) -> List[Dict[str, Any]]:
+    messages = list(get_recent_group_msgs(group_id, limit=limit))
+    seen_message_ids = {
+        str(msg.get("message_id", "") or "").strip()
+        for msg in messages
+        if isinstance(msg, dict) and str(msg.get("message_id", "") or "").strip()
+    }
+    extras: List[Dict[str, Any]] = []
+    for message_id in include_message_ids or []:
+        normalized = str(message_id or "").strip()
+        if not normalized or normalized in seen_message_ids:
+            continue
+        target = get_group_msg_by_message_id(group_id, normalized)
+        if target is None:
+            continue
+        extras.append(target)
+        seen_message_ids.add(normalized)
+    if not extras:
+        return messages
+    merged = extras + messages
+    merged.sort(key=lambda msg: (float(msg.get("time", 0) or 0), str(msg.get("message_id", "") or "")))
+    return merged
 
 
 def set_group_style(group_id: str, style: str):
-    def _mutate(current: object) -> Dict[str, dict]:
-        data = current if isinstance(current, dict) else {}
-        group_data = data.get(group_id)
-        if not isinstance(group_data, dict):
-            group_data = {"style": "", "messages": []}
-            data[group_id] = group_data
-        group_data["style"] = style
-        return data
-
-    get_data_store().mutate_sync(_CHAT_HISTORY_STORE, _mutate)
+    _upsert_chat_meta(group_id, lambda group_data: group_data.__setitem__("style", style))
 
 
 def get_group_style(group_id: str) -> str:
-    data = load_chat_history()
+    data = _load_chat_meta()
     group_data = data.get(group_id)
     if not isinstance(group_data, dict):
         return ""
@@ -104,25 +333,38 @@ def get_group_style(group_id: str) -> str:
 
 
 def get_group_topic_summary(group_id: str) -> str:
-    data = load_chat_history()
+    data = _load_chat_meta()
     group_data = data.get(group_id)
     if not isinstance(group_data, dict):
         return ""
-    return str(group_data.get("topic_summary", "") or "")
+    summary = str(group_data.get("topic_summary", "") or "")
+    if not summary:
+        return ""
+
+    expire_hours = _get_group_summary_expire_hours()
+    if expire_hours <= 0:
+        return summary
+
+    now_ts = time.time()
+    summary_ts = float(group_data.get("topic_summary_at", 0) or 0)
+    if summary_ts and now_ts - summary_ts > expire_hours * 3600:
+        return ""
+
+    recent_user_msgs = [msg for msg in get_recent_group_msgs(group_id, limit=20, expire_hours=expire_hours) if not msg.get("is_bot")]
+    if recent_user_msgs:
+        latest_msg_ts = float(recent_user_msgs[-1].get("time", 0) or 0)
+        if latest_msg_ts and now_ts - latest_msg_ts > expire_hours * 3600:
+            return ""
+
+    return summary
 
 
 def set_group_topic_summary(group_id: str, summary: str, ts: float) -> None:
-    def _mutate(current: object) -> Dict[str, dict]:
-        data = current if isinstance(current, dict) else {}
-        group_data = data.get(group_id)
-        if not isinstance(group_data, dict):
-            group_data = {"style": "", "messages": []}
-            data[group_id] = group_data
+    def _mutator(group_data: dict[str, Any]) -> None:
         group_data["topic_summary"] = summary
         group_data["topic_summary_at"] = float(ts)
-        return data
 
-    get_data_store().mutate_sync(_CHAT_HISTORY_STORE, _mutate)
+    _upsert_chat_meta(group_id, _mutator)
 
 
 def load_group_configs() -> Dict[str, dict]:
@@ -146,7 +388,6 @@ def set_group_prompt(group_id: str, prompt: Optional[str]):
         if not isinstance(group_config, dict):
             group_config = {}
             configs[group_id] = group_config
-
         if prompt is None:
             group_config.pop("custom_prompt", None)
         else:
@@ -190,6 +431,19 @@ def set_group_schedule_enabled(group_id: str, enabled: bool):
             group_config = {}
             configs[group_id] = group_config
         group_config["schedule_enabled"] = enabled
+        return configs
+
+    get_data_store().mutate_sync(_GROUP_CONFIG_STORE, _mutate)
+
+
+def set_group_tts_enabled(group_id: str, enabled: bool):
+    def _mutate(current: object) -> Dict[str, dict]:
+        configs = current if isinstance(current, dict) else {}
+        group_config = configs.get(group_id)
+        if not isinstance(group_config, dict):
+            group_config = {}
+            configs[group_id] = group_config
+        group_config["tts_enabled"] = enabled
         return configs
 
     get_data_store().mutate_sync(_GROUP_CONFIG_STORE, _mutate)
@@ -263,7 +517,6 @@ def add_request(group_id: str, user_id: str, group_name: str) -> bool:
         current_request = requests.get(group_id)
         if isinstance(current_request, dict) and current_request.get("status") == "pending":
             return requests
-
         now = time.time()
         requests[group_id] = {
             "group_id": group_id,
@@ -289,7 +542,6 @@ def update_request_status(group_id: str, status: str, operator_id: str = None) -
         request = requests.get(group_id)
         if not isinstance(request, dict):
             return requests
-
         request["status"] = status
         request["update_time"] = time.time()
         if operator_id:

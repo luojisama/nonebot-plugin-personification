@@ -1,0 +1,13 @@
+name: web_search
+enabled: true
+category: query
+entrypoint: scripts/main.py
+description: 联网搜索并返回结果摘要
+parameters:
+  type: object
+  properties:
+    query:
+      type: string
+      description: 搜索关键词
+  required:
+    - query

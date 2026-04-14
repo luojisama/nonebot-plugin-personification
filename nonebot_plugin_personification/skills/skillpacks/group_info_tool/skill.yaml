@@ -1,0 +1,9 @@
+name: group_info_tool
+enabled: true
+category: action
+entrypoint: scripts/main.py
+description: 查询白名单群列表信息
+parameters:
+  type: object
+  properties: {}
+  required: []

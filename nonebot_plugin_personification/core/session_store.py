@@ -1,46 +1,42 @@
-"""
-session_store.py  会话历史存储，支持滚动窗口 + LLM 精炼压缩。
-
-压缩流程：
-  当 append_session_message 写入后历史条数 >= compress_threshold 时：
-    1. 取 history[:-keep_recent] 作为待压缩片段
-    2. 调用 LLM 生成一条摘要
-    3. 用 [{"role":"system","content":"<摘要>"}] + history[-keep_recent:] 替换整条历史
-    4. 持久化
-
-压缩是异步后台任务（asyncio.create_task），不阻塞当前消息发送。
-压缩期间同一 session 只允许一个压缩任务在跑（通过 _compressing_sessions set 去重）。
-"""
-
 from __future__ import annotations
 
 import asyncio
 import json
-from pathlib import Path
-from typing import Any, Dict, List, Optional, Set
+import time
+from typing import Any, Dict, List, Optional
 
 from nonebot import logger
 
 from .context_policy import sanitize_message_content, stringify_history_content
+from .db import connect_sync
+from .group_context import render_group_context_structured
+from .memory_store import get_memory_store
 
-SESSION_HISTORY_PATH = Path("data/personification/session_histories.json")
 SESSION_HISTORY_LIMIT = 100
 GROUP_SESSION_PREFIX = "group_"
 PRIVATE_SESSION_PREFIX = "private_"
 
-# 运行时注入：由 service_factory / plugin_runtime 在启动后写入
 _plugin_config: Any = None
 _compress_tool_caller: Any = None
+_compress_tasks: Dict[str, asyncio.Task[None]] = {}
 
-# 正在压缩的 session_id 集合，防止并发重入
-_compressing_sessions: Set[str] = set()
+# 向后兼容导出，历史已不再保存在内存 dict 中。
+chat_histories: Dict[str, List[Dict[str, Any]]] = {}
 
 
 def init_session_store(plugin_config: Any, compress_tool_caller: Any = None) -> None:
-    """在插件启动时注入配置和压缩用 ToolCaller。"""
     global _plugin_config, _compress_tool_caller
     _plugin_config = plugin_config
     _compress_tool_caller = compress_tool_caller
+
+
+def load_session_histories() -> Dict[str, List[Dict[str, Any]]]:
+    with connect_sync() as conn:
+        rows = conn.execute("SELECT DISTINCT session_id FROM session_messages").fetchall()
+    return {
+        str(row["session_id"]): get_session_messages(str(row["session_id"]))
+        for row in rows
+    }
 
 
 def _get_compress_threshold() -> int:
@@ -55,40 +51,31 @@ def _get_keep_recent() -> int:
     return 20
 
 
-def load_session_histories() -> Dict[str, List[Dict]]:
-    if not SESSION_HISTORY_PATH.exists():
-        return {}
-
-    try:
-        raw_data = json.loads(SESSION_HISTORY_PATH.read_text(encoding="utf-8"))
-    except Exception as e:
-        logger.warning(f"拟人插件：加载会话历史失败，将使用空历史。错误: {e}")
-        return {}
-
-    if not isinstance(raw_data, dict):
-        return {}
-
-    normalized: Dict[str, List[Dict]] = {}
-    for session_id, history in raw_data.items():
-        if not isinstance(session_id, str):
-            continue
-        if isinstance(history, list):
-            normalized[session_id] = [msg for msg in history if isinstance(msg, dict)]
-    return normalized
+def _get_history_max_len() -> int:
+    if _plugin_config is not None:
+        value = int(getattr(_plugin_config, "personification_history_len", 120))
+        return max(20, min(value, 400))
+    return 120
 
 
-chat_histories: Dict[str, List[Dict]] = load_session_histories()
+def _get_message_expire_hours() -> float:
+    if _plugin_config is not None:
+        value = getattr(_plugin_config, "personification_message_expire_hours", 24.0)
+        try:
+            return max(0.0, float(value))
+        except (TypeError, ValueError):
+            return 24.0
+    return 24.0
 
 
-def save_session_histories() -> None:
-    try:
-        SESSION_HISTORY_PATH.parent.mkdir(parents=True, exist_ok=True)
-        SESSION_HISTORY_PATH.write_text(
-            json.dumps(chat_histories, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
-    except Exception as e:
-        logger.warning(f"拟人插件：保存会话历史失败: {e}")
+def _get_group_message_expire_hours() -> float:
+    if _plugin_config is not None:
+        raw = getattr(_plugin_config, "personification_group_context_expire_hours", 6.0)
+        try:
+            return max(0.0, float(raw))
+        except (TypeError, ValueError):
+            return 6.0
+    return 6.0
 
 
 def build_group_session_id(group_id: str) -> str:
@@ -104,61 +91,185 @@ def is_private_session_id(session_id: str) -> bool:
 
 
 def ensure_session_history(session_id: str, legacy_session_id: Optional[str] = None) -> List[Dict]:
-    if session_id not in chat_histories:
-        if legacy_session_id and legacy_session_id in chat_histories:
-            chat_histories[session_id] = chat_histories.pop(legacy_session_id)
-            save_session_histories()
-        else:
-            chat_histories[session_id] = []
-            save_session_histories()
-    return chat_histories[session_id]
+    if legacy_session_id and legacy_session_id != session_id:
+        with connect_sync() as conn:
+            conn.execute(
+                "UPDATE session_messages SET session_id=? WHERE session_id=?",
+                (session_id, legacy_session_id),
+            )
+            conn.commit()
+    return get_session_messages(session_id)
 
 
 def get_session_history_limit(session_id: str) -> int:
-    """向后兼容接口，返回压缩阈值。"""
     return _get_compress_threshold()
 
 
 def trim_session_history(session_id: str, legacy_session_id: Optional[str] = None) -> List[Dict]:
-    """向后兼容接口：不再全清，直接返回当前历史。"""
     return ensure_session_history(session_id, legacy_session_id=legacy_session_id)
 
 
-def get_session_messages(session_id: str, legacy_session_id: Optional[str] = None) -> List[Dict]:
-    return trim_session_history(session_id, legacy_session_id=legacy_session_id)
-
-
-def _build_compress_prompt(messages: List[Dict]) -> str:
-    """将消息列表序列化为压缩用 prompt。"""
-    lines: List[str] = []
-    for msg in messages:
-        role = msg.get("role", "")
-        content = msg.get("content", "")
-        lines.append(f"[{role}]: {stringify_history_content(content)[:300]}")
-    conversation = "\n".join(lines)
-    return (
-        "以下是一段对话历史，请用简洁的中文将其压缩为一段背景摘要（150字以内）。"
-        "保留关键事件、用户偏好、情感变化等重要信息，忽略寒暄和无意义内容。"
-        "只输出摘要文本，不要任何前缀或解释。\n\n"
-        f"{conversation}"
+def _is_summary_message(msg: Dict) -> bool:
+    return bool(msg.get("is_summary")) or (
+        msg.get("role") == "system" and str(msg.get("content", "")).startswith("【对话历史摘要】")
     )
 
 
-async def _run_compress(session_id: str) -> None:
-    """后台任务：压缩指定 session 的历史。"""
-    if session_id in _compressing_sessions:
-        return
-    _compressing_sessions.add(session_id)
-    try:
-        history = chat_histories.get(session_id)
-        if not history:
-            return
+def _dedupe_summary_messages(messages: List[Dict]) -> List[Dict]:
+    summaries = [msg for msg in messages if _is_summary_message(msg)]
+    non_summaries = [msg for msg in messages if not _is_summary_message(msg)]
+    if not summaries:
+        return non_summaries
+    return [summaries[-1]] + non_summaries
 
+
+def _filter_expired_messages(
+    messages: List[Dict],
+    expire_hours: float,
+    *,
+    keep_recent: bool = True,
+    keep_summary: bool = True,
+) -> List[Dict]:
+    if expire_hours <= 0:
+        return messages
+    now_ts = time.time()
+    expire_seconds = expire_hours * 3600
+    keep_recent_count = _get_keep_recent() if keep_recent else 0
+    result: List[Dict] = []
+    recent_indices = set(range(max(0, len(messages) - keep_recent_count), len(messages)))
+    for idx, msg in enumerate(messages):
+        if _is_summary_message(msg):
+            if keep_summary:
+                result.append(msg)
+            continue
+        if idx in recent_indices:
+            result.append(msg)
+            continue
+        msg_ts = float(msg.get("timestamp", 0) or 0)
+        if not msg_ts or now_ts - msg_ts <= expire_seconds:
+            result.append(msg)
+    return result
+
+
+def _deserialize_session_row(row: Any) -> Dict[str, Any]:
+    try:
+        content = json.loads(row["content"])
+    except Exception:
+        content = row["content"]
+    try:
+        metadata = json.loads(row["metadata"] or "{}")
+    except Exception:
+        metadata = {}
+    if not isinstance(metadata, dict):
+        metadata = {}
+    return {
+        "id": row["id"],
+        "role": row["role"],
+        "content": content,
+        "timestamp": float(row["timestamp"] or 0),
+        "is_summary": bool(row["is_summary"]),
+        **metadata,
+    }
+
+
+def _fetch_session_messages_sync(session_id: str) -> List[Dict[str, Any]]:
+    with connect_sync() as conn:
+        rows = conn.execute(
+            """
+            SELECT id, role, content, is_summary, timestamp, metadata
+            FROM session_messages
+            WHERE session_id=?
+            ORDER BY timestamp ASC, id ASC
+            """,
+            (session_id,),
+        ).fetchall()
+    return [_deserialize_session_row(row) for row in rows]
+
+
+def get_session_messages(session_id: str, legacy_session_id: Optional[str] = None) -> List[Dict]:
+    if legacy_session_id and legacy_session_id != session_id:
+        ensure_session_history(session_id, legacy_session_id=legacy_session_id)
+    raw_messages = _fetch_session_messages_sync(session_id)
+    if is_private_session_id(session_id):
+        expire_hours = _get_message_expire_hours()
+        if expire_hours <= 0:
+            return raw_messages
+        return _filter_expired_messages(raw_messages, expire_hours)
+
+    expire_hours = _get_group_message_expire_hours()
+    if expire_hours <= 0:
+        return _dedupe_summary_messages(raw_messages)
+    filtered = _filter_expired_messages(raw_messages, expire_hours, keep_recent=True, keep_summary=True)
+    return _dedupe_summary_messages(filtered)
+
+
+def _render_structured_speakers(messages: List[Dict[str, Any]]) -> str:
+    structured = render_group_context_structured(messages)
+    if structured:
+        return structured
+
+    lines: List[str] = []
+    for msg in messages:
+        speaker = str(msg.get("speaker") or msg.get("role") or "未知")
+        content = stringify_history_content(msg.get("content", ""))[:120]
+        if not content:
+            continue
+        lines.append(f"[对话][{speaker}|uid={msg.get('user_id', '') or ''}|普通发言] {content}")
+    return "\n".join(lines)
+
+
+def _build_compress_prompt(messages: List[Dict]) -> str:
+    return (
+        "以下是一段聊天历史，请压缩为背景摘要（150字以内）。\n"
+        "如果是群聊，必须保留：谁提出了什么请求 谁回应了谁 当前结论 Bot是否已介入。\n"
+        "用昵称区分不同发言人，不要丢失回复、提及和对话指向关系。\n"
+        "只输出摘要文本，不要任何前缀。\n\n"
+        f"{_render_structured_speakers(messages)}"
+    )
+
+
+def _replace_history_with_summary_sync(session_id: str, summary_text: str, recent: List[Dict[str, Any]]) -> None:
+    with connect_sync() as conn:
+        conn.execute("DELETE FROM session_messages WHERE session_id=?", (session_id,))
+        conn.execute(
+            """
+            INSERT INTO session_messages(session_id, role, content, is_summary, timestamp, metadata)
+            VALUES (?, ?, ?, 1, ?, ?)
+            """,
+            (
+                session_id,
+                "system",
+                json.dumps(f"【对话历史摘要】{summary_text}", ensure_ascii=False),
+                time.time(),
+                json.dumps({}, ensure_ascii=False),
+            ),
+        )
+        for msg in recent:
+            metadata = {k: v for k, v in msg.items() if k not in {"id", "role", "content", "timestamp", "is_summary"}}
+            conn.execute(
+                """
+                INSERT INTO session_messages(session_id, role, content, is_summary, timestamp, metadata)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    session_id,
+                    str(msg.get("role", "") or ""),
+                    json.dumps(msg.get("content", ""), ensure_ascii=False),
+                    1 if bool(msg.get("is_summary")) else 0,
+                    float(msg.get("timestamp", time.time()) or time.time()),
+                    json.dumps(metadata, ensure_ascii=False),
+                ),
+            )
+        conn.commit()
+
+
+async def _run_compress(session_id: str) -> None:
+    try:
+        history = _fetch_session_messages_sync(session_id)
         threshold = _get_compress_threshold()
         keep = _get_keep_recent()
         if len(history) < threshold:
             return
-
         to_compress = history[:-keep] if keep > 0 else history
         recent = history[-keep:] if keep > 0 else []
         if not to_compress:
@@ -174,28 +285,26 @@ async def _run_compress(session_id: str) -> None:
                     tools=[],
                     use_builtin_search=False,
                 )
-                summary_text = (response.content or "").strip()
-            except Exception as e:
-                logger.warning(f"[session_store] compress LLM call failed for {session_id}: {e}")
-
+                summary_text = str(response.content or "").strip()
+            except Exception as exc:
+                logger.warning(f"[session_store] compress LLM call failed for {session_id}: {exc}")
         if not summary_text:
-            logger.info(f"[session_store] compress fallback (no LLM) for {session_id}")
             summary_text = f"（此前 {len(to_compress)} 条历史已省略）"
-
-        summary_msg: Dict[str, Any] = {
-            "role": "system",
-            "content": f"【对话历史摘要】{summary_text}",
-        }
-        chat_histories[session_id] = [summary_msg] + list(recent)
-        save_session_histories()
-        logger.info(
-            f"[session_store] compressed {session_id}: "
-            f"{len(to_compress)} msgs -> summary + {len(recent)} recent"
-        )
-    except Exception as e:
-        logger.warning(f"[session_store] compress error for {session_id}: {e}")
+        await asyncio.to_thread(_replace_history_with_summary_sync, session_id, summary_text, recent)
+    except Exception as exc:
+        logger.warning(f"[session_store] compress error for {session_id}: {exc}")
     finally:
-        _compressing_sessions.discard(session_id)
+        _compress_tasks.pop(session_id, None)
+
+
+def _schedule_compress(session_id: str) -> None:
+    if session_id in _compress_tasks:
+        return
+    try:
+        task = asyncio.create_task(_run_compress(session_id))
+    except RuntimeError:
+        return
+    _compress_tasks[session_id] = task
 
 
 def append_session_message(
@@ -205,18 +314,80 @@ def append_session_message(
     legacy_session_id: Optional[str] = None,
     **metadata: Any,
 ) -> List[Dict]:
+    if legacy_session_id and legacy_session_id != session_id:
+        ensure_session_history(session_id, legacy_session_id=legacy_session_id)
+
     sanitized_content = sanitize_message_content(content)
-    message = {"role": role, "content": sanitized_content}
-    message.update({key: value for key, value in metadata.items() if value is not None})
-    history = ensure_session_history(session_id, legacy_session_id=legacy_session_id)
-    history.append(message)
-    save_session_histories()
+    timestamp = time.time()
+    safe_metadata = {key: value for key, value in metadata.items() if value is not None}
+    with connect_sync() as conn:
+        conn.execute(
+            """
+            INSERT INTO session_messages(session_id, role, content, is_summary, timestamp, metadata)
+            VALUES (?, ?, ?, 0, ?, ?)
+            """,
+            (
+                session_id,
+                role,
+                json.dumps(sanitized_content, ensure_ascii=False),
+                timestamp,
+                json.dumps(safe_metadata, ensure_ascii=False),
+            ),
+        )
+        rows = conn.execute(
+            "SELECT id FROM session_messages WHERE session_id=? ORDER BY timestamp ASC, id ASC",
+            (session_id,),
+        ).fetchall()
+        max_len = _get_history_max_len()
+        if len(rows) > max_len:
+            stale_ids = [int(row["id"]) for row in rows[:-max_len]]
+            placeholders = ",".join("?" for _ in stale_ids)
+            conn.execute(
+                f"DELETE FROM session_messages WHERE id IN ({placeholders})",
+                tuple(stale_ids),
+            )
+        conn.commit()
 
-    threshold = _get_compress_threshold()
-    if len(history) >= threshold and session_id not in _compressing_sessions:
-        try:
-            asyncio.create_task(_run_compress(session_id))
-        except RuntimeError:
-            pass
+    try:
+        memory_store = get_memory_store()
+        if session_id.startswith(GROUP_SESSION_PREFIX):
+            group_id = session_id.removeprefix(GROUP_SESSION_PREFIX)
+            memory_store.append_group_message(
+                group_id=group_id,
+                role=role,
+                content=sanitized_content,
+                metadata=safe_metadata,
+            )
+        elif legacy_session_id and not str(legacy_session_id).startswith(PRIVATE_SESSION_PREFIX):
+            memory_store.append_group_message(
+                group_id=str(legacy_session_id),
+                role=role,
+                content=sanitized_content,
+                metadata=safe_metadata,
+            )
+    except Exception:
+        pass
 
-    return history
+    current = get_session_messages(session_id)
+    if len(current) >= _get_compress_threshold():
+        _schedule_compress(session_id)
+    return current
+
+
+def save_session_histories() -> None:
+    return None
+
+
+async def clear_all_session_histories() -> int:
+    tasks = list(_compress_tasks.values())
+    for task in tasks:
+        task.cancel()
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
+    _compress_tasks.clear()
+    with connect_sync() as conn:
+        row = conn.execute("SELECT COUNT(DISTINCT session_id) AS cnt FROM session_messages").fetchone()
+        count = int(row["cnt"] if row else 0)
+        conn.execute("DELETE FROM session_messages")
+        conn.commit()
+    return count

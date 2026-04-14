@@ -85,42 +85,121 @@ def build_view_config_nodes(
     provider_names: str,
     plugin_config: Any,
     session_history_limit: int,
+    remote_skill_stats: Optional[Dict[str, int]] = None,
 ) -> list[Dict[str, Any]]:
-    global_conf_str = (
-        f"API 类型: {plugin_config.personification_api_type}\n"
-        f"模型名称: {plugin_config.personification_model}\n"
-        f"API URL: {plugin_config.personification_api_url}\n"
-        f"API 池: {provider_names}\n"
-        f"回复概率: {plugin_config.personification_probability}\n"
-        f"戳一戳概率: {plugin_config.personification_poke_probability}\n"
-        f"表情包概率: {plugin_config.personification_sticker_probability}\n"
-        f"联网搜索: {'开启' if plugin_config.personification_web_search else '关闭'}\n"
-        f"私聊上下文长度: {session_history_limit} (固定，超出清空重记)\n"
-        f"群聊上下文长度: {session_history_limit} (固定，超出清空重记)\n"
-        f"思考预算: {plugin_config.personification_thinking_budget}"
-    )
+    def _bool_text(value: Any) -> str:
+        return "开启" if bool(value) else "关闭"
+
+    def _pair(label: str, value: Any, description: str) -> str:
+        return f"{label}: {value}\n用途: {description}"
+
+    def _join_pairs(*items: str) -> str:
+        return "\n\n".join(item for item in items if item)
 
     is_enabled = group_config.get("enabled", "未设置 (跟随白名单)")
     sticker_enabled = group_config.get("sticker_enabled", True)
     schedule_enabled = group_config.get("schedule_enabled", False)
+    tts_enabled = group_config.get(
+        "tts_enabled",
+        getattr(plugin_config, "personification_tts_group_default_enabled", True),
+    )
     custom_prompt_len = len(group_config.get("custom_prompt", "")) if "custom_prompt" in group_config else 0
     prompt_status = f"自定义 ({custom_prompt_len} 字符)" if custom_prompt_len > 0 else "默认全局"
+    remote_skill_stats = remote_skill_stats or {"total": 0, "pending": 0, "approved": 0, "rejected": 0}
 
-    group_conf_str = (
-        f"当前群号: {group_id}\n"
-        f"拟人功能开关: {is_enabled}\n"
-        f"表情包开关: {'开启' if sticker_enabled else '关闭'}\n"
-        f"作息模拟开关: {'开启' if schedule_enabled else '关闭'}\n"
-        f"人设配置: {prompt_status}"
+    overview_conf_str = _join_pairs(
+        _pair("主模型", plugin_config.personification_model, "负责日常聊天、联网查证和拟人回复的主要模型。"),
+        _pair("API 类型", plugin_config.personification_api_type, "决定走哪类接口协议，例如 OpenAI / Gemini / Codex。"),
+        _pair("API 池", provider_names, "多个模型源时显示当前可轮换的 provider 列表。"),
+        _pair("时区", plugin_config.personification_timezone, "影响今天、早晚、作息模拟和定时主动发话的时间判断。"),
+        _pair("思考预算", plugin_config.personification_thinking_budget, "控制模型思考开销，越高通常越稳但也更慢。"),
+    )
+
+    behavior_conf_str = _join_pairs(
+        _pair("回复概率", plugin_config.personification_probability, "控制 Bot 在群里随机接话的基础活跃度。"),
+        _pair("续聊概率", getattr(plugin_config, "personification_group_chat_follow_probability", 0.0), "Bot 刚接过话后，继续顺着当前话题聊下去的概率。"),
+        _pair("热聊保留率", getattr(plugin_config, "personification_hot_chat_min_pass_rate", 0.0), "群里很热闹时仍允许 Bot 插话的最低保留比例，防止太安静或太抢话。"),
+        _pair("主动私聊", _bool_text(plugin_config.personification_proactive_enabled), "允许 Bot 在私聊里主动发起话题，而不只是被动回复。"),
+        _pair("主动消息概率", getattr(plugin_config, "personification_proactive_probability", 0.0), "定时检查命中后，真正发出主动消息的概率。"),
+    )
+
+    grounding_conf_str = _join_pairs(
+        _pair("工具联网", _bool_text(getattr(plugin_config, "personification_tool_web_search_enabled", plugin_config.personification_web_search)), "控制 web_search 等外部联网工具是否可用。"),
+        _pair("工具联网模式", getattr(plugin_config, "personification_tool_web_search_mode", "enabled"), "工具联网的模式开关，支持 enabled/cached/live/disabled。"),
+        _pair("模型内置搜索", _bool_text(getattr(plugin_config, "personification_model_builtin_search_enabled", getattr(plugin_config, "personification_builtin_search", True))), "控制主模型是否允许直接使用 provider 原生 builtin search。"),
+        _pair("群话题摘要", _bool_text(getattr(plugin_config, "personification_group_summary_enabled", True)), "持续概括不同群最近在聊什么，供后续续聊和联网检索使用。"),
+        _pair("60 秒新闻", _bool_text(getattr(plugin_config, "personification_60s_enabled", True)), "允许接入每日新闻摘要类能力，帮助 Bot 感知现实中的新鲜事件。"),
+        _pair("聊天上下文长度", session_history_limit, "群聊和私聊各自保留的短期上下文条数，超出后会滚动清理。"),
+    )
+
+    media_conf_str = _join_pairs(
+        _pair("表情包概率", plugin_config.personification_sticker_probability, "控制 Bot 发图或表情包的积极程度。"),
+        _pair("戳一戳概率", plugin_config.personification_poke_probability, "控制被戳后随机回应的频率。"),
+        _pair("语音总开关", _bool_text(plugin_config.personification_tts_enabled), "控制整个插件是否允许使用 TTS 语音能力。"),
+        _pair("语音自动回复", _bool_text(plugin_config.personification_tts_auto_enabled), "开启后，Bot 会在部分场景自动改用语音回复。"),
+        _pair("视觉模型", f"{plugin_config.personification_labeler_api_type}:{plugin_config.personification_labeler_model}", "用于图片理解、贴纸打标和视觉描述，不等同于主聊天模型。"),
+        _pair("视觉兜底", _bool_text(getattr(plugin_config, "personification_vision_fallback_enabled", True)), "主模型看图失败或不稳定时，是否允许异步拉起二级视觉兜底。"),
+    )
+
+    remote_skill_conf_str = _join_pairs(
+        _pair("远程 skill", _bool_text(getattr(plugin_config, "personification_skill_remote_enabled", False)), "允许从远程来源拉取额外技能包。"),
+        _pair("外部执行", _bool_text(getattr(plugin_config, "personification_skill_allow_unsafe_external", False)), "是否允许执行外部来源的 Python 或 MCP skill，关闭时更安全。"),
+        _pair("人工审批", _bool_text(getattr(plugin_config, "personification_skill_require_admin_review", True)), "远程 skill 加载前必须由管理员手动同意，避免自动执行外部代码。"),
+        _pair(
+            "审批统计",
+            f"总计 {remote_skill_stats['total']} / 待审批 {remote_skill_stats['pending']} / 已批准 {remote_skill_stats['approved']} / 已拒绝 {remote_skill_stats['rejected']}",
+            "显示当前配置里的远程 skill 审批进度，可配合“远程技能审批”命令使用。",
+        ),
+    )
+
+    group_conf_str = _join_pairs(
+        _pair("当前群号", group_id, "本条配置聊天记录对应的群。"),
+        _pair("拟人功能", is_enabled, "控制本群是否允许 Bot 参与拟人聊天。"),
+        _pair("表情包开关", _bool_text(sticker_enabled), "只影响本群发图/表情包，不影响其他群。"),
+        _pair("作息模拟", _bool_text(schedule_enabled), "开启后会按设定时段模拟在线/休息状态。"),
+        _pair("语音回复", _bool_text(tts_enabled), "控制本群是否允许自动或手动语音回复。"),
+        _pair("人设配置", prompt_status, "显示当前群是沿用全局人格，还是使用单独的人设提示词。"),
     )
 
     return [
         {
             "type": "node",
             "data": {
-                "name": "全局配置",
+                "name": "配置总览",
                 "uin": str(bot_self_id),
-                "content": global_conf_str,
+                "content": overview_conf_str,
+            },
+        },
+        {
+            "type": "node",
+            "data": {
+                "name": "聊天活跃度",
+                "uin": str(bot_self_id),
+                "content": behavior_conf_str,
+            },
+        },
+        {
+            "type": "node",
+            "data": {
+                "name": "联网与查证",
+                "uin": str(bot_self_id),
+                "content": grounding_conf_str,
+            },
+        },
+        {
+            "type": "node",
+            "data": {
+                "name": "视觉与语音",
+                "uin": str(bot_self_id),
+                "content": media_conf_str,
+            },
+        },
+        {
+            "type": "node",
+            "data": {
+                "name": "远程技能",
+                "uin": str(bot_self_id),
+                "content": remote_skill_conf_str,
             },
         },
         {

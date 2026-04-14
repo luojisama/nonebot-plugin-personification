@@ -1,0 +1,13 @@
+name: sticker_labeler
+enabled: true
+category: action
+entrypoint: scripts/main.py
+description: 贴图打标预处理与结果归一化
+parameters:
+  type: object
+  properties:
+    action:
+      type: string
+      description: to_data_url 或 normalize
+  required:
+    - action

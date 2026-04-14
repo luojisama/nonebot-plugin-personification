@@ -41,7 +41,8 @@ from .persona_commands import setup_persona_matchers
 from .record_message_handler import handle_record_message_event
 from .reply_buffer import handle_reply_event, run_buffer_timer
 from .reply_matchers import register_reply_matchers
-from ..flows.chat_summary_flow import maybe_update_group_summary
+from .tts_matchers import register_tts_matchers
+from ..flows.chat_summary_flow import safe_update_group_summary
 from .reply_processor import (
     PersonaDeps,
     ReplyProcessorDeps,
@@ -57,10 +58,19 @@ from .rule_builders import (
 )
 from .runtime_commands import (
     handle_clear_context_command,
+    handle_full_reset_memory_command,
+    handle_global_switch_command,
+    handle_install_remote_skill_command,
+    handle_personification_help_command,
     handle_proactive_switch_command,
+    handle_rebuild_plugin_knowledge_command,
+    handle_remote_skill_review_command,
+    handle_tts_global_switch_command,
+    handle_view_plugin_knowledge_status_command,
     handle_web_search_switch_command,
 )
 from .runtime_matchers import register_runtime_switch_matchers
+from .persona_admin_matchers import register_persona_admin_matchers
 from .sticker_chat_handler import handle_sticker_chat_event
 from .style_context_matchers import register_style_context_matchers
 from .style_diary_handlers import (
@@ -77,11 +87,16 @@ from .whitelist_handlers import (
     handle_remove_whitelist_command,
 )
 from .whitelist_matchers import register_whitelist_matchers
-from .yaml_response_handler import build_yaml_response_processor, process_yaml_response_logic
+from .yaml_response_handler import (
+    build_yaml_response_processor,
+    process_yaml_response_logic,
+)
+from ..core.web_grounding import extract_forward_message_content
 
 
 @dataclass
 class MatcherSetupDeps:
+    runtime_bundle: Any
     personification_rule: Any
     poke_notice_rule: Any
     record_msg_rule_core: Any
@@ -133,6 +148,7 @@ class MatcherSetupDeps:
     handle_group_feature_switch_command: Any
     set_group_enabled: Any
     set_group_sticker_enabled: Any
+    set_group_tts_enabled: Any
     handle_schedule_switch_command: Any
     save_plugin_runtime_config: Any
     set_group_schedule_enabled: Any
@@ -146,6 +162,7 @@ class MatcherSetupDeps:
     resolve_record_message: Any
     get_custom_title: Any
     record_group_msg: Any
+    should_trigger_group_style_analysis: Any
     handle_background_style_analysis: Any
     analyze_group_style_flow: Any
     set_group_style: Any
@@ -163,15 +180,27 @@ class MatcherSetupDeps:
     publish_qzone_shuo: Any
     handle_web_search_switch_command: Any
     handle_proactive_switch_command: Any
+    handle_remote_skill_review_command: Any
+    handle_rebuild_plugin_knowledge_command: Any
+    handle_view_plugin_knowledge_status_command: Any
+    handle_personification_help_command: Any
+    handle_install_remote_skill_command: Any
+    build_plugin_usage_text: Any
+    handle_global_switch_command: Any
+    handle_tts_global_switch_command: Any
     apply_web_search_switch: Any
     apply_proactive_switch: Any
+    apply_global_switch: Any
+    apply_tts_global_switch: Any
     handle_learn_style_command: Any
     handle_view_style_command: Any
     handle_clear_context_command: Any
+    handle_full_reset_memory_command: Any
     get_recent_group_msgs: Any
     call_ai_api: Any
     call_style_ai_api: Any
     get_group_style: Any
+    tts_service: Any
     chat_histories: Any
     save_session_histories: Any
     get_driver: Any
@@ -182,6 +211,12 @@ class MatcherSetupDeps:
     resolve_clear_target: Any
     clear_message_buffer: Any
     clear_session_context: Any
+    persona_store: Any
+    knowledge_store: Any
+    agent_tool_caller: Any
+    start_knowledge_builder: Any
+    get_knowledge_build_task: Any
+    set_knowledge_build_task: Any
 
 
 def setup_all_matchers(*, deps: MatcherSetupDeps) -> Dict[str, Any]:
@@ -203,6 +238,7 @@ def setup_all_matchers(*, deps: MatcherSetupDeps) -> Dict[str, Any]:
         message_cls=deps.message_cls,
         message_segment_cls=deps.message_segment_cls,
         logger=deps.logger,
+        finished_exception_cls=deps.finished_exception_cls,
     )
     handle_reply = reply_matchers["handle_reply"]
 
@@ -249,6 +285,7 @@ def setup_all_matchers(*, deps: MatcherSetupDeps) -> Dict[str, Any]:
         resolve_record_message=deps.resolve_record_message,
         get_custom_title=deps.get_custom_title,
         record_group_msg=deps.record_group_msg,
+        should_trigger_auto_analyze=deps.should_trigger_group_style_analysis,
         logger=deps.logger,
         create_background_task=lambda group_id: asyncio.create_task(
             deps.handle_background_style_analysis(
@@ -260,7 +297,7 @@ def setup_all_matchers(*, deps: MatcherSetupDeps) -> Dict[str, Any]:
             )
         ),
         create_summary_task=lambda group_id: asyncio.create_task(
-            maybe_update_group_summary(
+            safe_update_group_summary(
                 group_id=group_id,
                 call_ai_api=deps.call_ai_api,
                 logger=deps.logger,
@@ -270,6 +307,7 @@ def setup_all_matchers(*, deps: MatcherSetupDeps) -> Dict[str, Any]:
         handle_sticker_chat_event=deps.handle_sticker_chat_event,
         get_group_config=deps.get_group_config,
         sticker_path=deps.plugin_config.personification_sticker_path,
+        plugin_config=deps.plugin_config,
         message_segment_cls=deps.message_segment_cls,
         handle_reply=handle_reply,
     )
@@ -317,6 +355,7 @@ def setup_all_matchers(*, deps: MatcherSetupDeps) -> Dict[str, Any]:
         handle_group_feature_switch_command=deps.handle_group_feature_switch_command,
         set_group_enabled=deps.set_group_enabled,
         set_group_sticker_enabled=deps.set_group_sticker_enabled,
+        set_group_tts_enabled=deps.set_group_tts_enabled,
         handle_schedule_switch_command=deps.handle_schedule_switch_command,
         plugin_config=deps.plugin_config,
         save_plugin_runtime_config=deps.save_plugin_runtime_config,
@@ -327,6 +366,17 @@ def setup_all_matchers(*, deps: MatcherSetupDeps) -> Dict[str, Any]:
         get_configured_api_providers=deps.get_configured_api_providers,
         build_view_config_nodes=deps.build_view_config_nodes,
         session_history_limit=deps.session_history_limit,
+        track_command_keywords=deps.register_private_command_keywords,
+    )
+
+    tts_matchers = register_tts_matchers(
+        plugin_config=deps.plugin_config,
+        message_segment_cls=deps.message_segment_cls,
+        logger=deps.logger,
+        tts_service=deps.tts_service,
+        load_prompt=deps.load_prompt,
+        get_group_style=deps.get_group_style,
+        group_message_event_cls=deps.group_message_event_cls,
         track_command_keywords=deps.register_private_command_keywords,
     )
 
@@ -358,9 +408,25 @@ def setup_all_matchers(*, deps: MatcherSetupDeps) -> Dict[str, Any]:
 
     runtime_switch_matchers = register_runtime_switch_matchers(
         superuser_permission=deps.superuser_permission,
+        logger=deps.logger,
+        handle_personification_help_command=deps.handle_personification_help_command,
+        build_plugin_usage_text=deps.build_plugin_usage_text,
+        handle_install_remote_skill_command=deps.handle_install_remote_skill_command,
+        handle_global_switch_command=deps.handle_global_switch_command,
+        handle_tts_global_switch_command=deps.handle_tts_global_switch_command,
         handle_web_search_switch_command=deps.handle_web_search_switch_command,
         handle_proactive_switch_command=deps.handle_proactive_switch_command,
+        handle_remote_skill_review_command=deps.handle_remote_skill_review_command,
+        handle_rebuild_plugin_knowledge_command=deps.handle_rebuild_plugin_knowledge_command,
+        handle_view_plugin_knowledge_status_command=deps.handle_view_plugin_knowledge_status_command,
         plugin_config=deps.plugin_config,
+        knowledge_store=deps.knowledge_store,
+        agent_tool_caller=deps.agent_tool_caller,
+        start_knowledge_builder=deps.start_knowledge_builder,
+        get_knowledge_build_task=deps.get_knowledge_build_task,
+        set_knowledge_build_task=deps.set_knowledge_build_task,
+        apply_global_switch=deps.apply_global_switch,
+        apply_tts_global_switch=deps.apply_tts_global_switch,
         apply_web_search_switch=deps.apply_web_search_switch,
         apply_proactive_switch=deps.apply_proactive_switch,
         save_plugin_runtime_config=deps.save_plugin_runtime_config,
@@ -372,6 +438,7 @@ def setup_all_matchers(*, deps: MatcherSetupDeps) -> Dict[str, Any]:
         handle_learn_style_command=deps.handle_learn_style_command,
         handle_view_style_command=deps.handle_view_style_command,
         handle_clear_context_command=deps.handle_clear_context_command,
+        handle_full_reset_memory_command=deps.handle_full_reset_memory_command,
         analyze_group_style_flow=deps.analyze_group_style_flow,
         get_recent_group_msgs=deps.get_recent_group_msgs,
         get_configured_api_providers=deps.get_configured_api_providers,
@@ -393,12 +460,21 @@ def setup_all_matchers(*, deps: MatcherSetupDeps) -> Dict[str, Any]:
         resolve_clear_target=deps.resolve_clear_target,
         clear_message_buffer=deps.clear_message_buffer,
         clear_session_context=deps.clear_session_context,
+        persona_store=deps.persona_store,
         group_message_event_cls=deps.group_message_event_cls,
         private_message_event_cls=deps.private_message_event_cls,
+        message_segment_cls=deps.message_segment_cls,
+        track_command_keywords=deps.register_private_command_keywords,
+    )
+
+    persona_admin_matchers = register_persona_admin_matchers(
+        runtime_bundle=deps.runtime_bundle,
         track_command_keywords=deps.register_private_command_keywords,
     )
 
     return {
+        "personification_help_cmd": runtime_switch_matchers["personification_help_cmd"],
+        "install_remote_skill_cmd": runtime_switch_matchers["install_remote_skill_cmd"],
         "reply_matcher": reply_matchers["reply_matcher"],
         "poke_notice_matcher": reply_matchers["poke_notice_matcher"],
         "handle_reply": reply_matchers["handle_reply"],
@@ -418,17 +494,28 @@ def setup_all_matchers(*, deps: MatcherSetupDeps) -> Dict[str, Any]:
         "disable_personification": admin_matchers["disable_personification"],
         "enable_stickers": admin_matchers["enable_stickers"],
         "disable_stickers": admin_matchers["disable_stickers"],
+        "enable_tts": admin_matchers["enable_tts"],
+        "disable_tts": admin_matchers["disable_tts"],
         "enable_schedule": admin_matchers["enable_schedule"],
         "view_config": admin_matchers["view_config"],
+        "tts_cmd": tts_matchers["tts_cmd"],
         "perm_blacklist_add": perm_blacklist_matchers["perm_blacklist_add"],
         "perm_blacklist_del": perm_blacklist_matchers["perm_blacklist_del"],
         "perm_blacklist_list": perm_blacklist_matchers["perm_blacklist_list"],
         "manual_diary_cmd": diary_matchers["manual_diary_cmd"],
+        "global_switch_cmd": runtime_switch_matchers["global_switch_cmd"],
+        "tts_global_switch_cmd": runtime_switch_matchers["tts_global_switch_cmd"],
         "web_search_cmd": runtime_switch_matchers["web_search_cmd"],
         "proactive_msg_switch_cmd": runtime_switch_matchers["proactive_msg_switch_cmd"],
+        "remote_skill_review_cmd": runtime_switch_matchers["remote_skill_review_cmd"],
+        "rebuild_plugin_knowledge_cmd": runtime_switch_matchers["rebuild_plugin_knowledge_cmd"],
+        "plugin_knowledge_status_cmd": runtime_switch_matchers["plugin_knowledge_status_cmd"],
         "clear_context_cmd": style_context_matchers["clear_context_cmd"],
+        "full_reset_memory_cmd": style_context_matchers["full_reset_memory_cmd"],
         "learn_style_cmd": style_context_matchers["learn_style_cmd"],
+        "relabel_stickers_cmd": style_context_matchers["relabel_stickers_cmd"],
         "view_style_cmd": style_context_matchers["view_style_cmd"],
+        "persona_admin_cmd": persona_admin_matchers["persona_admin_cmd"],
     }
 
 
@@ -450,17 +537,23 @@ __all__ = [
     "sticker_chat_rule",
     "handle_background_style_analysis",
     "handle_clear_context_command",
+    "handle_full_reset_memory_command",
     "handle_group_fav_query_command",
     "handle_group_feature_switch_command",
     "handle_add_whitelist_command",
     "handle_agree_whitelist_command",
     "handle_apply_whitelist_command",
+    "handle_install_remote_skill_command",
+    "handle_personification_help_command",
     "register_whitelist_matchers",
     "handle_learn_style_command",
     "register_diary_matchers",
     "handle_manual_diary_command",
     "handle_reset_persona_command",
+    "handle_global_switch_command",
     "handle_proactive_switch_command",
+    "handle_remote_skill_review_command",
+    "handle_tts_global_switch_command",
     "register_runtime_switch_matchers",
     "register_perm_blacklist_matchers",
     "setup_persona_matchers",
@@ -470,6 +563,8 @@ __all__ = [
     "handle_reject_whitelist_command",
     "handle_remove_whitelist_command",
     "handle_schedule_switch_command",
+    "handle_rebuild_plugin_knowledge_command",
+    "handle_view_plugin_knowledge_status_command",
     "handle_web_search_switch_command",
     "handle_view_config_command",
     "handle_view_persona_command",
@@ -486,6 +581,7 @@ __all__ = [
     "handle_reply_event",
     "run_buffer_timer",
     "register_reply_matchers",
+    "register_tts_matchers",
     "handle_sticker_chat_event",
     "handle_record_message_event",
     "register_chat_matchers",
@@ -493,4 +589,5 @@ __all__ = [
     "parse_persona_update_args",
     "MatcherSetupDeps",
     "setup_all_matchers",
+    "extract_forward_message_content",
 ]
