@@ -1,6 +1,5 @@
 import asyncio
 from collections.abc import Callable, Iterable
-from pathlib import Path
 from typing import Any, Dict, Optional
 
 from nonebot import on_command
@@ -8,7 +7,7 @@ from nonebot.adapters.onebot.v11 import Bot, GroupMessageEvent, Message, Message
 from nonebot.params import CommandArg
 
 from ..skills.skillpacks.sticker_labeler.scripts.impl import StickerLabeler
-from ..skills.skillpacks.vision_caller.scripts.impl import build_vision_caller
+from ..core.sticker_library import resolve_sticker_dir
 
 
 def register_style_context_matchers(
@@ -44,6 +43,7 @@ def register_style_context_matchers(
     private_message_event_cls: Any,
     message_segment_cls: Any,
     track_command_keywords: Callable[[str, Iterable[str] | None], None] | None = None,
+    shared_runtime: Any = None,
 ) -> Dict[str, Any]:
     def _register_command(command: str, *, aliases: set[str] | None = None, **kwargs: Any) -> Any:
         if track_command_keywords:
@@ -85,18 +85,9 @@ def register_style_context_matchers(
     async def _analyze_group_style(group_id: str) -> Optional[str]:
         provider_api_type = ""
         try:
-            style_api_key = str(
-                getattr(plugin_config, "personification_style_api_key", "") or ""
-            ).strip()
-            if style_api_key:
-                provider_api_type = str(
-                    getattr(plugin_config, "personification_style_api_type", "")
-                    or getattr(plugin_config, "personification_api_type", "openai")
-                ).strip().lower()
-            else:
-                providers = get_configured_api_providers()
-                if providers:
-                    provider_api_type = str(providers[0].get("api_type", "") or "").strip().lower()
+            providers = get_configured_api_providers()
+            if providers:
+                provider_api_type = str(providers[0].get("api_type", "") or "").strip().lower()
         except Exception:
             provider_api_type = ""
         return await analyze_group_style_flow(
@@ -131,11 +122,8 @@ def register_style_context_matchers(
 
     @relabel_stickers_cmd.handle()
     async def _handle_relabel_stickers(bot: Bot, event: MessageEvent, args: Message = CommandArg()):
-        sticker_path = getattr(plugin_config, "personification_sticker_path", None)
-        if not sticker_path:
-            await relabel_stickers_cmd.finish("未配置表情包目录。")
-        vision_caller = build_vision_caller(plugin_config)
-        if vision_caller is None:
+        sticker_dir = resolve_sticker_dir(getattr(plugin_config, "personification_sticker_path", None), create=True)
+        if shared_runtime is None:
             await relabel_stickers_cmd.finish("未配置可用的表情包打标模型。")
 
         keyword = args.extract_plain_text().strip()
@@ -144,13 +132,13 @@ def register_style_context_matchers(
 
         async def _run() -> None:
             labeler = StickerLabeler(
-                Path(sticker_path),
+                sticker_dir,
                 logger=logger,
                 concurrency=max(1, int(getattr(plugin_config, "personification_labeler_concurrency", 3))),
             )
             try:
                 result = await labeler.relabel(
-                    vision_caller,
+                    shared_runtime,
                     force=True,
                     keyword=keyword,
                 )

@@ -25,8 +25,14 @@ from ..core.config_registry import (
     read_config_value,
     resolve_config_entry,
 )
+from ..core.ai_routes import summarize_route_state
 from ..core.help_registry import find_command_help, find_entries_by_category, get_command_help_entries
+from ..core.knowledge_builder import (
+    maybe_start_plugin_knowledge_builder,
+    stop_plugin_knowledge_builder,
+)
 from ..core.legacy_memory_migrator import LegacyMemoryMigrator
+from ..core.runtime_config import get_runtime_load_info
 from ..utils import get_group_config, is_group_whitelisted
 
 
@@ -34,8 +40,10 @@ _GROUP_CONFIG_NAMESPACE = "group_config"
 _COMMAND_ALIASES = {
     "help": "help",
     "帮助": "help",
+    "命令": "help",
     "config": "config",
     "配置": "config",
+    "配置项": "config",
     "status": "status",
     "状态": "status",
     "admin": "admin",
@@ -76,6 +84,28 @@ _SUBCOMMAND_ALIASES = {
     "结晶": "crystal",
     "运行": "run",
 }
+_COMPOUND_TOKEN_ALIASES = {
+    "配置列表": ("配置", "列表"),
+    "配置项列表": ("配置", "列表"),
+    "配置项查看": ("配置", "查看"),
+    "配置项设置": ("配置", "设置"),
+    "配置项重置": ("配置", "重置"),
+    "配置查看": ("配置", "查看"),
+    "配置设置": ("配置", "设置"),
+    "配置重置": ("配置", "重置"),
+    "命令列表": ("帮助",),
+    "管理员列表": ("管理员", "列表"),
+    "记忆状态": ("记忆", "状态"),
+    "记忆补建": ("记忆", "补建"),
+    "记忆衰减": ("记忆", "衰减"),
+    "记忆演化": ("记忆", "演化"),
+    "记忆结晶": ("记忆", "结晶"),
+    "记忆结晶执行": ("记忆", "结晶", "执行"),
+    "结晶执行": ("结晶", "执行"),
+    "迁移状态": ("迁移", "状态"),
+    "迁移执行": ("迁移", "执行"),
+    "召回统计": ("召回", "统计"),
+}
 
 
 def normalize_command_word(text: str) -> str:
@@ -90,7 +120,16 @@ def normalize_command_word(text: str) -> str:
 
 
 def tokenize_command_args(arg_text: str) -> list[str]:
-    return [token for token in str(arg_text or "").strip().split() if token]
+    tokens = [token for token in str(arg_text or "").strip().split() if token]
+    expanded: list[str] = []
+    for token in tokens:
+        normalized = str(token or "").strip()
+        compound = _COMPOUND_TOKEN_ALIASES.get(normalized) or _COMPOUND_TOKEN_ALIASES.get(normalized.lower())
+        if compound:
+            expanded.extend(compound)
+        else:
+            expanded.append(normalized)
+    return expanded
 
 
 def format_timestamp(ts: float) -> str:
@@ -122,19 +161,47 @@ def _normalize_scope_token(token: str) -> str:
 
 def _root_help_text() -> str:
     lines = [
-        "拟人帮助",
-        "常用命令：",
-        "1. 拟人 帮助",
-        "2. 拟人 状态",
-        "3. 拟人 配置列表",
-        "4. 拟人 配置 查看 记忆宫殿",
-        "5. 拟人 配置 设置 记忆宫殿 开",
-        "6. 拟人 记忆 状态",
+        "拟人命令总览",
+        "统一入口（推荐优先记这一组）：",
+        "- 拟人 帮助：查看命令总览、分类帮助或某个配置项说明。",
+        "- 拟人 状态：查看当前运行、记忆、联网和后台任务状态。",
+        "- 拟人 配置 列表：查看所有可配置项、当前值、范围和用途。",
+        "- 拟人 配置 查看 <配置项> [当前群/群号]：查看单个配置项详情。",
+        "- 拟人 配置 设置 <配置项> <值> [当前群/群号]：修改配置。",
+        "- 拟人 配置 重置 <配置项> [当前群/群号]：恢复默认值。",
+        "- 拟人 记忆 状态|补建|衰减|演化|结晶 执行：管理记忆系统。",
+        "- 拟人 管理员 列表|添加|删除：管理插件管理员。",
+        "- 拟人 迁移 状态|执行：查看或执行旧数据迁移。",
+        "- 拟人 召回 统计：查看长期记忆召回统计。",
         "",
-        "分类：配置 / 管理员 / 记忆 / 迁移 / 召回",
+        "旧命令兼容（仍可用，下面直接说明用途）：",
+        "- 拟人配置：发送聊天记录形式的配置总览。",
+        "- 拟人开关 / 拟人语音 / 拟人联网 / 拟人主动消息：快速切全局开关。",
+        "- 开启拟人 / 关闭拟人 / 开启表情包 / 关闭表情包 / 开启语音回复 / 关闭语音回复：快速切当前群功能。",
+        "- 拟人作息：切换当前群或全局作息模拟。",
+        "- 设置人设 / 查看人设 / 重置人设：管理群人设。",
+        "- 学习群聊风格 / 查看群聊风格：管理群风格。",
+        "- 群好感 / 设置群好感：查看或修改群好感度。",
+        "- 查看画像 / 刷新画像：查看或重建用户画像。",
+        "- 清除记忆 / 完全清除记忆：清理会话与记忆数据。",
+        "- 申请白名单 / 同意白名单 / 拒绝白名单 / 添加白名单 / 移除白名单：管理群准入。",
+        "",
+        "继续查看：拟人 帮助 配置 / 记忆 / 管理员 / 迁移 / 召回 / 某个配置项名",
+        "兼容写法：拟人 配置列表 / 配置查看 / 配置设置 / 配置重置 / 记忆状态 / 召回统计",
         "前缀：拟人 / 人格 / /persona",
     ]
     return "\n".join(lines)
+
+
+def _config_usage_text() -> str:
+    return (
+        "用法：\n"
+        "- 拟人 配置 列表 [全局/群]\n"
+        "- 拟人 配置 查看 <配置项> [当前群/群号]\n"
+        "- 拟人 配置 设置 <配置项> <值> [当前群/群号]\n"
+        "- 拟人 配置 重置 <配置项> [当前群/群号]\n"
+        "兼容简写：拟人 配置列表 / 配置查看 / 配置设置 / 配置重置"
+    )
 
 
 def _format_command_help(path: tuple[str, ...]) -> str:
@@ -239,6 +306,43 @@ def _apply_global_side_effects(bundle: Any, entry: ConfigEntry, value: Any) -> N
         mode = str(value or "").strip().lower()
         config.personification_tool_web_search_enabled = mode != "disabled"
         config.personification_web_search = mode != "disabled"
+    if entry.field_name == "personification_plugin_knowledge_build_enabled":
+        knowledge_store = getattr(bundle.reply_processor_deps.runtime, "knowledge_store", None)
+        tool_caller = getattr(bundle.reply_processor_deps.runtime, "agent_tool_caller", None)
+        get_task = getattr(bundle, "get_knowledge_build_task", None)
+        set_task = getattr(bundle, "set_knowledge_build_task", None)
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = None
+        if loop is None or knowledge_store is None or get_task is None or set_task is None:
+            return
+        if bool(value):
+            loop.create_task(
+                maybe_start_plugin_knowledge_builder(
+                    plugin_config=config,
+                    tool_caller=tool_caller,
+                    knowledge_store=knowledge_store,
+                    logger=bundle.logger,
+                    get_knowledge_build_task=get_task,
+                    set_knowledge_build_task=set_task,
+                    trigger="config_toggle",
+                    force=True,
+                )
+            )
+        else:
+            loop.create_task(
+                stop_plugin_knowledge_builder(
+                    logger=bundle.logger,
+                    knowledge_store=knowledge_store,
+                    get_knowledge_build_task=get_task,
+                    set_knowledge_build_task=set_task,
+                    enabled=False,
+                    trigger="config_toggle",
+                    result="runtime_disabled",
+                    reasons=["config_disabled"],
+                )
+            )
 
 
 def _set_config_value(
@@ -290,6 +394,11 @@ def _admin_error() -> str:
     return "权限不足：仅超级管理员、插件管理员可执行；群级配置可选放行当前群管理员。"
 
 
+def _normalize_help_tokens(tokens: list[str]) -> list[str]:
+    expanded = tokenize_command_args(" ".join(str(token or "") for token in tokens))
+    return [normalize_command_word(token) for token in expanded if str(token or "").strip()]
+
+
 async def dispatch_persona_admin_command(
     matcher: Any,
     *,
@@ -335,14 +444,16 @@ async def dispatch_persona_admin_command(
             await matcher.finish(_admin_error())
         await matcher.finish(handle_recall_command(bundle, tokens=rest))
 
-    await matcher.finish("未识别的子命令。可用 `/persona help` 查看帮助。")
+    await matcher.finish("未识别的子命令。可用“拟人 帮助”或“/persona help”查看帮助。")
 
 
 def render_help(bundle: Any, *, event: Any, tokens: list[str]) -> str:
     _ = event
     if not tokens:
         return _root_help_text()
-    normalized = [normalize_command_word(token) for token in tokens]
+    normalized = _normalize_help_tokens(tokens)
+    if not normalized:
+        return _root_help_text()
     if len(normalized) >= 2:
         entry = find_command_help(tuple(normalized[:3]))
         if entry is not None:
@@ -352,14 +463,16 @@ def render_help(bundle: Any, *, event: Any, tokens: list[str]) -> str:
             return _format_command_help(entry.path)
     if normalized[0] in {"config", "admin", "memory", "migrate", "help", "status", "recall"}:
         return _format_category_help(normalized[0])
-    config_entry = resolve_config_entry(tokens[0])
+    config_entry = resolve_config_entry(" ".join(tokens))
+    if config_entry is None:
+        config_entry = resolve_config_entry(tokens[0])
     if config_entry is not None:
         group_id = str(getattr(event, "group_id", "") or "")
         return _format_config_help(bundle, config_entry, group_id=group_id)
     command_entry = find_command_help(tuple(normalized[:3])) or find_command_help(tuple(normalized[:2])) or find_command_help(tuple(normalized[:1]))
     if command_entry is not None:
         return _format_command_help(command_entry.path)
-    return "未找到对应帮助。"
+    return "未找到对应帮助。可用“拟人 帮助”查看总览。"
 
 
 def render_status(bundle: Any) -> str:
@@ -367,6 +480,9 @@ def render_status(bundle: Any) -> str:
     background_status = (
         bundle.background_intelligence.get_status() if bundle.background_intelligence is not None else {}
     )
+    route_state = summarize_route_state(bundle.plugin_config)
+    runtime_load_info = get_runtime_load_info(bundle.plugin_config)
+    runtime_skipped = ", ".join(runtime_load_info.get("skipped_runtime_keys", [])[:12]) or "无"
     lines = [
         "运行状态",
         f"记忆总开关：{format_config_value(getattr(bundle.plugin_config, 'personification_memory_enabled', True))}",
@@ -376,7 +492,14 @@ def render_status(bundle: Any) -> str:
         f"后台智能：{'开' if background_status.get('enabled') else '关'}",
         f"本小时后台任务：{background_status.get('llm_tasks_used_this_hour', 0)}/{background_status.get('max_llm_tasks_per_hour', 0)}",
         f"本日后台任务：{background_status.get('llm_tasks_used_today', 0)}/{background_status.get('max_llm_tasks_per_day', 0)}",
-        f"视觉兜底：{format_config_value(getattr(bundle.plugin_config, 'personification_vision_fallback_enabled', True))}",
+        f"主路由：{route_state['primary']}",
+        f"全局兜底：{route_state['fallback']}",
+        f"全局兜底来源：{route_state['fallback_source'] or '无'}",
+        f"忽略的旧来源：{route_state['fallback_ignored'] or '无'}",
+        f"视频兜底例外：{route_state['video_fallback']}",
+        f"视频兜底来源：{route_state['video_fallback_source'] or '无'}",
+        f"运行时配置文件：{runtime_load_info.get('path') or '未记录'}",
+        f"env 覆盖的 runtime 键：{runtime_skipped}",
         f"模型内置搜索：{format_config_value(getattr(bundle.plugin_config, 'personification_model_builtin_search_enabled', False))}",
         f"联网模式：{getattr(bundle.plugin_config, 'personification_tool_web_search_mode', 'enabled')}",
         f"最近后台维护：{format_timestamp(background_status.get('last_periodic_at', 0))}",
@@ -387,7 +510,7 @@ def render_status(bundle: Any) -> str:
 def handle_config_command(bundle: Any, *, event: Any, tokens: list[str]) -> str:
     action = normalize_command_word(tokens[0]) if tokens else "list"
     if action not in {"list", "get", "set", "reset"}:
-        return "用法：拟人 配置 列表｜查看｜设置｜重置 ..."
+        return _config_usage_text()
 
     if action == "list":
         requested_scope = _normalize_scope_token(tokens[1]) if len(tokens) >= 2 else ""
@@ -403,19 +526,34 @@ def handle_config_command(bundle: Any, *, event: Any, tokens: list[str]) -> str:
         entries = get_config_entries()
         if requested_scope in {GLOBAL_SCOPE, GROUP_SCOPE}:
             entries = [entry for entry in entries if config_entry_matches_scope(entry, requested_scope)]
-        lines = ["配置列表"]
+        lines = [f"配置列表（共 {len(entries)} 项）"]
+        if requested_scope in {GLOBAL_SCOPE, GROUP_SCOPE}:
+            lines.append(f"当前筛选：{_scope_label(requested_scope)}")
+        else:
+            lines.append("当前筛选：全局 + 群")
+        if current_group_id:
+            lines.append(f"当前群：{current_group_id}")
+        else:
+            lines.append("当前群：未指定；群配置项显示默认值，可用“拟人 配置 查看 <配置项> <群号>”查看指定群。")
+        lines.append("查看单项：拟人 配置 查看 <配置项>")
+        lines.append("修改配置：拟人 配置 设置 <配置项> <值>")
+        current_scope = ""
         for entry in entries:
+            if entry.scope != current_scope:
+                current_scope = entry.scope
+                lines.append("")
+                lines.append(f"{_scope_label(current_scope)}配置：")
             current = _read_entry_value(bundle, entry, group_id=current_group_id)
             lines.append(
-                f"- {get_entry_label(entry)}：{format_config_value(current)}（{_scope_label(entry.scope)}）"
+                f"- {get_entry_label(entry)}：当前 {format_config_value(current)}，默认 {format_config_value(get_entry_default_value(entry, bundle.plugin_config))}，可选 {describe_choices(entry)}。作用：{entry.description}"
             )
         return "\n".join(lines)
 
     if len(tokens) < 2:
-        return "请写明要查看的配置项。"
+        return f"请写明配置项名。\n{_config_usage_text()}"
     entry = resolve_config_entry(tokens[1])
     if entry is None:
-        return "没找到这个配置项。可先用“拟人 配置列表”查看。"
+        return "没找到这个配置项。可先用“拟人 配置 列表”查看所有配置，或用“拟人 帮助 配置”查看命令说明。"
     target_group_id = _resolve_group_config_target(entry, event, tokens[2:] if len(tokens) > 2 else [])
     if entry.scope == GROUP_SCOPE and not target_group_id:
         return "这是群配置。请在群里使用，或写上群号/当前群。"
@@ -433,7 +571,7 @@ def handle_config_command(bundle: Any, *, event: Any, tokens: list[str]) -> str:
 
     if action == "set":
         if len(tokens) < 3:
-            return "请提供要设置的值。"
+            return f"请提供要设置的值。\n{_config_usage_text()}"
         allow_group_admin = entry.scope == GROUP_SCOPE and bool(target_group_id)
         if not can_manage_sensitive_action(
             event=event,

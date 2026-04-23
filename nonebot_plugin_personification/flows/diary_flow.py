@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any, Awaitable, Callable, Optional
 
 from ..agent.inner_state import load_inner_state, update_state_from_diary
+from ..core.emotion_state import describe_group_emotion_memory, load_emotion_state
 
 
 def filter_sensitive_content(text: str) -> str:
@@ -138,6 +139,19 @@ async def generate_ai_diary(
     """Generate a weekly diary entry from recent chat context."""
     system_prompt = load_prompt()
     chat_context = await get_recent_chat_context(bot, logger)
+    emotion_hint = ""
+    if data_dir is not None:
+        try:
+            emotion_state = await load_emotion_state(Path(data_dir))
+            group_hints = [
+                describe_group_emotion_memory(emotion_state, str(group_id))
+                for group_id in list((emotion_state or {}).get("per_group", {}).keys())[:3]
+            ]
+            group_hints = [hint for hint in group_hints if hint]
+            if group_hints:
+                emotion_hint = "最近群情绪记忆：\n" + "\n".join(f"- {hint}" for hint in group_hints)
+        except Exception as e:
+            logger.debug(f"[diary] load emotion_state failed: {e}")
 
     base_requirements = (
         "请写一篇自然、像真人发动态一样的周记。\n"
@@ -153,6 +167,7 @@ async def generate_ai_diary(
             "请结合下面这些最近聊天内容，写一篇带一点生活感的周记。\n"
             "不要逐条复述聊天记录，而是把它们消化成自己的感受、吐槽或碎碎念。\n\n"
             f"{chat_context}\n\n"
+            f"{emotion_hint}\n\n"
             f"{base_requirements}"
         )
         rich_result = await _generate_once(
@@ -210,6 +225,19 @@ async def maybe_generate_proactive_qzone_post(
             inner_state = await load_inner_state(Path(data_dir))
         except Exception as e:
             logger.warning(f"[qzone] load inner_state failed: {e}")
+    emotion_hint = ""
+    if data_dir is not None:
+        try:
+            emotion_state = await load_emotion_state(Path(data_dir))
+            group_hints = [
+                describe_group_emotion_memory(emotion_state, str(group_id))
+                for group_id in list((emotion_state or {}).get("per_group", {}).keys())[:3]
+            ]
+            group_hints = [hint for hint in group_hints if hint]
+            if group_hints:
+                emotion_hint = "\n".join(f"- {hint}" for hint in group_hints)
+        except Exception as e:
+            logger.debug(f"[qzone] load emotion_state failed: {e}")
 
     mood = str((inner_state or {}).get("mood", "平静") or "平静")
     energy = str((inner_state or {}).get("energy", "正常") or "正常")
@@ -230,6 +258,7 @@ async def maybe_generate_proactive_qzone_post(
         f"当前心情：{mood}\n"
         f"当前精力：{energy}\n"
         f"最近挂念：\n{pending_block}\n\n"
+        f"近期群情绪记忆：\n{emotion_hint or '- 暂无明显群情绪记忆'}\n\n"
         f"最近聊天片段：\n{chat_context}\n\n"
         "要求：\n"
         "1. 如果没有明确想说的话，就输出 SKIP|原因。\n"

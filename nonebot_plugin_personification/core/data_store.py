@@ -5,18 +5,12 @@ import json
 from pathlib import Path
 from typing import Any, Callable, Optional
 
-from ..plugin_data import get_plugin_data_dir
 from .db import connect_sync, init_db_sync
 from .migration import migrate_all
+from .paths import get_data_dir as _get_data_dir
 
 
 _ROOT_KEY = "__root__"
-
-
-def _get_data_dir(plugin_config: Any | None = None) -> Path:
-    _ = plugin_config
-    return get_plugin_data_dir()
-
 
 class DataStore:
     """

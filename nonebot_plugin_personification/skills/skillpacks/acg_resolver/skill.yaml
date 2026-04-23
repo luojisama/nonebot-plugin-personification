@@ -17,5 +17,8 @@ parameters:
       items:
         type: string
       description: 可选图片引用列表
+    visual_hints:
+      type: object
+      description: 来自 vision_analyze 的视觉候选和证据
   required:
     - query

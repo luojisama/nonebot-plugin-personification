@@ -10,9 +10,16 @@ from nonebot import logger
 from .context_policy import sanitize_message_content, stringify_history_content
 from .db import connect_sync
 from .group_context import render_group_context_structured
+from .memory_defaults import (
+    DEFAULT_COMPRESS_KEEP_RECENT,
+    DEFAULT_COMPRESS_THRESHOLD,
+    DEFAULT_GROUP_CONTEXT_EXPIRE_HOURS,
+    DEFAULT_HISTORY_LEN,
+    DEFAULT_MESSAGE_EXPIRE_HOURS,
+)
 from .memory_store import get_memory_store
 
-SESSION_HISTORY_LIMIT = 100
+SESSION_HISTORY_LIMIT = DEFAULT_HISTORY_LEN
 GROUP_SESSION_PREFIX = "group_"
 PRIVATE_SESSION_PREFIX = "private_"
 
@@ -41,41 +48,41 @@ def load_session_histories() -> Dict[str, List[Dict[str, Any]]]:
 
 def _get_compress_threshold() -> int:
     if _plugin_config is not None:
-        return int(getattr(_plugin_config, "personification_compress_threshold", 100))
-    return 100
+        return int(getattr(_plugin_config, "personification_compress_threshold", DEFAULT_COMPRESS_THRESHOLD))
+    return DEFAULT_COMPRESS_THRESHOLD
 
 
 def _get_keep_recent() -> int:
     if _plugin_config is not None:
-        return int(getattr(_plugin_config, "personification_compress_keep_recent", 20))
-    return 20
+        return int(getattr(_plugin_config, "personification_compress_keep_recent", DEFAULT_COMPRESS_KEEP_RECENT))
+    return DEFAULT_COMPRESS_KEEP_RECENT
 
 
 def _get_history_max_len() -> int:
     if _plugin_config is not None:
-        value = int(getattr(_plugin_config, "personification_history_len", 120))
-        return max(20, min(value, 400))
-    return 120
+        value = int(getattr(_plugin_config, "personification_history_len", DEFAULT_HISTORY_LEN))
+        return max(40, min(value, 800))
+    return DEFAULT_HISTORY_LEN
 
 
 def _get_message_expire_hours() -> float:
     if _plugin_config is not None:
-        value = getattr(_plugin_config, "personification_message_expire_hours", 24.0)
+        value = getattr(_plugin_config, "personification_message_expire_hours", DEFAULT_MESSAGE_EXPIRE_HOURS)
         try:
             return max(0.0, float(value))
         except (TypeError, ValueError):
-            return 24.0
-    return 24.0
+            return DEFAULT_MESSAGE_EXPIRE_HOURS
+    return DEFAULT_MESSAGE_EXPIRE_HOURS
 
 
 def _get_group_message_expire_hours() -> float:
     if _plugin_config is not None:
-        raw = getattr(_plugin_config, "personification_group_context_expire_hours", 6.0)
+        raw = getattr(_plugin_config, "personification_group_context_expire_hours", DEFAULT_GROUP_CONTEXT_EXPIRE_HOURS)
         try:
             return max(0.0, float(raw))
         except (TypeError, ValueError):
-            return 6.0
-    return 6.0
+            return DEFAULT_GROUP_CONTEXT_EXPIRE_HOURS
+    return DEFAULT_GROUP_CONTEXT_EXPIRE_HOURS
 
 
 def build_group_session_id(group_id: str) -> str:
@@ -102,7 +109,8 @@ def ensure_session_history(session_id: str, legacy_session_id: Optional[str] = N
 
 
 def get_session_history_limit(session_id: str) -> int:
-    return _get_compress_threshold()
+    _ = session_id
+    return _get_history_max_len()
 
 
 def trim_session_history(session_id: str, legacy_session_id: Optional[str] = None) -> List[Dict]:

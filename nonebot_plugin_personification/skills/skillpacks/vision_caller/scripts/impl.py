@@ -7,11 +7,14 @@ from typing import Any, Awaitable, Callable, Dict, List, Optional
 
 import httpx
 
+from nonebot_plugin_personification.core.image_refs import normalize_image_ref
 from nonebot_plugin_personification.skills.skillpacks.tool_caller.scripts.impl import (
+    OpenAICodexToolCaller,
     _convert_openai_tool_to_gemini,
     _extract_gemini_text,
     _extract_gemini_tool_calls,
     _normalize_api_type,
+    _normalize_codex_model_name,
     _normalize_openai_base_url,
     _obj_get,
     _split_data_url,
@@ -19,6 +22,20 @@ from nonebot_plugin_personification.skills.skillpacks.tool_caller.scripts.impl i
 
 
 logger = logging.getLogger(__name__)
+
+
+def _provider_model_is_compatible(api_type: str, model: str) -> bool:
+    normalized_type = _normalize_api_type(api_type)
+    normalized_model = str(model or "").strip().lower()
+    if not normalized_model:
+        return False
+    if normalized_type == "openai_codex":
+        return not normalized_model.startswith(("gemini", "claude"))
+    if normalized_type == "gemini_official":
+        return not normalized_model.startswith(("gpt-", "claude"))
+    if normalized_type == "anthropic":
+        return not normalized_model.startswith(("gpt-", "gemini"))
+    return True
 
 
 class VisionCaller(ABC):
@@ -53,6 +70,9 @@ class OpenAIVisionCaller(VisionCaller):
 
     async def describe(self, prompt: str, image_url: str) -> str:
         from openai import AsyncOpenAI
+        normalized_image_url, problem = normalize_image_ref(image_url)
+        if not normalized_image_url:
+            raise ValueError(f"invalid_image_ref:{problem or 'unknown'}")
 
         async with httpx.AsyncClient(timeout=httpx.Timeout(self.timeout, connect=10.0)) as http_client:
             client = AsyncOpenAI(
@@ -67,7 +87,7 @@ class OpenAIVisionCaller(VisionCaller):
                         "role": "user",
                         "content": [
                             {"type": "text", "text": prompt},
-                            {"type": "image_url", "image_url": {"url": image_url}},
+                            {"type": "image_url", "image_url": {"url": normalized_image_url}},
                         ],
                     }
                 ],
@@ -85,13 +105,16 @@ class OpenAIVisionCaller(VisionCaller):
         max_steps: int = 4,
     ) -> str:
         from openai import AsyncOpenAI
+        normalized_image_url, problem = normalize_image_ref(image_url)
+        if not normalized_image_url:
+            raise ValueError(f"invalid_image_ref:{problem or 'unknown'}")
 
         messages: List[Dict[str, Any]] = [
             {
                 "role": "user",
                 "content": [
                     {"type": "text", "text": prompt},
-                    {"type": "image_url", "image_url": {"url": image_url}},
+                    {"type": "image_url", "image_url": {"url": normalized_image_url}},
                 ],
             }
         ]
@@ -203,7 +226,10 @@ class GeminiVisionCaller(VisionCaller):
         }
 
     def _gemini_image_part(self, image_url: str) -> Dict[str, Any]:
-        parsed = _split_data_url(image_url)
+        normalized_image_url, problem = normalize_image_ref(image_url)
+        if not normalized_image_url:
+            raise ValueError(f"invalid_image_ref:{problem or 'unknown'}")
+        parsed = _split_data_url(normalized_image_url)
         if parsed:
             mime_type, base64_data = parsed
             return {
@@ -215,7 +241,7 @@ class GeminiVisionCaller(VisionCaller):
         return {
             "fileData": {
                 "mimeType": "image/*",
-                "fileUri": image_url,
+                "fileUri": normalized_image_url,
             }
         }
 
@@ -340,6 +366,9 @@ class AnthropicVisionCaller(VisionCaller):
 
     async def describe(self, prompt: str, image_url: str) -> str:
         from anthropic import AsyncAnthropic
+        normalized_image_url, problem = normalize_image_ref(image_url)
+        if not normalized_image_url:
+            raise ValueError(f"invalid_image_ref:{problem or 'unknown'}")
 
         client_kwargs: Dict[str, Any] = {
             "api_key": self.api_key,
@@ -357,7 +386,7 @@ class AnthropicVisionCaller(VisionCaller):
                     "role": "user",
                     "content": [
                         {"type": "text", "text": prompt},
-                        _anthropic_image_block(image_url),
+                        _anthropic_image_block(normalized_image_url),
                     ],
                 }
             ],
@@ -378,6 +407,163 @@ class AnthropicVisionCaller(VisionCaller):
             "tool calls will be ignored and falling back to plain describe."
         )
         return await self.describe(prompt, image_url)
+
+
+class CodexVisionCaller(VisionCaller):
+    def __init__(
+        self,
+        *,
+        model: str,
+        auth_path: str = "",
+        timeout: float = 120.0,
+    ) -> None:
+        self.model = _normalize_codex_model_name(model)
+        self.auth_path = str(auth_path or "").strip()
+        self.timeout = timeout
+        self._caller = OpenAICodexToolCaller(
+            model=self.model,
+            auth_path=self.auth_path,
+            timeout=self.timeout,
+        )
+
+    async def describe(self, prompt: str, image_url: str) -> str:
+        normalized_image_url, problem = normalize_image_ref(image_url)
+        if not normalized_image_url:
+            raise ValueError(f"invalid_image_ref:{problem or 'unknown'}")
+        response = await self._caller.chat_with_tools(
+            [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": prompt},
+                        {"type": "image_url", "image_url": {"url": normalized_image_url}},
+                    ],
+                }
+            ],
+            [],
+            False,
+        )
+        if response.vision_unavailable:
+            raise RuntimeError("codex_vision_unavailable")
+        return str(response.content or "").strip()
+
+    async def describe_with_tools(
+        self,
+        prompt: str,
+        image_url: str,
+        tools: List[Dict[str, Any]],
+        tool_handler: Optional[Callable[[str, Dict[str, Any]], Awaitable[str]]] = None,
+        max_steps: int = 4,
+    ) -> str:
+        normalized_image_url, problem = normalize_image_ref(image_url)
+        if not normalized_image_url:
+            raise ValueError(f"invalid_image_ref:{problem or 'unknown'}")
+        messages: List[Dict[str, Any]] = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": prompt},
+                    {"type": "image_url", "image_url": {"url": normalized_image_url}},
+                ],
+            }
+        ]
+        latest_text = ""
+        for _ in range(max(1, int(max_steps))):
+            response = await self._caller.chat_with_tools(messages, tools, False)
+            if response.vision_unavailable:
+                raise RuntimeError("codex_vision_unavailable")
+            text = str(response.content or "").strip()
+            if text:
+                latest_text = text
+            if not response.tool_calls:
+                return latest_text
+            messages.append(
+                {
+                    "role": "assistant",
+                    "content": text,
+                    "tool_calls": [
+                        {
+                            "id": call.id,
+                            "type": "function",
+                            "function": {
+                                "name": call.name,
+                                "arguments": json.dumps(call.arguments or {}, ensure_ascii=False),
+                            },
+                        }
+                        for call in response.tool_calls
+                    ],
+                }
+            )
+            if not callable(tool_handler):
+                return latest_text
+            for call in response.tool_calls:
+                tool_result = ""
+                try:
+                    tool_result = await tool_handler(call.name, dict(call.arguments or {}))
+                except Exception:
+                    tool_result = ""
+                messages.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": call.id,
+                        "name": call.name,
+                        "content": str(tool_result or ""),
+                    }
+                )
+        return latest_text
+
+
+class FallbackVisionCaller(VisionCaller):
+    def __init__(self, primary: VisionCaller, fallback: VisionCaller) -> None:
+        self.primary = primary
+        self.fallback = fallback
+        self.model = getattr(primary, "model", "") or getattr(fallback, "model", "")
+
+    async def describe(self, prompt: str, image_url: str) -> str:
+        try:
+            result = await self.primary.describe(prompt, image_url)
+            if str(result or "").strip():
+                return str(result).strip()
+        except Exception:
+            pass
+        return await self.fallback.describe(prompt, image_url)
+
+    async def describe_with_tools(
+        self,
+        prompt: str,
+        image_url: str,
+        tools: List[Dict[str, Any]],
+        tool_handler: Optional[Callable[[str, Dict[str, Any]], Awaitable[str]]] = None,
+        max_steps: int = 4,
+    ) -> str:
+        try:
+            result = await self.primary.describe_with_tools(
+                prompt=prompt,
+                image_url=image_url,
+                tools=tools,
+                tool_handler=tool_handler,
+                max_steps=max_steps,
+            )
+            if str(result or "").strip():
+                return str(result).strip()
+        except Exception:
+            pass
+        return await self.fallback.describe_with_tools(
+            prompt=prompt,
+            image_url=image_url,
+            tools=tools,
+            tool_handler=tool_handler,
+            max_steps=max_steps,
+        )
+
+
+def _vision_signature(api_type: str, model: str, auth_path: str = "", api_url: str = "") -> tuple[str, str, str, str]:
+    return (
+        str(api_type or "").strip().lower(),
+        str(model or "").strip().lower(),
+        str(auth_path or "").strip(),
+        str(api_url or "").strip(),
+    )
 
 
 def _anthropic_image_block(image_url: str) -> dict:
@@ -406,30 +592,6 @@ def build_vision_caller(config: Any) -> Optional[VisionCaller]:
             getattr(config, "personification_api_type", "openai"),
         )
     )
-
-    # openai_codex 不支持视觉输入，降级为 None（禁用 labeler）
-    if api_type == "openai_codex":
-        return None
-
-    api_key = str(
-        getattr(
-            config,
-            "personification_labeler_api_key",
-            getattr(config, "personification_api_key", ""),
-        )
-        or ""
-    ).strip()
-    if not api_key:
-        return None
-
-    api_url = str(
-        getattr(
-            config,
-            "personification_labeler_api_url",
-            getattr(config, "personification_api_url", ""),
-        )
-        or ""
-    ).strip()
     model = str(
         getattr(
             config,
@@ -439,22 +601,88 @@ def build_vision_caller(config: Any) -> Optional[VisionCaller]:
         or getattr(config, "personification_model", "")
         or ""
     ).strip()
+    auth_path = str(getattr(config, "personification_codex_auth_path", "") or "").strip()
 
-    if api_type == "anthropic":
-        return AnthropicVisionCaller(
+    def _build_single(
+        *,
+        selected_api_type: str,
+        selected_model: str,
+        key_attr: str,
+        url_attr: str,
+    ) -> Optional[VisionCaller]:
+        resolved_model = str(selected_model or "").strip()
+        if selected_api_type == "openai_codex":
+            if resolved_model and not _provider_model_is_compatible(selected_api_type, resolved_model):
+                return None
+            if not resolved_model or "codex" not in resolved_model.lower():
+                resolved_model = _normalize_codex_model_name(
+                    str(getattr(config, "personification_model", "") or "").strip() or "gpt-5.3-codex"
+                )
+            return CodexVisionCaller(
+                model=resolved_model,
+                auth_path=auth_path,
+            )
+        if not _provider_model_is_compatible(selected_api_type, resolved_model):
+            return None
+
+        api_key = str(getattr(config, key_attr, getattr(config, "personification_api_key", "")) or "").strip()
+        if not api_key:
+            return None
+        api_url = str(getattr(config, url_attr, getattr(config, "personification_api_url", "")) or "").strip()
+        if selected_api_type == "anthropic":
+            return AnthropicVisionCaller(
+                api_key=api_key,
+                base_url=api_url,
+                model=resolved_model,
+            )
+        if selected_api_type == "gemini_official":
+            return GeminiVisionCaller(
+                api_key=api_key,
+                base_url=api_url,
+                model=resolved_model,
+            )
+        return OpenAIVisionCaller(
             api_key=api_key,
             base_url=api_url,
-            model=model,
+            model=resolved_model,
         )
-    if api_type == "gemini_official":
-        return GeminiVisionCaller(
-            api_key=api_key,
-            base_url=api_url,
-            model=model,
-        )
-    return OpenAIVisionCaller(
-        api_key=api_key,
-        base_url=api_url,
-        model=model,
+
+    primary = _build_single(
+        selected_api_type=api_type,
+        selected_model=model,
+        key_attr="personification_labeler_api_key",
+        url_attr="personification_labeler_api_url",
     )
+    if primary is None:
+        return None
+
+    fallback_enabled = bool(getattr(config, "personification_vision_fallback_enabled", True))
+    fallback_provider = str(getattr(config, "personification_vision_fallback_provider", "") or "").strip()
+    fallback_type = _normalize_api_type(fallback_provider)
+    fallback_model = str(
+        getattr(config, "personification_vision_fallback_model", "") or ""
+    ).strip()
+    fallback = None
+    primary_signature = _vision_signature(
+        api_type,
+        model,
+        auth_path=auth_path,
+        api_url=str(getattr(config, "personification_labeler_api_url", getattr(config, "personification_api_url", "")) or "").strip(),
+    )
+    fallback_signature = _vision_signature(
+        fallback_type,
+        fallback_model,
+        auth_path=auth_path,
+        api_url=str(getattr(config, "personification_labeler_api_url", getattr(config, "personification_api_url", "")) or "").strip(),
+    )
+    if fallback_enabled and fallback_provider and fallback_model and fallback_signature != primary_signature:
+        fallback = _build_single(
+            selected_api_type=fallback_type,
+            selected_model=fallback_model,
+            key_attr="personification_labeler_api_key",
+            url_attr="personification_labeler_api_url",
+        )
+    if fallback is None:
+        return primary
+    return FallbackVisionCaller(primary, fallback)
 

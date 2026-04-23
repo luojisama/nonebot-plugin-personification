@@ -1,7 +1,22 @@
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from typing import Any, Callable, Iterable
+
+from .memory_defaults import (
+    DEFAULT_COMPRESS_KEEP_RECENT,
+    DEFAULT_COMPRESS_THRESHOLD,
+    DEFAULT_GROUP_CONTEXT_EXPIRE_HOURS,
+    DEFAULT_GROUP_SUMMARY_EXPIRE_HOURS,
+    DEFAULT_HISTORY_LEN,
+    DEFAULT_MEMORY_RECALL_TOP_K,
+    DEFAULT_MESSAGE_EXPIRE_HOURS,
+    DEFAULT_PERSONA_HISTORY_MAX,
+    DEFAULT_PRIVATE_HISTORY_TURNS,
+    MAX_MEMORY_RECALL_TOP_K,
+    MAX_PRIVATE_HISTORY_TURNS,
+)
 
 
 GLOBAL_SCOPE = "global"
@@ -36,6 +51,13 @@ def _int_parser(raw: str) -> int:
         return int(str(raw or "").strip())
     except (TypeError, ValueError) as exc:
         raise ValueError("需要整数值") from exc
+
+
+def _float_parser(raw: str) -> float:
+    try:
+        return float(str(raw or "").strip())
+    except (TypeError, ValueError) as exc:
+        raise ValueError("需要数字值") from exc
 
 
 def _str_parser(raw: str) -> str:
@@ -74,8 +96,8 @@ class ConfigEntry:
     admin_only: bool = True
     hot_reloadable: bool = True
     choices: tuple[str, ...] = ()
-    min_value: int | None = None
-    max_value: int | None = None
+    min_value: float | None = None
+    max_value: float | None = None
     help_aliases: tuple[str, ...] = ()
     risk_note: str = ""
     parser: Callable[[str], Any] | None = None
@@ -94,6 +116,13 @@ class ConfigEntry:
             value = allowed[normalized]
         if self.value_type == "int":
             number = int(value)
+            if self.min_value is not None and number < self.min_value:
+                raise ValueError(f"不能小于 {self.min_value}")
+            if self.max_value is not None and number > self.max_value:
+                raise ValueError(f"不能大于 {self.max_value}")
+            return number
+        if self.value_type == "float":
+            number = float(value)
             if self.min_value is not None and number < self.min_value:
                 raise ValueError(f"不能小于 {self.min_value}")
             if self.max_value is not None and number > self.max_value:
@@ -142,26 +171,232 @@ def _build_entries() -> list[ConfigEntry]:
             parser=_web_search_mode_parser,
         ),
         ConfigEntry(
-            key="vision_fallback_enabled",
-            field_name="personification_vision_fallback_enabled",
-            display_name="视觉兜底",
+            key="fallback_enabled",
+            field_name="personification_fallback_enabled",
+            display_name="全局兜底",
             value_type="bool",
             default=True,
             scope=GLOBAL_SCOPE,
-            description="主模型看图不稳定时允许兜底视觉流程。",
+            description="主模型路由失败时允许统一进入全局兜底。",
             category="config",
+            help_aliases=("视觉兜底", "vision_fallback", "fallback", "全局fallback"),
             parser=_bool_parser,
         ),
         ConfigEntry(
-            key="vision_fallback_model",
-            field_name="personification_vision_fallback_model",
-            display_name="视觉兜底模型",
+            key="fallback_api_type",
+            field_name="personification_fallback_api_type",
+            display_name="全局兜底供应商",
             value_type="str",
-            default="gpt-5.4",
+            default="",
             scope=GLOBAL_SCOPE,
-            description="视觉兜底模型名。",
+            description="全局兜底 provider 类型，主路由失败后才使用。",
             category="config",
+            help_aliases=("全局兜底供应商", "fallback_provider", "fallback_api_type"),
             parser=_str_parser,
+        ),
+        ConfigEntry(
+            key="fallback_api_url",
+            field_name="personification_fallback_api_url",
+            display_name="全局兜底 API 地址",
+            value_type="str",
+            default="",
+            scope=GLOBAL_SCOPE,
+            description="全局兜底 API 地址。",
+            category="config",
+            help_aliases=("全局兜底地址", "fallback_url", "fallback_api_url"),
+            parser=_str_parser,
+        ),
+        ConfigEntry(
+            key="fallback_api_key",
+            field_name="personification_fallback_api_key",
+            display_name="全局兜底 API Key",
+            value_type="str",
+            default="",
+            scope=GLOBAL_SCOPE,
+            description="全局兜底 API Key。",
+            category="config",
+            help_aliases=("全局兜底密钥", "fallback_key", "fallback_api_key"),
+            parser=_str_parser,
+        ),
+        ConfigEntry(
+            key="fallback_model",
+            field_name="personification_fallback_model",
+            display_name="全局兜底模型",
+            value_type="str",
+            default="",
+            scope=GLOBAL_SCOPE,
+            description="全局兜底模型名。",
+            category="config",
+            help_aliases=("视觉兜底模型", "vision_fallback_model", "fallback_model"),
+            parser=_str_parser,
+        ),
+        ConfigEntry(
+            key="fallback_auth_path",
+            field_name="personification_fallback_auth_path",
+            display_name="全局兜底认证路径",
+            value_type="str",
+            default="",
+            scope=GLOBAL_SCOPE,
+            description="全局兜底 Codex 等 provider 使用的本地认证路径。",
+            category="config",
+            help_aliases=("全局兜底认证", "fallback_auth_path"),
+            parser=_str_parser,
+        ),
+        ConfigEntry(
+            key="video_understanding_enabled",
+            field_name="personification_video_understanding_enabled",
+            display_name="视频理解",
+            value_type="bool",
+            default=False,
+            scope=GLOBAL_SCOPE,
+            description="允许在支持的视频路由上启用视频理解。",
+            category="config",
+            help_aliases=("视频理解", "video", "video_enabled"),
+            parser=_bool_parser,
+        ),
+        ConfigEntry(
+            key="video_fallback_enabled",
+            field_name="personification_video_fallback_enabled",
+            display_name="视频兜底",
+            value_type="bool",
+            default=True,
+            scope=GLOBAL_SCOPE,
+            description="主模型不支持视频时允许使用独立视频兜底。",
+            category="config",
+            help_aliases=("视频兜底", "video_fallback"),
+            parser=_bool_parser,
+        ),
+        ConfigEntry(
+            key="video_fallback_provider",
+            field_name="personification_video_fallback_provider",
+            display_name="视频兜底供应商",
+            value_type="str",
+            default="",
+            scope=GLOBAL_SCOPE,
+            description="视频兜底的 provider 类型，留空继承全局兜底。",
+            category="config",
+            help_aliases=("视频兜底供应商", "video_fallback_provider"),
+            parser=_str_parser,
+        ),
+        ConfigEntry(
+            key="video_fallback_api_url",
+            field_name="personification_video_fallback_api_url",
+            display_name="视频兜底 API 地址",
+            value_type="str",
+            default="",
+            scope=GLOBAL_SCOPE,
+            description="视频兜底 API 地址，留空继承全局兜底。",
+            category="config",
+            help_aliases=("视频兜底地址", "video_fallback_url", "video_fallback_api_url"),
+            parser=_str_parser,
+        ),
+        ConfigEntry(
+            key="video_fallback_api_key",
+            field_name="personification_video_fallback_api_key",
+            display_name="视频兜底 API Key",
+            value_type="str",
+            default="",
+            scope=GLOBAL_SCOPE,
+            description="视频兜底 API Key，留空继承全局兜底。",
+            category="config",
+            help_aliases=("视频兜底密钥", "video_fallback_key", "video_fallback_api_key"),
+            parser=_str_parser,
+        ),
+        ConfigEntry(
+            key="video_fallback_model",
+            field_name="personification_video_fallback_model",
+            display_name="视频兜底模型",
+            value_type="str",
+            default="",
+            scope=GLOBAL_SCOPE,
+            description="视频兜底模型名，留空继承全局兜底。",
+            category="config",
+            help_aliases=("视频兜底模型", "video_fallback_model"),
+            parser=_str_parser,
+        ),
+        ConfigEntry(
+            key="video_fallback_auth_path",
+            field_name="personification_video_fallback_auth_path",
+            display_name="视频兜底认证路径",
+            value_type="str",
+            default="",
+            scope=GLOBAL_SCOPE,
+            description="视频兜底认证路径，留空继承全局兜底。",
+            category="config",
+            help_aliases=("视频兜底认证", "video_fallback_auth_path"),
+            parser=_str_parser,
+        ),
+        ConfigEntry(
+            key="plugin_knowledge_build_enabled",
+            field_name="personification_plugin_knowledge_build_enabled",
+            display_name="插件知识库构建",
+            value_type="bool",
+            default=False,
+            scope=GLOBAL_SCOPE,
+            description="允许自动或手动启动插件知识库构建任务。",
+            category="config",
+            help_aliases=("知识库构建", "plugin_knowledge_build", "插件知识库"),
+            parser=_bool_parser,
+        ),
+        ConfigEntry(
+            key="lite_model",
+            field_name="personification_lite_model",
+            display_name="轻量辅助模型",
+            value_type="str",
+            default="",
+            scope=GLOBAL_SCOPE,
+            description="用于语义分类、审阅、图片分类等辅助链路；留空回退主模型。",
+            category="config",
+            help_aliases=("lite_model", "轻量模型", "辅助模型"),
+            parser=_str_parser,
+        ),
+        ConfigEntry(
+            key="global_enabled",
+            field_name="personification_global_enabled",
+            display_name="全局拟人回复",
+            value_type="bool",
+            default=True,
+            scope=GLOBAL_SCOPE,
+            description="总开关，关闭后所有群聊和私聊拟人回复都会停用。",
+            category="config",
+            help_aliases=("全局拟人", "拟人开关", "总开关"),
+            parser=_bool_parser,
+        ),
+        ConfigEntry(
+            key="tts_global_enabled",
+            field_name="personification_tts_global_enabled",
+            display_name="全局语音回复",
+            value_type="bool",
+            default=True,
+            scope=GLOBAL_SCOPE,
+            description="控制语音能力是否允许在所有场景下启用。",
+            category="config",
+            help_aliases=("全局语音", "拟人语音", "语音开关"),
+            parser=_bool_parser,
+        ),
+        ConfigEntry(
+            key="proactive_enabled",
+            field_name="personification_proactive_enabled",
+            display_name="主动私聊",
+            value_type="bool",
+            default=False,
+            scope=GLOBAL_SCOPE,
+            description="允许 Bot 在合适的时候主动发起私聊。",
+            category="config",
+            help_aliases=("主动消息", "主动私聊", "拟人主动消息"),
+            parser=_bool_parser,
+        ),
+        ConfigEntry(
+            key="schedule_global",
+            field_name="personification_schedule_global",
+            display_name="全局作息模拟",
+            value_type="bool",
+            default=False,
+            scope=GLOBAL_SCOPE,
+            description="让所有群统一启用作息背景，不必逐群单独开启。",
+            category="config",
+            help_aliases=("全局作息", "拟人作息", "作息全局"),
+            parser=_bool_parser,
         ),
         ConfigEntry(
             key="memory_enabled",
@@ -216,14 +451,126 @@ def _build_entries() -> list[ConfigEntry]:
             field_name="personification_memory_recall_top_k",
             display_name="记忆召回条数",
             value_type="int",
-            default=6,
+            default=DEFAULT_MEMORY_RECALL_TOP_K,
             scope=GLOBAL_SCOPE,
             description="单次 recall 默认返回记忆条数。",
             category="config",
             min_value=1,
-            max_value=10,
+            max_value=MAX_MEMORY_RECALL_TOP_K,
             help_aliases=("召回条数", "recall条数"),
             parser=_int_parser,
+        ),
+        ConfigEntry(
+            key="persona_history_max",
+            field_name="personification_persona_history_max",
+            display_name="画像更新阈值",
+            value_type="int",
+            default=DEFAULT_PERSONA_HISTORY_MAX,
+            scope=GLOBAL_SCOPE,
+            description="单个用户累计多少条新消息后触发一次画像更新。",
+            category="config",
+            min_value=10,
+            max_value=200,
+            help_aliases=("画像阈值", "画像历史条数", "人格画像阈值"),
+            parser=_int_parser,
+        ),
+        ConfigEntry(
+            key="history_len",
+            field_name="personification_history_len",
+            display_name="会话历史上限",
+            value_type="int",
+            default=DEFAULT_HISTORY_LEN,
+            scope=GLOBAL_SCOPE,
+            description="数据库中每个会话最多保留多少条原始消息，再多会滚动清理。",
+            category="config",
+            min_value=80,
+            max_value=800,
+            help_aliases=("上下文长度", "历史长度", "聊天上下文长度"),
+            parser=_int_parser,
+        ),
+        ConfigEntry(
+            key="compress_threshold",
+            field_name="personification_compress_threshold",
+            display_name="压缩触发条数",
+            value_type="int",
+            default=DEFAULT_COMPRESS_THRESHOLD,
+            scope=GLOBAL_SCOPE,
+            description="会话累计到多少条后开始把旧消息压缩成摘要。",
+            category="config",
+            min_value=40,
+            max_value=600,
+            help_aliases=("压缩阈值", "摘要阈值"),
+            parser=_int_parser,
+        ),
+        ConfigEntry(
+            key="compress_keep_recent",
+            field_name="personification_compress_keep_recent",
+            display_name="压缩保留条数",
+            value_type="int",
+            default=DEFAULT_COMPRESS_KEEP_RECENT,
+            scope=GLOBAL_SCOPE,
+            description="压缩后仍保留多少条最近原始消息，帮助模型续接当前话题。",
+            category="config",
+            min_value=8,
+            max_value=120,
+            help_aliases=("保留条数", "最近保留条数"),
+            parser=_int_parser,
+        ),
+        ConfigEntry(
+            key="private_history_turns",
+            field_name="personification_private_history_turns",
+            display_name="私聊送模条数",
+            value_type="int",
+            default=DEFAULT_PRIVATE_HISTORY_TURNS,
+            scope=GLOBAL_SCOPE,
+            description="私聊时真正送进主模型的最近消息条数上限，越大越容易延续长对话。",
+            category="config",
+            min_value=12,
+            max_value=MAX_PRIVATE_HISTORY_TURNS,
+            help_aliases=("私聊上下文条数", "私聊历史条数", "私聊轮数"),
+            parser=_int_parser,
+        ),
+        ConfigEntry(
+            key="message_expire_hours",
+            field_name="personification_message_expire_hours",
+            display_name="私聊上下文过期小时",
+            value_type="float",
+            default=DEFAULT_MESSAGE_EXPIRE_HOURS,
+            scope=GLOBAL_SCOPE,
+            description="私聊旧消息超过这个时长后不再参与上下文；0 表示不过期。",
+            category="config",
+            min_value=0,
+            max_value=720,
+            help_aliases=("消息过期小时", "私聊过期时间"),
+            parser=_float_parser,
+        ),
+        ConfigEntry(
+            key="group_context_expire_hours",
+            field_name="personification_group_context_expire_hours",
+            display_name="群上下文过期小时",
+            value_type="float",
+            default=DEFAULT_GROUP_CONTEXT_EXPIRE_HOURS,
+            scope=GLOBAL_SCOPE,
+            description="群聊旧消息超过这个时长后不再参与上下文；0 表示不过期。",
+            category="config",
+            min_value=0,
+            max_value=240,
+            help_aliases=("群过期时间", "群上下文时间"),
+            parser=_float_parser,
+        ),
+        ConfigEntry(
+            key="group_summary_expire_hours",
+            field_name="personification_group_summary_expire_hours",
+            display_name="群摘要过期小时",
+            value_type="float",
+            default=DEFAULT_GROUP_SUMMARY_EXPIRE_HOURS,
+            scope=GLOBAL_SCOPE,
+            description="群话题摘要在超过这个时长后不再注入给模型。",
+            category="config",
+            min_value=0,
+            max_value=240,
+            help_aliases=("群摘要时间", "话题摘要过期"),
+            parser=_float_parser,
         ),
         ConfigEntry(
             key="background_intelligence_enabled",
@@ -382,11 +729,30 @@ def _build_entries() -> list[ConfigEntry]:
 _ENTRIES = _build_entries()
 _ENTRY_BY_KEY: dict[str, ConfigEntry] = {entry.key: entry for entry in _ENTRIES}
 _ALIASES: dict[str, ConfigEntry] = {}
+
+
+def _normalize_alias(text: str) -> str:
+    return str(text or "").strip().lower()
+
+
+def _compact_alias(text: str) -> str:
+    normalized = _normalize_alias(text)
+    return re.sub(r"[\s_\-:/]+", "", normalized)
+
+
+def _register_alias(alias: str, entry: ConfigEntry) -> None:
+    for candidate in {_normalize_alias(alias), _compact_alias(alias)}:
+        if candidate:
+            _ALIASES[candidate] = entry
+
+
 for _entry in _ENTRIES:
-    _ALIASES[_entry.key.lower()] = _entry
-    _ALIASES[_entry.field_name.lower()] = _entry
+    _register_alias(_entry.key, _entry)
+    _register_alias(_entry.field_name, _entry)
+    _register_alias(_entry.display_name, _entry)
+    _register_alias(_entry.field_name.removeprefix("personification_"), _entry)
     for _alias in _entry.help_aliases:
-        _ALIASES[str(_alias or "").strip().lower()] = _entry
+        _register_alias(str(_alias or ""), _entry)
 
 
 def get_config_entries(scope: str | None = None) -> list[ConfigEntry]:
@@ -401,10 +767,11 @@ def get_global_runtime_config_keys() -> list[str]:
 
 
 def resolve_config_entry(key: str) -> ConfigEntry | None:
-    normalized = str(key or "").strip().lower()
+    normalized = _normalize_alias(key)
+    compact = _compact_alias(key)
     if not normalized:
         return None
-    return _ALIASES.get(normalized)
+    return _ALIASES.get(normalized) or _ALIASES.get(compact)
 
 
 def get_entry_default_value(entry: ConfigEntry, plugin_config: Any) -> Any:
@@ -436,6 +803,10 @@ def describe_choices(entry: ConfigEntry) -> str:
         lower = entry.min_value if entry.min_value is not None else "-"
         upper = entry.max_value if entry.max_value is not None else "-"
         return f"整数 ({lower}..{upper})"
+    if entry.value_type == "float":
+        lower = entry.min_value if entry.min_value is not None else "-"
+        upper = entry.max_value if entry.max_value is not None else "-"
+        return f"数字 ({lower}..{upper})"
     return "自由文本"
 
 
@@ -458,5 +829,7 @@ def config_entry_matches_scope(entry: ConfigEntry, scope: str) -> bool:
 def iter_config_aliases(entry: ConfigEntry) -> Iterable[str]:
     yield entry.key
     yield entry.field_name
+    yield entry.display_name
+    yield entry.field_name.removeprefix("personification_")
     for alias in entry.help_aliases:
         yield alias

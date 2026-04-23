@@ -4,6 +4,8 @@ import threading
 import time
 from typing import Any, Dict, List, Optional
 
+from .message_parts import normalize_message_parts
+from .visual_capabilities import error_indicates_vision_unavailable, heuristic_supports_vision
 from ..skills.skillpacks.tool_caller.scripts.impl import (
     AnthropicToolCaller,
     GeminiToolCaller,
@@ -15,7 +17,9 @@ from ..skills.skillpacks.tool_caller.scripts.impl import (
 
 PROVIDER_FAILURE_STATE: Dict[str, Dict[str, Any]] = {}
 PROVIDER_ROTATION_CURSOR = 0
-_CURSOR_LOCK = threading.Lock()
+_PROVIDER_STATE_LOCK = threading.RLock()
+_CURSOR_LOCK = _PROVIDER_STATE_LOCK
+_LOGGED_PROVIDER_CONFIG_SIGNATURES: set[tuple[str, tuple[tuple[str, str, str], ...]]] = set()
 
 
 def normalize_api_type(api_type: Optional[str]) -> str:
@@ -27,6 +31,10 @@ def normalize_api_type(api_type: Optional[str]) -> str:
     if value not in {"openai", "gemini", "anthropic", "openai_codex"}:
         return "openai"
     return value
+
+
+def provider_supports_vision(api_type: Optional[str], model: Optional[str] = None) -> bool:
+    return heuristic_supports_vision(str(api_type or ""), model)
 
 
 def _to_bool(value: Any, default: bool = False) -> bool:
@@ -63,6 +71,18 @@ def _provider_max_retries(provider: Dict[str, Any]) -> int:
     return max(1, _to_int(provider.get("max_retries", 2), 2))
 
 
+def _override_provider_model(provider: Dict[str, Any], model_override: str = "") -> Dict[str, Any]:
+    cloned = dict(provider or {})
+    override = str(model_override or "").strip()
+    if not override:
+        return cloned
+    if normalize_api_type(cloned.get("api_type")) == "openai_codex":
+        cloned["model"] = _normalize_codex_model(override)
+    else:
+        cloned["model"] = override
+    return cloned
+
+
 def _normalize_codex_model(model: str) -> str:
     value = (model or "").strip()
     if not value:
@@ -75,6 +95,47 @@ def _normalize_codex_model(model: str) -> str:
         "gpt-5": "gpt-5-codex",
     }
     return alias_map.get(lower, value)
+
+
+def _provider_config_signature(
+    source: str,
+    providers: List[Dict[str, Any]],
+) -> tuple[str, tuple[tuple[str, str, str], ...]]:
+    return (
+        source,
+        tuple(
+            (
+                str(provider.get("name", "") or ""),
+                str(provider.get("api_type", "") or ""),
+                str(provider.get("model", "") or ""),
+            )
+            for provider in providers
+        ),
+    )
+
+
+def _log_active_provider_config_once(
+    *,
+    logger: Any,
+    source: str,
+    providers: List[Dict[str, Any]],
+) -> None:
+    signature = _provider_config_signature(source, providers)
+    with _PROVIDER_STATE_LOCK:
+        if signature in _LOGGED_PROVIDER_CONFIG_SIGNATURES:
+            return
+        _LOGGED_PROVIDER_CONFIG_SIGNATURES.add(signature)
+    summary = ", ".join(
+        f"{provider.get('name') or 'unnamed'}({provider.get('api_type') or 'unset'}:{provider.get('model') or 'unset'})"
+        for provider in providers
+    ) or "none"
+    try:
+        logger.info(
+            "personification: active primary provider route "
+            f"source={source} count={len(providers)} providers={summary}"
+        )
+    except Exception:
+        pass
 
 
 def load_api_pool_config(plugin_config: Any, logger: Any) -> List[Dict[str, Any]]:
@@ -124,8 +185,8 @@ def load_api_pool_config(plugin_config: Any, logger: Any) -> List[Dict[str, Any]
             "timeout": _provider_timeout({"api_type": api_type, **item}),
             "max_retries": max(1, _to_int(item.get("max_retries", 2), 2)),
             "supports_native_search": _to_bool(
-                item.get("supports_native_search", api_type in {"gemini", "anthropic"}),
-                api_type in {"gemini", "anthropic"},
+                item.get("supports_native_search", api_type in {"gemini", "anthropic", "openai", "openai_codex"}),
+                api_type in {"gemini", "anthropic", "openai", "openai_codex"},
             ),
             "supports_reasoning": item.get("supports_reasoning"),
         }
@@ -139,11 +200,16 @@ def load_api_pool_config(plugin_config: Any, logger: Any) -> List[Dict[str, Any]
 def get_configured_api_providers(plugin_config: Any, logger: Any) -> List[Dict[str, Any]]:
     providers = load_api_pool_config(plugin_config, logger)
     if providers:
+        _log_active_provider_config_once(
+            logger=logger,
+            source="personification_api_pools",
+            providers=providers,
+        )
         return providers
 
     legacy_type = normalize_api_type(getattr(plugin_config, "personification_api_type", "openai"))
     if legacy_type == "openai_codex":
-        return [
+        providers = [
             {
                 "name": "legacy_primary",
                 "api_type": legacy_type,
@@ -158,26 +224,40 @@ def get_configured_api_providers(plugin_config: Any, logger: Any) -> List[Dict[s
                 "supports_native_search": True,
             }
         ]
+        _log_active_provider_config_once(
+            logger=logger,
+            source="personification_api_*",
+            providers=providers,
+        )
+        return providers
 
+    api_url = str(getattr(plugin_config, "personification_api_url", "") or "").strip()
     api_key = str(getattr(plugin_config, "personification_api_key", "") or "").strip()
-    if not api_key:
+    model = str(getattr(plugin_config, "personification_model", "") or "").strip()
+    if not api_key or not api_url or not model:
         return []
 
-    return [
+    providers = [
         {
             "name": "legacy_primary",
             "api_type": legacy_type,
-            "api_url": str(getattr(plugin_config, "personification_api_url", "") or "").strip(),
+            "api_url": api_url,
             "api_key": api_key,
-            "model": getattr(plugin_config, "personification_model", ""),
+            "model": model,
             "auth_path": "",
             "enabled": True,
             "priority": 0,
             "timeout": 120 if legacy_type in {"gemini", "anthropic"} else 60,
             "max_retries": 2,
-            "supports_native_search": legacy_type in {"gemini", "anthropic"},
+            "supports_native_search": legacy_type in {"gemini", "anthropic", "openai", "openai_codex"},
         }
     ]
+    _log_active_provider_config_once(
+        logger=logger,
+        source="personification_api_*",
+        providers=providers,
+    )
+    return providers
 
 
 def get_provider_candidates(plugin_config: Any, logger: Any) -> List[Dict[str, Any]]:
@@ -190,12 +270,13 @@ def get_provider_candidates(plugin_config: Any, logger: Any) -> List[Dict[str, A
     now_ts = time.time()
     available: List[Dict[str, Any]] = []
     cooling: List[Dict[str, Any]] = []
-    for provider in providers:
-        state = PROVIDER_FAILURE_STATE.get(provider["name"], {})
-        if state.get("cooldown_until", 0) > now_ts:
-            cooling.append(provider)
-        else:
-            available.append(provider)
+    with _PROVIDER_STATE_LOCK:
+        for provider in providers:
+            state = PROVIDER_FAILURE_STATE.get(provider["name"], {})
+            if state.get("cooldown_until", 0) > now_ts:
+                cooling.append(provider)
+            else:
+                available.append(provider)
 
     if not available:
         available = cooling
@@ -203,26 +284,28 @@ def get_provider_candidates(plugin_config: Any, logger: Any) -> List[Dict[str, A
     if len(available) <= 1:
         return available
 
-    with _CURSOR_LOCK:
+    with _PROVIDER_STATE_LOCK:
         cursor = PROVIDER_ROTATION_CURSOR % len(available)
         PROVIDER_ROTATION_CURSOR = (PROVIDER_ROTATION_CURSOR + 1) % len(available)
     return available[cursor:] + available[:cursor]
 
 
 def _mark_provider_success(provider_name: str) -> None:
-    PROVIDER_FAILURE_STATE.pop(provider_name, None)
+    with _PROVIDER_STATE_LOCK:
+        PROVIDER_FAILURE_STATE.pop(provider_name, None)
 
 
 def _mark_provider_failure(provider_name: str, error: Exception) -> None:
     now_ts = time.time()
-    state = PROVIDER_FAILURE_STATE.get(provider_name, {})
-    failures = int(state.get("failures", 0)) + 1
-    PROVIDER_FAILURE_STATE[provider_name] = {
-        "failures": failures,
-        "cooldown_until": now_ts + min(300, 30 * failures),
-        "last_error": str(error),
-        "last_failed_at": now_ts,
-    }
+    with _PROVIDER_STATE_LOCK:
+        state = PROVIDER_FAILURE_STATE.get(provider_name, {})
+        failures = int(state.get("failures", 0)) + 1
+        PROVIDER_FAILURE_STATE[provider_name] = {
+            "failures": failures,
+            "cooldown_until": now_ts + min(300, 30 * failures),
+            "last_error": str(error),
+            "last_failed_at": now_ts,
+        }
 
 
 def _get_thinking_mode(plugin_config: Any) -> str:
@@ -266,7 +349,7 @@ def _build_provider_caller(provider: Dict[str, Any], plugin_config: Any):
 def _should_use_builtin_search(provider: Dict[str, Any], use_builtin_search: bool) -> bool:
     if not use_builtin_search:
         return False
-    if provider["api_type"] not in {"gemini", "anthropic", "openai_codex"}:
+    if provider["api_type"] not in {"gemini", "anthropic", "openai", "openai_codex"}:
         return False
     return bool(provider.get("supports_native_search", True))
 
@@ -296,6 +379,26 @@ def _empty_response() -> ToolCallerResponse:
     )
 
 
+def _empty_vision_unavailable_response() -> ToolCallerResponse:
+    return ToolCallerResponse(
+        finish_reason="stop",
+        content="",
+        tool_calls=[],
+        raw=None,
+        vision_unavailable=True,
+    )
+
+
+def _contains_image_input(messages: List[Dict[str, Any]]) -> bool:
+    for message in messages:
+        if str(message.get("role", "") or "").strip() not in {"user", "assistant"}:
+            continue
+        for part in normalize_message_parts(message.get("content", "")):
+            if part.get("type") in {"image_url", "image_file"}:
+                return True
+    return False
+
+
 GENERIC_REFUSAL_TEXTS = {
     "i can't discuss that.",
     "i cant discuss that.",
@@ -316,6 +419,16 @@ def _is_generic_refusal_response(response: ToolCallerResponse) -> bool:
     return normalized in GENERIC_REFUSAL_TEXTS
 
 
+def _is_invalid_route_response(response: ToolCallerResponse) -> bool:
+    if response.tool_calls:
+        return False
+    if response.vision_unavailable:
+        return True
+    if not str(response.content or "").strip():
+        return True
+    return _is_generic_refusal_response(response)
+
+
 def _error_text(error: Exception) -> str:
     text = str(error).strip()
     if text:
@@ -323,26 +436,25 @@ def _error_text(error: Exception) -> str:
     return f"{type(error).__name__}"
 
 
-async def call_ai_api(
-    messages: List[Dict[str, Any]],
+async def _try_provider_chain(
+    providers: List[Dict[str, Any]],
     *,
+    messages: List[Dict[str, Any]],
     plugin_config: Any,
     logger: Any,
     tools: Optional[List[Dict[str, Any]]] = None,
     use_builtin_search: bool = False,
-) -> ToolCallerResponse:
-    providers = get_provider_candidates(plugin_config, logger)
-    if not providers:
-        logger.warning("personification: no configured API provider available")
-        return _empty_response()
-
+) -> tuple[ToolCallerResponse | None, list[str], bool]:
     errors: List[str] = []
+    contains_image_input = _contains_image_input(messages)
+    saw_vision_unavailable = False
     for provider in providers:
         logger.info(
             f"personification: try provider={provider['name']} "
             f"type={provider['api_type']} model={provider['model']}"
         )
         retries = _provider_max_retries(provider)
+        skip_provider = False
         for attempt in range(retries):
             try:
                 response = await _call_provider_once(
@@ -352,13 +464,30 @@ async def call_ai_api(
                     tools=tools,
                     use_builtin_search=use_builtin_search,
                 )
-                if _is_generic_refusal_response(response):
+                if response.vision_unavailable:
+                    saw_vision_unavailable = True
+                    errors.append(f"{provider['name']}#{attempt + 1}: vision_unavailable")
+                    logger.warning(
+                        f"personification: provider {provider['name']} does not support current image input"
+                    )
+                    skip_provider = True
+                    break
+                if _is_invalid_route_response(response):
                     raise RuntimeError(
-                        f"generic refusal response: {response.content.strip()}"
+                        f"empty or invalid route response: {str(response.content or '').strip()[:120]}"
                     )
                 _mark_provider_success(provider["name"])
-                return response
+                return response, errors, saw_vision_unavailable
             except Exception as e:
+                if contains_image_input and error_indicates_vision_unavailable(e):
+                    saw_vision_unavailable = True
+                    errors.append(f"{provider['name']}#{attempt + 1}: vision_unavailable")
+                    logger.warning(
+                        f"personification: provider {provider['name']} rejected image input "
+                        f"({attempt + 1}/{retries}): {_error_text(e)}"
+                    )
+                    skip_provider = True
+                    break
                 error_text = _error_text(e)
                 errors.append(f"{provider['name']}#{attempt + 1}: {error_text}")
                 logger.warning(
@@ -369,10 +498,90 @@ async def call_ai_api(
                     _mark_provider_failure(provider["name"], e)
                 else:
                     await asyncio.sleep(min(2, attempt + 1))
+        if skip_provider:
+            continue
         logger.warning(
             f"personification: switching to next provider after failure: {provider['name']}"
         )
+    return None, errors, saw_vision_unavailable
+
+
+async def call_ai_api(
+    messages: List[Dict[str, Any]],
+    *,
+    plugin_config: Any,
+    logger: Any,
+    tools: Optional[List[Dict[str, Any]]] = None,
+    use_builtin_search: bool = False,
+    model_override: str = "",
+) -> ToolCallerResponse:
+    providers = [
+        _override_provider_model(provider, model_override)
+        for provider in get_provider_candidates(plugin_config, logger)
+    ]
+    errors: List[str] = []
+    saw_vision_unavailable = False
+
+    if providers:
+        response, primary_errors, primary_saw_vision_unavailable = await _try_provider_chain(
+            providers,
+            messages=messages,
+            plugin_config=plugin_config,
+            logger=logger,
+            tools=tools,
+            use_builtin_search=use_builtin_search,
+        )
+        errors.extend(primary_errors)
+        saw_vision_unavailable = saw_vision_unavailable or primary_saw_vision_unavailable
+        if response is not None:
+            return response
+    else:
+        logger.warning("personification: no configured API provider available")
+
+    from .ai_routes import resolve_global_fallback_provider
+
+    fallback_resolution = resolve_global_fallback_provider(plugin_config, logger, warn=True)
+    if fallback_resolution is not None:
+        fallback_provider = _override_provider_model(fallback_resolution.provider, model_override)
+        fallback_provider["api_type"] = normalize_api_type(fallback_provider.get("api_type"))
+        fallback_signature = (
+            normalize_api_type(fallback_provider.get("api_type")),
+            str(fallback_provider.get("api_url", "") or "").strip(),
+            str(fallback_provider.get("api_key", "") or "").strip(),
+            str(fallback_provider.get("model", "") or "").strip(),
+            str(fallback_provider.get("auth_path", "") or "").strip(),
+        )
+        primary_signatures = {
+            (
+                normalize_api_type(provider.get("api_type")),
+                str(provider.get("api_url", "") or "").strip(),
+                str(provider.get("api_key", "") or "").strip(),
+                str(provider.get("model", "") or "").strip(),
+                str(provider.get("auth_path", "") or "").strip(),
+            )
+            for provider in providers
+        }
+        if fallback_signature not in primary_signatures:
+            fallback_provider.setdefault("name", "configured_fallback")
+            fallback_provider.setdefault("priority", 999)
+            fallback_provider.setdefault("timeout", 120 if fallback_provider["api_type"] in {"gemini", "anthropic"} else 60)
+            fallback_provider.setdefault("max_retries", 2)
+            fallback_provider.setdefault("supports_native_search", fallback_provider["api_type"] in {"gemini", "anthropic", "openai", "openai_codex"})
+            response, fallback_errors, fallback_saw_vision_unavailable = await _try_provider_chain(
+                [fallback_provider],
+                messages=messages,
+                plugin_config=plugin_config,
+                logger=logger,
+                tools=tools,
+                use_builtin_search=use_builtin_search,
+            )
+            errors.extend(fallback_errors)
+            saw_vision_unavailable = saw_vision_unavailable or fallback_saw_vision_unavailable
+            if response is not None:
+                return response
 
     if errors:
         logger.error("personification: all providers failed: " + " | ".join(errors))
+    if saw_vision_unavailable:
+        return _empty_vision_unavailable_response()
     return _empty_response()

@@ -10,7 +10,6 @@ from typing import Any
 import yaml
 
 from ..agent.tool_registry import AgentTool, ToolRegistry
-from ..plugin_data import get_plugin_data_dir
 from ..core.remote_skill_review import filter_approved_remote_sources
 from .compat_adapters import build_compat_tools
 from .mcp_compat import normalize_mcp_config, register_mcp_tools
@@ -154,17 +153,19 @@ async def _register_skill(registry: ToolRegistry, logger: Any, skill_dir: Path, 
     plugin_config = config.get("plugin_config")
     isolation = config.get("isolation") or {}
     mcp = config.get("mcp")
+    is_process_isolated = str(isolation.get("mode") or "inprocess").strip().lower() == "process"
+    is_mcp_isolated = isinstance(mcp, dict)
     allow_unsafe_external = bool(
         getattr(plugin_config, "personification_skill_allow_unsafe_external", False)
     ) if plugin_config is not None else False
 
-    if not trusted and not allow_unsafe_external:
+    if not trusted and not allow_unsafe_external and not is_process_isolated and not is_mcp_isolated:
         logger.warning(
             f"[custom skill] skip untrusted external skill without explicit opt-in: {skill_dir.name}"
         )
         return
 
-    if isinstance(mcp, dict):
+    if is_mcp_isolated:
         loaded = await register_mcp_tools(
             registry=registry,
             logger=logger,
@@ -480,9 +481,6 @@ async def load_custom_skills(
         remote_enabled = bool(
             getattr(plugin_config, "personification_skill_remote_enabled", False)
         )
-        allow_unsafe_external = bool(
-            getattr(plugin_config, "personification_skill_allow_unsafe_external", False)
-        )
         raw_remote_sources = getattr(plugin_config, "personification_skill_sources", None)
         has_remote_sources = bool(raw_remote_sources)
         if has_remote_sources and not remote_enabled:
@@ -490,12 +488,7 @@ async def load_custom_skills(
                 "[custom skill] remote skill sources configured but disabled; "
                 "set personification_skill_remote_enabled=true to allow fetching"
             )
-        elif has_remote_sources and not allow_unsafe_external:
-            logger.warning(
-                "[custom skill] remote skill sources configured but unsafe external execution "
-                "is not allowed; set personification_skill_allow_unsafe_external=true to opt in"
-            )
-        elif remote_enabled and allow_unsafe_external:
+        elif has_remote_sources:
             require_admin_review = bool(
                 getattr(plugin_config, "personification_skill_require_admin_review", True)
             )
@@ -527,10 +520,7 @@ async def load_custom_skills(
                         return getattr(self._original, name)
 
                 remote_config = _RemoteSourceConfigProxy(plugin_config, approved_sources)
-                cache_dir = get_skill_cache_dir(
-                    remote_config,
-                    Path(runtime.data_dir or get_plugin_data_dir()),
-                )
+                cache_dir = get_skill_cache_dir(remote_config, Path(runtime.data_dir or "data/personification"))
                 source_roots = await resolve_skill_source_dirs(
                     plugin_config=remote_config,
                     logger=logger,

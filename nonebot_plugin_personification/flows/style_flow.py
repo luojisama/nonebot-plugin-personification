@@ -16,8 +16,7 @@ async def analyze_group_style(
 
     chat_content: List[Dict[str, Any]] = []
     image_count = 0
-    api_type = str(provider_api_type or "").strip().lower()
-    allow_image_blocks = api_type != "openai_codex"
+    _ = str(provider_api_type or "").strip().lower()
 
     for msg in msgs:
         if msg.get("is_bot"):
@@ -28,28 +27,22 @@ async def analyze_group_style(
             continue
         chat_content.append({"type": "text", "text": f"({nickname}): {content}\n"})
 
-        images = msg.get("images") or []
-        if not isinstance(images, list):
+        visual_summary = str(msg.get("visual_summary", "") or "").strip()
+        try:
+            message_image_count = max(0, int(msg.get("image_count", 0) or 0))
+        except (TypeError, ValueError):
+            message_image_count = 0
+        if len(chat_content) >= 50 or image_count >= 10 or message_image_count <= 0:
             continue
-
-        for img_b64 in images:
-            if len(chat_content) >= 50 or image_count >= 10:
-                break
-            if allow_image_blocks:
-                chat_content.append(
-                    {
-                        "type": "image_url",
-                        "image_url": {
-                            "url": f"data:image/jpeg;base64,{img_b64}",
-                        },
-                    }
-                )
-            else:
-                chat_content.append({"type": "text", "text": f"({nickname}): [图片]\n"})
-            image_count += 1
+        if visual_summary:
+            chat_content.append({"type": "text", "text": f"({nickname}): [图片语义] {visual_summary}\n"})
+        else:
+            token = "[发送了一张图片]" if message_image_count == 1 else f"[发送了{message_image_count}张图片]"
+            chat_content.append({"type": "text", "text": f"({nickname}): {token}\n"})
+        image_count += message_image_count
 
     prompt_text = (
-        "你是一个群聊风格分析师。请根据以下群聊记录（包含部分图片），总结该群的聊天风格。\n"
+        "你是一个群聊风格分析师。请根据以下群聊记录（包含部分图片语义），总结该群的聊天风格。\n"
         "请包含以下几个方面：\n"
         "1. 整体氛围（如：轻松、严肃、二次元、搞怪等）\n"
         "2. 常用梗或黑话（如果有）\n"

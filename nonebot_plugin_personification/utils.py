@@ -4,6 +4,7 @@ from typing import Any, Dict, List, Optional
 
 from .core.data_store import get_data_store
 from .core.db import connect_sync
+from .core.group_relation_edges import update_relation_edges_from_message
 
 
 _WHITELIST_STORE = "whitelist"
@@ -127,20 +128,27 @@ def record_group_msg(
     mentioned_ids = safe_metadata.get("mentioned_ids", [])
     if not isinstance(mentioned_ids, list):
         mentioned_ids = []
+    try:
+        image_count = max(0, int(safe_metadata.get("image_count", 0) or 0))
+    except (TypeError, ValueError):
+        image_count = 0
+    visual_summary = str(safe_metadata.get("visual_summary", "") or "").strip()
 
     with connect_sync() as conn:
         conn.execute(
             """
             INSERT INTO group_messages(
-                group_id, user_id, nickname, content, is_bot, reply_to_msg_id, reply_to_user_id,
-                mentioned_ids, is_at_bot, message_id, source_kind, timestamp
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                group_id, user_id, nickname, content, image_count, visual_summary, is_bot,
+                reply_to_msg_id, reply_to_user_id, mentioned_ids, is_at_bot, message_id, source_kind, timestamp
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 str(group_id),
                 str(safe_metadata.get("user_id", "") or ""),
                 str(nickname or ""),
                 str(content or ""),
+                image_count,
+                visual_summary,
                 1 if is_bot else 0,
                 safe_metadata.get("reply_to_msg_id"),
                 safe_metadata.get("reply_to_user_id"),
@@ -150,6 +158,19 @@ def record_group_msg(
                 str(safe_metadata.get("source_kind", "bot" if is_bot else "user") or "user"),
                 now_ts,
             ),
+        )
+        update_relation_edges_from_message(
+            conn,
+            group_id=str(group_id),
+            user_id=str(safe_metadata.get("user_id", "") or ""),
+            is_bot=bool(is_bot),
+            source_kind=str(safe_metadata.get("source_kind", "bot" if is_bot else "user") or "user"),
+            reply_to_user_id=str(safe_metadata.get("reply_to_user_id", "") or ""),
+            reply_to_msg_id=str(safe_metadata.get("reply_to_msg_id", "") or ""),
+            mentioned_ids=[str(item or "").strip() for item in mentioned_ids if str(item or "").strip()],
+            message_id=str(safe_metadata.get("message_id", "") or ""),
+            content=str(content or ""),
+            timestamp=now_ts,
         )
         row = conn.execute(
             "SELECT COUNT(1) AS cnt FROM group_messages WHERE group_id=?",
@@ -208,8 +229,8 @@ def get_group_msg_by_message_id(group_id: str, message_id: str) -> Optional[Dict
     with connect_sync() as conn:
         row = conn.execute(
             """
-            SELECT group_id, user_id, nickname, content, is_bot, reply_to_msg_id, reply_to_user_id,
-                   mentioned_ids, is_at_bot, message_id, source_kind, timestamp
+            SELECT group_id, user_id, nickname, content, image_count, visual_summary, is_bot,
+                   reply_to_msg_id, reply_to_user_id, mentioned_ids, is_at_bot, message_id, source_kind, timestamp
             FROM group_messages
             WHERE group_id=? AND message_id=?
             ORDER BY timestamp DESC
@@ -220,7 +241,7 @@ def get_group_msg_by_message_id(group_id: str, message_id: str) -> Optional[Dict
     if not row:
         return None
 
-    raw_mentions = row["mentioned_ids"] if hasattr(row, "__getitem__") else row[7]
+    raw_mentions = row["mentioned_ids"] if hasattr(row, "__getitem__") else row[9]
     try:
         mentioned_ids = json.loads(raw_mentions) if raw_mentions else []
     except Exception:
@@ -230,6 +251,8 @@ def get_group_msg_by_message_id(group_id: str, message_id: str) -> Optional[Dict
         "user_id": row["user_id"],
         "nickname": row["nickname"],
         "content": row["content"],
+        "image_count": int(row["image_count"] or 0),
+        "visual_summary": str(row["visual_summary"] or ""),
         "time": float(row["timestamp"] or 0),
         "is_bot": bool(row["is_bot"]),
         "reply_to_msg_id": row["reply_to_msg_id"],
@@ -255,8 +278,8 @@ def get_recent_group_msgs(group_id: str, limit: int = 200, expire_hours: Optiona
     with connect_sync() as conn:
         rows = conn.execute(
             f"""
-            SELECT group_id, user_id, nickname, content, is_bot, reply_to_msg_id, reply_to_user_id,
-                   mentioned_ids, is_at_bot, message_id, source_kind, timestamp
+            SELECT group_id, user_id, nickname, content, image_count, visual_summary, is_bot,
+                   reply_to_msg_id, reply_to_user_id, mentioned_ids, is_at_bot, message_id, source_kind, timestamp
             FROM group_messages
             WHERE {" AND ".join(clauses)}
             ORDER BY timestamp DESC
@@ -267,7 +290,7 @@ def get_recent_group_msgs(group_id: str, limit: int = 200, expire_hours: Optiona
 
     messages: List[Dict[str, Any]] = []
     for row in reversed(rows):
-        raw_mentions = row["mentioned_ids"] if hasattr(row, "__getitem__") else row[7]
+        raw_mentions = row["mentioned_ids"] if hasattr(row, "__getitem__") else row[9]
         try:
             mentioned_ids = json.loads(raw_mentions) if raw_mentions else []
         except Exception:
@@ -278,6 +301,8 @@ def get_recent_group_msgs(group_id: str, limit: int = 200, expire_hours: Optiona
                 "user_id": row["user_id"],
                 "nickname": row["nickname"],
                 "content": row["content"],
+                "image_count": int(row["image_count"] or 0),
+                "visual_summary": str(row["visual_summary"] or ""),
                 "time": float(row["timestamp"] or 0),
                 "is_bot": bool(row["is_bot"]),
                 "reply_to_msg_id": row["reply_to_msg_id"],

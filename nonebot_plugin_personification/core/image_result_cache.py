@@ -8,8 +8,6 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from ..plugin_data import get_plugin_data_dir
-
 
 _CACHE_LOCK = threading.Lock()
 _CACHE_STATE: dict[str, dict[str, Any]] | None = None
@@ -31,7 +29,30 @@ _REFRESH_HINTS = (
 
 
 def _data_dir() -> Path:
-    return get_plugin_data_dir()
+    # 第一优先级：读取 NoneBot 配置中的 personification_data_dir
+    # 与 inner_state.py 的 get_personification_data_dir() 逻辑保持一致，
+    # 确保所有数据文件使用同一个固定目录，不随 bot 账号变化。
+    try:
+        from nonebot import get_driver
+
+        configured = str(
+            getattr(get_driver().config, "personification_data_dir", "") or ""
+        ).strip()
+        if configured:
+            return Path(configured)
+    except Exception:
+        pass
+
+    # 第二优先级：nonebot_plugin_localstore 标准插件数据目录
+    try:
+        import nonebot_plugin_localstore as store
+
+        return Path(store.get_plugin_data_dir())
+    except Exception:
+        pass
+
+    # 兜底：相对路径
+    return Path("data") / "personification"
 
 
 def _cache_path() -> Path:

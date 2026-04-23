@@ -10,7 +10,13 @@ personification_model="gpt-4o-mini"
 personification_whitelist=["123456789","987654321"]
 ```
 
-`0.5.0` 起，插件数据目录固定使用 `nonebot-plugin-localstore` 的 `get_plugin_data_dir()` 结果，不再提供自定义数据目录配置项。
+默认使用 `nonebot-plugin-localstore` 的 `get_plugin_data_dir()` 结果作为插件数据目录；如需兼容旧部署或显式指定路径，可通过 `personification_data_dir` 覆盖。
+
+## 数据目录与路径
+
+| 配置项 | 示例写法 | 默认值 | 备注 |
+| --- | --- | --- | --- |
+| `personification_data_dir` | `"data/personification"` | `""` | 插件数据目录；留空时自动使用 `nonebot-plugin-localstore`。 |
 
 ## 基础行为
 
@@ -23,6 +29,8 @@ personification_whitelist=["123456789","987654321"]
 | `personification_tts_global_enabled` | `false` | `true` | 全局语音回复总开关。 |
 | `personification_agent_enabled` | `true` | `true` | 是否启用 Agent 工具调用链。 |
 | `personification_agent_max_steps` | `6` | `5` | 单次 Agent 允许的最大工具调用步数。 |
+| `personification_image_input_mode` | `"auto"` | `"auto"` | 图片输入策略；常用值为 `auto` / `url` / `base64`，具体取决于接入模型。 |
+| `personification_image_detail` | `"high"` | `"auto"` | 视觉输入细节等级；是否生效取决于 provider。 |
 | `personification_schedule_global` | `true` | `false` | 全局作息模拟开关。 |
 | `personification_thinking_mode` | `"low"` | `"none"` | 主回复思考模式，取值依赖接入模型。 |
 | `personification_state_thinking_mode` | `"adaptive"` | `"adaptive"` | 内心状态更新时的思考模式。 |
@@ -56,6 +64,7 @@ personification_whitelist=["123456789","987654321"]
 | `personification_skill_require_admin_review` | `true` | `true` | 是否要求超管审批远程 skill。 |
 | `personification_use_skillpacks` | `true` | `false` | 是否强制走 skillpack 体系。 |
 | `personification_github_token` | `"ghp_xxx"` | `""` | 远程 skill / GitHub 访问令牌。 |
+| `personification_plugin_knowledge_build_enabled` | `true` | `false` | 是否启用插件知识库构建能力。 |
 
 ## 主模型与专用模型
 
@@ -66,6 +75,7 @@ personification_whitelist=["123456789","987654321"]
 | `personification_api_url` | `"https://api.openai.com/v1"` | `"https://api.openai.com/v1"` | 主模型 API 地址。 |
 | `personification_api_key` | `"sk-xxxx"` | `""` | 主模型 API Key。 |
 | `personification_model` | `"gpt-4o-mini"` | `"gpt-4o-mini"` | 主回复模型。 |
+| `personification_lite_model` | `"gpt-5.4-mini"` | `""` | 轻量任务专用模型，用于意图分类、回复 review、图片分类等流程；留空回退到主模型。 |
 | `personification_persona_api_type` | `"openai"` | `""` | 画像模型 provider；留空沿用主模型。 |
 | `personification_persona_api_url` | `"https://api.openai.com/v1"` | `""` | 画像模型 API 地址。 |
 | `personification_persona_api_key` | `"sk-xxxx"` | `""` | 画像模型 API Key。 |
@@ -104,9 +114,22 @@ personification_whitelist=["123456789","987654321"]
 | `personification_labeler_api_key` | `"sk-xxxx"` | `""` | 贴图标注模型 API Key。 |
 | `personification_labeler_model` | `"gemini-2.0-flash"` | `"gemini-2.0-flash"` | 贴图标注模型。 |
 | `personification_labeler_concurrency` | `4` | `3` | 贴图扫描并发数。 |
+| `personification_fallback_enabled` | `true` | `true` | 主流程不可用时是否允许回退到补充模型。 |
+| `personification_fallback_api_type` | `"openai"` | `""` | 主流程回退模型 provider。 |
+| `personification_fallback_api_url` | `"https://api.openai.com/v1"` | `""` | 主流程回退模型 API 地址。 |
+| `personification_fallback_api_key` | `"sk-xxxx"` | `""` | 主流程回退模型 API Key。 |
+| `personification_fallback_model` | `"gpt-4o-mini"` | `""` | 主流程回退模型。 |
+| `personification_fallback_auth_path` | `"C:/Users/you/.codex/auth.json"` | `""` | `openai_codex` 等模式下回退模型的凭证路径。 |
 | `personification_vision_fallback_enabled` | `true` | `true` | 视觉能力不可用时是否启用回退模型。 |
 | `personification_vision_fallback_provider` | `"openai"` | `""` | 回退视觉 provider；留空按默认路由。 |
 | `personification_vision_fallback_model` | `"gpt-4o-mini"` | `"gpt-5.4"` | 回退视觉模型。 |
+| `personification_video_understanding_enabled` | `true` | `false` | 是否启用视频理解。 |
+| `personification_video_fallback_enabled` | `true` | `true` | 视频理解不可用时是否允许回退到补充模型。 |
+| `personification_video_fallback_provider` | `"openai"` | `""` | 视频理解回退 provider。 |
+| `personification_video_fallback_api_url` | `"https://api.openai.com/v1"` | `""` | 视频理解回退 API 地址。 |
+| `personification_video_fallback_api_key` | `"sk-xxxx"` | `""` | 视频理解回退 API Key。 |
+| `personification_video_fallback_model` | `"gpt-4o-mini"` | `""` | 视频理解回退模型。 |
+| `personification_video_fallback_auth_path` | `"C:/Users/you/.codex/auth.json"` | `""` | 视频理解回退凭证路径。 |
 
 ## 用户画像与长期记忆
 
@@ -137,6 +160,7 @@ personification_whitelist=["123456789","987654321"]
 | `personification_history_len` | `300` | `200` | 主对话上下文长度。 |
 | `personification_compress_threshold` | `120` | `100` | 达到该条数后触发压缩。 |
 | `personification_compress_keep_recent` | `24` | `20` | 压缩后保留的最近原始消息数。 |
+| `personification_private_history_turns` | `40` | `30` | 私聊送入主模型的最近消息轮数上限。 |
 | `personification_message_expire_hours` | `12.0` | `24.0` | 消息上下文过期时间，`0` 为禁用。 |
 | `personification_group_context_expire_hours` | `4.0` | `6.0` | 群聊上下文衰减时间。 |
 | `personification_group_summary_expire_hours` | `6.0` | `4.0` | 群话题摘要过期时间。 |

@@ -42,7 +42,7 @@ _GITHUB_HEADERS = {
     "User-Agent": "personification-resource-agent/1.0",
 }
 _MAX_RESULTS_PER_ENGINE = 5
-_FETCH_TIMEOUT = 12.0
+_FETCH_TIMEOUT = 8.0
 _LOW_QUALITY_DOMAINS = {"zhidao.baidu.com", "wenda.so.com", "wenwen.sogou.com"}
 _AD_PATTERNS = re.compile(r"(ad|sponsor|广告|推广|联系我们|copyright)", re.IGNORECASE)
 _GITHUB_OWNER_REPO_RE = re.compile(r"^/([^/]+)/([^/]+)")

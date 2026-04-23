@@ -11,6 +11,8 @@ def register_runtime_switch_matchers(
     superuser_permission: Any,
     logger: Any,
     handle_personification_help_command: Any,
+    handle_reload_config_command: Any,
+    handle_stats_command: Any,
     build_plugin_usage_text: Any,
     handle_install_remote_skill_command: Any,
     handle_global_switch_command: Any,
@@ -19,7 +21,10 @@ def register_runtime_switch_matchers(
     handle_proactive_switch_command: Any,
     handle_remote_skill_review_command: Any,
     handle_rebuild_plugin_knowledge_command: Any,
+    handle_delete_plugin_knowledge_command: Any,
+    handle_clear_plugin_knowledge_command: Any,
     handle_view_plugin_knowledge_status_command: Any,
+    handle_view_plugin_knowledge_error_command: Any,
     plugin_config: Any,
     knowledge_store: Any,
     agent_tool_caller: Any,
@@ -31,6 +36,8 @@ def register_runtime_switch_matchers(
     apply_web_search_switch: Any,
     apply_proactive_switch: Any,
     save_plugin_runtime_config: Any,
+    load_plugin_runtime_config: Any = None,
+    reload_runtime_services: Any = None,
     track_command_keywords: Callable[[str, Iterable[str] | None], None] | None = None,
 ) -> Dict[str, Any]:
     def _register_command(command: str, *, aliases: set[str] | None = None, **kwargs: Any) -> Any:
@@ -52,6 +59,39 @@ def register_runtime_switch_matchers(
         await handle_personification_help_command(
             personification_help_cmd,
             build_plugin_usage_text=build_plugin_usage_text,
+        )
+
+    reload_config_cmd = _register_command(
+        "reload_config",
+        aliases={"重载拟人配置"},
+        permission=superuser_permission,
+        priority=5,
+        block=True,
+    )
+
+    @reload_config_cmd.handle()
+    async def _handle_reload_config(_bot: Bot, _event: MessageEvent):
+        await handle_reload_config_command(
+            reload_config_cmd,
+            plugin_config=plugin_config,
+            load_plugin_runtime_config=load_plugin_runtime_config,
+            reload_runtime_services=reload_runtime_services,
+            logger=logger,
+        )
+
+    stats_cmd = _register_command(
+        "!stats",
+        aliases={"stats", "拟人统计"},
+        permission=superuser_permission,
+        priority=5,
+        block=True,
+    )
+
+    @stats_cmd.handle()
+    async def _handle_stats(_bot: Bot, _event: MessageEvent):
+        await handle_stats_command(
+            stats_cmd,
+            plugin_config=plugin_config,
         )
 
     install_remote_skill_cmd = _register_command(
@@ -164,6 +204,41 @@ def register_runtime_switch_matchers(
             set_knowledge_build_task=set_knowledge_build_task,
         )
 
+    delete_plugin_knowledge_cmd = _register_command(
+        "删除插件知识库",
+        permission=superuser_permission,
+        priority=5,
+        block=True,
+    )
+
+    @delete_plugin_knowledge_cmd.handle()
+    async def _handle_delete_plugin_knowledge(_bot: Bot, _event: MessageEvent, arg: Message = CommandArg()):
+        await handle_delete_plugin_knowledge_command(
+            delete_plugin_knowledge_cmd,
+            plugin_name_text=arg.extract_plain_text().strip(),
+            knowledge_store=knowledge_store,
+            logger=logger,
+            get_knowledge_build_task=get_knowledge_build_task,
+            set_knowledge_build_task=set_knowledge_build_task,
+        )
+
+    clear_plugin_knowledge_cmd = _register_command(
+        "清空插件知识库",
+        permission=superuser_permission,
+        priority=5,
+        block=True,
+    )
+
+    @clear_plugin_knowledge_cmd.handle()
+    async def _handle_clear_plugin_knowledge(_bot: Bot, _event: MessageEvent):
+        await handle_clear_plugin_knowledge_command(
+            clear_plugin_knowledge_cmd,
+            knowledge_store=knowledge_store,
+            logger=logger,
+            get_knowledge_build_task=get_knowledge_build_task,
+            set_knowledge_build_task=set_knowledge_build_task,
+        )
+
     plugin_knowledge_status_cmd = _register_command(
         "插件知识库状态",
         aliases={"查看插件知识库状态"},
@@ -177,11 +252,31 @@ def register_runtime_switch_matchers(
         await handle_view_plugin_knowledge_status_command(
             plugin_knowledge_status_cmd,
             knowledge_store=knowledge_store,
+            plugin_config=plugin_config,
+            get_knowledge_build_task=get_knowledge_build_task,
+        )
+
+    plugin_knowledge_error_cmd = _register_command(
+        "插件知识库错误",
+        aliases={"查看插件知识库错误"},
+        permission=superuser_permission,
+        priority=5,
+        block=True,
+    )
+
+    @plugin_knowledge_error_cmd.handle()
+    async def _handle_plugin_knowledge_error(_bot: Bot, _event: MessageEvent, arg: Message = CommandArg()):
+        await handle_view_plugin_knowledge_error_command(
+            plugin_knowledge_error_cmd,
+            plugin_name_text=arg.extract_plain_text().strip(),
+            knowledge_store=knowledge_store,
             get_knowledge_build_task=get_knowledge_build_task,
         )
 
     return {
         "personification_help_cmd": personification_help_cmd,
+        "reload_config_cmd": reload_config_cmd,
+        "stats_cmd": stats_cmd,
         "install_remote_skill_cmd": install_remote_skill_cmd,
         "global_switch_cmd": global_switch_cmd,
         "tts_global_switch_cmd": tts_global_switch_cmd,
@@ -189,5 +284,8 @@ def register_runtime_switch_matchers(
         "proactive_msg_switch_cmd": proactive_msg_switch_cmd,
         "remote_skill_review_cmd": remote_skill_review_cmd,
         "rebuild_plugin_knowledge_cmd": rebuild_plugin_knowledge_cmd,
+        "delete_plugin_knowledge_cmd": delete_plugin_knowledge_cmd,
+        "clear_plugin_knowledge_cmd": clear_plugin_knowledge_cmd,
         "plugin_knowledge_status_cmd": plugin_knowledge_status_cmd,
+        "plugin_knowledge_error_cmd": plugin_knowledge_error_cmd,
     }

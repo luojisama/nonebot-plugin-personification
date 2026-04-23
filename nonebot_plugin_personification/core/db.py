@@ -5,16 +5,12 @@ import sqlite3
 from pathlib import Path
 from typing import Any
 
-from ..plugin_data import get_plugin_data_dir
+from .paths import get_data_dir as _get_data_dir
 
 try:
     import aiosqlite  # type: ignore
 except Exception:  # pragma: no cover - runtime fallback when dependency is unavailable
     aiosqlite = None
-
-def _get_data_dir(plugin_config: Any | None = None) -> Path:
-    _ = plugin_config
-    return get_plugin_data_dir()
 
 
 DB_FILENAME = "personification.db"
@@ -56,6 +52,8 @@ DDL_STATEMENTS = (
         user_id     TEXT    NOT NULL DEFAULT '',
         nickname    TEXT    NOT NULL DEFAULT '',
         content     TEXT    NOT NULL,
+        image_count INTEGER NOT NULL DEFAULT 0,
+        visual_summary TEXT NOT NULL DEFAULT '',
         is_bot      INTEGER NOT NULL DEFAULT 0,
         reply_to_msg_id  TEXT DEFAULT NULL,
         reply_to_user_id TEXT DEFAULT NULL,
@@ -69,6 +67,22 @@ DDL_STATEMENTS = (
     """
     CREATE INDEX IF NOT EXISTS idx_group_messages_group
         ON group_messages(group_id, timestamp)
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS group_relation_edges (
+        group_id      TEXT NOT NULL,
+        src_user_id   TEXT NOT NULL,
+        dst_user_id   TEXT NOT NULL,
+        edge_kind     TEXT NOT NULL,
+        weight        REAL NOT NULL DEFAULT 0,
+        last_seen_at  REAL NOT NULL DEFAULT 0,
+        sample_msg_id TEXT NOT NULL DEFAULT '',
+        PRIMARY KEY (group_id, src_user_id, dst_user_id, edge_kind)
+    )
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS idx_group_relation_edges_group
+        ON group_relation_edges(group_id, last_seen_at)
     """,
     """
     CREATE TABLE IF NOT EXISTS user_personas (
@@ -133,12 +147,30 @@ def connect_sync(db_path: Path | None = None) -> sqlite3.Connection:
     return _configure_connection(conn)
 
 
+def _table_columns(conn: sqlite3.Connection, table_name: str) -> set[str]:
+    rows = conn.execute(f"PRAGMA table_info({table_name})").fetchall()
+    columns: set[str] = set()
+    for row in rows:
+        name = row["name"] if hasattr(row, "__getitem__") else row[1]
+        columns.add(str(name))
+    return columns
+
+
+def _ensure_group_message_schema(conn: sqlite3.Connection) -> None:
+    columns = _table_columns(conn, "group_messages")
+    if "image_count" not in columns:
+        conn.execute("ALTER TABLE group_messages ADD COLUMN image_count INTEGER NOT NULL DEFAULT 0")
+    if "visual_summary" not in columns:
+        conn.execute("ALTER TABLE group_messages ADD COLUMN visual_summary TEXT NOT NULL DEFAULT ''")
+
+
 def init_db_sync(data_dir: str | Path) -> Path:
     global _db_path
     _db_path = Path(data_dir) / DB_FILENAME
     with connect_sync(_db_path) as conn:
         for ddl in DDL_STATEMENTS:
             conn.execute(ddl)
+        _ensure_group_message_schema(conn)
         conn.commit()
     return _db_path
 

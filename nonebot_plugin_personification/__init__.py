@@ -1,6 +1,27 @@
 import asyncio
-from importlib import import_module
+import sys
+import types
 from pathlib import Path
+
+_module = sys.modules[__name__]
+if __name__ == "nonebot_plugin_personification":
+    _plugin_root = str(Path(__file__).resolve().parent.parent)
+    plugin_namespace = sys.modules.get("plugin")
+    if plugin_namespace is None:
+        plugin_namespace = types.ModuleType("plugin")
+        plugin_namespace.__path__ = [_plugin_root]  # type: ignore[attr-defined]
+        sys.modules["plugin"] = plugin_namespace
+    else:
+        plugin_path = getattr(plugin_namespace, "__path__", None)
+        if plugin_path is None:
+            plugin_namespace.__path__ = [_plugin_root]  # type: ignore[attr-defined]
+        elif _plugin_root not in plugin_path:
+            try:
+                plugin_path.append(_plugin_root)
+            except Exception:
+                plugin_namespace.__path__ = list(plugin_path) + [_plugin_root]  # type: ignore[attr-defined]
+    setattr(plugin_namespace, "personification", _module)
+    sys.modules.setdefault("plugin.personification", _module)
 
 from nonebot import get_bots, get_driver, get_plugin_config, logger, require
 from nonebot.adapters.onebot.v11 import (
@@ -17,7 +38,7 @@ from nonebot.rule import Rule
 
 try:
     require("nonebot_plugin_apscheduler")
-    scheduler = import_module("nonebot_plugin_apscheduler").scheduler
+    from nonebot_plugin_apscheduler import scheduler
 except Exception as e:
     raise RuntimeError(
         'Cannot load required plugin "nonebot_plugin_apscheduler". '
@@ -26,17 +47,35 @@ except Exception as e:
     ) from e
 
 try:
-    require("nonebot_plugin_htmlrender")
-    md_to_pic = getattr(import_module("nonebot_plugin_htmlrender"), "md_to_pic", None)
-except Exception as e:
-    logger.warning(f'拟人插件：加载 "nonebot_plugin_htmlrender" 失败，渲染能力将降级。{e}')
+    from nonebot_plugin_htmlrender import md_to_pic
+except ImportError:
     md_to_pic = None
 
 from .config import Config
 from .core.file_sender import build_file_sender
+from .core.config_manager import ConfigManager
+from .core.knowledge_builder import (
+    maybe_start_plugin_knowledge_builder,
+    stop_plugin_knowledge_builder,
+)
 from .core.plugin_meta import build_plugin_metadata
 from .core.plugin_runtime import build_plugin_runtime
 from .core.runtime_state import close_shared_http_client
+from .core.ai_routes import (
+    build_routed_tool_caller,
+    format_provider_summary,
+    resolve_global_fallback_provider,
+)
+from .core.visual_capabilities import (
+    VISUAL_ROUTE_AGENT,
+    VISUAL_ROUTE_REPLY_PLAIN,
+    VISUAL_ROUTE_REPLY_YAML,
+    VISUAL_ROUTE_VISION,
+    build_primary_route_probe_caller,
+    probe_tool_caller_vision,
+    probe_vision_caller,
+    set_visual_capability,
+)
 from .flows import setup_flows
 from .handlers import setup_all_matchers
 from .handlers.persona_commands import setup_persona_matchers
@@ -45,16 +84,17 @@ from .schedule import get_current_local_time
 from .agent.inner_state import get_personification_data_dir
 from .skill_runtime.runtime_api import SkillRuntime
 from .skills.skillpacks.sticker_labeler.scripts.impl import StickerLabeler, start_watchdog
-from .skills.skillpacks.tool_caller.scripts.impl import build_tool_caller
-from .skills.skillpacks.vision_caller.scripts.impl import build_vision_caller
+from .core.sticker_library import resolve_sticker_dir
 from .utils import is_group_whitelisted
 
 plugin_config = get_plugin_config(Config)
+ConfigManager(plugin_config=plugin_config, logger=logger).load()
 superusers = get_driver().config.superusers
 __plugin_meta__ = build_plugin_metadata(Config)
 
 _sticker_labeler_observer = None
 _knowledge_build_task: asyncio.Task | None = None
+_visual_probe_task: asyncio.Task | None = None
 runtime_bundle = None
 flow_handles: dict[str, object] = {}
 job_handles: dict[str, object] = {}
@@ -93,6 +133,75 @@ async def _persona_whitelist_rule(event: MessageEvent) -> bool:
     return False
 
 
+async def _probe_visual_routes_on_startup() -> None:
+    if runtime_bundle is None:
+        return
+
+    probe_caller, primary_api_type, primary_model = build_primary_route_probe_caller(
+        plugin_config=plugin_config,
+        get_configured_api_providers=runtime_bundle.get_configured_api_providers,
+    )
+    main_supported = await probe_tool_caller_vision(
+        route_name=VISUAL_ROUTE_REPLY_PLAIN,
+        caller=probe_caller,
+        api_type=primary_api_type,
+        model=primary_model,
+        logger=logger,
+    )
+    if main_supported is not None:
+        set_visual_capability(
+            VISUAL_ROUTE_REPLY_YAML,
+            primary_api_type,
+            primary_model,
+            main_supported,
+            source="startup_probe",
+            detail="shared_with_plain_route",
+        )
+
+    agent_api_type, agent_model = primary_api_type, primary_model
+    await probe_tool_caller_vision(
+        route_name=VISUAL_ROUTE_AGENT,
+        caller=probe_caller,
+        api_type=agent_api_type,
+        model=agent_model,
+        logger=logger,
+    )
+
+    fallback_resolution = resolve_global_fallback_provider(plugin_config, logger, warn=True)
+    if fallback_resolution is not None:
+        await probe_vision_caller(
+            route_name=VISUAL_ROUTE_VISION,
+            caller=runtime_bundle.reply_processor_deps.runtime.vision_caller,
+            api_type=str(fallback_resolution.provider.get("api_type", "") or ""),
+            model=str(fallback_resolution.provider.get("model", "") or ""),
+            logger=logger,
+        )
+
+
+async def _run_visual_probe_background() -> None:
+    try:
+        await _probe_visual_routes_on_startup()
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        logger.warning(f"[vision] startup background probe failed: {exc}")
+
+
+def _start_visual_probe_background() -> None:
+    global _visual_probe_task
+    if _visual_probe_task is not None and not _visual_probe_task.done():
+        return
+    task = asyncio.create_task(_run_visual_probe_background())
+    _visual_probe_task = task
+
+    def _clear_probe_task(done_task: asyncio.Task) -> None:
+        global _visual_probe_task
+        if _visual_probe_task is done_task:
+            _visual_probe_task = None
+
+    task.add_done_callback(_clear_probe_task)
+
+
 @get_driver().on_startup
 async def _init_personification_runtime() -> None:
     global runtime_bundle, flow_handles, job_handles, matcher_handles
@@ -118,6 +227,9 @@ async def _init_personification_runtime() -> None:
         message_segment_cls=MessageSegment,
         md_to_pic=md_to_pic,
     )
+    runtime_bundle.get_knowledge_build_task = _get_knowledge_build_task
+    runtime_bundle.set_knowledge_build_task = _set_knowledge_build_task
+    _start_visual_probe_background()
 
     personification_rule = runtime_bundle.personification_rule
     poke_rule = runtime_bundle.poke_rule
@@ -141,9 +253,9 @@ async def _init_personification_runtime() -> None:
             apply_tts_global_switch=flow_handles["apply_tts_global_switch"],
             apply_web_search_switch=flow_handles["apply_web_search_switch"],
             apply_proactive_switch=flow_handles["apply_proactive_switch"],
-            start_knowledge_builder=import_module(
-                ".core.knowledge_builder",
-                __package__,
+            start_knowledge_builder=__import__(
+                "plugin.personification.core.knowledge_builder",
+                fromlist=["start_knowledge_builder"],
             ).start_knowledge_builder,
             get_knowledge_build_task=_get_knowledge_build_task,
             set_knowledge_build_task=_set_knowledge_build_task,
@@ -234,7 +346,7 @@ async def _load_custom_skills() -> None:
     tool_caller = bundle.reply_processor_deps.runtime.agent_tool_caller
     if tool_caller is None:
         try:
-            tool_caller = build_tool_caller(plugin_config)
+            tool_caller = build_routed_tool_caller(plugin_config, logger)
         except Exception as e:
             logger.warning(f"[custom_skills] 构建自动分析 tool caller 失败: {e}")
             tool_caller = None
@@ -283,27 +395,31 @@ async def _load_custom_skills() -> None:
 async def _init_personification_sticker_labeler() -> None:
     global _sticker_labeler_observer
 
-    sticker_path = getattr(plugin_config, "personification_sticker_path", None)
-    if not sticker_path:
-        return
+    sticker_dir = resolve_sticker_dir(getattr(plugin_config, "personification_sticker_path", None), create=True)
+    bundle = _require_runtime_bundle()
+    sticker_runtime = bundle.reply_processor_deps.runtime
 
     labeler = StickerLabeler(
-        Path(sticker_path),
+        sticker_dir,
         logger=logger,
         concurrency=max(1, int(getattr(plugin_config, "personification_labeler_concurrency", 3))),
     )
-    vision_caller = None
     if getattr(plugin_config, "personification_labeler_enabled", True):
-        vision_caller = build_vision_caller(plugin_config)
-        if vision_caller is not None:
-            await labeler.scan_on_startup(vision_caller)
+        route_summary = resolve_global_fallback_provider(plugin_config, logger, warn=True)
+        if sticker_runtime is not None:
+            await labeler.scan_on_startup(sticker_runtime)
             _sticker_labeler_observer = start_watchdog(
-                Path(sticker_path),
-                vision_caller,
+                sticker_dir,
+                sticker_runtime,
                 logger,
                 concurrency=max(1, int(getattr(plugin_config, "personification_labeler_concurrency", 3))),
                 loop=asyncio.get_running_loop(),
             )
+            if route_summary is not None:
+                logger.info(
+                    "[sticker labeler] using main-first route with fallback "
+                    f"{format_provider_summary(route_summary.provider)}"
+                )
             return
 
     await labeler.legacy_scan()
@@ -313,39 +429,58 @@ async def _init_personification_sticker_labeler() -> None:
 async def _init_plugin_knowledge() -> None:
     global _knowledge_build_task
 
-    from .core.knowledge_builder import start_knowledge_builder
-
     bundle = _require_runtime_bundle()
     knowledge_store = bundle.reply_processor_deps.runtime.knowledge_store
     if knowledge_store is None:
         logger.warning("[plugin_knowledge] knowledge_store 未初始化，跳过后台构建")
         return
 
-    _knowledge_build_task = start_knowledge_builder(
+    result = await maybe_start_plugin_knowledge_builder(
         plugin_config=plugin_config,
         tool_caller=bundle.reply_processor_deps.runtime.agent_tool_caller,
         knowledge_store=knowledge_store,
         logger=logger,
+        get_knowledge_build_task=_get_knowledge_build_task,
+        set_knowledge_build_task=_set_knowledge_build_task,
+        trigger="startup",
     )
-    logger.info("[plugin_knowledge] 知识库后台构建已启动")
+    if result.get("started"):
+        logger.info("[plugin_knowledge] 知识库后台构建已启动")
+    else:
+        logger.info(
+            f"[plugin_knowledge] 启动检查完成，未启动构建 result={result.get('result')} reasons={result.get('reasons')}"
+        )
 
 
 @get_driver().on_shutdown
 async def _close_personification_runtime() -> None:
-    global _sticker_labeler_observer, _knowledge_build_task, runtime_bundle
+    global _sticker_labeler_observer, _knowledge_build_task, _visual_probe_task, runtime_bundle
     if _sticker_labeler_observer is not None:
         _sticker_labeler_observer.stop()
         _sticker_labeler_observer.join()
         _sticker_labeler_observer = None
-    if _knowledge_build_task is not None and not _knowledge_build_task.done():
-        _knowledge_build_task.cancel()
+    if _visual_probe_task is not None and not _visual_probe_task.done():
+        _visual_probe_task.cancel()
         try:
-            await _knowledge_build_task
+            await _visual_probe_task
         except asyncio.CancelledError:
             pass
-        except Exception:
-            pass
-        _knowledge_build_task = None
+    _visual_probe_task = None
+    await stop_plugin_knowledge_builder(
+        logger=logger,
+        knowledge_store=(
+            runtime_bundle.reply_processor_deps.runtime.knowledge_store
+            if runtime_bundle is not None
+            else None
+        ),
+        get_knowledge_build_task=_get_knowledge_build_task,
+        set_knowledge_build_task=_set_knowledge_build_task,
+        enabled=bool(getattr(plugin_config, "personification_plugin_knowledge_build_enabled", False)),
+        trigger="shutdown",
+        result="shutdown",
+        reasons=["shutdown"],
+    )
+    _knowledge_build_task = None
     if runtime_bundle is not None and getattr(runtime_bundle, "background_intelligence", None) is not None:
         try:
             await runtime_bundle.background_intelligence.close()

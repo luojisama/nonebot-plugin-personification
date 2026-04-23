@@ -5,6 +5,13 @@ from .context_cleanup import (
     is_global_clear_command,
     resolve_clear_target,
 )
+from .config_manager import (
+    ConfigManager,
+    get_env_config_load_info,
+    get_env_config_path,
+    load_managed_env_config,
+    save_managed_env_config,
+)
 from .context_policy import (
     build_private_anti_loop_hint,
     clear_private_command_keywords,
@@ -22,6 +29,7 @@ from .proactive_store import (
 )
 from .prompt_loader import load_prompt
 from .plugin_meta import build_plugin_metadata
+from .metrics import format_metrics_snapshot, record_counter, record_timing, snapshot_metrics
 from .provider_router import (
     call_ai_api,
     get_configured_api_providers,
@@ -85,6 +93,7 @@ __all__ = [
     "build_group_session_id",
     "build_private_session_id",
     "build_private_anti_loop_hint",
+    "ConfigManager",
     "clear_private_command_keywords",
     "chat_histories",
     "clear_all_context",
@@ -128,10 +137,18 @@ __all__ = [
     "stringify_history_content",
     "do_web_search",
     "extract_forward_message_content",
+    "format_metrics_snapshot",
     "is_msg_processed",
     "call_ai_api",
+    "get_env_config_load_info",
+    "get_env_config_path",
+    "load_managed_env_config",
     "normalize_api_type",
+    "record_counter",
+    "record_timing",
+    "save_managed_env_config",
     "should_avoid_interrupting",
+    "snapshot_metrics",
     "update_private_interaction_time",
     "resolve_clear_target",
 ]

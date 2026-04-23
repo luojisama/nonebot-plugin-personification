@@ -433,22 +433,7 @@ class TtsService:
         is_private: bool = False,
         group_style: str | None = None,
     ) -> str | None:
-        merged = " ".join(
-            part for part in [str(text or ""), str(user_hint or ""), str(group_style or "")]
-            if part
-        )
-        if not merged:
-            return "自然"
-        if any(keyword in merged for keyword in ("哈哈", "开心", "太棒", "耶", "真开心")):
-            return "开心"
-        if any(keyword in merged for keyword in ("生气", "烦死", "可恶", "讨厌", "滚")):
-            return "生气"
-        if any(keyword in merged for keyword in ("累", "困", "晚安", "有气无力", "疲惫")):
-            return "轻柔"
-        if any(keyword in merged for keyword in ("小声", "悄悄话", "轻声", "耳语")):
-            return "悄悄话"
-        if any(keyword in merged for keyword in ("紧张", "害怕", "面试", "冷静")):
-            return "紧张"
+        _ = text, user_hint, is_private, group_style
         if is_private:
             return "自然"
         return "自然"

@@ -27,7 +27,7 @@ def normalize_isolation_config(
     timeout = int(block.get("timeout", default_timeout) or default_timeout)
     python_executable = str(block.get("python") or block.get("python_executable") or "").strip()
     cwd = str(block.get("cwd") or "").strip()
-    inherit_env = bool(block.get("inherit_env", True))
+    inherit_env = bool(block.get("inherit_env", trusted))
     env_raw = block.get("env")
     env = env_raw if isinstance(env_raw, dict) else {}
     return {

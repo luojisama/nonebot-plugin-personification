@@ -15,6 +15,25 @@ async def run_list_plugins(runtime: SkillRuntime) -> str:
     return impl.list_plugins(store)
 
 
+async def run_search_plugin_knowledge(runtime: SkillRuntime, query: str, top_k: int = 3) -> str:
+    store = getattr(runtime, "knowledge_store", None)
+    if store is None:
+        return "插件知识库未初始化。"
+    return impl.search_plugin_knowledge(query, store, top_k=top_k)
+
+
+async def run_search_plugin_source(
+    runtime: SkillRuntime,
+    plugin_name: str,
+    query: str,
+    top_k: int = 3,
+) -> str:
+    store = getattr(runtime, "knowledge_store", None)
+    if store is None:
+        return "插件知识库未初始化。"
+    return impl.search_plugin_source(plugin_name, query, store, top_k=top_k)
+
+
 async def run_list_plugin_features(runtime: SkillRuntime, plugin_name: str) -> str:
     store = getattr(runtime, "knowledge_store", None)
     if store is None:
@@ -27,6 +46,7 @@ async def run_get_feature_detail(
     plugin_name: str,
     feature_key: str,
     include_runtime: bool = False,
+    include_source: bool = True,
 ) -> str:
     store = getattr(runtime, "knowledge_store", None)
     if store is None:
@@ -36,6 +56,7 @@ async def run_get_feature_detail(
         feature_key,
         store,
         include_runtime=include_runtime,
+        include_source=include_source,
     )
 
 

@@ -1,5 +1,8 @@
 from typing import Any, Dict, Optional, Tuple
 
+from ..core.ai_routes import summarize_route_state
+from ..core.runtime_config import get_runtime_load_info
+
 
 def build_group_fav_markdown(group_id: str, favorability: float, daily_count: float, status: str) -> str:
     title_color = "#ff69b4"
@@ -106,6 +109,10 @@ def build_view_config_nodes(
     custom_prompt_len = len(group_config.get("custom_prompt", "")) if "custom_prompt" in group_config else 0
     prompt_status = f"自定义 ({custom_prompt_len} 字符)" if custom_prompt_len > 0 else "默认全局"
     remote_skill_stats = remote_skill_stats or {"total": 0, "pending": 0, "approved": 0, "rejected": 0}
+    route_state = summarize_route_state(plugin_config)
+    runtime_load_info = get_runtime_load_info(plugin_config)
+    runtime_skipped = ", ".join(runtime_load_info.get("skipped_runtime_keys", [])[:12]) or "无"
+    runtime_path = str(runtime_load_info.get("path", "") or "未记录")
 
     overview_conf_str = _join_pairs(
         _pair("主模型", plugin_config.personification_model, "负责日常聊天、联网查证和拟人回复的主要模型。"),
@@ -129,7 +136,15 @@ def build_view_config_nodes(
         _pair("模型内置搜索", _bool_text(getattr(plugin_config, "personification_model_builtin_search_enabled", getattr(plugin_config, "personification_builtin_search", True))), "控制主模型是否允许直接使用 provider 原生 builtin search。"),
         _pair("群话题摘要", _bool_text(getattr(plugin_config, "personification_group_summary_enabled", True)), "持续概括不同群最近在聊什么，供后续续聊和联网检索使用。"),
         _pair("60 秒新闻", _bool_text(getattr(plugin_config, "personification_60s_enabled", True)), "允许接入每日新闻摘要类能力，帮助 Bot 感知现实中的新鲜事件。"),
-        _pair("聊天上下文长度", session_history_limit, "群聊和私聊各自保留的短期上下文条数，超出后会滚动清理。"),
+        _pair("会话历史上限", session_history_limit, "数据库中每个会话最多保留多少条原始消息，超出后会滚动清理。"),
+        _pair("压缩触发条数", getattr(plugin_config, "personification_compress_threshold", 0), "达到这个数量后，会把更早的历史压缩成摘要，减少 token 占用。"),
+        _pair("压缩保留条数", getattr(plugin_config, "personification_compress_keep_recent", 0), "压缩后仍保留的最近原始消息条数，越大越容易续接当前话题。"),
+        _pair("私聊送模条数", getattr(plugin_config, "personification_private_history_turns", 0), "私聊真正送进主模型的最近消息条数上限，直接影响长对话延续性。"),
+        _pair("私聊过期小时", getattr(plugin_config, "personification_message_expire_hours", 0.0), "私聊旧消息超过这个时间后不再参与上下文；0 表示不过期。"),
+        _pair("群过期小时", getattr(plugin_config, "personification_group_context_expire_hours", 0.0), "群聊旧消息超过这个时间后不再参与上下文；0 表示不过期。"),
+        _pair("群摘要过期小时", getattr(plugin_config, "personification_group_summary_expire_hours", 0.0), "群话题摘要过期后不再自动注入，避免长期围绕旧话题。"),
+        _pair("记忆召回条数", getattr(plugin_config, "personification_memory_recall_top_k", 0), "单次长期记忆召回默认取回的条数，越大越容易记住久远细节。"),
+        _pair("画像更新阈值", getattr(plugin_config, "personification_persona_history_max", 0), "同一用户累计多少条新消息后触发一次画像更新。"),
     )
 
     media_conf_str = _join_pairs(
@@ -137,8 +152,13 @@ def build_view_config_nodes(
         _pair("戳一戳概率", plugin_config.personification_poke_probability, "控制被戳后随机回应的频率。"),
         _pair("语音总开关", _bool_text(plugin_config.personification_tts_enabled), "控制整个插件是否允许使用 TTS 语音能力。"),
         _pair("语音自动回复", _bool_text(plugin_config.personification_tts_auto_enabled), "开启后，Bot 会在部分场景自动改用语音回复。"),
-        _pair("视觉模型", f"{plugin_config.personification_labeler_api_type}:{plugin_config.personification_labeler_model}", "用于图片理解、贴纸打标和视觉描述，不等同于主聊天模型。"),
-        _pair("视觉兜底", _bool_text(getattr(plugin_config, "personification_vision_fallback_enabled", True)), "主模型看图失败或不稳定时，是否允许异步拉起二级视觉兜底。"),
+        _pair("主路由", route_state["primary"], "主模型优先路由，聊天、视觉、打标和后台分析都会先走这里。"),
+        _pair("全局兜底", route_state["fallback"], "主路由失败后统一进入的二级兜底，不再区分 style/persona/compress 等专用模型。"),
+        _pair("视频兜底例外", route_state["video_fallback"], "视频理解允许单独覆盖兜底模型；留空时继承全局兜底。"),
+        _pair("弃用别名折叠", route_state["fallback_source"] or "无", "显示当前是否仍在从旧的 labeler/style/persona/compress 配置折叠全局兜底。"),
+        _pair("忽略的旧来源", route_state["fallback_ignored"] or "无", "当多个旧配置同时存在且冲突时，这里显示被忽略的来源。"),
+        _pair("运行时配置文件", runtime_path, "runtime_config.json 的实际读取路径；重启时只会补 env 未显式设置的字段。"),
+        _pair("env 覆盖的 runtime 键", runtime_skipped, "这些运行时配置在启动时被 .env.prod 或进程环境中的显式值覆盖，没有回填。"),
     )
 
     remote_skill_conf_str = _join_pairs(

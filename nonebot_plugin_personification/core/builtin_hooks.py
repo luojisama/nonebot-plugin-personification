@@ -5,11 +5,12 @@ from typing import Any, Dict, List, Optional
 
 from ..skills.skillpacks.friend_request_tool.scripts.impl import check_friend_request_gate
 from ..utils import build_group_context_window, get_group_topic_summary
+from .chat_intent import infer_turn_semantic_frame_with_llm
 from .context_policy import sanitize_history_text
 from .group_context import render_group_context_structured
+from .group_relations import summarize_group_relationships
 from .message_relations import extract_event_message_id, extract_reply_message_id
 from .prompt_hooks import HookContext, register_prompt_hook
-from .web_grounding import infer_grounding_intent
 
 
 _FRIEND_IDS_CACHE: Dict[str, tuple[float, set[str]]] = {}
@@ -48,25 +49,21 @@ def _normalized_topic_key(text: Any) -> str:
     return normalized[:80]
 
 
-def _is_meta_source_question(text: str) -> bool:
-    plain = sanitize_history_text(text)
-    if not plain:
-        return False
-    keywords = (
-        "什么意思",
-        "何意味",
-        "啥意思",
-        "什么情况",
-        "怎么回事",
-        "谁发的",
-        "谁触发的",
-        "为什么",
-        "怎么成机器人了",
-        "怎么变机器人了",
-        "怎么突然",
-        "哪来的",
+async def _ensure_semantic_frame(ctx: HookContext, *, recent_context: str = "") -> Any:
+    if getattr(ctx, "semantic_frame", None) is not None:
+        return ctx.semantic_frame
+    tool_caller = getattr(ctx.runtime, "lite_tool_caller", None) or getattr(ctx.runtime, "agent_tool_caller", None)
+    if tool_caller is None:
+        return None
+    frame = await infer_turn_semantic_frame_with_llm(
+        ctx.message_text or ctx.message_content or "",
+        is_group=not ctx.is_private,
+        is_random_chat=ctx.is_random_chat,
+        tool_caller=tool_caller,
+        recent_context=recent_context,
     )
-    return any(keyword in plain for keyword in keywords)
+    ctx.semantic_frame = frame
+    return frame
 
 
 def _format_recent_group_context(
@@ -86,18 +83,11 @@ def _format_recent_group_context(
     return render_group_context_structured(recent, trigger_msg_id=trigger_msg_id)
 
 
-def _looks_like_domain_sensitive_chat(text: str) -> bool:
-    lowered = (text or "").strip().lower()
-    if not lowered:
+def _is_domain_sensitive_frame(frame: Any) -> bool:
+    if frame is None:
         return False
-    if infer_grounding_intent(lowered) == "game_anime":
-        return True
-    extra_keywords = (
-        "热搜", "热点", "热梗", "版本", "更新", "联动", "活动", "卡池",
-        "新番", "漫画", "动画", "番剧", "剧情", "角色", "配队", "强度",
-        "攻略", "boss", "副本", "电竞", "比赛", "赛程",
-    )
-    return any(keyword in lowered for keyword in extra_keywords)
+    focus = str(getattr(frame, "domain_focus", "") or "").strip().lower()
+    return focus in {"game_anime", "realtime", "knowledge", "plugin"}
 
 
 async def _get_cached_friend_ids(bot: Any, logger: Any, ttl_seconds: int = 300) -> set[str]:
@@ -186,8 +176,14 @@ async def _group_style_hook(ctx: HookContext) -> Optional[str]:
 async def _recent_group_context_hook(ctx: HookContext) -> Optional[str]:
     if ctx.is_private:
         return None
-    message_text = sanitize_history_text(ctx.message_text or ctx.message_content or "")
-    is_meta_question = _is_meta_source_question(message_text)
+    base_recent = _format_recent_group_context(
+        ctx.group_id,
+        limit=6,
+        trigger_msg_id=extract_event_message_id(ctx.event),
+        reply_to_msg_id=extract_reply_message_id(ctx.event),
+    )
+    frame = await _ensure_semantic_frame(ctx, recent_context=base_recent)
+    is_meta_question = bool(getattr(frame, "meta_question", False))
 
     recent_block = _format_recent_group_context(
         ctx.group_id,
@@ -214,7 +210,26 @@ async def _recent_group_context_hook(ctx: HookContext) -> Optional[str]:
     return block
 
 
+async def _group_relationship_hook(ctx: HookContext) -> Optional[str]:
+    if ctx.is_private:
+        return None
+    recent = build_group_context_window(
+        ctx.group_id,
+        limit=8,
+        include_message_ids=[extract_reply_message_id(ctx.event)],
+    )
+    summary = summarize_group_relationships(
+        recent,
+        trigger_msg_id=extract_event_message_id(ctx.event),
+        trigger_user_id=ctx.user_id,
+        bot_self_id=str(getattr(ctx.bot, "self_id", "") or ""),
+    )
+    return summary or None
+
+
 async def _web_search_hook(ctx: HookContext) -> Optional[str]:
+    if ctx.disable_network_hooks:
+        return None
     if not bool(
         getattr(
             ctx.plugin_config,
@@ -233,6 +248,8 @@ async def _web_search_hook(ctx: HookContext) -> Optional[str]:
 
 
 async def _grounding_hook(ctx: HookContext) -> Optional[str]:
+    if ctx.disable_network_hooks:
+        return None
     message_text = (ctx.message_text or ctx.message_content or "").strip()
     if ctx.is_random_chat and len(message_text) < 18:
         return None
@@ -253,8 +270,10 @@ async def _grounding_hook(ctx: HookContext) -> Optional[str]:
 
 
 async def _domain_focus_hook(ctx: HookContext) -> Optional[str]:
-    message_text = (ctx.message_text or ctx.message_content or "").strip()
-    if not _looks_like_domain_sensitive_chat(message_text):
+    frame = getattr(ctx, "semantic_frame", None)
+    if frame is None:
+        frame = await _ensure_semantic_frame(ctx)
+    if not _is_domain_sensitive_frame(frame):
         return None
     return (
         "## 话题理解约束\n"
@@ -306,6 +325,24 @@ async def _group_anti_loop_hook(ctx: HookContext) -> Optional[str]:
         "- 如果同一话题你已经接过两轮，而对方没有明确追问新信息，这一轮只保留一句短反应，或者直接 [SILENCE]。\n"
         "- 优先跟随最新一句的重心，不要继续延伸你上一轮自己的话。"
     )
+
+
+async def _repeat_cluster_hook(ctx: HookContext) -> Optional[str]:
+    if ctx.is_private or not ctx.repeat_clusters:
+        return None
+    lines = ["## 当前批次里的复读/接龙线索"]
+    for cluster in ctx.repeat_clusters[:3]:
+        text = str(cluster.get("text", "") or "").strip()
+        count = int(cluster.get("count", 0) or 0)
+        speakers = ", ".join(str(item or "") for item in (cluster.get("speakers") or [])[:4])
+        if not text or count <= 0:
+            continue
+        lines.append(f"- 原句：{text}")
+        lines.append(f"  次数：{count}；参与者：{speakers or '未知'}")
+    if len(lines) == 1:
+        return None
+    lines.append("理解规则：先把它当成群友在复读、接龙或玩同一个梗，优先顺着气氛接，不要先解释笑点。")
+    return "\n".join(lines)
 
 
 async def _group_idle_hook(ctx: HookContext) -> Optional[str]:
@@ -401,7 +438,9 @@ def register_all_builtin_hooks() -> None:
     register_prompt_hook("user_persona", _user_persona_hook, priority=20, phase="system_context")
     register_prompt_hook("group_style", _group_style_hook, priority=25, phase="system_context")
     register_prompt_hook("recent_group_context", _recent_group_context_hook, priority=26, phase="system_context")
-    register_prompt_hook("domain_focus", _domain_focus_hook, priority=28, phase="system_context")
+    register_prompt_hook("group_relationship", _group_relationship_hook, priority=27, phase="system_context")
+    register_prompt_hook("repeat_cluster", _repeat_cluster_hook, priority=28, phase="system_context")
+    register_prompt_hook("domain_focus", _domain_focus_hook, priority=29, phase="system_context")
     register_prompt_hook("web_search", _web_search_hook, priority=30, phase="system_context")
     register_prompt_hook("grounding", _grounding_hook, priority=35, phase="system_postlude")
     register_prompt_hook("friend_request", _friend_request_hook, priority=50, phase="message")

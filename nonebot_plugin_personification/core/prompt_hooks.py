@@ -44,6 +44,12 @@ class HookContext:
     runtime: Any
     bot: Any
     event: Any
+    batched_events: list[dict] = field(default_factory=list)
+    batch_trigger: dict[str, Any] = field(default_factory=dict)
+    repeat_clusters: list[dict] = field(default_factory=list)
+    batch_event_count: int = 1
+    disable_network_hooks: bool = False
+    semantic_frame: Any = None
 
 
 PromptHook = Callable[[HookContext], Awaitable[Optional[str]]]

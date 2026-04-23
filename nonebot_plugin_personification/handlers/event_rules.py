@@ -35,6 +35,55 @@ def _topic_related(message_text: str, topic: str) -> bool:
     return False
 
 
+def _detect_solo_speaker_follow(
+    recent_msgs: list[dict[str, Any]],
+    *,
+    current_user_id: str,
+    current_text: str,
+    now_ts: float | None = None,
+) -> dict[str, Any]:
+    if not recent_msgs:
+        return {}
+    current_user = str(current_user_id or "").strip()
+    if not current_user:
+        return {}
+    current_time = float(now_ts or time.time())
+    recent_window = [
+        msg
+        for msg in list(recent_msgs)[-8:]
+        if isinstance(msg, dict) and current_time - float(msg.get("time", 0) or 0) <= 6 * 60
+    ]
+    if not recent_window:
+        return {}
+    recent_non_bot = [msg for msg in recent_window if not bool(msg.get("is_bot"))]
+    if len(recent_non_bot) < 3:
+        return {}
+    tail = recent_non_bot[-4:]
+    same_user_msgs = [msg for msg in tail if str(msg.get("user_id", "") or "").strip() == current_user]
+    if len(same_user_msgs) < 3:
+        return {}
+    if str(tail[-1].get("user_id", "") or "").strip() != current_user:
+        return {}
+    if any(bool(msg.get("is_bot")) for msg in recent_window[-6:]):
+        return {}
+
+    topic_seed = str(same_user_msgs[-1].get("content", "") or "").strip()
+    if current_text:
+        topic_match = any(
+            _topic_related(current_text, str(msg.get("content", "") or "").strip())
+            or _topic_related(str(msg.get("content", "") or "").strip(), current_text)
+            for msg in same_user_msgs[-3:]
+        )
+        if not topic_match and topic_seed and not _topic_related(current_text, topic_seed):
+            return {}
+
+    return {
+        "user_id": current_user,
+        "count": len(same_user_msgs),
+        "topic": topic_seed[:80],
+    }
+
+
 async def personification_rule(
     event: Event,
     state: T_State,
@@ -134,7 +183,6 @@ async def personification_rule(
 
         plain_text = str(event.get_plaintext() or "").strip()
         msg_len = len(plain_text)
-        has_question = any(mark in plain_text for mark in ("?", "？", "吗", "么", "咋", "怎么", "为何", "为什么"))
         if get_recent_group_msgs is not None:
             try:
                 recent_msgs = get_recent_group_msgs(group_id, 8)
@@ -149,7 +197,19 @@ async def personification_rule(
         else:
             message_target = state.get("message_target", "")
 
-        if message_target == TARGET_OTHERS:
+        solo_speaker_follow: dict[str, Any] = {}
+        if get_recent_group_msgs is not None:
+            solo_speaker_follow = _detect_solo_speaker_follow(
+                recent_msgs=recent_msgs,
+                current_user_id=user_id,
+                current_text=plain_text,
+            )
+        if solo_speaker_follow:
+            state["solo_speaker_follow"] = solo_speaker_follow
+        else:
+            state.pop("solo_speaker_follow", None)
+
+        if message_target == TARGET_OTHERS and not solo_speaker_follow:
             state["is_random_chat"] = False
             return False
 
@@ -164,8 +224,6 @@ async def personification_rule(
                 current_prob = max(current_prob, 0.92)
             elif related_topic:
                 current_prob = max(current_prob, 0.78)
-            elif has_question and msg_len <= 24:
-                current_prob = max(current_prob * 0.8, 0.58)
             else:
                 current_prob *= 0.35
 
@@ -174,24 +232,30 @@ async def personification_rule(
                 state["active_followup"] = group_chat_active_state
                 return True
 
+        if solo_speaker_follow:
+            current_prob = min(1.0, max(probability * 1.45, 0.72))
+            if msg_len <= 4:
+                current_prob = max(current_prob, 0.68)
+            if random.random() < current_prob:
+                state["is_random_chat"] = True
+                return True
+
         is_unsuitable_time = not is_rest_time(allow_unsuitable_prob=0.0)
         current_prob = probability * (0.55 if is_unsuitable_time else 1.0)
         if message_target == TARGET_BOT:
             current_prob = max(current_prob, probability)
         if msg_len <= 1:
-            current_prob *= 0.35
+            current_prob *= 0.5
         elif msg_len <= 4:
-            current_prob *= 0.65
+            current_prob *= 0.8
         elif msg_len >= 24:
             current_prob *= 1.1
-        if has_question:
-            current_prob *= 1.15
         if idle_active_state:
             topic = str(idle_active_state.get("topic", "") or "").strip()
             if topic and _topic_related(plain_text, topic):
                 current_prob = min(1.0, max(current_prob, probability * 0.9))
             else:
-                current_prob = min(current_prob, probability * 0.65)
+                current_prob = min(current_prob, probability * 0.8)
         if random.random() < min(1.0, current_prob):
             state["is_random_chat"] = True
             return True
@@ -210,6 +274,48 @@ async def record_msg_rule(_event: Event) -> bool:
     return True
 
 
+def _extract_recordable_group_message(event: Any) -> tuple[str, int, str]:
+    plain_text = str(event.get_plaintext() or "").strip()
+    message = getattr(event, "message", None)
+    if message is None:
+        return plain_text, 0, ""
+
+    text_parts: list[str] = []
+    visual_parts: list[str] = []
+    image_count = 0
+    try:
+        for seg in message:
+            seg_type = str(getattr(seg, "type", "") or "").strip().lower()
+            data = getattr(seg, "data", {}) or {}
+            if seg_type == "text":
+                text = str(data.get("text", "") or "")
+                if text:
+                    text_parts.append(text)
+            elif seg_type == "face":
+                face_id = str(data.get("id", "") or "").strip()
+                token = f"[表情id:{face_id}]" if face_id else "[表情]"
+                text_parts.append(token)
+                visual_parts.append(token)
+            elif seg_type == "mface":
+                summary = str(data.get("summary", "") or "表情包").strip() or "表情包"
+                token = f"[{summary}]"
+                text_parts.append(token)
+                visual_parts.append(token)
+            elif seg_type == "image":
+                image_count += 1
+                token = "[图片]"
+                text_parts.append(token)
+                visual_parts.append(token)
+    except Exception:
+        return plain_text, 0, ""
+
+    content = "".join(text_parts).strip() or plain_text
+    if not content and image_count > 0:
+        content = "[发送了一张图片]" if image_count == 1 else f"[发送了{image_count}张图片]"
+    visual_summary = " ".join(visual_parts[:6]).strip()
+    return content, image_count, visual_summary
+
+
 def resolve_record_message(
     event: Any,
     *,
@@ -218,7 +324,7 @@ def resolve_record_message(
     should_trigger_auto_analyze: Optional[Callable[[str, int], bool]] = None,
 ) -> Tuple[Optional[str], bool]:
     """记录群消息，返回 (group_id, should_auto_analyze)。"""
-    raw_msg = event.get_plaintext().strip()
+    raw_msg, image_count, visual_summary = _extract_recordable_group_message(event)
     if not raw_msg or raw_msg.startswith("/") or len(raw_msg) >= 500:
         return None, False
 
@@ -248,6 +354,8 @@ def resolve_record_message(
         raw_msg,
         is_bot=is_bot_message,
         user_id=user_id,
+        image_count=image_count,
+        visual_summary=visual_summary,
         **relation_metadata,
     )
     if should_trigger_auto_analyze is None:

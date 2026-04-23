@@ -8,9 +8,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from ..plugin_data import get_plugin_data_dir
 from .embedding_index import EMBED_MODEL_VERSION, cosine_similarity, embed_text, normalize_text, tokenize
 from .entity_index import extract_entities
+from .memory_defaults import MAX_MEMORY_RECALL_TOP_K
 from .search_ranker import (
     build_time_hint,
     now_ts,
@@ -22,15 +22,24 @@ from .search_ranker import (
 )
 
 
-MAX_RECALL_LIMIT = 6
+MAX_RECALL_LIMIT = MAX_MEMORY_RECALL_TOP_K
 MAX_SEARCH_STATS_ROWS = 20000
 SEARCH_STATS_RETENTION_DAYS = 30
 SEARCH_STATS_PRUNE_INTERVAL_SECONDS = 3600
 
 
 def _plugin_data_dir(plugin_config: Any | None = None) -> Path:
-    _ = plugin_config
-    return get_plugin_data_dir()
+    configured = ""
+    if plugin_config is not None:
+        configured = str(getattr(plugin_config, "personification_data_dir", "") or "").strip()
+    if configured:
+        return Path(configured)
+    try:
+        import nonebot_plugin_localstore as store
+
+        return Path(store.get_plugin_data_dir())
+    except Exception:
+        return Path("data") / "personification"
 
 
 def resolve_memory_root(plugin_config: Any | None = None) -> Path:

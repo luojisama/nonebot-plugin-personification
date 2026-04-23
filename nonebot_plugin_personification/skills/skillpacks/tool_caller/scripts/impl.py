@@ -9,6 +9,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
 
+from nonebot_plugin_personification.core.image_refs import normalize_image_ref
 from nonebot_plugin_personification.core.message_parts import extract_text_from_parts, normalize_message_parts
 
 
@@ -149,6 +150,45 @@ def _extract_system_message(messages: List[dict]) -> Tuple[str, List[dict]]:
     return "\n\n".join(part for part in system_parts if part), rest
 
 
+def _messages_contain_images(messages: List[dict]) -> bool:
+    for message in messages:
+        if str(message.get("role", "") or "").strip() not in {"user", "assistant"}:
+            continue
+        for part in normalize_message_parts(message.get("content", "")):
+            if part.get("type") in {"image_url", "image_file"}:
+                return True
+    return False
+
+
+def _error_indicates_vision_unavailable(error: Exception) -> bool:
+    text = str(error or "").strip().lower()
+    if not text:
+        return False
+    return any(
+        token in text
+        for token in (
+            "unsupported image",
+            "image input not supported",
+            "invalid image_url",
+            "content type image_url",
+            "vision not supported",
+            "multimodal not supported",
+            "input_image",
+            "image input",
+        )
+    )
+
+
+def _vision_unavailable_response(error: Exception) -> ToolCallerResponse:
+    return ToolCallerResponse(
+        finish_reason="stop",
+        content="",
+        tool_calls=[],
+        raw={"error": str(error or "")},
+        vision_unavailable=True,
+    )
+
+
 def _maybe_openai_reasoning(model: str, thinking_mode: str) -> Optional[dict]:
     if "gpt-5" not in (model or "").lower():
         return None
@@ -194,6 +234,16 @@ def _convert_openai_tool_to_anthropic(tool: dict) -> dict:
     }
 
 
+def _convert_openai_tool_to_responses(tool: dict) -> dict:
+    function_def = tool.get("function", tool)
+    return {
+        "type": "function",
+        "name": function_def.get("name", ""),
+        "description": function_def.get("description", ""),
+        "parameters": function_def.get("parameters", {"type": "object", "properties": {}}),
+    }
+
+
 def _gemini_part_from_dict(item: dict) -> dict:
     if "function_call" in item:
         return {"function_call": item["function_call"]}
@@ -206,7 +256,10 @@ def _gemini_part_from_dict(item: dict) -> dict:
     if item.get("type") == "text":
         return {"text": str(item.get("text", ""))}
     if item.get("type") == "image_url":
-        image_url = str(_obj_get(item.get("image_url", {}), "url", ""))
+        raw_image_url = str(_obj_get(item.get("image_url", {}), "url", ""))
+        image_url, _ = normalize_image_ref(raw_image_url)
+        if not image_url:
+            return {"text": ""}
         parsed = _split_data_url(image_url)
         if parsed:
             mime_type, base64_data = parsed
@@ -215,6 +268,48 @@ def _gemini_part_from_dict(item: dict) -> dict:
     if "text" in item:
         return {"text": str(item["text"])}
     return {"text": json.dumps(item, ensure_ascii=False)}
+
+
+def _parse_tool_arguments(arguments: Any) -> dict[str, Any]:
+    if isinstance(arguments, dict):
+        return dict(arguments)
+    if isinstance(arguments, str):
+        raw = arguments.strip() or "{}"
+        try:
+            parsed = json.loads(raw)
+        except Exception:
+            return {}
+        return parsed if isinstance(parsed, dict) else {}
+    return {}
+
+
+def _gemini_tool_call_parts(tool_calls: Any) -> List[dict]:
+    parts: List[dict] = []
+    if not isinstance(tool_calls, list):
+        return parts
+    for index, raw_tool_call in enumerate(tool_calls):
+        if not isinstance(raw_tool_call, dict):
+            continue
+        function_part = raw_tool_call.get("function", {})
+        if not isinstance(function_part, dict):
+            function_part = {}
+        name = str(function_part.get("name", "") or "").strip()
+        if not name:
+            continue
+        arguments = _parse_tool_arguments(function_part.get("arguments", {}))
+        part: dict[str, Any] = {
+            "function_call": {
+                "name": name,
+                "args": arguments,
+            }
+        }
+        call_id = str(raw_tool_call.get("id") or raw_tool_call.get("call_id") or "").strip()
+        if call_id:
+            part["function_call"]["id"] = call_id
+        else:
+            part["function_call"]["id"] = f"gemini-call-{index}"
+        parts.append(part)
+    return parts
 
 
 def _gemini_parts_from_content(content: Any) -> List[dict]:
@@ -230,6 +325,7 @@ def _convert_messages_to_gemini(messages: List[dict]) -> Tuple[Optional[str], Li
     contents: List[dict] = []
     for message in rest_messages:
         parts = _gemini_parts_from_content(message.get("parts", message.get("content", "")))
+        parts.extend(_gemini_tool_call_parts(message.get("tool_calls", [])))
         contents.append(
             {
                 "role": "model" if message.get("role") == "assistant" else "user",
@@ -258,12 +354,12 @@ def _extract_gemini_tool_calls(parts: List[Any]) -> List[ToolCall]:
         if function_call is None:
             continue
         name = str(_obj_get(function_call, "name", ""))
-        args = _obj_get(function_call, "args", {}) or {}
+        args = _parse_tool_arguments(_obj_get(function_call, "args", {}) or {})
         tool_calls.append(
             ToolCall(
                 id=str(_obj_get(function_call, "id", f"gemini-call-{index}")),
                 name=name,
-                arguments=dict(args),
+                arguments=args,
             )
         )
     return tool_calls
@@ -286,7 +382,10 @@ def _anthropic_content_blocks(content: Any) -> List[dict]:
                 if item_type == "text":
                     blocks.append({"type": "text", "text": str(item.get("text", ""))})
                 elif item_type == "image_url":
-                    image_url = str(_obj_get(item.get("image_url", {}), "url", ""))
+                    raw_image_url = str(_obj_get(item.get("image_url", {}), "url", ""))
+                    image_url, _ = normalize_image_ref(raw_image_url)
+                    if not image_url:
+                        continue
                     parsed = _split_data_url(image_url)
                     if parsed:
                         mime_type, base64_data = parsed
@@ -314,14 +413,194 @@ def _anthropic_content_blocks(content: Any) -> List[dict]:
     return [{"type": "text", "text": str(content)}]
 
 
+def _openai_responses_input_item_from_content(role: str, content: Any) -> dict | None:
+    if role not in {"user", "assistant"}:
+        return None
+    parts = normalize_message_parts(content)
+    if not parts:
+        text = extract_text_from_parts(content)
+        if not text:
+            return None
+        return {"role": role, "content": text}
+
+    converted_parts: list[dict[str, Any]] = []
+    for part in parts:
+        part_type = str(part.get("type", "") or "").strip().lower()
+        if part_type == "text":
+            text = str(part.get("text", "") or "").strip()
+            if text:
+                converted_parts.append({"type": "input_text", "text": text})
+        elif part_type == "image_url":
+            image_obj = part.get("image_url", {})
+            if isinstance(image_obj, dict) and image_obj.get("url"):
+                normalized_image_url, _ = normalize_image_ref(str(image_obj.get("url")))
+                if not normalized_image_url:
+                    continue
+                image_item: dict[str, Any] = {
+                    "type": "input_image",
+                    "image_url": normalized_image_url,
+                }
+                detail = str(image_obj.get("detail", "") or "").strip()
+                if detail:
+                    image_item["detail"] = detail
+                converted_parts.append(image_item)
+        elif part_type == "image_file":
+            image_obj = part.get("image_file", {})
+            path = str(image_obj.get("path", "") if isinstance(image_obj, dict) else "").strip()
+            if path:
+                normalized_path, _ = normalize_image_ref(path)
+                if not normalized_path:
+                    continue
+                image_item = {"type": "input_image", "image_url": normalized_path}
+                detail = str(part.get("detail", "") or "").strip()
+                if detail:
+                    image_item["detail"] = detail
+                converted_parts.append(image_item)
+    if not converted_parts:
+        text = extract_text_from_parts(content)
+        if not text:
+            return None
+        return {"role": role, "content": text}
+    return {"role": role, "content": converted_parts}
+
+
+def _openai_responses_input(messages: List[dict]) -> tuple[str | None, List[dict]]:
+    system_instruction, rest_messages = _extract_system_message(messages)
+    input_items: List[dict] = []
+    for message in rest_messages:
+        role = str(message.get("role", "user") or "user")
+        content = message.get("parts", message.get("content", ""))
+        if role in {"user", "assistant"}:
+            item = _openai_responses_input_item_from_content(role, content)
+            if item is not None:
+                input_items.append(item)
+            if role == "assistant":
+                raw_tool_calls = message.get("tool_calls", [])
+                if isinstance(raw_tool_calls, list):
+                    for raw_tool_call in raw_tool_calls:
+                        if not isinstance(raw_tool_call, dict):
+                            continue
+                        function_part = raw_tool_call.get("function", {})
+                        if not isinstance(function_part, dict):
+                            function_part = {}
+                        call_id = str(raw_tool_call.get("id") or raw_tool_call.get("call_id") or "").strip()
+                        name = str(function_part.get("name", "")).strip()
+                        arguments = function_part.get("arguments", "{}")
+                        if isinstance(arguments, dict):
+                            arguments = json.dumps(arguments, ensure_ascii=False)
+                        else:
+                            arguments = str(arguments or "{}")
+                        if call_id and name:
+                            input_items.append(
+                                {
+                                    "type": "function_call",
+                                    "call_id": call_id,
+                                    "name": name,
+                                    "arguments": arguments,
+                                }
+                            )
+        elif role == "tool":
+            input_items.append(
+                {
+                    "type": "function_call_output",
+                    "call_id": str(message.get("tool_call_id", "")),
+                    "output": str(message.get("content", "")),
+                }
+            )
+    return system_instruction or None, input_items
+
+
+def _parse_openai_responses_output(data: dict) -> tuple[str, List[ToolCall], bool]:
+    output = data.get("output", [])
+    text_parts: List[str] = []
+    tool_calls: List[ToolCall] = []
+    used_builtin_search = False
+
+    for item in output:
+        item_type = str(_obj_get(item, "type", "") or "")
+        if item_type == "message":
+            content_blocks = list(_obj_get(item, "content", []) or [])
+            for block in content_blocks:
+                block_type = str(_obj_get(block, "type", "") or "")
+                if block_type in {"output_text", "text"}:
+                    text = _obj_get(block, "text", "")
+                    if text:
+                        text_parts.append(str(text))
+        elif item_type == "function_call":
+            tool_calls.append(
+                ToolCall(
+                    id=str(_obj_get(item, "call_id", _obj_get(item, "id", ""))),
+                    name=str(_obj_get(item, "name", "")),
+                    arguments=_parse_tool_arguments(_obj_get(item, "arguments", {}) or {}),
+                )
+            )
+        elif item_type == "web_search_call":
+            used_builtin_search = True
+
+    return "".join(text_parts).strip(), tool_calls, used_builtin_search
+
+
+def _openai_chat_search_model(model: str) -> bool:
+    lower = str(model or "").strip().lower()
+    return any(token in lower for token in ("search-preview", "search-api"))
+
+
+def _openai_tool_name(tool: dict) -> str:
+    return str(
+        _obj_get(_obj_get(tool, "function", {}), "name", "") or _obj_get(tool, "name", "") or ""
+    ).strip()
+
+
+def _response_to_dict(response: Any) -> dict:
+    if hasattr(response, "model_dump"):
+        try:
+            dumped = response.model_dump()
+            if isinstance(dumped, dict):
+                return dumped
+        except Exception:
+            pass
+    if isinstance(response, dict):
+        return response
+    return {}
+
+
+def _anthropic_tool_use_blocks(tool_calls: Any) -> List[dict]:
+    blocks: List[dict] = []
+    if not isinstance(tool_calls, list):
+        return blocks
+    for index, raw_tool_call in enumerate(tool_calls):
+        if not isinstance(raw_tool_call, dict):
+            continue
+        function_part = raw_tool_call.get("function", {})
+        if not isinstance(function_part, dict):
+            function_part = {}
+        name = str(function_part.get("name", "") or "").strip()
+        if not name:
+            continue
+        call_id = str(raw_tool_call.get("id") or raw_tool_call.get("call_id") or "").strip()
+        if not call_id:
+            call_id = f"anthropic-call-{index}"
+        blocks.append(
+            {
+                "type": "tool_use",
+                "id": call_id,
+                "name": name,
+                "input": _parse_tool_arguments(function_part.get("arguments", {})),
+            }
+        )
+    return blocks
+
+
 def _convert_messages_to_anthropic(messages: List[dict]) -> Tuple[str, List[dict]]:
     system_instruction, rest_messages = _extract_system_message(messages)
     converted: List[dict] = []
     for message in rest_messages:
+        content_blocks = _anthropic_content_blocks(message.get("content", ""))
+        content_blocks.extend(_anthropic_tool_use_blocks(message.get("tool_calls", [])))
         converted.append(
             {
                 "role": "assistant" if message.get("role") == "assistant" else "user",
-                "content": _anthropic_content_blocks(message.get("content", "")),
+                "content": content_blocks,
             }
         )
     return system_instruction, converted
@@ -361,53 +640,140 @@ class OpenAIToolCaller(ToolCaller):
     ) -> ToolCallerResponse:
         from openai import AsyncOpenAI
 
-        async with httpx.AsyncClient(timeout=httpx.Timeout(self.timeout, connect=10.0)) as http_client:
-            client = AsyncOpenAI(
-                api_key=self.api_key,
-                base_url=self.base_url,
-                http_client=http_client,
-            )
-            payload: Dict[str, Any] = {
-                "model": self.model,
-                "messages": messages,
-            }
-            if tools:
-                payload["tools"] = tools
-                payload["tool_choice"] = "auto"
-            reasoning = _maybe_openai_reasoning(self.model, self.thinking_mode)
-            if reasoning and self._supports_reasoning is not False:
-                payload["reasoning"] = reasoning
+        contains_image_input = _messages_contain_images(messages)
+        try:
+            async with httpx.AsyncClient(timeout=httpx.Timeout(self.timeout, connect=10.0)) as http_client:
+                client = AsyncOpenAI(
+                    api_key=self.api_key,
+                    base_url=self.base_url,
+                    http_client=http_client,
+                )
+                all_tools = list(tools)
+                filtered_tools = [
+                    tool
+                    for tool in all_tools
+                    if not (use_builtin_search and _openai_tool_name(tool) == "web_search")
+                ]
+                responses_failed = False
+                if use_builtin_search and not _openai_chat_search_model(self.model):
+                    system_instruction, input_items = _openai_responses_input(messages)
+                    response_tools = [_convert_openai_tool_to_responses(tool) for tool in filtered_tools]
+                    response_tools.append({"type": "web_search"})
+                    payload: Dict[str, Any] = {
+                        "model": self.model,
+                        "input": input_items,
+                        "tools": response_tools,
+                        "tool_choice": "auto",
+                    }
+                    if system_instruction:
+                        payload["instructions"] = system_instruction
+                    reasoning = _maybe_openai_reasoning(self.model, self.thinking_mode)
+                    if reasoning and self._supports_reasoning is not False:
+                        payload["reasoning"] = reasoning
 
-            try:
-                response = await client.chat.completions.create(**payload)
-            except TypeError as e:
-                error_msg = str(e).lower()
-                if "reasoning" in error_msg and "unexpected keyword" in error_msg:
-                    payload.pop("reasoning", None)
-                    self._supports_reasoning = False
+                    try:
+                        response = await client.responses.create(**payload)
+                        content, tool_calls, used_builtin_search = _parse_openai_responses_output(
+                            _response_to_dict(response)
+                        )
+                        return ToolCallerResponse(
+                            finish_reason="tool_calls" if tool_calls else "stop",
+                            content=content,
+                            tool_calls=tool_calls,
+                            raw=response,
+                            used_builtin_search=used_builtin_search,
+                        )
+                    except TypeError as e:
+                        error_msg = str(e).lower()
+                        if "reasoning" in error_msg and "unexpected keyword" in error_msg:
+                            payload.pop("reasoning", None)
+                            self._supports_reasoning = False
+                            try:
+                                response = await client.responses.create(**payload)
+                                content, tool_calls, used_builtin_search = _parse_openai_responses_output(
+                                    _response_to_dict(response)
+                                )
+                                return ToolCallerResponse(
+                                    finish_reason="tool_calls" if tool_calls else "stop",
+                                    content=content,
+                                    tool_calls=tool_calls,
+                                    raw=response,
+                                    used_builtin_search=used_builtin_search,
+                                )
+                            except Exception:
+                                responses_failed = True
+                        else:
+                            raise
+                    except Exception:
+                        responses_failed = True
+
+                chat_supports_native_search = use_builtin_search and _openai_chat_search_model(self.model)
+
+                def _build_chat_payload(*, use_native_search: bool, use_original_tools: bool) -> Dict[str, Any]:
+                    payload = {
+                        "model": self.model,
+                        "messages": messages,
+                    }
+                    payload_tools = all_tools if use_original_tools else filtered_tools
+                    if payload_tools:
+                        payload["tools"] = payload_tools
+                        payload["tool_choice"] = "auto"
+                    if use_native_search:
+                        payload["web_search_options"] = {}
+                    reasoning = _maybe_openai_reasoning(self.model, self.thinking_mode)
+                    if reasoning and self._supports_reasoning is not False:
+                        payload["reasoning"] = reasoning
+                    return payload
+
+                payload = _build_chat_payload(
+                    use_native_search=chat_supports_native_search and not responses_failed,
+                    use_original_tools=(not use_builtin_search) or responses_failed,
+                )
+
+                try:
                     response = await client.chat.completions.create(**payload)
-                else:
-                    raise
+                except TypeError as e:
+                    error_msg = str(e).lower()
+                    if "reasoning" in error_msg and "unexpected keyword" in error_msg:
+                        payload.pop("reasoning", None)
+                        self._supports_reasoning = False
+                        response = await client.chat.completions.create(**payload)
+                    elif use_builtin_search and chat_supports_native_search and not responses_failed:
+                        payload = _build_chat_payload(use_native_search=False, use_original_tools=True)
+                        response = await client.chat.completions.create(**payload)
+                    else:
+                        raise
+                except Exception:
+                    if use_builtin_search and chat_supports_native_search and not responses_failed:
+                        payload = _build_chat_payload(use_native_search=False, use_original_tools=True)
+                        response = await client.chat.completions.create(**payload)
+                    else:
+                        raise
 
-        message = response.choices[0].message
-        raw_tool_calls = list(_obj_get(message, "tool_calls", []) or [])
-        tool_calls = [
-            ToolCall(
-                id=str(_obj_get(tool_call, "id", "")),
-                name=str(_obj_get(_obj_get(tool_call, "function", {}), "name", "")),
-                arguments=json.loads(_obj_get(_obj_get(tool_call, "function", {}), "arguments", "{}") or "{}"),
+            message = response.choices[0].message
+            raw_tool_calls = list(_obj_get(message, "tool_calls", []) or [])
+            tool_calls = [
+                ToolCall(
+                    id=str(_obj_get(tool_call, "id", "")),
+                    name=str(_obj_get(_obj_get(tool_call, "function", {}), "name", "")),
+                    arguments=_parse_tool_arguments(_obj_get(_obj_get(tool_call, "function", {}), "arguments", "{}")),
+                )
+                for tool_call in raw_tool_calls
+            ]
+            content = str(_obj_get(message, "content", "") or "").strip()
+            finish_reason = "tool_calls" if tool_calls else "stop"
+            used_builtin_search = bool(_obj_get(message, "annotations", []) or [])
+            return ToolCallerResponse(
+                finish_reason=finish_reason,
+                content=content,
+                tool_calls=tool_calls,
+                raw=response,
+                used_builtin_search=used_builtin_search,
             )
-            for tool_call in raw_tool_calls
-        ]
-        content = str(_obj_get(message, "content", "") or "").strip()
-        finish_reason = "tool_calls" if tool_calls else "stop"
-        return ToolCallerResponse(
-            finish_reason=finish_reason,
-            content=content,
-            tool_calls=tool_calls,
-            raw=response,
-            used_builtin_search=False,
-        )
+        except Exception as exc:
+            if contains_image_input and _error_indicates_vision_unavailable(exc):
+                return _vision_unavailable_response(exc)
+            raise
 
     def build_tool_result_message(
         self,
@@ -445,54 +811,60 @@ class GeminiToolCaller(ToolCaller):
     ) -> ToolCallerResponse:
         import google.generativeai as genai
 
-        _configure_genai(self.api_key, self.base_url)
-        system_instruction, contents = _convert_messages_to_gemini(messages)
+        contains_image_input = _messages_contain_images(messages)
+        try:
+            _configure_genai(self.api_key, self.base_url)
+            system_instruction, contents = _convert_messages_to_gemini(messages)
 
-        tool_payload: List[dict] = []
-        if tools:
-            tool_payload.append(
-                {
-                    "function_declarations": [
-                        _convert_openai_tool_to_gemini(tool)
-                        for tool in tools
-                    ]
+            tool_payload: List[dict] = []
+            if tools:
+                tool_payload.append(
+                    {
+                        "function_declarations": [
+                            _convert_openai_tool_to_gemini(tool)
+                            for tool in tools
+                        ]
+                    }
+                )
+            if use_builtin_search:
+                tool_payload.append({"google_search": {}})
+
+            generation_config: Dict[str, Any] = {
+                "thinking_config": {
+                    "thinking_budget": GEMINI_THINKING_BUDGET_MAP[self.thinking_mode]
                 }
-            )
-        if use_builtin_search:
-            tool_payload.append({"google_search": {}})
-
-        generation_config: Dict[str, Any] = {
-            "thinking_config": {
-                "thinking_budget": GEMINI_THINKING_BUDGET_MAP[self.thinking_mode]
             }
-        }
-        model = genai.GenerativeModel(
-            model_name=self.model,
-            system_instruction=system_instruction,
-            tools=tool_payload or None,
-        )
-        response = await model.generate_content_async(
-            contents,
-            generation_config=generation_config,
-        )
+            model = genai.GenerativeModel(
+                model_name=self.model,
+                system_instruction=system_instruction,
+                tools=tool_payload or None,
+            )
+            response = await model.generate_content_async(
+                contents,
+                generation_config=generation_config,
+            )
 
-        candidates = list(_obj_get(response, "candidates", []) or [])
-        if not candidates:
-            return ToolCallerResponse("stop", "", [], response)
+            candidates = list(_obj_get(response, "candidates", []) or [])
+            if not candidates:
+                return ToolCallerResponse("stop", "", [], response)
 
-        content = _obj_get(candidates[0], "content", {})
-        parts = list(_obj_get(content, "parts", []) or [])
-        tool_calls = _extract_gemini_tool_calls(parts)
-        text = _extract_gemini_text(parts)
-        finish_reason = "tool_calls" if tool_calls else "stop"
-        used_builtin = _gemini_used_builtin_search(response)
-        return ToolCallerResponse(
-            finish_reason=finish_reason,
-            content=text,
-            tool_calls=tool_calls,
-            raw=response,
-            used_builtin_search=used_builtin,
-        )
+            content = _obj_get(candidates[0], "content", {})
+            parts = list(_obj_get(content, "parts", []) or [])
+            tool_calls = _extract_gemini_tool_calls(parts)
+            text = _extract_gemini_text(parts)
+            finish_reason = "tool_calls" if tool_calls else "stop"
+            used_builtin = _gemini_used_builtin_search(response)
+            return ToolCallerResponse(
+                finish_reason=finish_reason,
+                content=text,
+                tool_calls=tool_calls,
+                raw=response,
+                used_builtin_search=used_builtin,
+            )
+        except Exception as exc:
+            if contains_image_input and _error_indicates_vision_unavailable(exc):
+                return _vision_unavailable_response(exc)
+            raise
 
     def build_tool_result_message(
         self,
@@ -537,67 +909,73 @@ class AnthropicToolCaller(ToolCaller):
     ) -> ToolCallerResponse:
         from anthropic import AsyncAnthropic
 
-        system_instruction, anthropic_messages = _convert_messages_to_anthropic(messages)
-        filtered_tools = [
-            tool
-            for tool in tools
-            if not (
-                use_builtin_search
-                and str(_obj_get(_obj_get(tool, "function", {}), "name", "") or "") == "web_search"
-            )
-        ]
-        tool_payload = [_convert_openai_tool_to_anthropic(tool) for tool in filtered_tools]
-        if use_builtin_search:
-            tool_payload.append(dict(ANTHROPIC_BUILTIN_SEARCH_TOOL))
-
-        client_kwargs: Dict[str, Any] = {
-            "api_key": self.api_key,
-            "timeout": self.timeout,
-        }
-        if self.base_url:
-            client_kwargs["base_url"] = self.base_url.rstrip("/")
-        client = AsyncAnthropic(**client_kwargs)
-
-        payload: Dict[str, Any] = {
-            "model": self.model,
-            "messages": anthropic_messages,
-            "max_tokens": 1024,
-        }
-        if system_instruction:
-            payload["system"] = system_instruction
-        if tool_payload:
-            payload["tools"] = tool_payload
-        thinking = _maybe_anthropic_thinking(self.thinking_mode)
-        if thinking:
-            payload["thinking"] = thinking
-
-        response = await client.messages.create(**payload)
-
-        content_blocks = list(_obj_get(response, "content", []) or [])
-        text_parts: List[str] = []
-        tool_calls: List[ToolCall] = []
-        for block in content_blocks:
-            block_type = _obj_get(block, "type", "")
-            if block_type == "text":
-                text_parts.append(str(_obj_get(block, "text", "")))
-            elif block_type == "tool_use":
-                tool_calls.append(
-                    ToolCall(
-                        id=str(_obj_get(block, "id", "")),
-                        name=str(_obj_get(block, "name", "")),
-                        arguments=dict(_obj_get(block, "input", {}) or {}),
-                    )
+        contains_image_input = _messages_contain_images(messages)
+        try:
+            system_instruction, anthropic_messages = _convert_messages_to_anthropic(messages)
+            filtered_tools = [
+                tool
+                for tool in tools
+                if not (
+                    use_builtin_search
+                    and str(_obj_get(_obj_get(tool, "function", {}), "name", "") or "") == "web_search"
                 )
+            ]
+            tool_payload = [_convert_openai_tool_to_anthropic(tool) for tool in filtered_tools]
+            if use_builtin_search:
+                tool_payload.append(dict(ANTHROPIC_BUILTIN_SEARCH_TOOL))
 
-        finish_reason = "tool_calls" if tool_calls else "stop"
-        used_builtin = _anthropic_used_builtin_search(content_blocks)
-        return ToolCallerResponse(
-            finish_reason=finish_reason,
-            content="".join(text_parts).strip(),
-            tool_calls=tool_calls,
-            raw=response,
-            used_builtin_search=used_builtin,
-        )
+            client_kwargs: Dict[str, Any] = {
+                "api_key": self.api_key,
+                "timeout": self.timeout,
+            }
+            if self.base_url:
+                client_kwargs["base_url"] = self.base_url.rstrip("/")
+            client = AsyncAnthropic(**client_kwargs)
+
+            payload: Dict[str, Any] = {
+                "model": self.model,
+                "messages": anthropic_messages,
+                "max_tokens": 1024,
+            }
+            if system_instruction:
+                payload["system"] = system_instruction
+            if tool_payload:
+                payload["tools"] = tool_payload
+            thinking = _maybe_anthropic_thinking(self.thinking_mode)
+            if thinking:
+                payload["thinking"] = thinking
+
+            response = await client.messages.create(**payload)
+
+            content_blocks = list(_obj_get(response, "content", []) or [])
+            text_parts: List[str] = []
+            tool_calls: List[ToolCall] = []
+            for block in content_blocks:
+                block_type = _obj_get(block, "type", "")
+                if block_type == "text":
+                    text_parts.append(str(_obj_get(block, "text", "")))
+                elif block_type == "tool_use":
+                    tool_calls.append(
+                        ToolCall(
+                            id=str(_obj_get(block, "id", "")),
+                            name=str(_obj_get(block, "name", "")),
+                            arguments=_parse_tool_arguments(_obj_get(block, "input", {}) or {}),
+                        )
+                    )
+
+            finish_reason = "tool_calls" if tool_calls else "stop"
+            used_builtin = _anthropic_used_builtin_search(content_blocks)
+            return ToolCallerResponse(
+                finish_reason=finish_reason,
+                content="".join(text_parts).strip(),
+                tool_calls=tool_calls,
+                raw=response,
+                used_builtin_search=used_builtin,
+            )
+        except Exception as exc:
+            if contains_image_input and _error_indicates_vision_unavailable(exc):
+                return _vision_unavailable_response(exc)
+            raise
 
     def build_tool_result_message(
         self,
@@ -850,22 +1228,29 @@ class OpenAICodexToolCaller(ToolCaller):
                         elif part_type == "image_url":
                             image_obj = part.get("image_url", {})
                             if isinstance(image_obj, dict) and image_obj.get("url"):
-                                codex_parts.append(
-                                    {
-                                        "type": "input_image",
-                                        "image_url": str(image_obj.get("url")),
-                                    }
-                                )
+                                normalized_image_url, _ = normalize_image_ref(str(image_obj.get("url")))
+                                if not normalized_image_url:
+                                    continue
+                                image_item: dict[str, Any] = {
+                                    "type": "input_image",
+                                    "image_url": normalized_image_url,
+                                }
+                                detail = str(image_obj.get("detail", "") or "").strip()
+                                if detail:
+                                    image_item["detail"] = detail
+                                codex_parts.append(image_item)
                         elif part_type == "image_file":
                             image_obj = part.get("image_file", {})
                             path = str(image_obj.get("path", "") if isinstance(image_obj, dict) else "").strip()
                             if path:
-                                codex_parts.append(
-                                    {
-                                        "type": "input_image",
-                                        "image_url": Path(path).resolve().as_uri(),
-                                    }
-                                )
+                                normalized_path, _ = normalize_image_ref(path)
+                                if not normalized_path:
+                                    continue
+                                image_item = {"type": "input_image", "image_url": normalized_path}
+                                detail = str(part.get("detail", "") or "").strip()
+                                if detail:
+                                    image_item["detail"] = detail
+                                codex_parts.append(image_item)
                     if codex_parts:
                         input_items.append({"role": role, "content": codex_parts})
                 else:

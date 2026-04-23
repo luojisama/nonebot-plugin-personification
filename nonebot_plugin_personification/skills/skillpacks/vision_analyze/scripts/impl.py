@@ -1,14 +1,16 @@
 from __future__ import annotations
 
 import json
-from pathlib import Path
 from typing import Any
 
 from nonebot_plugin_personification.agent.tool_registry import AgentTool
+from nonebot_plugin_personification.core.ai_routes import build_fallback_vision_caller
+from nonebot_plugin_personification.core.media_refs import normalize_media_refs
+from nonebot_plugin_personification.core.media_understanding import (
+    analyze_images_with_route_or_fallback,
+    analyze_videos_with_route_or_fallback,
+)
 from nonebot_plugin_personification.skills.skillpacks.sticker_tool.scripts.impl import get_current_image_urls
-from nonebot_plugin_personification.skills.skillpacks.vision_caller.scripts.impl import build_vision_caller
-
-
 VISION_ANALYZE_PROMPT = """你是 ACG 场景视觉分析器。
 请基于图片和用户问题，输出一个 JSON 对象，不要输出解释性文字。
 
@@ -31,38 +33,7 @@ VISION_ANALYZE_PROMPT = """你是 ACG 场景视觉分析器。
 
 
 def _build_fallback_vision_caller(plugin_config: Any):
-    class _ConfigProxy:
-        def __init__(self, original: Any) -> None:
-            self._original = original
-
-        def __getattr__(self, name: str) -> Any:
-            if name == "personification_labeler_api_type":
-                return getattr(self._original, "personification_vision_fallback_provider", "") or getattr(
-                    self._original,
-                    "personification_labeler_api_type",
-                    "",
-                )
-            if name == "personification_labeler_api_url":
-                return getattr(self._original, "personification_labeler_api_url", "") or getattr(
-                    self._original,
-                    "personification_api_url",
-                    "",
-                )
-            if name == "personification_labeler_api_key":
-                return getattr(self._original, "personification_labeler_api_key", "") or getattr(
-                    self._original,
-                    "personification_api_key",
-                    "",
-                )
-            if name == "personification_labeler_model":
-                return getattr(self._original, "personification_vision_fallback_model", "") or getattr(
-                    self._original,
-                    "personification_labeler_model",
-                    "",
-                )
-            return getattr(self._original, name)
-
-    return build_vision_caller(_ConfigProxy(plugin_config))
+    return build_fallback_vision_caller(plugin_config)
 
 
 def _normalize_images(images: list[str] | None, image_urls: list[str] | None = None) -> list[str]:
@@ -73,7 +44,8 @@ def _normalize_images(images: list[str] | None, image_urls: list[str] | None = N
             merged.append(value)
     if not merged:
         merged.extend(get_current_image_urls())
-    return merged[:3]
+    normalized = normalize_media_refs(images=merged, image_limit=3)
+    return list(normalized.get("images") or [])[:3]
 
 
 async def analyze_images(
@@ -82,10 +54,18 @@ async def analyze_images(
     query: str,
     images: list[str] | None = None,
     image_urls: list[str] | None = None,
+    videos: list[str] | None = None,
 ) -> str:
     prompt = f"{VISION_ANALYZE_PROMPT}\n\n用户问题：{str(query or '').strip() or '请分析图片'}"
-    refs = _normalize_images(images, image_urls=image_urls)
-    if not refs:
+    raw_refs = list(images or []) + list(image_urls or [])
+    if not raw_refs:
+        raw_refs = get_current_image_urls()
+    normalized_media = normalize_media_refs(images=raw_refs, videos=list(videos or []), image_limit=3, video_limit=1)
+    refs = list(normalized_media.get("images") or [])
+    invalid_refs = list(normalized_media.get("image_problems") or [])
+    video_refs = list(normalized_media.get("videos") or [])
+    invalid_video_refs = list(normalized_media.get("video_problems") or [])
+    if not refs and not video_refs:
         return json.dumps(
             {
                 "scene_summary": "",
@@ -93,14 +73,20 @@ async def analyze_images(
                 "characters_or_entities": [],
                 "franchise_candidates": [],
                 "visual_evidence": [],
-                "ambiguity_notes": ["missing_images"],
+                "ambiguity_notes": ["missing_media", *invalid_refs, *invalid_video_refs],
                 "confidence": 0.0,
             },
             ensure_ascii=False,
         )
 
     vision_caller = getattr(runtime, "vision_caller", None)
-    if vision_caller is None and bool(getattr(runtime.plugin_config, "personification_vision_fallback_enabled", True)):
+    if vision_caller is None and bool(
+        getattr(
+            runtime.plugin_config,
+            "personification_fallback_enabled",
+            getattr(runtime.plugin_config, "personification_vision_fallback_enabled", True),
+        )
+    ):
         vision_caller = _build_fallback_vision_caller(runtime.plugin_config)
     if vision_caller is None:
         return json.dumps(
@@ -116,33 +102,115 @@ async def analyze_images(
             ensure_ascii=False,
         )
 
-    outputs: list[str] = []
-    for ref in refs:
-        target = ref
-        if not ref.startswith(("data:", "http://", "https://")) and Path(ref).exists():
-            target = Path(ref).as_uri()
-        outputs.append(await vision_caller.describe(prompt, target))
+    outputs: list[tuple[str, str]] = []
+    if refs:
+        route_output, route_mode = await analyze_images_with_route_or_fallback(
+            runtime=runtime,
+            prompt=prompt,
+            image_refs=refs,
+            fallback_vision_caller=vision_caller,
+        )
+        if route_output:
+            outputs.append((route_output, route_mode))
+    video_output = ""
+    video_mode = ""
+    if video_refs:
+        video_output, video_mode = await analyze_videos_with_route_or_fallback(
+            runtime=runtime,
+            prompt=prompt,
+            video_refs=video_refs,
+        )
+        if video_output:
+            outputs.append((video_output, video_mode))
+    if not outputs:
+        return json.dumps(
+            {
+                "scene_summary": "",
+                "ocr_text": [],
+                "characters_or_entities": [],
+                "franchise_candidates": [],
+                "visual_evidence": [],
+                "ambiguity_notes": [
+                    "vision_unavailable",
+                    *invalid_refs,
+                    *invalid_video_refs,
+                    *(["video_understanding_disabled"] if video_refs and not bool(getattr(runtime.plugin_config, "personification_video_understanding_enabled", False)) else []),
+                ],
+                "confidence": 0.0,
+            },
+            ensure_ascii=False,
+        )
 
     if len(outputs) == 1:
-        return outputs[0]
+        return outputs[0][0]
+
+    per_image: list[dict[str, Any]] = []
+    merged_summaries: list[str] = []
+    merged_ocr: list[str] = []
+    merged_entities: list[dict[str, Any]] = []
+    merged_candidates: list[dict[str, Any]] = []
+    ambiguity_notes: list[str] = ["multi_media_combined", *invalid_refs, *invalid_video_refs]
+    for index, (output, output_mode) in enumerate(outputs, start=1):
+        if output_mode and output_mode not in ambiguity_notes:
+            ambiguity_notes.append(output_mode)
+        parsed: dict[str, Any] | None = None
+        try:
+            parsed = json.loads(str(output or "").strip())
+        except Exception:
+            parsed = None
+        per_image.append(
+            {
+                "index": index,
+                "analysis": parsed if isinstance(parsed, dict) else str(output or "").strip(),
+            }
+        )
+        if isinstance(parsed, dict):
+            summary = str(parsed.get("scene_summary", "") or "").strip()
+            if summary:
+                merged_summaries.append(f"图{index}：{summary}")
+            for item in list(parsed.get("ocr_text") or [])[:8]:
+                text = str(item or "").strip()
+                if text and text not in merged_ocr:
+                    merged_ocr.append(text)
+            for item in list(parsed.get("characters_or_entities") or [])[:6]:
+                if isinstance(item, dict) and item not in merged_entities:
+                    merged_entities.append(item)
+            for item in list(parsed.get("franchise_candidates") or [])[:6]:
+                if isinstance(item, dict) and item not in merged_candidates:
+                    merged_candidates.append(item)
+            for item in list(parsed.get("ambiguity_notes") or [])[:4]:
+                text = str(item or "").strip()
+                if text and text not in ambiguity_notes:
+                    ambiguity_notes.append(text)
 
     return json.dumps(
         {
-            "scene_summary": "",
-            "ocr_text": [],
-            "characters_or_entities": [],
-            "franchise_candidates": [],
-            "visual_evidence": outputs,
-            "ambiguity_notes": ["multi_image_raw_merge"],
-            "confidence": 0.35,
+            "scene_summary": "；".join(merged_summaries)[:300],
+            "ocr_text": merged_ocr[:12],
+            "characters_or_entities": merged_entities[:12],
+            "franchise_candidates": merged_candidates[:12],
+            "visual_evidence": per_image,
+            "ambiguity_notes": ambiguity_notes[:8],
+            "confidence": 0.45,
         },
         ensure_ascii=False,
     )
 
 
 def build_vision_tool(runtime: Any) -> AgentTool:
-    async def _handler(query: str, images: list[str] | None = None, image_urls: list[str] | None = None) -> str:
-        return await analyze_images(runtime=runtime, query=query, images=images, image_urls=image_urls)
+    async def _handler(
+        query: str,
+        images: list[str] | None = None,
+        image_urls: list[str] | None = None,
+        videos: list[str] | None = None,
+    ) -> str:
+        return await analyze_images(
+            runtime=runtime,
+            query=query,
+            images=images,
+            image_urls=image_urls,
+            videos=videos,
+        )
 
     return AgentTool(
         name="vision_analyze",
@@ -155,11 +223,12 @@ def build_vision_tool(runtime: Any) -> AgentTool:
             "properties": {
                 "query": {"type": "string", "description": "用户问题或分析目标"},
                 "images": {"type": "array", "items": {"type": "string"}, "description": "图片引用列表"},
+                "videos": {"type": "array", "items": {"type": "string"}, "description": "视频引用列表（当前默认关闭）"},
             },
             "required": ["query"],
         },
         handler=_handler,
-        enabled=lambda: bool(getattr(runtime.plugin_config, "personification_vision_fallback_enabled", True))
+        enabled=lambda: bool(getattr(runtime, "agent_tool_caller", None))
         or getattr(runtime, "vision_caller", None) is not None,
     )
 

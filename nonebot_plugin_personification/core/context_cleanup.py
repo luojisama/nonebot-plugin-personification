@@ -44,7 +44,7 @@ def clear_message_buffer(msg_buffer: Dict[str, Dict[str, Any]], target_id: str) 
     """按目标会话前缀清理消息缓冲。"""
     keys_to_remove = []
     for key in list(msg_buffer.keys()):
-        if key.startswith(f"{target_id}_"):
+        if key == target_id:
             keys_to_remove.append(key)
 
     for key in keys_to_remove:

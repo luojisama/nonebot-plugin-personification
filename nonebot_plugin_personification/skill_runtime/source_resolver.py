@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import html
 import json
+import ipaddress
+import os
 import re
 import shutil
 import time
@@ -13,9 +16,79 @@ from urllib.parse import urljoin, urlparse
 
 import httpx
 import yaml
+import socket
 
 
 _SKILL_PAGE_HOSTS = {"clawhub.ai", "skillhub.tencent.com", "skillhub.cn"}
+_MAX_REMOTE_ZIP_BYTES = 50 * 1024 * 1024
+_MAX_REMOTE_REDIRECTS = 5
+_BLOCKED_REMOTE_HOST_SUFFIXES = (".local", ".lan", ".home", ".internal", ".corp")
+_BLOCKED_REMOTE_HOSTS = {
+    "localhost",
+    "127.0.0.1",
+    "::1",
+    "0.0.0.0",
+    "host.docker.internal",
+}
+
+
+def _is_disallowed_ip_address(ip: ipaddress._BaseAddress) -> bool:
+    return any(
+        (
+            ip.is_private,
+            ip.is_loopback,
+            ip.is_link_local,
+            ip.is_multicast,
+            ip.is_reserved,
+            ip.is_unspecified,
+        )
+    )
+
+
+async def _is_safe_remote_url(url: str, logger: Any) -> bool:
+    try:
+        parsed = urlparse(str(url or "").strip())
+    except Exception:
+        return False
+    if parsed.scheme not in {"http", "https"}:
+        return False
+    host = (parsed.hostname or "").strip().lower()
+    if not host:
+        return False
+    if host in _BLOCKED_REMOTE_HOSTS or host.endswith(_BLOCKED_REMOTE_HOST_SUFFIXES):
+        logger.warning(f"[skill_source]拒绝访问高风险地址 host={host}")
+        return False
+
+    try:
+        literal_ip = ipaddress.ip_address(host)
+    except ValueError:
+        literal_ip = None
+    if literal_ip is not None:
+        return not _is_disallowed_ip_address(literal_ip)
+
+    try:
+        infos = await asyncio.to_thread(
+            socket.getaddrinfo,
+            host,
+            parsed.port or (443 if parsed.scheme == "https" else 80),
+            socket.AF_UNSPEC,
+            socket.SOCK_STREAM,
+        )
+    except socket.gaierror:
+        return True
+    except Exception as e:
+        logger.warning(f"[skill_source]解析地址失败，已拒绝 {host}: {e}")
+        return False
+
+    for info in infos:
+        try:
+            resolved_ip = ipaddress.ip_address(info[4][0])
+        except Exception:
+            continue
+        if _is_disallowed_ip_address(resolved_ip):
+            logger.warning(f"[skill_source]拒绝解析到内网/本地的地址 host={host} ip={resolved_ip}")
+            return False
+    return True
 
 
 def parse_skill_sources(raw: Any, logger: Any) -> list[dict[str, Any]]:
@@ -169,7 +242,7 @@ async def _prepare_source_dir(
     if should_refresh:
         try:
             download_url = await _resolve_remote_download_url(remote_url)
-            await _download_zip(download_url, archive_path)
+            await _download_zip(download_url, archive_path, logger)
             _extract_zip_file(archive_path, extracted_path, logger, force=True)
             manifest_path.write_text(
                 json.dumps(
@@ -273,12 +346,30 @@ async def _resolve_remote_download_url(url: str) -> str:
     raise RuntimeError(f"failed to resolve zip download url from skill page: {url}")
 
 
-async def _download_zip(url: str, target: Path) -> None:
-    async with httpx.AsyncClient(follow_redirects=True, timeout=60.0) as client:
-        response = await client.get(url)
-        response.raise_for_status()
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_bytes(response.content)
+async def _download_zip(url: str, target: Path, logger: Any) -> None:
+    async with httpx.AsyncClient(follow_redirects=False, timeout=60.0) as client:
+        current_url = url
+        for _ in range(_MAX_REMOTE_REDIRECTS):
+            if not await _is_safe_remote_url(current_url, logger):
+                raise RuntimeError(f"unsafe remote zip url: {current_url}")
+            async with client.stream("GET", current_url) as response:
+                if response.status_code in {301, 302, 303, 307, 308}:
+                    location = str(response.headers.get("location") or "").strip()
+                    if not location:
+                        raise RuntimeError("redirect without location")
+                    current_url = urljoin(current_url, location)
+                    continue
+                response.raise_for_status()
+                target.parent.mkdir(parents=True, exist_ok=True)
+                total = 0
+                with open(target, "wb") as fh:
+                    async for chunk in response.aiter_bytes():
+                        total += len(chunk)
+                        if total > _MAX_REMOTE_ZIP_BYTES:
+                            raise RuntimeError("remote zip too large")
+                        fh.write(chunk)
+                return
+        raise RuntimeError("too many redirects while downloading remote zip")
 
 
 def _extract_zip_file(archive_path: Path, dest_dir: Path, logger: Any, *, force: bool = False) -> None:
@@ -290,7 +381,11 @@ def _extract_zip_file(archive_path: Path, dest_dir: Path, logger: Any, *, force:
         for member in zf.infolist():
             member_name = member.filename.replace("\\", "/")
             target_path = (dest_dir / member_name).resolve()
-            if not str(target_path).startswith(str(root)):
+            try:
+                if os.path.commonpath([str(root), str(target_path)]) != str(root):
+                    logger.warning(f"[skill_source] skip unsafe archive member: {member.filename}")
+                    continue
+            except Exception:
                 logger.warning(f"[skill_source] skip unsafe archive member: {member.filename}")
                 continue
             zf.extract(member, dest_dir)

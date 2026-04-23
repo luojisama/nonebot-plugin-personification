@@ -8,6 +8,11 @@ from pathlib import Path
 from typing import Any, Awaitable, Callable, Dict, Iterable, Optional
 
 from ..agent.inner_state import DEFAULT_STATE, load_inner_state
+from ..core.emotion_state import (
+    describe_group_emotion_memory,
+    describe_user_emotion_memory,
+    load_emotion_state,
+)
 from ..skills.skillpacks.datetime_tool.scripts.impl import get_current_datetime_info
 from ..utils import get_group_topic_summary
 
@@ -24,6 +29,9 @@ PROACTIVE_DECISION_PROMPT = """[角色设定]
 精力：{energy}
 悬挂念头：
 {pending_thoughts_formatted}
+
+[近期情绪记忆]
+{emotion_memory_formatted}
 
 [当前时间]
 {datetime_info}
@@ -64,6 +72,9 @@ GROUP_IDLE_TOPIC_PROMPT = """[角色设定]
 [当前内心状态]
 心情：{mood}
 精力：{energy}
+
+[近期群情绪记忆]
+{group_emotion_memory}
 
 [当前时间]
 {datetime_info}
@@ -171,6 +182,7 @@ def _build_candidates(
     all_user_data: Dict[str, Dict[str, Any]],
     proactive_state: Dict[str, Dict[str, Any]],
     inner_state: dict,
+    emotion_state: dict | None,
     now: datetime,
     threshold: float,
     idle_hours: float,
@@ -217,6 +229,7 @@ def _build_candidates(
                 "last_chat": _format_last_chat(last_interaction),
                 "warmth": _find_relation_warmth(inner_state, nickname, str(user_id)),
                 "persona_snippet": persona_snippet,
+                "emotion_memory": describe_user_emotion_memory(emotion_state or {}, str(user_id)),
             }
         )
 
@@ -229,6 +242,7 @@ def _build_fallback_candidates(
     friend_profiles: Dict[str, Dict[str, Any]],
     proactive_state: Dict[str, Dict[str, Any]],
     inner_state: dict,
+    emotion_state: dict | None,
     now: datetime,
     idle_hours: float,
     persona_store: Any = None,
@@ -261,6 +275,7 @@ def _build_fallback_candidates(
                 "last_chat": _format_last_chat(last_interaction),
                 "warmth": _find_relation_warmth(inner_state, nickname, str(user_id)),
                 "persona_snippet": persona_snippet,
+                "emotion_memory": describe_user_emotion_memory(emotion_state or {}, str(user_id)),
                 "last_interaction_ts": last_interaction,
             }
         )
@@ -314,6 +329,9 @@ def _format_candidates(candidates: Iterable[dict]) -> str:
         persona_snippet = str(item.get("persona_snippet", "") or "").strip()
         if persona_snippet:
             line += f" / 画像：{persona_snippet}"
+        emotion_memory = str(item.get("emotion_memory", "") or "").strip()
+        if emotion_memory:
+            line += f" / 近期情绪：{emotion_memory}"
         lines.append(line)
     return "\n".join(lines) if lines else "- 无可联系对象"
 
@@ -514,6 +532,12 @@ async def run_proactive_messaging(
             inner_state.update(await load_inner_state(Path(agent_data_dir)))
         except Exception as e:
             logger.warning(f"[proactive] load inner_state failed: {e}")
+    emotion_state = {}
+    if agent_data_dir is not None:
+        try:
+            emotion_state = await load_emotion_state(Path(agent_data_dir))
+        except Exception as e:
+            logger.warning(f"[proactive] load emotion_state failed: {e}")
 
     persona_snippet_max_chars = int(
         getattr(plugin_config, "personification_persona_snippet_max_chars", 150)
@@ -525,6 +549,7 @@ async def run_proactive_messaging(
             all_user_data=all_user_data,
             proactive_state=proactive_state,
             inner_state=inner_state,
+            emotion_state=emotion_state,
             now=now,
             threshold=float(getattr(plugin_config, "personification_proactive_threshold", 60.0)),
             idle_hours=idle_hours,
@@ -537,6 +562,7 @@ async def run_proactive_messaging(
             friend_profiles=friend_profiles,
             proactive_state=proactive_state,
             inner_state=inner_state,
+            emotion_state=emotion_state,
             now=now,
             idle_hours=idle_hours,
             persona_store=persona_store,
@@ -550,11 +576,20 @@ async def run_proactive_messaging(
     timezone_name = getattr(plugin_config, "personification_timezone", "Asia/Shanghai")
     datetime_info = get_current_datetime_info(timezone_name, now)
     elapsed_minutes = int((now_ts - last_proactive_at) / 60) if last_proactive_at else 999999
+    emotion_memory_formatted = (
+        "\n".join(
+            f"- {item['nickname']}: {item['emotion_memory']}"
+            for item in candidates
+            if str(item.get("emotion_memory", "") or "").strip()
+        )
+        or "- 暂无明显近期情绪记忆"
+    )
     user_prompt = PROACTIVE_DECISION_PROMPT.format(
         system_prompt=system_prompt,
         mood=str(inner_state.get("mood", DEFAULT_STATE["mood"])),
         energy=str(inner_state.get("energy", DEFAULT_STATE["energy"])),
         pending_thoughts_formatted=_format_pending_thoughts(inner_state.get("pending_thoughts", [])),
+        emotion_memory_formatted=emotion_memory_formatted,
         datetime_info=datetime_info,
         candidates_formatted=_format_candidates(candidates),
         fav="fav",
@@ -675,6 +710,12 @@ async def run_group_idle_topic(
             inner_state.update(await load_inner_state(Path(agent_data_dir)))
         except Exception as e:
             logger.warning(f"[group_idle] load inner_state failed: {e}")
+    emotion_state = {}
+    if agent_data_dir is not None:
+        try:
+            emotion_state = await load_emotion_state(Path(agent_data_dir))
+        except Exception as e:
+            logger.warning(f"[group_idle] load emotion_state failed: {e}")
 
     sent_count = 0
 
@@ -749,10 +790,12 @@ async def run_group_idle_topic(
                 superuser_context = f"[联网话题参考]\n{grounding_hint}\n\n"
 
             datetime_info = get_current_datetime_info(timezone_name, now)
+            group_emotion_memory = describe_group_emotion_memory(emotion_state, group_id) or "暂无明显群情绪记忆"
             user_prompt = GROUP_IDLE_TOPIC_PROMPT.format(
                 system_prompt=system_prompt,
                 mood=str(inner_state.get("mood", DEFAULT_STATE["mood"])),
                 energy=str(inner_state.get("energy", DEFAULT_STATE["energy"])),
+                group_emotion_memory=group_emotion_memory,
                 datetime_info=datetime_info,
                 group_id=group_id,
                 group_name=group_name,

@@ -31,7 +31,7 @@ pip install nonebot-plugin-shiro-personification
 ## 配置
 
 - 完整配置表见 [CONFIG.md](./CONFIG.md)，其中包含每一个配置项的示例写法、默认值与备注。
-- 插件数据目录固定使用 `nonebot-plugin-localstore` 的 `get_plugin_data_dir()` 结果，不再提供自定义数据目录配置。
+- 默认使用 `nonebot-plugin-localstore` 的数据目录；如需兼容旧部署，可通过 `personification_data_dir` 显式覆盖。
 
 ## 常用命令
 
@@ -63,6 +63,12 @@ pip install nonebot-plugin-shiro-personification
 - 依赖其他插件时统一使用 `require(...)` 声明，避免因普通 `import` 提前导入导致插件加载失败。
 
 ## 更新
+
+### 0.5.1
+
+- 将本地 `personification` 的当前功能面、测试与配置项完整同步到发布包 `nonebot-plugin-shiro-personification`。
+- 新增稳定的 `web_console_api` 接口，供 `nonebot-plugin-shiro-web-console` 在在线版与本地版之间统一读取状态、全局配置、群配置与统计信息。
+- 补齐轻量模型、视觉/视频理解回退、插件知识库构建、图片输入模式等配置文档，并修正文档中对数据目录配置的旧说明。
 
 ### 0.5.0
 

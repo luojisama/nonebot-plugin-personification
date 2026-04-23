@@ -19,7 +19,7 @@ parameters:
       description: 是否主动发送
     sticker_dir:
       type: string
-      description: 贴图目录，默认插件 localstore 数据目录下的 stickers
+      description: 贴图目录，默认 data/personification/sticker
     user_text:
       type: string
       description: context 动作时可传入补充文本

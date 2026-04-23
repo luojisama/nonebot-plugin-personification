@@ -3,6 +3,18 @@ from typing import Any, Dict, List, Optional, Union
 from pydantic import BaseModel
 import warnings
 
+from .core.memory_defaults import (
+    DEFAULT_COMPRESS_KEEP_RECENT,
+    DEFAULT_COMPRESS_THRESHOLD,
+    DEFAULT_GROUP_CONTEXT_EXPIRE_HOURS,
+    DEFAULT_GROUP_SUMMARY_EXPIRE_HOURS,
+    DEFAULT_HISTORY_LEN,
+    DEFAULT_MEMORY_RECALL_TOP_K,
+    DEFAULT_MESSAGE_EXPIRE_HOURS,
+    DEFAULT_PERSONA_HISTORY_MAX,
+    DEFAULT_PRIVATE_HISTORY_TURNS,
+)
+
 
 DEFAULT_FAVORABILITY_ATTITUDES: Dict[str, str] = {
     "初见": "保持基本礼貌，态度温和但不过于亲热。",
@@ -20,21 +32,24 @@ DEFAULT_FAVORABILITY_ATTITUDES: Dict[str, str] = {
 
 class Config(BaseModel):
     personification_whitelist: List[str] = []
-    personification_probability: float = 0.24
+    personification_probability: float = 0.30
 
     personification_global_enabled: bool = True
     personification_tts_global_enabled: bool = True
 
     personification_agent_enabled: bool = True
-    personification_agent_max_steps: int = 5
+    personification_agent_max_steps: int = 7
+    personification_image_input_mode: str = "auto"
+    personification_image_detail: str = "auto"
     personification_builtin_search: bool = True
     personification_model_builtin_search_enabled: bool = False
     personification_tool_web_search_enabled: bool = True
     personification_tool_web_search_mode: str = "enabled"
     personification_thinking_mode: str = "none"
     personification_state_thinking_mode: str = "adaptive"
+    personification_data_dir: str = ""
     personification_persona_enabled: bool = True
-    personification_persona_history_max: int = 30
+    personification_persona_history_max: int = DEFAULT_PERSONA_HISTORY_MAX
     personification_persona_data_path: Optional[str] = None
     personification_persona_snippet_max_chars: int = 150
     personification_persona_prompt_max_chars: int = 120
@@ -42,7 +57,7 @@ class Config(BaseModel):
     personification_memory_palace_enabled: bool = False
     personification_memory_decay_enabled: bool = True
     personification_memory_consolidation_enabled: bool = True
-    personification_memory_recall_top_k: int = 6
+    personification_memory_recall_top_k: int = DEFAULT_MEMORY_RECALL_TOP_K
     personification_background_intelligence_enabled: bool = True
     personification_background_evolves_enabled: bool = True
     personification_background_crystals_enabled: bool = True
@@ -70,9 +85,23 @@ class Config(BaseModel):
     personification_labeler_api_key: str = ""
     personification_labeler_model: str = "gemini-2.0-flash"
     personification_labeler_concurrency: int = 3
+    personification_fallback_enabled: bool = True
+    personification_fallback_api_type: str = ""
+    personification_fallback_api_url: str = ""
+    personification_fallback_api_key: str = ""
+    personification_fallback_model: str = ""
+    personification_fallback_auth_path: str = ""
     personification_vision_fallback_enabled: bool = True
     personification_vision_fallback_provider: str = ""
-    personification_vision_fallback_model: str = "gpt-5.4"
+    personification_vision_fallback_model: str = ""
+    personification_video_understanding_enabled: bool = False
+    personification_video_fallback_enabled: bool = True
+    personification_video_fallback_provider: str = ""
+    personification_video_fallback_api_url: str = ""
+    personification_video_fallback_api_key: str = ""
+    personification_video_fallback_model: str = ""
+    personification_video_fallback_auth_path: str = ""
+    personification_plugin_knowledge_build_enabled: bool = False
     personification_qzone_enabled: bool = False
     personification_qzone_cookie: str = ""
     qzone_cookie: str = ""
@@ -91,9 +120,13 @@ class Config(BaseModel):
 
     personification_api_pools: Optional[Union[str, List[Dict[str, Any]]]] = None
     personification_api_type: str = "openai"
-    personification_api_url: str = "https://api.openai.com/v1"
+    personification_api_url: str = ""
     personification_api_key: str = ""
     personification_model: str = "gpt-4o-mini"
+    # 轻量任务（intent 分类、回复 review、随机插话判定、图片分类）使用的模型名。
+    # 留空时 fallback 到主模型，无需额外配置。
+    # 建议值：与主模型同 provider 的 mini 版本（如 gpt-4.1-mini / gpt-5.4-mini）。
+    personification_lite_model: str = ""
     personification_persona_api_type: str = ""
     personification_persona_api_url: str = ""
     personification_persona_api_key: str = ""
@@ -129,24 +162,26 @@ class Config(BaseModel):
 
     personification_favorability_attitudes: Dict[str, str] = DEFAULT_FAVORABILITY_ATTITUDES.copy()
 
-    personification_history_len: int = 200
+    personification_history_len: int = DEFAULT_HISTORY_LEN
     # 滚动窗口：触发压缩的条数阈值（达到此数量时压缩）
-    personification_compress_threshold: int = 100
+    personification_compress_threshold: int = DEFAULT_COMPRESS_THRESHOLD
     # 压缩后保留的最近原始消息条数
-    personification_compress_keep_recent: int = 20
+    personification_compress_keep_recent: int = DEFAULT_COMPRESS_KEEP_RECENT
+    # 私聊送入主模型的最近消息条数上限，越大越容易延续长对话，但也更耗 token
+    personification_private_history_turns: int = DEFAULT_PRIVATE_HISTORY_TURNS
     # 消息过期时间（小时），超过此时间的消息不再作为上下文，设为 0 禁用
-    personification_message_expire_hours: float = 24.0
+    personification_message_expire_hours: float = DEFAULT_MESSAGE_EXPIRE_HOURS
     # 群聊上下文默认衰减更快，减少机器人长期围着旧话题打转
-    personification_group_context_expire_hours: float = 6.0
+    personification_group_context_expire_hours: float = DEFAULT_GROUP_CONTEXT_EXPIRE_HOURS
     # 群聊话题摘要过期时间（小时），过期后不再注入旧摘要
-    personification_group_summary_expire_hours: float = 4.0
-    # 压缩专用 API 类型，留空则沿用主力模型
+    personification_group_summary_expire_hours: float = DEFAULT_GROUP_SUMMARY_EXPIRE_HOURS
+    # DEPRECATED: 仅在未配置 personification_fallback_* 时作为兜底别名读取
     personification_compress_api_type: str = ""
-    # 压缩专用 API 地址，留空则沿用主力模型
+    # DEPRECATED: 仅在未配置 personification_fallback_* 时作为兜底别名读取
     personification_compress_api_url: str = ""
-    # 压缩专用 API Key，留空则沿用主力模型
+    # DEPRECATED: 仅在未配置 personification_fallback_* 时作为兜底别名读取
     personification_compress_api_key: str = ""
-    # 压缩专用模型名，留空则沿用主力模型
+    # DEPRECATED: 仅在未配置 personification_fallback_* 时作为兜底别名读取
     personification_compress_model: str = ""
 
     personification_sticker_path: Optional[str] = "data/stickers"
@@ -174,8 +209,8 @@ class Config(BaseModel):
     # 每个群每天最多主动发话次数（默认 1）
     personification_group_idle_daily_limit: int = 1
     # Bot 刚接过话后，保留一段“活跃窗口”，更容易继续顺着当前话题聊
-    personification_group_chat_active_minutes: int = 8
-    personification_group_chat_follow_probability: float = 0.92
+    personification_group_chat_active_minutes: int = 12
+    personification_group_chat_follow_probability: float = 0.96
     # 群风格自动分析阈值；首次达到后改用冷却+新增消息策略控制重触发。
     personification_group_style_auto_analyze_threshold: int = 200
     # 距离上次自动分析至少新增多少条消息才允许再次触发。
@@ -192,7 +227,7 @@ class Config(BaseModel):
     personification_friend_request_daily_limit: int = 2
 
     # KY 保护：热聊时 bot 随机发言的最低通过概率（0.0 完全拦截，0.3 保留30%机会）
-    personification_hot_chat_min_pass_rate: float = 0.28
+    personification_hot_chat_min_pass_rate: float = 0.40
 
     personification_blacklist_duration: int = 300
 
@@ -206,20 +241,8 @@ class Config(BaseModel):
     # 留空则自动按优先级查找 ~/.codex/auth.json
     personification_codex_auth_path: str = ""
 
-    def __init__(self, **data: Any) -> None:
-        super().__init__(**data)
-        self._apply_compat_defaults()
-
     def model_post_init(self, __context: Any) -> None:
-        self._apply_compat_defaults()
-
-    def _apply_compat_defaults(self) -> None:
-        if getattr(self, "_compat_defaults_applied", False):
-            return
-        object.__setattr__(self, "_compat_defaults_applied", True)
-        fields_set = getattr(self, "__pydantic_fields_set__", None)
-        if fields_set is None:
-            fields_set = getattr(self, "__fields_set__", set())
+        fields_set = getattr(self, "__pydantic_fields_set__", set())
         if (
             "personification_model_builtin_search_enabled" not in fields_set
             and "personification_builtin_search" in fields_set

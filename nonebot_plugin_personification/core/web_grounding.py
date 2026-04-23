@@ -19,13 +19,13 @@ async def extract_forward_message_content(
 ) -> str:
     """
     从转发消息中提取文本内容。
-
+    
     Args:
         bot: Bot 实例
         event: 消息事件
         logger: 日志器
         max_nodes: 最大解析节点数
-
+        
     Returns:
         提取的文本内容，格式为 "发送者: 消息内容" 的多行文本
     """
@@ -33,50 +33,50 @@ async def extract_forward_message_content(
         message = getattr(event, "message", None)
         if not message:
             return ""
-
+        
         forward_nodes = []
         for seg in message:
             if getattr(seg, "type", None) == "forward":
                 forward_nodes.append(seg)
-
+        
         if not forward_nodes:
             return ""
-
+        
         all_content: List[str] = []
-
+        
         for forward_seg in forward_nodes:
             data = getattr(forward_seg, "data", {}) or {}
             message_id = data.get("id")
-
+            
             if not message_id:
                 continue
-
+            
             try:
                 if hasattr(bot, "get_forward_msg"):
                     forward_data = await bot.get_forward_msg(message_id=message_id)
                 else:
                     forward_data = await bot.call_api("get_forward_msg", message_id=message_id)
-
+                
                 if not forward_data:
                     continue
-
+                
                 messages = forward_data.get("messages", [])
                 if not isinstance(messages, list):
                     messages = [forward_data] if isinstance(forward_data, dict) else []
-
+                
                 for i, node in enumerate(messages[:max_nodes]):
                     if not isinstance(node, dict):
                         continue
-
+                    
                     sender_name = ""
                     content = ""
-
+                    
                     if "sender" in node:
                         sender = node["sender"] or {}
                         sender_name = str(
                             sender.get("card") or sender.get("nickname") or sender.get("user_id") or "未知"
                         ).strip()
-
+                    
                     node_content = node.get("content") or node.get("message") or ""
                     if isinstance(node_content, list):
                         text_parts = []
@@ -94,19 +94,19 @@ async def extract_forward_message_content(
                         content = "".join(text_parts)
                     elif isinstance(node_content, str):
                         content = node_content
-
+                    
                     if content:
                         if sender_name:
                             all_content.append(f"{sender_name}: {content}")
                         else:
                             all_content.append(content)
-
+                            
             except Exception as e:
                 logger.warning(f"拟人插件：解析转发消息失败: {e}")
                 continue
-
+        
         return "\n".join(all_content)
-
+        
     except Exception as e:
         logger.warning(f"拟人插件：提取转发消息内容失败: {e}")
         return ""

@@ -3,6 +3,7 @@ import re
 from typing import Any, Callable, Dict, Optional
 from urllib.parse import urlparse
 
+from ..core.config_manager import get_env_config_load_info, get_env_config_path
 from ..core.remote_skill_review import (
     get_remote_skill_review_stats,
     list_remote_skill_reviews,
@@ -10,7 +11,13 @@ from ..core.remote_skill_review import (
 )
 
 from ..core.data_store import get_data_store
+from ..core.knowledge_builder import (
+    maybe_start_plugin_knowledge_builder,
+    stop_plugin_knowledge_builder,
+)
 from ..core.image_result_cache import clear_image_result_cache
+from ..core.metrics import format_metrics_snapshot
+from ..core.runtime_config import get_runtime_load_info
 from ..core.session_store import clear_all_session_histories
 from ..skill_runtime.source_resolver import parse_skill_sources
 import asyncio
@@ -66,15 +73,26 @@ def install_remote_skill_source(
             break
 
     changed = False
+    reprioritized = False
     if existing_index >= 0:
         existing_entry = dict(current_sources[existing_index])
+        merged_entry = dict(existing_entry)
+        merged_entry.update(entry)
+        if merged_entry != existing_entry:
+            current_sources[existing_index] = merged_entry
+            existing_entry = merged_entry
+            changed = True
         if prefer_first and existing_index != 0:
             current_sources.pop(existing_index)
             current_sources.insert(0, existing_entry)
             changed = True
+            reprioritized = True
+        elif prefer_first and existing_index == 0:
+            changed = True
+            reprioritized = True
         entry_for_reply = existing_entry
         exists_text = "该远程 skill 源已存在。"
-        if changed:
+        if reprioritized:
             exists_text += " 已调整为优先加载源。"
     else:
         if prefer_first:
@@ -197,6 +215,50 @@ async def handle_personification_help_command(
     build_plugin_usage_text: Callable[[], str],
 ) -> None:
     await matcher.finish(build_plugin_usage_text())
+
+
+async def handle_reload_config_command(
+    matcher: Any,
+    *,
+    plugin_config: Any,
+    load_plugin_runtime_config: Callable[[], None] | None,
+    reload_runtime_services: Callable[[], None] | None,
+    logger: Any,
+) -> None:
+    if load_plugin_runtime_config is None:
+        await matcher.finish("当前运行时未提供配置重载器。")
+    try:
+        load_plugin_runtime_config()
+        if reload_runtime_services is not None:
+            reload_runtime_services()
+    except Exception as exc:
+        logger.warning(f"personification: reload config failed: {exc}")
+        await matcher.finish(f"重载拟人配置失败：{exc}")
+    env_info = get_env_config_load_info(plugin_config)
+    runtime_info = get_runtime_load_info(plugin_config)
+    await matcher.finish(
+        "已重载拟人配置。\n"
+        f"env.json: {env_info.get('path') or str(get_env_config_path(plugin_config))}\n"
+        f"env 应用 {len(list(env_info.get('applied_fields') or []))} 项 / 跳过 {len(list(env_info.get('skipped_fields') or []))} 项\n"
+        f"runtime_config: {runtime_info.get('path') or '未记录'}\n"
+        f"runtime 应用 {len(list(runtime_info.get('applied_runtime_keys') or []))} 项 / 跳过 {len(list(runtime_info.get('skipped_runtime_keys') or []))} 项"
+    )
+
+
+async def handle_stats_command(
+    matcher: Any,
+    *,
+    plugin_config: Any,
+) -> None:
+    env_info = get_env_config_load_info(plugin_config)
+    runtime_info = get_runtime_load_info(plugin_config)
+    lines = [
+        "拟人运行时统计",
+        f"env.json 路径：{env_info.get('path') or str(get_env_config_path(plugin_config))}",
+        f"runtime_config 路径：{runtime_info.get('path') or '未记录'}",
+        format_metrics_snapshot(top_n=6),
+    ]
+    await matcher.finish("\n".join(lines))
 
 
 def _extract_github_source_name(url: str) -> str:
@@ -802,7 +864,42 @@ async def handle_rebuild_plugin_knowledge_command(
         await matcher.finish("插件知识库未初始化，无法重建。")
     if tool_caller is None:
         await matcher.finish("知识库分析模型未初始化，无法重建插件知识库。")
+    if not bool(getattr(plugin_config, "personification_plugin_knowledge_build_enabled", False)):
+        await matcher.finish(
+            "插件知识库构建已关闭，请先启用 `plugin_knowledge_build_enabled` 后再重建。"
+        )
 
+    await stop_plugin_knowledge_builder(
+        logger=logger,
+        knowledge_store=knowledge_store,
+        get_knowledge_build_task=get_knowledge_build_task,
+        set_knowledge_build_task=set_knowledge_build_task,
+        enabled=True,
+        trigger="manual_rebuild",
+        result="manual_restart",
+        reasons=["manual_rebuild"],
+    )
+    result = await maybe_start_plugin_knowledge_builder(
+        plugin_config=plugin_config,
+        tool_caller=tool_caller,
+        knowledge_store=knowledge_store,
+        logger=logger,
+        get_knowledge_build_task=get_knowledge_build_task,
+        set_knowledge_build_task=set_knowledge_build_task,
+        trigger="manual_rebuild",
+        force=True,
+    )
+    if result.get("started"):
+        await matcher.finish("已启动插件知识库后台重建。可用“插件知识库状态”查看进度。")
+    await matcher.finish("插件知识库重建未启动。")
+
+
+async def _stop_running_knowledge_build_task(
+    *,
+    logger: Any,
+    get_knowledge_build_task: Callable[[], Any],
+    set_knowledge_build_task: Callable[[Any], None],
+) -> None:
     current_task = get_knowledge_build_task()
     if current_task is not None and not current_task.done():
         current_task.cancel()
@@ -812,21 +909,124 @@ async def handle_rebuild_plugin_knowledge_command(
             pass
         except Exception as e:
             logger.warning(f"[plugin_knowledge] cancel previous build task failed: {e}")
+    set_knowledge_build_task(None)
 
-    new_task = start_knowledge_builder(
-        plugin_config=plugin_config,
-        tool_caller=tool_caller,
-        knowledge_store=knowledge_store,
+
+async def handle_delete_plugin_knowledge_command(
+    matcher: Any,
+    *,
+    plugin_name_text: str,
+    knowledge_store: Any,
+    logger: Any,
+    get_knowledge_build_task: Callable[[], Any],
+    set_knowledge_build_task: Callable[[Any], None],
+) -> None:
+    if knowledge_store is None:
+        await matcher.finish("插件知识库未初始化，无法删除。")
+
+    query = str(plugin_name_text or "").strip()
+    if not query:
+        await matcher.finish("请提供要删除的插件名。")
+
+    candidates = await knowledge_store.find_plugin_candidates(query, top_k=8)
+    if not candidates:
+        await matcher.finish(f"插件知识库中未找到和「{query}」匹配的插件。")
+    if len(candidates) > 1:
+        await matcher.finish(
+            "匹配到多个插件，请改用更精确的名字：\n" + "\n".join(f"- {name}" for name in candidates[:8])
+        )
+
+    await _stop_running_knowledge_build_task(
         logger=logger,
+        get_knowledge_build_task=get_knowledge_build_task,
+        set_knowledge_build_task=set_knowledge_build_task,
     )
-    set_knowledge_build_task(new_task)
-    await matcher.finish("已启动插件知识库后台重建。可用“插件知识库状态”查看进度。")
+    result = await knowledge_store.delete_plugin_knowledge(candidates[0])
+    if not isinstance(result, dict) or not result.get("deleted"):
+        await matcher.finish(f"未能删除插件知识库：{candidates[0]}")
+    await matcher.finish(
+        f"已删除插件知识库：{candidates[0]}\n移除文件数：{int(result.get('removed_files', 0) or 0)}"
+    )
+
+
+async def handle_clear_plugin_knowledge_command(
+    matcher: Any,
+    *,
+    knowledge_store: Any,
+    logger: Any,
+    get_knowledge_build_task: Callable[[], Any],
+    set_knowledge_build_task: Callable[[Any], None],
+) -> None:
+    if knowledge_store is None:
+        await matcher.finish("插件知识库未初始化，无法清空。")
+
+    await _stop_running_knowledge_build_task(
+        logger=logger,
+        get_knowledge_build_task=get_knowledge_build_task,
+        set_knowledge_build_task=set_knowledge_build_task,
+    )
+    result = await knowledge_store.clear_all_plugin_knowledge()
+    await matcher.finish(
+        f"已清空插件知识库。\n移除文件数：{int((result or {}).get('removed_files', 0) or 0)}"
+    )
+
+
+def _normalize_build_status(value: Any) -> str:
+    status = str(value or "").strip().lower()
+    return status if status in {"pending", "success", "failed", "degraded"} else "unknown"
+
+
+def _find_build_state_matches(query: str, state_plugins: dict[str, Any]) -> list[str]:
+    normalized = str(query or "").strip().lower()
+    if not normalized:
+        return []
+    exact: list[str] = []
+    fuzzy: list[str] = []
+    for plugin_name in state_plugins.keys():
+        name = str(plugin_name or "").strip()
+        if not name:
+            continue
+        lowered = name.lower()
+        if lowered == normalized:
+            exact.append(name)
+        elif normalized in lowered:
+            fuzzy.append(name)
+    return sorted(exact) or sorted(fuzzy)
+
+
+def _format_build_error_line(plugin_name: str, meta: dict[str, Any]) -> str:
+    phase = str(meta.get("phase", "") or "unknown").strip()
+    error = str(meta.get("error_message", "") or meta.get("error", "") or "未知错误").strip()
+    retry = int(meta.get("retry_count", 0) or 0)
+    updated_at = str(meta.get("updated_at", "") or "").strip()
+    return f"- {plugin_name}: [{phase}] {error} (retry={retry}, updated={updated_at or 'unknown'})"
+
+
+def _format_startup_check_result(control: dict[str, Any], *, enabled: bool) -> str:
+    if not enabled:
+        return "当前关闭未检查"
+    result = str(control.get("last_check_result", "") or "").strip().lower()
+    action = str(control.get("last_check_action", "") or "").strip().lower()
+    if result == "healthy_skip":
+        return "正常跳过"
+    if action == "start" and result == "started":
+        return "发现异常已启动"
+    if result == "already_running":
+        return "已有构建任务运行中"
+    if result == "tool_caller_unavailable":
+        return "构建模型未就绪，已跳过"
+    if result == "store_unavailable":
+        return "知识库存储未就绪，已跳过"
+    if result == "disabled_skip":
+        return "当前关闭未检查"
+    return str(control.get("last_check_result", "") or "未记录")
 
 
 async def handle_view_plugin_knowledge_status_command(
     matcher: Any,
     *,
     knowledge_store: Any,
+    plugin_config: Any,
     get_knowledge_build_task: Callable[[], Any],
 ) -> None:
     if knowledge_store is None:
@@ -840,22 +1040,35 @@ async def handle_view_plugin_knowledge_status_command(
         plugins = {}
     if not isinstance(state_plugins, dict):
         state_plugins = {}
+    control = build_state.get("control", {}) if isinstance(build_state, dict) else {}
+    if not isinstance(control, dict):
+        control = {}
 
     success = 0
     failed = 0
+    degraded = 0
     pending = 0
     recent_failures: list[str] = []
+    current_meta = build_state.get("current", {}) if isinstance(build_state, dict) else {}
+    current_plugin = ""
+    current_phase = ""
+    if isinstance(current_meta, dict):
+        current_plugin = str(current_meta.get("plugin_name", "") or "").strip()
+        current_phase = str(current_meta.get("phase", "") or "").strip()
     for plugin_name, meta in state_plugins.items():
         if not isinstance(meta, dict):
             continue
-        status = str(meta.get("status", "") or "").strip().lower()
+        status = _normalize_build_status(meta.get("status", ""))
         if status == "success":
             success += 1
+        elif status == "degraded":
+            degraded += 1
+            if len(recent_failures) < 5:
+                recent_failures.append(_format_build_error_line(plugin_name, meta))
         elif status == "failed":
             failed += 1
             if len(recent_failures) < 5:
-                error = str(meta.get("error", "") or "").strip()
-                recent_failures.append(f"- {plugin_name}: {error or '未知错误'}")
+                recent_failures.append(_format_build_error_line(plugin_name, meta))
         elif status == "pending":
             pending += 1
 
@@ -872,11 +1085,114 @@ async def handle_view_plugin_knowledge_status_command(
 
     lines = [
         "插件知识库状态",
+        f"构建开关: {'开启' if bool(getattr(plugin_config, 'personification_plugin_knowledge_build_enabled', False)) else '关闭'}",
+        f"启动检查结果: {_format_startup_check_result(control, enabled=bool(getattr(plugin_config, 'personification_plugin_knowledge_build_enabled', False)))}",
         f"后台任务: {task_status}",
         f"索引插件数: {len(plugins)}",
-        f"构建状态: 成功 {success} / 失败 {failed} / 进行中 {pending}",
+        f"构建状态: 成功 {success} / 失败 {failed} / 降级 {degraded} / 进行中 {pending}",
     ]
+    if current_plugin:
+        lines.append(f"当前构建: {current_plugin} [{current_phase or 'unknown'}]")
     if recent_failures:
         lines.append("最近失败项：")
         lines.extend(recent_failures)
+    await matcher.finish("\n".join(lines))
+
+
+async def handle_view_plugin_knowledge_error_command(
+    matcher: Any,
+    *,
+    plugin_name_text: str,
+    knowledge_store: Any,
+    get_knowledge_build_task: Callable[[], Any],
+) -> None:
+    if knowledge_store is None:
+        await matcher.finish("插件知识库未初始化。")
+
+    build_state = await knowledge_store.load_build_state()
+    state_plugins = build_state.get("plugins", {}) if isinstance(build_state, dict) else {}
+    if not isinstance(state_plugins, dict):
+        state_plugins = {}
+
+    query = str(plugin_name_text or "").strip()
+    if not query:
+        lines = ["插件知识库错误"]
+        current_meta = build_state.get("current", {}) if isinstance(build_state, dict) else {}
+        if isinstance(current_meta, dict) and str(current_meta.get("plugin_name", "") or "").strip():
+            lines.append(
+                f"当前进行中: {current_meta.get('plugin_name')} [{str(current_meta.get('phase', '') or 'unknown')}]"
+            )
+        problematic = []
+        for plugin_name, meta in state_plugins.items():
+            if not isinstance(meta, dict):
+                continue
+            status = _normalize_build_status(meta.get("status", ""))
+            if status not in {"failed", "degraded", "pending"}:
+                continue
+            problematic.append((status, plugin_name, meta))
+        if not problematic:
+            await matcher.finish("当前没有失败、降级或进行中的插件知识库构建项。")
+        problematic.sort(key=lambda item: (item[0] != "pending", item[0] != "failed", item[1]))
+        for status, plugin_name, meta in problematic[:12]:
+            if status == "pending":
+                lines.append(
+                    f"- {plugin_name}: [pending/{str(meta.get('phase', '') or 'unknown')}] updated={str(meta.get('updated_at', '') or 'unknown')}"
+                )
+            else:
+                lines.append(_format_build_error_line(plugin_name, meta))
+        await matcher.finish("\n".join(lines))
+
+    matches = _find_build_state_matches(query, state_plugins)
+    if not matches:
+        await matcher.finish(f"构建状态里未找到和「{query}」匹配的插件。")
+    if len(matches) > 1:
+        await matcher.finish("匹配到多个插件，请改用更精确的名字：\n" + "\n".join(f"- {name}" for name in matches[:8]))
+
+    target = matches[0]
+    meta = state_plugins.get(target, {})
+    if not isinstance(meta, dict):
+        await matcher.finish(f"{target} 没有可显示的构建状态。")
+
+    status = _normalize_build_status(meta.get("status", ""))
+    task = get_knowledge_build_task()
+    task_status = "空闲"
+    if task is not None and not task.done():
+        task_status = "构建中"
+    elif task is not None and task.cancelled():
+        task_status = "已取消"
+    elif task is not None and task.done():
+        exc = task.exception()
+        task_status = f"已结束（异常: {exc}）" if exc else "已完成"
+
+    lines = [
+        f"插件知识库错误详情: {target}",
+        f"状态: {status}",
+        f"阶段: {str(meta.get('phase', '') or 'unknown')}",
+        f"分析策略: {str(meta.get('analysis_strategy', '') or 'unknown')}",
+        f"后台任务: {task_status}",
+        f"重试次数: {int(meta.get('retry_count', 0) or 0)}",
+        f"更新时间: {str(meta.get('updated_at', '') or 'unknown')}",
+        f"上次成功: {str(meta.get('last_success_at', '') or '无')}",
+        f"源码文件数: {int(meta.get('source_file_count', 0) or 0)}",
+        f"源码分片数: {int(meta.get('source_chunk_count', 0) or 0)}",
+        f"模块分析单元数: {int(meta.get('module_bundle_count', 0) or 0)}",
+        f"失败批次: {int(meta.get('failed_batch_index', 0) or 0)}/{int(meta.get('failed_batch_total', 0) or 0)}",
+        f"根目录: {str(meta.get('root_path', '') or 'unknown')}",
+    ]
+    error_message = str(meta.get("error_message", "") or meta.get("error", "") or "").strip()
+    if error_message:
+        lines.append(f"错误: {error_message}")
+    raw_preview = str(meta.get("raw_preview", "") or "").strip()
+    if raw_preview:
+        lines.append("原始返回预览:")
+        lines.append(raw_preview[:600])
+    recent_errors = list(meta.get("recent_errors") or [])
+    if recent_errors:
+        lines.append("最近错误历史:")
+        for item in recent_errors[-3:]:
+            if not isinstance(item, dict):
+                continue
+            lines.append(
+                f"- [{str(item.get('phase', '') or 'unknown')}] {str(item.get('error_message', '') or '未知错误')} @ {str(item.get('updated_at', '') or 'unknown')}"
+            )
     await matcher.finish("\n".join(lines))

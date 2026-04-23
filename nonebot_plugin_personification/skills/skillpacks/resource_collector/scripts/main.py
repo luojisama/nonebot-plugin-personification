@@ -104,7 +104,7 @@ def build_tools(runtime):
     return [
         AgentTool(
             name="search_web",
-            description="获取结构化网页搜索结果。适合需要外部事实、链接、入口页、资料页时使用，返回 JSON 结果列表，供你自行综合后回答。若用户明确是在找攻略、教程、资源合集，优先使用 collect_resources。",
+            description="获取结构化网页搜索结果。更适合找入口页、资料页、链接列表并返回 JSON 结果。若是普通事实查证、实时信息或定义解释，优先使用 web_search/wiki_lookup；若用户明确是在找攻略、教程、资源合集，优先使用 collect_resources。",
             parameters={
                 "type": "object",
                 "properties": {

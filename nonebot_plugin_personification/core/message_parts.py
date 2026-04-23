@@ -3,6 +3,8 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
+from .image_input import normalize_image_detail
+
 
 def normalize_message_parts(content: Any) -> list[dict[str, Any]]:
     if isinstance(content, list):
@@ -45,6 +47,11 @@ def normalize_message_part(item: Any) -> dict[str, Any] | None:
             "type": "image_url",
             "image_url": {"url": url},
         }
+        detail = normalize_image_detail(
+            item.get("detail", "") or image_value.get("detail", "") or "auto"
+        )
+        if detail:
+            normalized["image_url"]["detail"] = detail
         mime_type = str(item.get("mime_type", "") or image_value.get("mime_type", "") or "").strip()
         alt_text = str(item.get("alt_text", "") or image_value.get("alt_text", "") or "").strip()
         if mime_type:
@@ -98,6 +105,7 @@ def extract_image_refs_from_parts(content: Any) -> list[dict[str, Any]]:
                     {
                         "kind": "url",
                         "url": str(image_obj["url"]),
+                        "detail": str(image_obj.get("detail", "") or "").strip(),
                         "mime_type": str(part.get("mime_type", "") or "").strip(),
                         "alt_text": str(part.get("alt_text", "") or "").strip(),
                     }
@@ -121,17 +129,21 @@ def build_user_message_content(
     text: str,
     image_urls: list[str] | None = None,
     image_files: list[str | Path] | None = None,
+    image_detail: str = "auto",
     mime_type: str = "",
     alt_text: str = "",
 ) -> str | list[dict[str, Any]]:
     parts: list[dict[str, Any]] = []
     if str(text or "").strip():
         parts.append({"type": "text", "text": str(text).strip()})
+    detail = normalize_image_detail(image_detail)
     for image_url in image_urls or []:
         url = str(image_url or "").strip()
         if not url:
             continue
         part: dict[str, Any] = {"type": "image_url", "image_url": {"url": url}}
+        if detail:
+            part["image_url"]["detail"] = detail
         if mime_type:
             part["mime_type"] = mime_type
         if alt_text:
@@ -152,3 +164,34 @@ def build_user_message_content(
     if len(parts) == 1 and parts[0].get("type") == "text":
         return str(parts[0]["text"])
     return parts
+
+
+def clone_messages_with_text_suffix(messages: list[dict[str, Any]], suffix: str) -> list[dict[str, Any]]:
+    cloned: list[dict[str, Any]] = [dict(message) for message in messages]
+    if not cloned:
+        return cloned
+
+    target_index = None
+    for index in range(len(cloned) - 1, -1, -1):
+        if str(cloned[index].get("role", "") or "").strip() == "user":
+            target_index = index
+            break
+
+    if target_index is None:
+        return cloned
+
+    target = dict(cloned[target_index])
+    content = target.get("content", "")
+    base_text = extract_text_from_parts(content)
+    suffix_text = str(suffix or "").strip()
+    if base_text and suffix_text:
+        replacement = f"{base_text}\n\n{suffix_text}"
+    elif suffix_text:
+        replacement = suffix_text
+    else:
+        replacement = base_text
+    if not replacement:
+        replacement = "[图片]"
+    target["content"] = replacement
+    cloned[target_index] = target
+    return cloned

@@ -7,8 +7,9 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict
 
-from ..plugin_data import get_plugin_data_dir
 from ..core.data_store import get_data_store
+from ..core.paths import get_data_dir
+from ..core.prompts import load_prompt
 from ..schedule import format_time_context, get_activity_status, get_current_local_time
 from ..skills.skillpacks.tool_caller.scripts.impl import ToolCaller
 
@@ -21,54 +22,12 @@ DEFAULT_STATE = {
     "updated_at": "",
 }
 
-INNER_STATE_UPDATE_PROMPT = """你刚结束了一段对话，请根据对话内容简短更新你的内心状态。
-只输出 JSON，不要任何解释。
-
-当前时间：{current_time}
-当前时段：{time_period}
-
-当前状态：
-{current_state_json}
-
-本次对话摘要：
-{conversation_summary}
-
-请输出更新后的状态（只修改需要变化的字段，不变的字段原样保留）：
-{{
-  "mood": "用一句话描述当前心情（如变化不大可保持原样）",
-  "energy": "高/中/低",
-  "pending_thoughts": [
-    保留原有未解决的念头，
-    如果本次对话产生了新的念头则追加，
-    如果某个念头已经解决了则删除
-  ],
-  "relation_warmth": {
-    只更新本次对话涉及的人，其他人原样保留
-  }
-}}
-
-注意：
-- 对话愉快时 mood 变积极，被催促或冷场时变平淡
-- pending_thoughts 里的念头不要无限累积，超过5条时删除最旧的
-- 只输出 JSON，不要解释，不要 markdown"""
-
-DIARY_STATE_UPDATE_PROMPT = """今天的日记如下：
-{diary_text}
-
-请根据日记内容，用 JSON 格式更新以下两个字段（只输出这两个字段的更新值）：
-{
-  "mood": "根据今天整体感受，用一句话描述明天开始的基础心情",
-  "pending_thoughts": [
-    如果日记中提到了还没做完的事、想跟进的人/话题，加入这里
-    格式：{"thought": "...", "born_at": "{today}"}
-  ]
-}
-只输出 JSON。"""
+INNER_STATE_UPDATE_PROMPT = load_prompt("inner_state_update")
+DIARY_STATE_UPDATE_PROMPT = load_prompt("diary_state_update")
 
 
 def get_personification_data_dir(plugin_config: Any | None = None) -> Path:
-    _ = plugin_config
-    return get_plugin_data_dir()
+    return get_data_dir(plugin_config)
 
 _STORE_NAME = "inner_state"
 

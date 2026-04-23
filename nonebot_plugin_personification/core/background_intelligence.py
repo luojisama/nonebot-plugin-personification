@@ -197,6 +197,14 @@ class BackgroundIntelligence:
         key: str,
         coro_factory: Callable[[], Any],
     ) -> None:
+        asyncio.create_task(self._schedule_debounced_async(key=key, coro_factory=coro_factory))
+
+    async def _schedule_debounced_async(
+        self,
+        *,
+        key: str,
+        coro_factory: Callable[[], Any],
+    ) -> None:
         async def _runner() -> None:
             try:
                 await asyncio.sleep(self.debounce_seconds())
@@ -206,12 +214,17 @@ class BackgroundIntelligence:
             except Exception as exc:
                 self._log_warning(f"[background_intelligence] task {key} failed: {exc}")
             finally:
-                self._pending_tasks.pop(key, None)
+                async with self._task_lock:
+                    current = self._pending_tasks.get(key)
+                    if current is asyncio.current_task():
+                        self._pending_tasks.pop(key, None)
 
-        existing = self._pending_tasks.get(key)
-        if existing is not None and not existing.done():
-            existing.cancel()
-        self._pending_tasks[key] = asyncio.create_task(_runner())
+        async with self._task_lock:
+            existing = self._pending_tasks.get(key)
+            if existing is not None and not existing.done():
+                existing.cancel()
+            task = asyncio.create_task(_runner())
+            self._pending_tasks[key] = task
 
     async def _handle_new_memory(self, *, memory_id: str, group_id: str) -> None:
         if self.evolves_enabled():

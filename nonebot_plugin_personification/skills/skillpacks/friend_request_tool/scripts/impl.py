@@ -6,6 +6,7 @@ from typing import Any, Callable
 
 from nonebot_plugin_personification.agent.tool_registry import AgentTool
 from nonebot_plugin_personification.core.data_store import get_data_store
+from nonebot_plugin_personification.core.time_ctx import get_current_day_str
 
 
 FRIEND_REQUEST_DESCRIPTION = """向指定用户发送好友申请。
@@ -34,7 +35,7 @@ def check_friend_request_gate(
     now_ts: float | None = None,
 ) -> tuple[bool, str]:
     state = _load_state(plugin_config)
-    today = time.strftime("%Y-%m-%d")
+    today = get_current_day_str()
     today_count_map = state.get("today_count", {})
     if not isinstance(today_count_map, dict):
         today_count_map = {}
@@ -125,7 +126,7 @@ def build_friend_request_tool(
             return json.dumps({"ok": False, "reason": gate_reason}, ensure_ascii=False)
 
         state = _load_state(plugin_config)
-        today = time.strftime("%Y-%m-%d")
+        today = get_current_day_str()
         today_count_map = state.get("today_count", {})
         if not isinstance(today_count_map, dict):
             today_count_map = {}
