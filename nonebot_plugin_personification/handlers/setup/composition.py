@@ -250,6 +250,7 @@ def setup_all_matchers(*, deps: MatcherSetupDeps) -> Dict[str, Any]:
         message_cls=deps.message_cls,
         message_segment_cls=deps.message_segment_cls,
         logger=deps.logger,
+        plugin_config=deps.plugin_config,
         finished_exception_cls=deps.finished_exception_cls,
     )
     handle_reply = reply_matchers["handle_reply"]

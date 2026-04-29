@@ -61,6 +61,7 @@ DDL_STATEMENTS = (
         is_at_bot        INTEGER NOT NULL DEFAULT 0,
         message_id       TEXT DEFAULT NULL,
         source_kind      TEXT NOT NULL DEFAULT 'user',
+        sender_role      TEXT NOT NULL DEFAULT '',
         timestamp   REAL    NOT NULL
     )
     """,
@@ -162,6 +163,8 @@ def _ensure_group_message_schema(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE group_messages ADD COLUMN image_count INTEGER NOT NULL DEFAULT 0")
     if "visual_summary" not in columns:
         conn.execute("ALTER TABLE group_messages ADD COLUMN visual_summary TEXT NOT NULL DEFAULT ''")
+    if "sender_role" not in columns:
+        conn.execute("ALTER TABLE group_messages ADD COLUMN sender_role TEXT NOT NULL DEFAULT ''")
 
 
 def init_db_sync(data_dir: str | Path) -> Path:

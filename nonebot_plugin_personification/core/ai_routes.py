@@ -609,6 +609,7 @@ def build_fallback_vision_caller(
     logger: Any = None,
     *,
     warn: bool = False,
+    model_override: str = "",
 ) -> Any:
     resolution = resolve_global_fallback_provider(plugin_config, logger, warn=warn)
     if resolution is None:
@@ -618,6 +619,7 @@ def build_fallback_vision_caller(
         def __init__(self, original: Any, provider: dict[str, Any]) -> None:
             self._original = original
             self._provider = dict(provider or {})
+            self._model_override = str(model_override or "").strip()
 
         def __getattr__(self, name: str) -> Any:
             if name == "personification_labeler_api_type":
@@ -627,6 +629,8 @@ def build_fallback_vision_caller(
             if name == "personification_labeler_api_key":
                 return self._provider.get("api_key", "")
             if name == "personification_labeler_model":
+                if self._model_override:
+                    return self._model_override
                 return self._provider.get("model", "")
             if name == "personification_api_type":
                 return self._provider.get("api_type", "openai")

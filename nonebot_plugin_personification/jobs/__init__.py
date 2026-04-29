@@ -77,6 +77,10 @@ def setup_jobs(*, scheduler: Any, deps: JobSetupDeps) -> Dict[str, Any]:
     )
     auto_post_diary = None
     proactive_qzone_post = None
+    if not deps.qzone_publish_available:
+        deps.logger.info(
+            "拟人插件：Qzone 说说功能未启用（personification_qzone_enabled=False），跳过定时注册"
+        )
     if deps.qzone_publish_available:
         auto_post_diary = build_auto_post_diary_task(
             run_auto_post_diary=run_auto_post_diary,
@@ -99,6 +103,7 @@ def setup_jobs(*, scheduler: Any, deps: JobSetupDeps) -> Dict[str, Any]:
                 load_prompt=deps.load_prompt,
                 call_ai_api=deps.call_ai_api,
                 logger=deps.logger,
+                agent_tool_caller=deps.agent_tool_caller,
                 agent_data_dir=deps.agent_data_dir,
             )
             proactive_qzone_post = build_proactive_qzone_post_task(

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from nonebot_plugin_personification.core.persona_service import (
+from plugin.personification.core.persona_service import (
     PERSONA_PROMPT_NEW,
     PERSONA_PROMPT_UPDATE,
     PersonaEntry,
@@ -15,4 +15,3 @@ __all__ = [
     "PersonaStore",
     "_build_persona_prompt",
 ]
-

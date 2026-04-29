@@ -5,7 +5,7 @@ import json
 import re
 import time
 from dataclasses import dataclass
-from typing import Any, List
+from typing import Any, Awaitable, Callable, List
 
 from ..query_rewriter import ContextualQueryRewrite, QueryRewriteContext, contextual_query_rewriter
 from ...core.error_utils import log_exception
@@ -20,19 +20,19 @@ from ...skills.skillpacks.tool_caller.scripts.impl import (
     OpenAICodexToolCaller,
     ToolCaller,
 )
-from .constants import DEFAULT_AGENT_MAX_STEPS, MAX_EMPTY_LOOKUP_RECOVERY_ROUNDS
+from .constants import (
+    DEFAULT_AGENT_MAX_STEPS,
+    MAX_EMPTY_LOOKUP_RECOVERY_ROUNDS,
+    MAX_PROMISED_LOOKUP_NO_TOOL_ROUNDS,
+)
 from .intent import (
     _clean_user_query_text,
-    _compact_lookup_query,
     _derive_query_rewrite_context,
     _extract_focus_query_text,
     _extract_group_topic_hint,
     _extract_latest_user_images,
     _extract_latest_user_text,
-    _extract_quoted_message_text,
-    _infer_chat_intent,
     _infer_intent_decision_with_context,
-    _messages_indicate_private_scene,
     _recover_followup_query_from_context,
     _render_message_text,
 )
@@ -45,7 +45,6 @@ from .tool_args import (
 )
 from .tool_selection import (
     _normalize_agent_max_steps,
-    _requires_forced_lookup,
     _schema_tool_name,
     _select_tool_schemas,
     _semantic_tool_guidance,
@@ -80,6 +79,7 @@ _LOOKUP_FINAL_REPLY_HINTS = (
 )
 _QUERY_REWRITE_TOOL_NAMES = frozenset(
     {
+        "parallel_research",
         "web_search",
         "search_web",
         "wiki_lookup",
@@ -91,10 +91,22 @@ _QUERY_REWRITE_TOOL_NAMES = frozenset(
     }
 )
 _RETRYABLE_LOOKUP_TOOLS = frozenset(
-    {"web_search", "search_web", "wiki_lookup", "resolve_acg_entity", "collect_resources", "search_images"}
+    {"parallel_research", "web_search", "search_web", "wiki_lookup", "resolve_acg_entity", "collect_resources", "search_images"}
 )
 _TIME_SENSITIVE_SEARCH_TOOLS = frozenset({"web_search", "search_web"})
 _TIME_SENSITIVE_RE = re.compile("\u6700\u65b0|\u8fd1\u671f|\u73b0\u5728|\u4eca\u5e74|\u4eca\u5929|\u5f53\u524d|latest|recent|now", re.IGNORECASE)
+_IMAGE_B64_TOOL_RESULT_RE = re.compile(r"\[IMAGE_B64\]([A-Za-z0-9+/=\r\n]+)\[/IMAGE_B64\]")
+_IMAGE_GENERATION_TOOL_NAME = "generate_image"
+_IMAGE_FAILURE_DIAGNOSTIC_HINTS = (
+    "empty image response",
+    "raw_keys=",
+    "output_items=",
+    "output_types=",
+    "content_types=",
+    "result_keys=",
+)
+_IMAGE_GENERATION_BACKGROUND_MAX_STEPS = 5
+_IMAGE_GENERATION_STATUS_TIMEOUT_SECONDS = 8.0
 
 
 def _maybe_inject_date_to_query(tool_name: str, args: dict[str, Any]) -> dict[str, Any]:
@@ -117,6 +129,7 @@ _PLUGIN_KNOWLEDGE_TOOL_NAMES = frozenset(
 _PLUGIN_LATEST_EXTRA_TOOL_NAMES = frozenset({"web_search", "search_official_site", "search_github_repos"})
 _NETWORK_TOOL_NAMES = frozenset(
     {
+        "parallel_research",
         "web_search",
         "search_web",
         "multi_search_engine",
@@ -127,6 +140,7 @@ _NETWORK_TOOL_NAMES = frozenset(
         "wiki_lookup",
         "get_baike_entry",
         "get_daily_news",
+        "get_ai_news",
         "get_trending",
         "get_history_today",
         "get_epic_games",
@@ -139,26 +153,6 @@ _BANTER_BLOCKED_TOOL_NAMES = frozenset(
     set(_NETWORK_TOOL_NAMES)
     | set(_PLUGIN_KNOWLEDGE_TOOL_NAMES)
     | {"vision_analyze", "analyze_image", "resolve_acg_entity"}
-)
-_PLAIN_EMPTY_TOOL_RESULT_MARKERS = (
-    "未找到足够可靠的wiki条目",
-    "没有找到足够可靠的wiki条目",
-    "未找到可靠wiki条目",
-    "未找到相关wiki条目",
-    "未找到可靠结果",
-    "没有找到可靠结果",
-    "no_results",
-)
-_FORCED_LOOKUP_PATTERNS = (
-    re.compile(r"(最新|现在|当前|今天|刚刚|最近|多少钱|多少|天气|汇率|股价|票房|热搜|新闻|价格)"),
-)
-_LOOKUP_QUERY_LEADING_RE = re.compile(
-    r"^(?:我问的是|我想问的是|我想问下|我想问一下|我想知道|我问下|我问一下|"
-    r"请问|想问下|想问一下|帮我查下|帮我查一下|帮我搜下|帮我搜一下|查一下|搜一下)\s*"
-)
-_LOOKUP_QUERY_TRAILING_RE = re.compile(
-    r"(?:到底)?(?:算|指)?(?:是)?(?:什么(?:东西|意思|玩意儿?|来着)?|啥(?:意思|东西)?|"
-    r"指什么|是什么(?:东西|意思|玩意儿?)?|怎么回事)\s*[?？!！.。]*$"
 )
 
 
@@ -282,6 +276,292 @@ async def _invoke_tool_handler(
     return await McpBridge().call_remote(tool_name, tool_args)
 
 
+def _remaining_time_budget_seconds(deadline: float | None) -> float | None:
+    if deadline is None:
+        return None
+    return max(0.0, float(deadline) - time.monotonic())
+
+
+def _tool_timeout_result(tool_name: str) -> str:
+    normalized_tool_name = str(tool_name or "").strip()
+    if normalized_tool_name == _IMAGE_GENERATION_TOOL_NAME:
+        return "图片生成失败：生成超时，请稍后重试"
+    return "工具调用失败：超时"
+
+
+def _extract_image_b64_tool_result(result_text: str) -> str:
+    match = _IMAGE_B64_TOOL_RESULT_RE.search(str(result_text or ""))
+    if not match:
+        return ""
+    return re.sub(r"\s+", "", match.group(1) or "").strip()
+
+
+def _can_send_background_image(executor: Any) -> bool:
+    return bool(
+        callable(getattr(executor, "send_image_b64", None))
+        and callable(getattr(executor, "send_text", None))
+    )
+
+
+def _can_start_background_image_generation(
+    *,
+    registry: ToolRegistry,
+    executor: Any,
+    user_request: str,
+) -> bool:
+    return bool(
+        _can_send_background_image(executor)
+        and registry.get(_IMAGE_GENERATION_TOOL_NAME) is not None
+        and str(user_request or "").strip()
+    )
+
+
+def _clone_messages_for_background(messages: List[dict]) -> list[dict]:
+    return [dict(message) for message in list(messages or []) if isinstance(message, dict)]
+
+
+def _clean_image_generation_status_reply(text: str) -> str:
+    reply = _IMAGE_B64_TOOL_RESULT_RE.sub("", str(text or "")).strip()
+    if reply in {"[NO_REPLY]", "<NO_REPLY>", "[SILENCE]", "<SILENCE>"}:
+        return reply
+    return reply
+
+
+async def _generate_image_generation_status_reply(
+    *,
+    tool_caller: ToolCaller,
+    messages: List[dict],
+    user_request: str,
+    logger: Any,
+) -> str:
+    status_messages = _clone_messages_for_background(messages)
+    status_messages.append(
+        {
+            "role": "system",
+            "content": (
+                "当前用户的需求会进入图片生成流程。"
+                "你只负责按人设和当前对话，给用户一句自然、很短的即时回应。"
+                "不要固定模板，不要解释工具流程，不要暴露后台、检索、prompt、模型等实现细节。"
+                "如果此刻不适合回复，可以只输出 [NO_REPLY]。"
+                f"\n用户图片需求：{str(user_request or '').strip()[:500]}"
+            ),
+        }
+    )
+    try:
+        response = await asyncio.wait_for(
+            tool_caller.chat_with_tools(
+                status_messages,
+                [],
+                False,
+            ),
+            timeout=_IMAGE_GENERATION_STATUS_TIMEOUT_SECONDS,
+        )
+    except Exception as exc:
+        log_exception(logger, "[agent] image generation status reply failed", exc, level="debug")
+        return ""
+    if getattr(response, "tool_calls", None):
+        return ""
+    return _clean_image_generation_status_reply(str(getattr(response, "content", "") or ""))
+
+
+def _build_background_image_generation_messages(
+    *,
+    messages: List[dict],
+    user_request: str,
+) -> list[dict]:
+    planning_messages = _clone_messages_for_background(messages)
+    planning_messages.append(
+        {
+            "role": "system",
+            "content": (
+                "你现在负责准备并执行图片生成，不是在写聊天回复。"
+                "先理解用户真正想要的画面、主体、风格、用途、文字和限制。"
+                "如有必要，优先调用 parallel_research 并行聚合图片参考、百科/设定和联网资料；"
+                "也可自行调用联网搜索、图片搜索、资源搜集、百科/实体解析、视觉理解等工具补充事实和参考图线索；"
+                "如果需求已经足够明确，也可以不检索。"
+                "拿到足够上下文后，必须调用 generate_image。"
+                "调用 generate_image 时，由你组装完整、可执行的生图 prompt，"
+                "把检索/参考图得到的关键信息消化进画面描述，不要只原样转述用户一句话。"
+                "size 也由你根据构图需求从工具允许值中选择。"
+                "不要向用户输出制作步骤；图片生成失败或需要澄清时，才输出一句自然说明。"
+                "如果调用了 parallel_research 或其他上下文工具，请先阅读结果，"
+                "把 must_include、must_avoid、prompt_hints 等关键约束吸收到最终 prompt，再调用 generate_image。"
+                f"\n用户图片需求：{str(user_request or '').strip()[:1000]}"
+            ),
+        }
+    )
+    return planning_messages
+
+
+async def _send_background_text(executor: Any, text: str, logger: Any) -> None:
+    content = str(text or "").strip()
+    if not content:
+        return
+    try:
+        await executor.send_text(content)
+    except Exception as exc:
+        log_exception(logger, "[agent] background image text send failed", exc, level="warning")
+
+
+async def _run_background_image_generation(
+    *,
+    registry: ToolRegistry,
+    executor: Any,
+    tool_caller: ToolCaller,
+    messages: List[dict],
+    user_request: str,
+    rewritten_query: ContextualQueryRewrite | None,
+    user_images: list[str],
+    use_builtin_search: bool,
+    logger: Any,
+) -> None:
+    if registry.get(_IMAGE_GENERATION_TOOL_NAME) is None:
+        await _send_background_text(executor, "图片生成失败：工具不可用", logger)
+        return
+    background_messages = _build_background_image_generation_messages(
+        messages=messages,
+        user_request=user_request,
+    )
+    last_tool_name = ""
+    last_tool_result_text = ""
+    for step in range(_IMAGE_GENERATION_BACKGROUND_MAX_STEPS):
+        active_schemas = _select_tool_schemas(
+            registry,
+            has_images=bool(user_images),
+            chat_intent="image_generation",
+            plugin_question_intent="",
+        )
+        try:
+            response = await tool_caller.chat_with_tools(
+                background_messages,
+                active_schemas,
+                use_builtin_search,
+            )
+        except Exception as exc:
+            log_exception(logger, "[agent] background image planning failed", exc, level="warning")
+            await _send_background_text(executor, f"图片生成失败：{exc}", logger)
+            return
+        content = str(getattr(response, "content", "") or "").strip()
+        tool_calls = list(getattr(response, "tool_calls", []) or [])
+        logger.info(
+            f"[agent] background_image step={step + 1} "
+            f"tool_calls={len(tool_calls)} content_len={len(content)}"
+        )
+        if not tool_calls:
+            if content:
+                await _send_background_text(executor, content, logger)
+            else:
+                await _send_background_text(executor, "图片生成失败：模型没有完成图片生成", logger)
+            return
+        background_messages.append(
+            {
+                "role": "assistant",
+                "content": content,
+                "tool_calls": [
+                    {
+                        "id": tool_call.id,
+                        "type": "function",
+                        "function": {
+                            "name": tool_call.name,
+                            "arguments": json.dumps(tool_call.arguments, ensure_ascii=False),
+                        },
+                    }
+                    for tool_call in tool_calls
+                ],
+            }
+        )
+        for tool_call in tool_calls:
+            logger.info(f"[agent] background_image tool_call name={tool_call.name}")
+            tool_args, result = await _execute_tool_with_retries(
+                registry=registry,
+                tool_name=tool_call.name,
+                tool_args=dict(tool_call.arguments or {}),
+                rewritten_query=None,
+                user_images=user_images,
+                previous_tool_name=last_tool_name,
+                previous_tool_result_text=last_tool_result_text,
+                logger=logger,
+                budget_deadline=None,
+            )
+            _ = tool_args
+            last_tool_name = str(tool_call.name or "").strip()
+            if str(result or "").strip():
+                last_tool_result_text = str(result).strip()
+            logger.info(
+                f"[agent] background_image tool_result name={tool_call.name} "
+                f"preview={str(result).replace(chr(10), ' ')[:220]}"
+            )
+            if last_tool_name == _IMAGE_GENERATION_TOOL_NAME:
+                image_b64 = _extract_image_b64_tool_result(str(result or ""))
+                if image_b64:
+                    try:
+                        await executor.send_image_b64(image_b64)
+                    except Exception as exc:
+                        log_exception(logger, "[agent] background image send failed", exc, level="warning")
+                        await _send_background_text(executor, "图片生成好了，但发送图片失败了", logger)
+                    return
+                await _send_background_text(executor, _format_image_generation_failure(str(result or "")), logger)
+                return
+            background_messages.append(
+                tool_caller.build_tool_result_message(
+                    tool_call.id,
+                    tool_call.name,
+                    result,
+                )
+            )
+    if last_tool_result_text:
+        await _send_background_text(executor, "图片生成失败：模型没有继续完成生图调用", logger)
+        return
+    await _send_background_text(executor, "图片生成失败：模型没有开始生图调用", logger)
+
+
+def _start_background_image_generation(
+    *,
+    registry: ToolRegistry,
+    executor: Any,
+    tool_caller: ToolCaller,
+    messages: List[dict],
+    user_request: str,
+    rewritten_query: ContextualQueryRewrite | None,
+    user_images: list[str],
+    use_builtin_search: bool,
+    logger: Any,
+) -> bool:
+    request_text = str(user_request or "").strip()
+    if not _can_start_background_image_generation(
+        registry=registry,
+        executor=executor,
+        user_request=request_text,
+    ):
+        return False
+    task = asyncio.create_task(
+        _run_background_image_generation(
+            registry=registry,
+            executor=executor,
+            tool_caller=tool_caller,
+            messages=_clone_messages_for_background(messages),
+            user_request=request_text,
+            rewritten_query=rewritten_query,
+            user_images=list(user_images or []),
+            use_builtin_search=use_builtin_search,
+            logger=logger,
+        )
+    )
+
+    def _done(done_task: asyncio.Task) -> None:
+        if done_task.cancelled():
+            return
+        try:
+            exc = done_task.exception()
+        except asyncio.InvalidStateError:
+            return
+        if exc is not None:
+            log_exception(logger, "[agent] background image generation task crashed", exc, level="warning")
+
+    task.add_done_callback(_done)
+    return True
+
+
 async def _execute_tool_with_retries(
     *,
     registry: ToolRegistry,
@@ -292,6 +572,7 @@ async def _execute_tool_with_retries(
     previous_tool_name: str = "",
     previous_tool_result_text: str = "",
     logger: Any,
+    budget_deadline: float | None = None,
 ) -> tuple[dict[str, Any], str]:
     tool = registry.get(tool_name)
     if tool is None:
@@ -327,13 +608,31 @@ async def _execute_tool_with_retries(
             tool_args=attempt_args,
         )
         last_args = attempt_args
+        remaining_timeout = _remaining_time_budget_seconds(budget_deadline)
+        if remaining_timeout is not None and remaining_timeout <= 0.0:
+            record_counter("agent.tool_fail_total", tool=tool_name, reason="timeout")
+            record_timing("agent.tool_exec_ms", 0, tool=tool_name, status="timeout")
+            logger.warning(f"[agent] tool {tool_name} skipped because time budget was exhausted")
+            last_result = _tool_timeout_result(tool_name)
+            break
         started_at = time.monotonic()
         try:
-            last_result = await _invoke_tool_handler(
+            invoke_coro = _invoke_tool_handler(
                 tool_name=tool_name,
                 tool=tool,
                 tool_args=attempt_args,
             )
+            if remaining_timeout is None:
+                last_result = await invoke_coro
+            else:
+                last_result = await asyncio.wait_for(invoke_coro, timeout=remaining_timeout)
+        except asyncio.TimeoutError:
+            elapsed_ms = int((time.monotonic() - started_at) * 1000)
+            record_counter("agent.tool_fail_total", tool=tool_name, reason="timeout")
+            record_timing("agent.tool_exec_ms", elapsed_ms, tool=tool_name, status="timeout")
+            last_result = _tool_timeout_result(tool_name)
+            logger.warning(f"[agent] tool {tool_name} timed out after {elapsed_ms}ms")
+            break
         except Exception as e:
             elapsed_ms = int((time.monotonic() - started_at) * 1000)
             record_counter("agent.tool_fail_total", tool=tool_name, reason="exception")
@@ -397,11 +696,126 @@ def _render_tool_result_for_user(tool_name: str, result_text: str, query: str) -
     return "\n".join(lines).strip()
 
 
+def _is_direct_media_tool_result(tool_name: str, result_text: str) -> bool:
+    return str(tool_name or "").strip() == _IMAGE_GENERATION_TOOL_NAME and bool(
+        _IMAGE_B64_TOOL_RESULT_RE.search(str(result_text or ""))
+    )
+
+
+def _format_image_generation_failure(result_text: str) -> str:
+    text = str(result_text or "").strip()
+    if not text:
+        return "图片生成失败：工具没有返回图片数据"
+    detail = text
+    if detail.startswith("图片生成失败"):
+        detail = detail.removeprefix("图片生成失败").lstrip("：: \t\r\n")
+    detail = re.sub(r"\s+", " ", detail).strip()
+    lowered = detail.lower()
+    if not detail:
+        return "图片生成失败：工具没有返回图片数据"
+    if any(hint in lowered for hint in _IMAGE_FAILURE_DIAGNOSTIC_HINTS):
+        return "图片生成失败：图片服务没有返回图片数据"
+    if len(detail) > 80:
+        detail = detail[:77].rstrip() + "..."
+    return f"图片生成失败：{detail}"
+
+
+def _direct_tool_result_agent_result(
+    *,
+    tool_name: str,
+    result_text: str,
+    pending_actions: List[dict],
+) -> AgentResult | None:
+    text = str(result_text or "").strip()
+    normalized_tool_name = str(tool_name or "").strip()
+    if _is_direct_media_tool_result(normalized_tool_name, text):
+        return AgentResult(
+            text=text,
+            pending_actions=pending_actions,
+            direct_output=False,
+            bypass_length_limits=True,
+        )
+    if normalized_tool_name == _IMAGE_GENERATION_TOOL_NAME:
+        return AgentResult(
+            text=_format_image_generation_failure(text),
+            pending_actions=pending_actions,
+            direct_output=False,
+            bypass_length_limits=False,
+        )
+    return None
+
+
+def _extract_persona_system_prompt(messages: List[dict]) -> str:
+    for message in messages:
+        if str(message.get("role", "") or "").strip() != "system":
+            continue
+        content = _render_message_text(message.get("content", ""))
+        if len(content) >= 200:
+            return content[:1200]
+    return ""
+
+
+async def _wrap_tool_result_in_persona(
+    *,
+    tool_caller: ToolCaller,
+    rendered_tool_result: str,
+    user_query_text: str,
+    persona_system: str = "",
+) -> str:
+    fallback_text = str(rendered_tool_result or "").strip()
+    if not fallback_text:
+        return ""
+    wrap_messages: list[dict[str, Any]] = []
+    if persona_system:
+        wrap_messages.append({"role": "system", "content": persona_system[:1200]})
+    wrap_messages.append(
+        {
+            "role": "system",
+            "content": (
+                "把下面的搜索/工具结果用你自己的口吻自然说给对方。"
+                "像群友顺手接话，不要暴露搜索、查询、工具、来源、链接这些中间过程。"
+                "不要列 URL，不要说“根据搜索结果”“我查了一下”。"
+                "控制在 60 字以内。"
+            ),
+        }
+    )
+    wrap_messages.append(
+        {
+            "role": "user",
+            "content": f"查询：{str(user_query_text or '').strip()[:200]}\n工具结果：{fallback_text[:1000]}",
+        }
+    )
+    try:
+        response = await asyncio.wait_for(
+            tool_caller.chat_with_tools(
+                wrap_messages,
+                [],
+                False,
+            ),
+            timeout=10.0,
+        )
+    except Exception:
+        return fallback_text
+    wrapped_text = str(getattr(response, "content", "") or "").strip()
+    return wrapped_text or fallback_text
+
+
 def _tool_signature(tool_name: str, tool_args: dict[str, Any]) -> str:
     return (
         f"{str(tool_name or '').strip()}:"
         f"{json.dumps(tool_args or {}, ensure_ascii=False, sort_keys=True, separators=(',', ':'))}"
     )
+
+
+async def _safe_ack(
+    ack_sender: Callable[[str], Awaitable[None]],
+    text: str,
+    logger: Any,
+) -> None:
+    try:
+        await ack_sender(text)
+    except Exception as exc:
+        logger.debug(f"[agent] ack send failed: {exc}")
 
 
 async def run_agent(
@@ -418,6 +832,9 @@ async def run_agent(
     repeat_clusters: list[dict[str, Any]] | None = None,
     relationship_hint: str = "",
     recent_bot_replies: list[str] | None = None,
+    precomputed_intent: Any = None,
+    time_budget_seconds: float | None = None,
+    ack_sender: Callable[[str], Awaitable[None]] | None = None,
 ) -> AgentResult:
     use_builtin_search = (
         bool(
@@ -436,6 +853,7 @@ async def run_agent(
     empty_lookup_tools: set[str] = set()
     semantic_fallback_attempted = False
     empty_lookup_recovery_rounds = 0
+    promised_lookup_no_tool_rounds = 0
     user_text = _extract_latest_user_text(messages)
     focus_query_text = _clean_user_query_text(_extract_focus_query_text(user_text))
     contextual_query_text = _recover_followup_query_from_context(user_text, focus_query_text)
@@ -448,18 +866,21 @@ async def run_agent(
         or focus_query_text
         or user_text
     )
-    intent_decision = await _infer_intent_decision_with_context(
-        preliminary_query_text or user_text,
-        messages,
-        tool_caller=tool_caller,
-        repeat_clusters=repeat_clusters,
-        relationship_hint=relationship_hint,
-        recent_bot_replies=recent_bot_replies,
-    )
+    if precomputed_intent is not None:
+        intent_decision = precomputed_intent
+        logger.debug("[agent] using precomputed intent_decision, skipping LLM inference")
+    else:
+        intent_decision = await _infer_intent_decision_with_context(
+            preliminary_query_text or user_text,
+            messages,
+            tool_caller=tool_caller,
+            repeat_clusters=repeat_clusters,
+            relationship_hint=relationship_hint,
+            recent_bot_replies=recent_bot_replies,
+        )
     chat_intent = intent_decision.chat_intent
     plugin_query_intent = intent_decision.plugin_question_intent if chat_intent == "plugin_question" else ""
-    force_lookup = _requires_forced_lookup(preliminary_query_text or user_text)
-    runtime_chat_intent = "lookup" if chat_intent == "banter" and force_lookup else chat_intent
+    runtime_chat_intent = chat_intent
     effective_max_steps = _normalize_agent_max_steps(
         max_steps if max_steps is not None else getattr(plugin_config, "personification_agent_max_steps", DEFAULT_AGENT_MAX_STEPS)
     )
@@ -468,13 +889,13 @@ async def run_agent(
         current_images=user_images,
         provided=query_rewrite_context,
     )
-    if runtime_chat_intent == "banter":
+    if runtime_chat_intent in {"banter", "image_generation"}:
         rewritten_query = ContextualQueryRewrite(
             primary_query=preliminary_query_text,
             query_candidates=[preliminary_query_text] if preliminary_query_text else [],
             context_clues=[],
             need_image_understanding=bool(user_images),
-            recommended_tools=[],
+            recommended_tools=["generate_image"] if runtime_chat_intent == "image_generation" else [],
             search_plan=[],
         )
     else:
@@ -500,7 +921,45 @@ async def run_agent(
         )
     )
     has_tool_call = False
-    vision_fallback_task: asyncio.Task | None = None
+    ack_sent = False
+    budget_deadline = (
+        time.monotonic() + max(0.0, float(time_budget_seconds or 0.0))
+        if time_budget_seconds is not None
+        else None
+    )
+    background_image_request = user_query_text or preliminary_query_text or user_text
+    if (
+        runtime_chat_intent == "image_generation"
+        and bool(getattr(plugin_config, "personification_image_gen_background_enabled", True))
+        and _can_start_background_image_generation(
+            registry=registry,
+            executor=executor,
+            user_request=background_image_request,
+        )
+    ):
+        status_reply = await _generate_image_generation_status_reply(
+            tool_caller=tool_caller,
+            messages=messages,
+            user_request=background_image_request,
+            logger=logger,
+        )
+        if _start_background_image_generation(
+            registry=registry,
+            executor=executor,
+            tool_caller=tool_caller,
+            messages=messages,
+            user_request=background_image_request,
+            rewritten_query=rewritten_query,
+            user_images=user_images,
+            use_builtin_search=use_builtin_search,
+            logger=logger,
+        ):
+            return AgentResult(
+                text=status_reply or "[NO_REPLY]",
+                pending_actions=pending_actions,
+                direct_output=False,
+                bypass_length_limits=False,
+            )
     messages.append(
         {
             "role": "system",
@@ -524,6 +983,16 @@ async def run_agent(
                 "content": (
                     "当前更像接梗、吐槽、复读或顺嘴接话场景。"
                     "优先短句自然接话，不要进入解释、定义、考据或检索腔。"
+                ),
+            }
+        )
+    elif runtime_chat_intent == "image_generation":
+        messages.append(
+            {
+                "role": "system",
+                "content": (
+                    "当前用户是在要求生成图片。必须调用 generate_image 工具，"
+                    "不要只回复提示词、描述或制作步骤。"
                 ),
             }
         )
@@ -596,15 +1065,46 @@ async def run_agent(
                 "content": image_prompt,
             }
         )
-        vision_fallback_task = None
 
     for _step in range(effective_max_steps):
+        if budget_deadline is not None and time.monotonic() >= budget_deadline:
+            logger.warning(
+                f"[agent] time budget exhausted at step={_step + 1}, "
+                f"forcing answer from last_tool_result={bool(last_tool_result_text)}"
+            )
+            if last_tool_result_text:
+                direct_result = _direct_tool_result_agent_result(
+                    tool_name=last_tool_name,
+                    result_text=last_tool_result_text,
+                    pending_actions=pending_actions,
+                )
+                if direct_result is not None:
+                    return direct_result
+                rendered_tool_result = _render_tool_result_for_user(
+                    last_tool_name,
+                    last_tool_result_text,
+                    user_query_text,
+                )
+                return AgentResult(
+                    text=await _wrap_tool_result_in_persona(
+                        tool_caller=tool_caller,
+                        rendered_tool_result=rendered_tool_result,
+                        user_query_text=user_query_text,
+                        persona_system=_extract_persona_system_prompt(messages),
+                    ),
+                    pending_actions=pending_actions,
+                    direct_output=False,
+                    bypass_length_limits=False,
+                )
+            return AgentResult(
+                text="[NO_REPLY]",
+                pending_actions=pending_actions,
+            )
         active_schemas = _select_tool_schemas(
             registry,
             has_images=bool(user_images),
             chat_intent=runtime_chat_intent,
             plugin_question_intent=plugin_query_intent,
-            force_lookup=force_lookup,
         )
         selected_names = [
             _schema_tool_name(schema)
@@ -648,6 +1148,12 @@ async def run_agent(
                     previous_tool_result_text=last_tool_result_text,
                 )
         if response.finish_reason == "stop":
+            if runtime_chat_intent == "banter" and not response.tool_calls and content_len > 0:
+                return AgentResult(
+                    text=str(response.content or "").strip(),
+                    pending_actions=pending_actions,
+                    bypass_length_limits=False,
+                )
             if (
                 response.vision_unavailable
                 and bool(
@@ -679,6 +1185,7 @@ async def run_agent(
                         step=_step + 1,
                     )
                     has_tool_call = True
+                    promised_lookup_no_tool_rounds = 0
                     last_tool_name = bg_name
                     last_tool_result_text = bg_result
                     logger.info("[agent] injected background vision fallback result")
@@ -708,7 +1215,6 @@ async def run_agent(
                     has_images=bool(user_images),
                     chat_intent=runtime_chat_intent,
                     plugin_question_intent=plugin_query_intent,
-                    force_lookup=force_lookup,
                     user_images=user_images,
                     previous_tool_name=last_tool_name,
                     previous_tool_result_text=last_tool_result_text,
@@ -740,6 +1246,7 @@ async def run_agent(
                             previous_tool_name=last_tool_name,
                             previous_tool_result_text=last_tool_result_text,
                             logger=logger,
+                            budget_deadline=budget_deadline,
                         )
                         fallback_id = f"fallback-{fallback_name}-{_step + 1}"
                         messages.append(
@@ -769,6 +1276,7 @@ async def run_agent(
                         if str(fallback_result or "").strip():
                             last_tool_result_text = str(fallback_result).strip()
                         has_tool_call = True
+                        promised_lookup_no_tool_rounds = 0
                         semantic_fallback_attempted = False
                         logger.info(f"[agent] fallback tool_call name={fallback_name}")
                         continue
@@ -805,15 +1313,30 @@ async def run_agent(
                         step=_step + 1,
                     )
                     has_tool_call = True
+                    promised_lookup_no_tool_rounds = 0
                     last_tool_name = bg_name
                     last_tool_result_text = bg_result
                     logger.info("[agent] awaited background vision fallback result")
                     continue
             if promised_lookup and not has_tool_call:
+                if promised_lookup_no_tool_rounds >= MAX_PROMISED_LOOKUP_NO_TOOL_ROUNDS:
+                    logger.info("[agent] deferred lookup no-tool retry exhausted, returning current content")
+                    if content_len > 0:
+                        return AgentResult(
+                            text=str(response.content or "").strip(),
+                            pending_actions=pending_actions,
+                            bypass_length_limits=False,
+                        )
+                    return AgentResult(
+                        text="[NO_REPLY]",
+                        pending_actions=pending_actions,
+                    )
+                promised_lookup_no_tool_rounds += 1
                 messages.append(
                     {
                         "role": "system",
                         "content": (
+                            f"你刚才口头承诺要查，但没有调用工具。这是第 {promised_lookup_no_tool_rounds}/{MAX_PROMISED_LOOKUP_NO_TOOL_ROUNDS} 次纠正。"
                             "不要口头承诺你会去查。"
                             "如果不需要工具，就直接基于现有上下文回答；"
                             "如果需要工具，就直接调用。"
@@ -855,11 +1378,28 @@ async def run_agent(
                 continue
             if promised_lookup and has_tool_call and last_tool_result_text:
                 logger.info("[agent] deferred lookup reply after tool result, returning last tool result directly")
-                return AgentResult(
-                    text=_render_tool_result_for_user(last_tool_name, last_tool_result_text, user_query_text),
+                direct_result = _direct_tool_result_agent_result(
+                    tool_name=last_tool_name,
+                    result_text=last_tool_result_text,
                     pending_actions=pending_actions,
-                    direct_output=True,
-                    bypass_length_limits=True,
+                )
+                if direct_result is not None:
+                    return direct_result
+                rendered_tool_result = _render_tool_result_for_user(
+                    last_tool_name,
+                    last_tool_result_text,
+                    user_query_text,
+                )
+                return AgentResult(
+                    text=await _wrap_tool_result_in_persona(
+                        tool_caller=tool_caller,
+                        rendered_tool_result=rendered_tool_result,
+                        user_query_text=user_query_text,
+                        persona_system=_extract_persona_system_prompt(messages),
+                    ),
+                    pending_actions=pending_actions,
+                    direct_output=False,
+                    bypass_length_limits=False,
                 )
             if promised_lookup and has_tool_call:
                 messages.append(
@@ -887,6 +1427,9 @@ async def run_agent(
             )
 
         if response.tool_calls:
+            if not has_tool_call and not ack_sent and ack_sender is not None:
+                ack_sent = True
+                await _safe_ack(ack_sender, "", logger)
             messages.append(
                 {
                     "role": "assistant",
@@ -907,6 +1450,7 @@ async def run_agent(
 
         for tool_call in response.tool_calls:
             has_tool_call = True
+            promised_lookup_no_tool_rounds = 0
             logger.info(f"[agent] tool_call name={tool_call.name}")
             tool = registry.get(tool_call.name)
             if tool is None:
@@ -921,10 +1465,16 @@ async def run_agent(
                     previous_tool_name=last_tool_name,
                     previous_tool_result_text=last_tool_result_text,
                     logger=logger,
+                    budget_deadline=budget_deadline,
                 )
+            tool_result_preview_limit = (
+                1000
+                if str(tool_call.name or "").strip() == _IMAGE_GENERATION_TOOL_NAME
+                else 220
+            )
             logger.info(
                 f"[agent] tool_result name={tool_call.name} "
-                f"preview={str(result).replace(chr(10), ' ')[:220]}"
+                f"preview={str(result).replace(chr(10), ' ')[:tool_result_preview_limit]}"
             )
             last_tool_name = str(tool_call.name or "").strip()
             if str(result or "").strip():
@@ -935,6 +1485,13 @@ async def run_agent(
                 else:
                     empty_lookup_tools.discard(last_tool_name)
             semantic_fallback_attempted = False
+            direct_result = _direct_tool_result_agent_result(
+                tool_name=last_tool_name,
+                result_text=result,
+                pending_actions=pending_actions,
+            )
+            if direct_result is not None:
+                return direct_result
 
             messages.append(
                 tool_caller.build_tool_result_message(
@@ -947,11 +1504,28 @@ async def run_agent(
     logger.warning("[agent] MAX_STEPS reached")
     if last_tool_result_text:
         logger.warning("[agent] using last tool result as fallback final answer")
-        return AgentResult(
-            text=_render_tool_result_for_user(last_tool_name, last_tool_result_text, user_query_text),
+        direct_result = _direct_tool_result_agent_result(
+            tool_name=last_tool_name,
+            result_text=last_tool_result_text,
             pending_actions=pending_actions,
-            direct_output=True,
-            bypass_length_limits=True,
+        )
+        if direct_result is not None:
+            return direct_result
+        rendered_tool_result = _render_tool_result_for_user(
+            last_tool_name,
+            last_tool_result_text,
+            user_query_text,
+        )
+        return AgentResult(
+            text=await _wrap_tool_result_in_persona(
+                tool_caller=tool_caller,
+                rendered_tool_result=rendered_tool_result,
+                user_query_text=user_query_text,
+                persona_system=_extract_persona_system_prompt(messages),
+            ),
+            pending_actions=pending_actions,
+            direct_output=False,
+            bypass_length_limits=False,
         )
     return AgentResult(
         text="[NO_REPLY]",

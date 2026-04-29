@@ -4,7 +4,7 @@ import asyncio
 
 from ._loader import load_personification_module
 
-context_policy = load_personification_module("nonebot_plugin_personification.core.context_policy")
+context_policy = load_personification_module("plugin.personification.core.context_policy")
 
 
 def test_compress_context_if_needed_falls_back_when_llm_summary_fails() -> None:
@@ -28,4 +28,3 @@ def test_compress_context_if_needed_falls_back_when_llm_summary_fails() -> None:
 
     assert result[0].startswith("## 较早上下文摘要")
     assert "今晚先发修复版" in result[-2]
-

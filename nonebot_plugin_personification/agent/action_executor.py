@@ -12,6 +12,16 @@ class ActionExecutor:
         self.config = config
         self.logger = logger
 
+    async def send_text(self, text: str) -> None:
+        content = str(text or "").strip()
+        if content:
+            await self.bot.send(self.event, content)
+
+    async def send_image_b64(self, image_b64: str) -> None:
+        payload = str(image_b64 or "").strip()
+        if payload:
+            await self.bot.send(self.event, MessageSegment.image(f"base64://{payload}"))
+
     async def execute(self, action: str, params: dict) -> str:
         match action:
             case "send_sticker":

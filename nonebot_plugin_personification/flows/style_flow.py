@@ -1,5 +1,7 @@
 from typing import Any, Awaitable, Callable, Dict, List, Optional
 
+from ..core.group_roles import render_group_role_label
+
 
 async def analyze_group_style(
     group_id: str,
@@ -22,10 +24,12 @@ async def analyze_group_style(
         if msg.get("is_bot"):
             continue
         nickname = str(msg.get("nickname", "未知"))
+        role_label = render_group_role_label(msg.get("sender_role", ""))
+        speaker = f"{nickname}({role_label})" if role_label else nickname
         content = str(msg.get("content", ""))
         if not content.strip():
             continue
-        chat_content.append({"type": "text", "text": f"({nickname}): {content}\n"})
+        chat_content.append({"type": "text", "text": f"({speaker}): {content}\n"})
 
         visual_summary = str(msg.get("visual_summary", "") or "").strip()
         try:
@@ -35,10 +39,10 @@ async def analyze_group_style(
         if len(chat_content) >= 50 or image_count >= 10 or message_image_count <= 0:
             continue
         if visual_summary:
-            chat_content.append({"type": "text", "text": f"({nickname}): [图片语义] {visual_summary}\n"})
+            chat_content.append({"type": "text", "text": f"({speaker}): [图片语义] {visual_summary}\n"})
         else:
             token = "[发送了一张图片]" if message_image_count == 1 else f"[发送了{message_image_count}张图片]"
-            chat_content.append({"type": "text", "text": f"({nickname}): {token}\n"})
+            chat_content.append({"type": "text", "text": f"({speaker}): {token}\n"})
         image_count += message_image_count
 
     prompt_text = (
@@ -47,7 +51,8 @@ async def analyze_group_style(
         "1. 整体氛围（如：轻松、严肃、二次元、搞怪等）\n"
         "2. 常用梗或黑话（如果有）\n"
         "3. 成员互动方式（如：互损、互夸、复读等）\n"
-        "4. 语言特色（如：口癖、表情包使用习惯等）\n\n"
+        "4. 语言特色（如：口癖、表情包使用习惯等）\n"
+        "5. 群主/管理员是否有特殊发言风格或群内影响力；如果记录不足，不要强行编。\n\n"
         "请输出一段精简的描述（200字以内），用于指导 AI 融入该群聊。\n"
         "格式要求：直接输出描述内容，不要包含其他客套话。\n\n"
         "## 聊天记录开始\n"

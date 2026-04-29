@@ -47,8 +47,10 @@ except Exception as e:
     ) from e
 
 try:
+    require("nonebot_plugin_htmlrender")
     from nonebot_plugin_htmlrender import md_to_pic
-except ImportError:
+except Exception as e:
+    logger.warning(f'拟人插件：加载 "nonebot_plugin_htmlrender" 失败，渲染能力将降级。{e}')
     md_to_pic = None
 
 from .config import Config
@@ -95,6 +97,7 @@ __plugin_meta__ = build_plugin_metadata(Config)
 _sticker_labeler_observer = None
 _knowledge_build_task: asyncio.Task | None = None
 _visual_probe_task: asyncio.Task | None = None
+_llm_warmup_task: asyncio.Task | None = None
 runtime_bundle = None
 flow_handles: dict[str, object] = {}
 job_handles: dict[str, object] = {}
@@ -202,6 +205,43 @@ def _start_visual_probe_background() -> None:
     task.add_done_callback(_clear_probe_task)
 
 
+async def _warmup_llm_connection() -> None:
+    bundle = _require_runtime_bundle()
+    caller = (
+        bundle.reply_processor_deps.runtime.agent_tool_caller
+        or bundle.reply_processor_deps.runtime.lite_tool_caller
+    )
+    if caller is None:
+        return
+    try:
+        await asyncio.wait_for(
+            caller.chat_with_tools(
+                [{"role": "user", "content": "hi"}],
+                [],
+                False,
+            ),
+            timeout=30.0,
+        )
+        logger.info("[warmup] LLM 连接预热完成")
+    except Exception as exc:
+        logger.debug(f"[warmup] LLM 预热失败（不影响正常使用）: {exc}")
+
+
+def _start_llm_warmup_background() -> None:
+    global _llm_warmup_task
+    if _llm_warmup_task is not None and not _llm_warmup_task.done():
+        return
+    task = asyncio.create_task(_warmup_llm_connection())
+    _llm_warmup_task = task
+
+    def _clear_warmup_task(done_task: asyncio.Task) -> None:
+        global _llm_warmup_task
+        if _llm_warmup_task is done_task:
+            _llm_warmup_task = None
+
+    task.add_done_callback(_clear_warmup_task)
+
+
 @get_driver().on_startup
 async def _init_personification_runtime() -> None:
     global runtime_bundle, flow_handles, job_handles, matcher_handles
@@ -230,6 +270,7 @@ async def _init_personification_runtime() -> None:
     runtime_bundle.get_knowledge_build_task = _get_knowledge_build_task
     runtime_bundle.set_knowledge_build_task = _set_knowledge_build_task
     _start_visual_probe_background()
+    _start_llm_warmup_background()
 
     personification_rule = runtime_bundle.personification_rule
     poke_rule = runtime_bundle.poke_rule

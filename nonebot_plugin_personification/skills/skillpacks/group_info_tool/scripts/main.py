@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 
-from nonebot_plugin_personification.skill_runtime.runtime_api import SkillRuntime
+from plugin.personification.skill_runtime.runtime_api import SkillRuntime
 from . import impl
 
 
@@ -24,4 +24,3 @@ def build_group_info_tool_for_runtime(*, bot, runtime: SkillRuntime):
         get_whitelisted_groups=runtime.get_whitelisted_groups,  # type: ignore[attr-defined]
         logger=runtime.logger,
     )
-

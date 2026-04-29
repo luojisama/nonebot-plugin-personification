@@ -5,6 +5,8 @@ from typing import Any, Callable, Dict
 from nonebot import on_message, on_notice
 from nonebot.rule import Rule
 
+from ..core.group_mute import update_group_mute_from_notice
+
 try:
     from nonebot.typing import T_State
     from nonebot.adapters.onebot.v11 import Bot, Event
@@ -99,8 +101,14 @@ def register_reply_matchers(
     message_cls: Any,
     message_segment_cls: Any,
     logger: Any,
+    plugin_config: Any,
     finished_exception_cls: Any = None,
 ) -> Dict[str, Any]:
+    response_timeout_seconds = max(
+        30.0,
+        float(getattr(plugin_config, "personification_response_timeout", 180) or 180),
+    )
+
     async def _direct_reply_rule(event: Event, state: T_State) -> bool:
         result = await _evaluate_personification_rule(
             personification_rule=personification_rule,
@@ -121,6 +129,19 @@ def register_reply_matchers(
     random_reply_matcher = on_message(rule=Rule(_random_reply_rule), priority=100, block=False)
     poke_notice_matcher = on_notice(rule=Rule(poke_notice_rule), priority=10, block=False)
 
+    async def _group_mute_notice_rule(event: Event) -> bool:
+        return str(getattr(event, "notice_type", "") or "").strip() == "group_ban"
+
+    group_mute_notice_matcher = on_notice(rule=Rule(_group_mute_notice_rule), priority=9, block=False)
+
+    @group_mute_notice_matcher.handle()
+    async def _handle_group_mute_notice(bot: Bot, event: Event):
+        update_group_mute_from_notice(
+            event,
+            bot_self_id=str(getattr(bot, "self_id", "") or ""),
+            logger=logger,
+        )
+
     async def _buffer_timer(key: str, bot: Bot, wait_seconds: float):
         await run_buffer_timer(
             key,
@@ -133,6 +154,7 @@ def register_reply_matchers(
             logger=logger,
             finished_exception_cls=finished_exception_cls,
             delay=wait_seconds,
+            response_timeout_seconds=response_timeout_seconds,
         )
 
     @direct_reply_matcher.handle()
@@ -158,6 +180,7 @@ def register_reply_matchers(
         "reply_matcher": direct_reply_matcher,
         "random_reply_matcher": random_reply_matcher,
         "poke_notice_matcher": poke_notice_matcher,
+        "group_mute_notice_matcher": group_mute_notice_matcher,
         "handle_reply": _handle_reply,
     }
 

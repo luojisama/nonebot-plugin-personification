@@ -5,7 +5,7 @@ from typing import Any
 
 import httpx
 
-from nonebot_plugin_personification.agent.tool_registry import AgentTool
+from plugin.personification.agent.tool_registry import AgentTool
 from . import impl
 
 
@@ -94,4 +94,3 @@ def build_tools(runtime):
             enabled=lambda: wiki_enabled,
         )
     ]
-

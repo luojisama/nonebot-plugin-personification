@@ -1,0 +1,5 @@
+name: parallel_research
+enabled: true
+category: search
+entrypoint: scripts/main.py
+description: 由 LLM 动态拆分多个只读研究子任务，并发调用搜索、百科、图片和视觉工具后聚合为结构化资料。

@@ -11,6 +11,11 @@ from ...skill_runtime.loader import load_builtin_skillpacks_sync
 from ...skill_runtime.runtime_api import SkillRuntime
 from ..ai_routes import build_routed_tool_caller
 from ..file_sender import build_file_sender
+from ..model_router import (
+    MODEL_ROLE_AGENT,
+    MODEL_ROLE_INTENT,
+    get_model_override_for_role,
+)
 from ..session_store import init_session_store
 from ..tasks_service import make_cancel_task_tool, make_create_task_tool
 from ..web_grounding import do_web_search as do_web_search_core
@@ -74,6 +79,9 @@ def build_agent_tool_registry(
         from ...skills.skillpacks.resource_collector.scripts.main import (
             build_tools as build_resource_tools,
         )
+        from ...skills.skillpacks.parallel_research.scripts.main import (
+            build_tools as build_parallel_research_tools,
+        )
         from ...skills.skillpacks.vision_analyze.scripts.main import (
             build_tools as build_vision_tools,
         )
@@ -122,8 +130,17 @@ def build_agent_tool_registry(
             registry.register(tool)
         for tool in build_acg_tools(legacy_runtime):
             registry.register(tool)
+        for tool in build_parallel_research_tools(legacy_runtime):
+            registry.register(tool)
         for tool in build_memory_tools(legacy_runtime):
             registry.register(tool)
+        try:
+            from ...skills.skillpacks.image_gen.scripts.main import build_tools as build_image_gen_tools
+
+            for tool in build_image_gen_tools(legacy_runtime):
+                registry.register(tool)
+        except Exception as exc:
+            logger.warning(f"[skillpack] image_gen load failed: {exc}")
 
     if not use_skillpacks:
         from ...skills.skillpacks.sticker_tool.scripts.impl import (
@@ -231,6 +248,7 @@ def build_agent_tool_registry(
 
     if (not use_skillpacks) and getattr(plugin_config, "personification_60s_enabled", True):
         from ...skills.skillpacks.news.scripts.impl import (
+            build_ai_news_tool,
             build_baike_tool,
             build_daily_news_tool,
             build_epic_games_tool,
@@ -248,6 +266,7 @@ def build_agent_tool_registry(
             getattr(plugin_config, "personification_60s_local_api_base", "http://127.0.0.1:4399") or ""
         ).strip().rstrip("/") or "http://127.0.0.1:4399"
         registry.register(build_daily_news_tool(_60s_base, logger, _60s_local_base))
+        registry.register(build_ai_news_tool(_60s_base, logger, _60s_local_base))
         registry.register(build_trending_tool(_60s_base, logger, _60s_local_base))
         registry.register(build_joke_tool(_60s_base, logger, _60s_local_base))
         registry.register(build_history_today_tool(_60s_base, logger, _60s_local_base))
@@ -291,11 +310,15 @@ def _build_agent_tool_caller(plugin_config: Any, logger: Any) -> Any:
     return build_routed_tool_caller(
         plugin_config=plugin_config,
         logger=logger,
+        model_override=get_model_override_for_role(plugin_config, MODEL_ROLE_AGENT),
     )
 
 
 def _build_lite_tool_caller(plugin_config: Any, logger: Any, default_caller: Any = None) -> Any:
-    lite_model = str(getattr(plugin_config, "personification_lite_model", "") or "").strip()
+    lite_model = (
+        get_model_override_for_role(plugin_config, MODEL_ROLE_INTENT)
+        or str(getattr(plugin_config, "personification_lite_model", "") or "").strip()
+    )
     if not lite_model:
         return default_caller
     try:

@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import json
 import re
 from dataclasses import dataclass
 from typing import Any, Callable, Iterable
+
+from .model_router import normalize_model_overrides
 
 from .memory_defaults import (
     DEFAULT_COMPRESS_KEEP_RECENT,
@@ -64,6 +67,19 @@ def _str_parser(raw: str) -> str:
     return str(raw or "").strip()
 
 
+def _json_object_parser(raw: str) -> dict[str, Any]:
+    text = str(raw or "").strip()
+    if not text:
+        return {}
+    try:
+        parsed = json.loads(text)
+    except Exception as exc:
+        raise ValueError("需要 JSON 对象") from exc
+    if not isinstance(parsed, dict):
+        raise ValueError("需要 JSON 对象")
+    return parsed
+
+
 def _web_search_mode_parser(raw: str) -> str:
     text = str(raw or "").strip().lower()
     mapping = {
@@ -79,6 +95,29 @@ def _web_search_mode_parser(raw: str) -> str:
         "disabled": "disabled",
         "关闭": "disabled",
         "禁用": "disabled",
+    }
+    return mapping.get(text, text)
+
+
+def _tts_mode_parser(raw: str) -> str:
+    text = str(raw or "").strip().lower()
+    mapping = {
+        "preset": "preset",
+        "builtin": "preset",
+        "built_in": "preset",
+        "预置": "preset",
+        "内置": "preset",
+        "design": "design",
+        "voice_design": "design",
+        "voicedesign": "design",
+        "描述": "design",
+        "定制": "design",
+        "设计": "design",
+        "clone": "clone",
+        "voice_clone": "clone",
+        "voiceclone": "clone",
+        "克隆": "clone",
+        "复刻": "clone",
     }
     return mapping.get(text, text)
 
@@ -134,6 +173,18 @@ class ConfigEntry:
 def _build_entries() -> list[ConfigEntry]:
     entries = [
         ConfigEntry(
+            key="model_overrides",
+            field_name="personification_model_overrides",
+            display_name="模型覆盖",
+            value_type="dict",
+            default={},
+            scope=GLOBAL_SCOPE,
+            description="按调用阶段覆盖模型，支持 intent/review/agent/sticker。推荐用“拟人 模型”命令热更新。",
+            category="config",
+            help_aliases=("模型覆盖", "model_overrides", "模型路由"),
+            parser=lambda raw: normalize_model_overrides(_json_object_parser(raw)),
+        ),
+        ConfigEntry(
             key="model_builtin_search_enabled",
             field_name="personification_model_builtin_search_enabled",
             display_name="模型内置搜索",
@@ -169,6 +220,34 @@ def _build_entries() -> list[ConfigEntry]:
             choices=("enabled", "live", "cached", "disabled"),
             help_aliases=("web_search_mode", "搜索模式", "联网方式"),
             parser=_web_search_mode_parser,
+        ),
+        ConfigEntry(
+            key="agent_max_steps",
+            field_name="personification_agent_max_steps",
+            display_name="Agent 最大步数",
+            value_type="int",
+            default=10,
+            scope=GLOBAL_SCOPE,
+            description="单轮 Agent 最多模型/工具循环次数；复杂查证可调高，但会增加耗时。",
+            category="config",
+            min_value=3,
+            max_value=16,
+            help_aliases=("agent步数", "工具循环", "agent_max_steps"),
+            parser=_int_parser,
+        ),
+        ConfigEntry(
+            key="response_timeout",
+            field_name="personification_response_timeout",
+            display_name="单轮回复超时",
+            value_type="int",
+            default=180,
+            scope=GLOBAL_SCOPE,
+            description="单轮回复处理总超时时间，秒。Agent 会在该预算内预留收尾时间。",
+            category="config",
+            min_value=30,
+            max_value=600,
+            help_aliases=("回复超时", "单轮超时", "response_timeout"),
+            parser=_int_parser,
         ),
         ConfigEntry(
             key="fallback_enabled",
@@ -327,13 +406,141 @@ def _build_entries() -> list[ConfigEntry]:
             parser=_str_parser,
         ),
         ConfigEntry(
+            key="image_gen_enabled",
+            field_name="personification_image_gen_enabled",
+            display_name="图片生成工具",
+            value_type="bool",
+            default=True,
+            scope=GLOBAL_SCOPE,
+            description="允许 agent 在用户明确要求画图/生成图片时调用 Codex 图片生成工具。",
+            category="config",
+            help_aliases=("图片生成", "image_gen", "画图工具"),
+            parser=_bool_parser,
+        ),
+        ConfigEntry(
+            key="image_gen_model",
+            field_name="personification_image_gen_model",
+            display_name="图片生成模型",
+            value_type="str",
+            default="gpt-image-2",
+            scope=GLOBAL_SCOPE,
+            description="Codex 图片生成请求的 GPT Image 模型名；默认 gpt-image-2。仅用于 Codex 后端 image_generation 托管工具，不走 OpenAI API。",
+            category="config",
+            help_aliases=("图片生成模型", "image_gen_model", "image2", "gpt-image-2"),
+            parser=_str_parser,
+        ),
+        ConfigEntry(
+            key="image_gen_background_enabled",
+            field_name="personification_image_gen_background_enabled",
+            display_name="图片生成后台发送",
+            value_type="bool",
+            default=True,
+            scope=GLOBAL_SCOPE,
+            description="用户明确要求生成图片时，先快速回复并在后台继续生成图片，避免单轮回复超时。",
+            category="config",
+            help_aliases=("图片后台生成", "image_gen_background", "画图后台发送"),
+            parser=_bool_parser,
+        ),
+        ConfigEntry(
+            key="image_gen_timeout",
+            field_name="personification_image_gen_timeout",
+            display_name="图片生成超时",
+            value_type="int",
+            default=180,
+            scope=GLOBAL_SCOPE,
+            description="Codex 图片生成后台任务的等待秒数；仅影响 generate_image 工具。",
+            category="config",
+            help_aliases=("图片生成超时", "image_gen_timeout", "画图超时"),
+            parser=_int_parser,
+        ),
+        ConfigEntry(
+            key="parallel_research_enabled",
+            field_name="personification_parallel_research_enabled",
+            display_name="并行研究工具",
+            value_type="bool",
+            default=True,
+            scope=GLOBAL_SCOPE,
+            description="允许 agent 调用并行子Agent研究工具，聚合联网、百科、图片和视觉资料。",
+            category="config",
+            help_aliases=("并行研究", "parallel_research", "子agent搜索"),
+            parser=_bool_parser,
+        ),
+        ConfigEntry(
+            key="parallel_research_lookup_enabled",
+            field_name="personification_parallel_research_lookup_enabled",
+            display_name="查询场景并行研究",
+            value_type="bool",
+            default=True,
+            scope=GLOBAL_SCOPE,
+            description="允许 parallel_research 用于复杂查询；关闭后仅建议用于生图准备。",
+            category="config",
+            help_aliases=("查询并行研究", "parallel_research_lookup"),
+            parser=_bool_parser,
+        ),
+        ConfigEntry(
+            key="parallel_research_max_workers",
+            field_name="personification_parallel_research_max_workers",
+            display_name="并行研究最大子Agent数",
+            value_type="int",
+            default=6,
+            scope=GLOBAL_SCOPE,
+            description="parallel_research 单次最多启动的研究子Agent数量。LLM 动态决定实际数量，代码按该值截断。",
+            category="config",
+            min_value=0,
+            max_value=6,
+            help_aliases=("子agent数量", "parallel_workers", "并行worker"),
+            parser=_int_parser,
+        ),
+        ConfigEntry(
+            key="parallel_research_worker_timeout",
+            field_name="personification_parallel_research_worker_timeout",
+            display_name="并行研究单子Agent超时",
+            value_type="int",
+            default=35,
+            scope=GLOBAL_SCOPE,
+            description="parallel_research 单个研究子Agent的最长运行秒数。",
+            category="config",
+            min_value=5,
+            max_value=180,
+            help_aliases=("子agent超时", "parallel_worker_timeout"),
+            parser=_int_parser,
+        ),
+        ConfigEntry(
+            key="parallel_research_total_timeout",
+            field_name="personification_parallel_research_total_timeout",
+            display_name="并行研究总超时",
+            value_type="int",
+            default=90,
+            scope=GLOBAL_SCOPE,
+            description="parallel_research 单次规划、并发研究和聚合的总超时秒数。",
+            category="config",
+            min_value=10,
+            max_value=300,
+            help_aliases=("并行研究超时", "parallel_total_timeout"),
+            parser=_int_parser,
+        ),
+        ConfigEntry(
+            key="parallel_research_max_tool_rounds",
+            field_name="personification_parallel_research_max_tool_rounds",
+            display_name="并行研究工具轮次",
+            value_type="int",
+            default=2,
+            scope=GLOBAL_SCOPE,
+            description="parallel_research 每个子Agent最多可进行的工具调用轮次。",
+            category="config",
+            min_value=0,
+            max_value=4,
+            help_aliases=("子agent工具轮次", "parallel_tool_rounds"),
+            parser=_int_parser,
+        ),
+        ConfigEntry(
             key="plugin_knowledge_build_enabled",
             field_name="personification_plugin_knowledge_build_enabled",
             display_name="插件知识库构建",
             value_type="bool",
             default=False,
             scope=GLOBAL_SCOPE,
-            description="允许自动或手动启动插件知识库构建任务。",
+            description="允许自动或手动启动插件知识库构建任务；需先执行“拟人 知识库 构建/重建插件知识库”后才会注入插件摘要。",
             category="config",
             help_aliases=("知识库构建", "plugin_knowledge_build", "插件知识库"),
             parser=_bool_parser,
@@ -373,6 +580,117 @@ def _build_entries() -> list[ConfigEntry]:
             category="config",
             help_aliases=("全局语音", "拟人语音", "语音开关"),
             parser=_bool_parser,
+        ),
+        ConfigEntry(
+            key="tts_llm_decision_enabled",
+            field_name="personification_tts_llm_decision_enabled",
+            display_name="TTS LLM 决策",
+            value_type="bool",
+            default=True,
+            scope=GLOBAL_SCOPE,
+            description="自动语音和命令语音在合成前交由 LLM 判断 voice/text/block，并进行语义违禁阻断。",
+            category="config",
+            help_aliases=("语音LLM决策", "tts_llm_decision", "语音审查"),
+            parser=_bool_parser,
+        ),
+        ConfigEntry(
+            key="tts_decision_timeout",
+            field_name="personification_tts_decision_timeout",
+            display_name="TTS 决策超时",
+            value_type="int",
+            default=8,
+            scope=GLOBAL_SCOPE,
+            description="TTS 合成前 LLM 决策/审查的超时秒数；失败时回退文字，不合成语音。",
+            category="config",
+            min_value=2,
+            max_value=30,
+            help_aliases=("语音审查超时", "tts_decision_timeout"),
+            parser=_int_parser,
+        ),
+        ConfigEntry(
+            key="tts_builtin_safety_enabled",
+            field_name="personification_tts_builtin_safety_enabled",
+            display_name="TTS 内置安全策略",
+            value_type="bool",
+            default=True,
+            scope=GLOBAL_SCOPE,
+            description="启用内置高风险内容分类，交由 LLM 在语音合成前做语义判断。",
+            category="config",
+            help_aliases=("语音内置安全", "tts_builtin_safety"),
+            parser=_bool_parser,
+        ),
+        ConfigEntry(
+            key="tts_forbidden_policy",
+            field_name="personification_tts_forbidden_policy",
+            display_name="TTS 自定义违禁策略",
+            value_type="str",
+            default="",
+            scope=GLOBAL_SCOPE,
+            description="追加给 LLM 的语音合成违禁策略文本；不做本地关键词匹配。",
+            category="config",
+            help_aliases=("语音违禁策略", "tts_forbidden_policy", "语音禁读"),
+            parser=_str_parser,
+        ),
+        ConfigEntry(
+            key="tts_mode",
+            field_name="personification_tts_mode",
+            display_name="TTS 模式",
+            value_type="str",
+            default="preset",
+            scope=GLOBAL_SCOPE,
+            description="MiMo-V2.5 TTS 模式：preset 预置音色、design 描述定制音色、clone 音频样本克隆。",
+            category="config",
+            choices=("preset", "design", "clone"),
+            help_aliases=("tts_mode", "语音模式", "音色模式"),
+            parser=_tts_mode_parser,
+        ),
+        ConfigEntry(
+            key="tts_model",
+            field_name="personification_tts_model",
+            display_name="TTS 模型",
+            value_type="str",
+            default="mimo-v2.5-tts",
+            scope=GLOBAL_SCOPE,
+            description="MiMo TTS 模型名；通常由 TTS 模式自动选择。",
+            category="config",
+            help_aliases=("tts_model", "语音模型"),
+            parser=_str_parser,
+        ),
+        ConfigEntry(
+            key="tts_default_voice",
+            field_name="personification_tts_default_voice",
+            display_name="TTS 预置音色",
+            value_type="str",
+            default="mimo_default",
+            scope=GLOBAL_SCOPE,
+            description="预置音色 ID，例如 mimo_default、冰糖、茉莉、苏打、白桦、Mia、Chloe、Milo、Dean。",
+            category="config",
+            help_aliases=("tts_voice", "语音音色", "预置音色"),
+            parser=_str_parser,
+        ),
+        ConfigEntry(
+            key="tts_voice_design_prompt",
+            field_name="personification_tts_voice_design_prompt",
+            display_name="TTS 音色描述",
+            value_type="str",
+            default="",
+            scope=GLOBAL_SCOPE,
+            description="design 模式下放入 user message 的音色描述。",
+            category="config",
+            help_aliases=("音色描述", "voice_design_prompt", "voice_prompt"),
+            parser=_str_parser,
+        ),
+        ConfigEntry(
+            key="tts_voice_clone_path",
+            field_name="personification_tts_voice_clone_path",
+            display_name="TTS 克隆样本路径",
+            value_type="str",
+            default="",
+            scope=GLOBAL_SCOPE,
+            description="clone 模式下的 mp3/wav 样本路径，文件需小于 10 MB。",
+            category="config",
+            help_aliases=("克隆音色路径", "voice_clone_path", "clone_path"),
+            parser=_str_parser,
         ),
         ConfigEntry(
             key="proactive_enabled",
@@ -807,6 +1125,8 @@ def describe_choices(entry: ConfigEntry) -> str:
         lower = entry.min_value if entry.min_value is not None else "-"
         upper = entry.max_value if entry.max_value is not None else "-"
         return f"数字 ({lower}..{upper})"
+    if entry.value_type == "dict":
+        return "JSON 对象"
     return "自由文本"
 
 
@@ -815,6 +1135,8 @@ def format_config_value(value: Any) -> str:
         return "开" if value else "关"
     if value is None:
         return "未设置"
+    if isinstance(value, dict):
+        return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
     return str(value)
 
 

@@ -12,7 +12,7 @@ from .sticker_semantics import (
 )
 
 
-ChatIntent = Literal["banter", "explanation", "lookup", "plugin_question"]
+ChatIntent = Literal["banter", "explanation", "lookup", "plugin_question", "image_generation"]
 PluginQuestionIntent = Literal["capability", "implementation", "latest"]
 AmbiguityLevel = Literal["low", "medium", "high"]
 EmotionIntensity = Literal["low", "medium", "high"]
@@ -75,35 +75,6 @@ def normalize_intent_text(text: str) -> str:
 
 
 
-def classify_chat_intent(
-    text: str,
-    *,
-    is_group: bool = False,
-    is_random_chat: bool = False,
-) -> ChatIntent:
-    return heuristic_turn_semantic_frame(
-        text,
-        is_group=is_group,
-        is_random_chat=is_random_chat,
-    ).chat_intent
-
-
-def is_plugin_question(
-    text: str,
-    *,
-    is_group: bool = False,
-    is_random_chat: bool = False,
-) -> bool:
-    return (
-        classify_chat_intent(
-            text,
-            is_group=is_group,
-            is_random_chat=is_random_chat,
-        )
-        == "plugin_question"
-    )
-
-
 def looks_like_explanatory_output(text: str) -> bool:
     normalized = normalize_intent_text(text)
     if not normalized:
@@ -155,30 +126,15 @@ def _metadata_fallback_turn_semantic_frame(
     )
 
 
-def heuristic_turn_semantic_frame(
-    text: str,
+def metadata_fallback_turn_semantic_frame_for_session(
     *,
     is_group: bool = False,
     is_random_chat: bool = False,
 ) -> TurnSemanticFrame:
-    _ = text
     return _metadata_fallback_turn_semantic_frame(
         is_group=is_group,
         is_random_chat=is_random_chat,
     )
-
-
-def heuristic_intent_decision(
-    text: str,
-    *,
-    is_group: bool = False,
-    is_random_chat: bool = False,
-) -> IntentDecision:
-    return heuristic_turn_semantic_frame(
-        text,
-        is_group=is_group,
-        is_random_chat=is_random_chat,
-    ).to_intent_decision()
 
 
 def _coerce_bool(value: Any, default: bool = False) -> bool:
@@ -195,7 +151,7 @@ def _parse_turn_semantic_frame_payload(payload: Any) -> TurnSemanticFrame | None
     if not isinstance(payload, dict):
         return None
     chat_intent = str(payload.get("chat_intent", "") or "").strip()
-    if chat_intent not in {"banter", "explanation", "lookup", "plugin_question"}:
+    if chat_intent not in {"banter", "explanation", "lookup", "plugin_question", "image_generation"}:
         return None
     plugin_question_intent = str(payload.get("plugin_question_intent", "capability") or "capability").strip()
     if plugin_question_intent not in {"capability", "implementation", "latest"}:
@@ -288,7 +244,7 @@ async def infer_turn_semantic_frame_with_llm(
         "你是群聊/私聊的语义与情绪判别器。"
         "请根据最新一句和上下文，输出严格 JSON，不要输出 markdown 或解释。\n"
         "JSON 结构："
-        '{"chat_intent":"banter|explanation|lookup|plugin_question",'
+        '{"chat_intent":"banter|explanation|lookup|plugin_question|image_generation",'
         '"plugin_question_intent":"capability|implementation|latest",'
         '"ambiguity_level":"low|medium|high",'
         '"recommend_silence":false,'
@@ -306,7 +262,8 @@ async def infer_turn_semantic_frame_with_llm(
         '"reason":"一句极短中文原因"}\n'
         "判别要求：\n"
         "1. chat_intent 关注用户这一轮真正想让 bot 做什么，而不是句子里表面词汇。\n"
-        "2. plugin_question 只在对方确实在问 bot/插件/本地实现/配置/能力时使用。\n"
+        "2. plugin_question 只在对方确实在问 bot/插件/本地实现/配置/能力时使用。"
+        "用户让 bot 直接生成、绘制、制作图片/海报/头像/梗图时，chat_intent=image_generation，不要标成 plugin_question。\n"
         "3. meta_question=true 表示这句更像在问上一条消息是谁发的、为什么触发、接的是谁的话，而不是问正文知识点。\n"
         "4. requires_emotional_care=true 只在用户明显需要被安抚、接住情绪、失落/委屈/脆弱时使用；普通吐槽、调侃、玩梗不要滥开。"
         "群聊里如果不确定对方是不是在对你倾诉，优先保持 false。\n"
@@ -380,12 +337,9 @@ __all__ = [
     "IntentDecision",
     "PluginQuestionIntent",
     "TurnSemanticFrame",
-    "classify_chat_intent",
-    "heuristic_intent_decision",
-    "heuristic_turn_semantic_frame",
     "infer_intent_decision_with_llm",
     "infer_turn_semantic_frame_with_llm",
-    "is_plugin_question",
     "looks_like_explanatory_output",
+    "metadata_fallback_turn_semantic_frame_for_session",
     "normalize_intent_text",
 ]

@@ -6,6 +6,7 @@ from ..provider_router import call_ai_api as call_ai_api_core
 from ..provider_router import (
     get_configured_api_providers as get_configured_api_providers_core,
 )
+from ..model_router import get_model_override_for_role
 from ..runtime_state import is_msg_processed as is_msg_processed_core
 from ..web_grounding import (
     build_grounding_context as build_grounding_context_core,
@@ -131,6 +132,7 @@ def build_ai_api_caller(
     plugin_config: Any,
     logger: Any,
     model_override_field_name: str = "",
+    model_role: str = "",
 ) -> Callable[
     [List[Dict[str, Any]], Optional[List[Dict[str, Any]]], Optional[int], float],
     Awaitable[Optional[str]],
@@ -142,7 +144,9 @@ def build_ai_api_caller(
         temperature: float = 0.7,
     ) -> Optional[str]:
         model_override = ""
-        if model_override_field_name:
+        if model_role:
+            model_override = get_model_override_for_role(plugin_config, model_role)
+        if not model_override and model_override_field_name:
             model_override = str(getattr(plugin_config, model_override_field_name, "") or "").strip()
         response = await call_ai_api_core(
             messages,

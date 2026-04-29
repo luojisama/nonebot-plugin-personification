@@ -245,7 +245,7 @@ async def _register_skill(registry: ToolRegistry, logger: Any, skill_dir: Path, 
             for tool in tools:
                 if isinstance(tool, AgentTool):
                     registry.register(tool)
-            if tools:
+            if isinstance(result, list):
                 return
         except Exception as e:
             logger.warning(f"[custom skill] build_tools failed {skill_dir.name}: {e}")

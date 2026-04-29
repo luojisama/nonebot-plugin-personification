@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Callable
 
-from nonebot_plugin_personification.skill_runtime.runtime_api import SkillRuntime
+from plugin.personification.skill_runtime.runtime_api import SkillRuntime
 from . import impl
 
 
@@ -20,6 +20,32 @@ async def _daily_news() -> str:
     return "\n".join(lines)
 
 
+async def _ai_news() -> str:
+    data = await impl._fetch_v2_data(
+        impl.BASE_URL_DEFAULT,
+        "/v2/ai-news",
+        local_base_url=impl.LOCAL_BASE_URL_DEFAULT,
+    )
+    date = str(data.get("date", "今日")).strip() or "今日"
+    items = impl._extract_items(data, "news", "items", "list")
+    lines = [f"【AI 资讯 {date}】"]
+    for idx, item in enumerate(items[:8], 1):
+        if not isinstance(item, dict):
+            continue
+        title = impl._extract_text(item, "title", "name")
+        detail = impl._extract_text(item, "summary", "description", "detail", "content")
+        source = impl._extract_text(item, "source")
+        if not title:
+            continue
+        line = f"{idx}. {title}"
+        if source:
+            line += f" [{source}]"
+        lines.append(line)
+        if detail:
+            lines.append(detail[:80])
+    return "\n".join(lines) if len(lines) > 1 else "AI 资讯暂时获取失败，稍后再试。"
+
+
 async def _trending(platform: str) -> str:
     platform = str(platform or "").strip()
     mapped = impl.PLATFORM_MAP.get(platform)
@@ -30,49 +56,50 @@ async def _trending(platform: str) -> str:
         f"/v2/{mapped}",
         local_base_url=impl.LOCAL_BASE_URL_DEFAULT,
     )
-    items = data.get("list", [])
+    items = impl._extract_items(data, "list", "items")
     lines = [f"【{platform} 热搜 Top10】"]
-    if isinstance(items, list):
-        for idx, item in enumerate(items[:10], 1):
-            title = str(item.get("title", "")) if isinstance(item, dict) else ""
-            if title:
-                lines.append(f"{idx}. {title}")
+    for idx, item in enumerate(items[:10], 1):
+        if isinstance(item, dict):
+            title = impl._extract_text(item, "title", "name", "word", "hotword", "keyword")
+        else:
+            title = str(item or "").strip()
+        if title:
+            lines.append(f"{idx}. {title}")
     return "\n".join(lines)
 
 
 async def _joke() -> str:
-    data = await impl._fetch_v2_data(impl.BASE_URL_DEFAULT, "/v2/joke", local_base_url=impl.LOCAL_BASE_URL_DEFAULT)
-    return str(data.get("content", "")).strip() or "段子暂时获取失败，等会再讲一个。"
+    data = await impl._fetch_v2_data(impl.BASE_URL_DEFAULT, "/v2/duanzi", local_base_url=impl.LOCAL_BASE_URL_DEFAULT)
+    return impl._extract_text(data, "duanzi", "content", "text") or "段子暂时获取失败，等会再讲一个。"
 
 
 async def _history() -> str:
-    data = await impl._fetch_v2_data(impl.BASE_URL_DEFAULT, "/v2/history", local_base_url=impl.LOCAL_BASE_URL_DEFAULT)
-    items = data.get("list", data if isinstance(data, list) else [])
+    data = await impl._fetch_v2_data(
+        impl.BASE_URL_DEFAULT,
+        "/v2/today-in-history",
+        local_base_url=impl.LOCAL_BASE_URL_DEFAULT,
+    )
+    items = impl._extract_items(data, "items", "list")
     lines = ["【历史上的今天】"]
-    if isinstance(items, list):
-        for item in items[:5]:
-            if not isinstance(item, dict):
-                continue
-            year = str(item.get("year", "")).strip()
-            title = str(item.get("title", "")).strip()
-            if year and title:
-                lines.append(f"{year}年：{title}")
+    for item in items[:5]:
+        if not isinstance(item, dict):
+            continue
+        year = str(item.get("year", "")).strip()
+        title = str(item.get("title", "")).strip()
+        if year and title:
+            lines.append(f"{year}年：{title}")
     return "\n".join(lines)
 
 
 async def _epic() -> str:
     data = await impl._fetch_v2_data(impl.BASE_URL_DEFAULT, "/v2/epic", local_base_url=impl.LOCAL_BASE_URL_DEFAULT)
-    games = data.get("list", data.get("games", data if isinstance(data, list) else []))
+    games = impl._extract_items(data, "list", "games", "items")
     lines = ["【Epic 本周免费游戏】"]
-    if isinstance(games, list):
-        for game in games[:4]:
-            if not isinstance(game, dict):
-                continue
-            title = str(game.get("title", "")).strip()
-            end_date = impl._to_mmdd(str(game.get("end", "")))
-            if title:
-                lines.append(f"《{title}》 免费至 {end_date}")
-    return "\n".join(lines)
+    for game in games[:4]:
+        if not isinstance(game, dict):
+            continue
+        lines.extend(impl._format_epic_game_line(game))
+    return "\n".join(lines) if len(lines) > 1 else "Epic 本周暂无免费游戏信息。"
 
 
 async def _gold() -> str:
@@ -119,6 +146,9 @@ async def run(topic: str = "daily", platform: str = "微博", keyword: str = "",
     handlers: dict[str, Callable[[], object]] = {
         "daily": _daily_news,
         "news": _daily_news,
+        "ai_news": _ai_news,
+        "ai-news": _ai_news,
+        "ai": _ai_news,
         "trending": lambda: _trending(platform),
         "joke": _joke,
         "history": _history,
@@ -148,6 +178,7 @@ def build_tools(runtime: SkillRuntime):
     logger = runtime.logger
     return [
         impl.build_daily_news_tool(base, logger, local_base),
+        impl.build_ai_news_tool(base, logger, local_base),
         impl.build_trending_tool(base, logger, local_base),
         impl.build_joke_tool(base, logger, local_base),
         impl.build_history_today_tool(base, logger, local_base),
@@ -156,4 +187,3 @@ def build_tools(runtime: SkillRuntime):
         impl.build_baike_tool(base, logger, local_base),
         impl.build_exchange_rate_tool(base, logger, local_base),
     ]
-

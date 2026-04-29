@@ -19,6 +19,8 @@ from ...core.memory_defaults import DEFAULT_PRIVATE_HISTORY_TURNS, MAX_PRIVATE_H
 from ...core.message_parts import build_user_message_content
 from ...core.message_relations import build_event_relation_metadata
 from ...core.persona_profile import load_persona_profile, render_persona_snapshot
+from ...core.prompt_loader import pick_ack_phrase
+from ...core.reply_style_policy import build_reply_style_policy_prompt
 from ...core.visual_capabilities import VISUAL_ROUTE_REPLY_PLAIN
 from ...skill_runtime.runtime_api import SkillRuntime
 from ...skills.skillpacks.friend_request_tool.scripts.main import build_friend_request_tool_for_runtime
@@ -28,6 +30,8 @@ from ...skills.skillpacks.group_info_tool.scripts.main import build_group_info_t
 _FRIEND_IDS_CACHE: Dict[str, tuple[float, set[str]]] = {}
 _IMAGE_CLASSIFY_CACHE: Dict[str, IncomingImageClassification] = {}
 _IMAGE_CLASSIFY_CACHE_MAX = 256
+_DEFAULT_RESPONSE_TIMEOUT_SECONDS = 180.0
+_AGENT_TIME_BUDGET_RESERVE_SECONDS = 30.0
 
 
 @dataclass(frozen=True)
@@ -492,6 +496,8 @@ def should_use_agent_for_reply(
     tool_registry: Any,
     agent_tool_caller: Any,
     message_intent: str,
+    ambiguity_level: str = "",
+    is_direct_mention: bool = False,
     has_image_input: bool,
 ) -> bool:
     if not (
@@ -504,7 +510,25 @@ def should_use_agent_for_reply(
         return True
     if bool(getattr(plugin_config, "personification_web_search_always", False)):
         return True
-    return str(message_intent or "").strip() in {"lookup", "plugin_question", "explanation"}
+    if (
+        str(message_intent or "").strip() == "lookup"
+        and str(ambiguity_level or "").strip().lower() == "high"
+        and not is_direct_mention
+    ):
+        return False
+    return str(message_intent or "").strip() in {"lookup", "plugin_question", "explanation", "image_generation"}
+
+
+def compute_agent_time_budget(
+    *,
+    started_at: float | None,
+    total_timeout_seconds: float = _DEFAULT_RESPONSE_TIMEOUT_SECONDS,
+    reserve_seconds: float = _AGENT_TIME_BUDGET_RESERVE_SECONDS,
+) -> float | None:
+    available = float(total_timeout_seconds) - float(reserve_seconds)
+    if started_at is not None:
+        available -= max(0.0, time.monotonic() - float(started_at))
+    return max(0.0, available)
 
 
 def clone_tool_registry(registry: ToolRegistry) -> ToolRegistry:
@@ -554,6 +578,10 @@ async def run_agent_if_enabled(
     repeat_clusters: list[dict[str, Any]] | None = None,
     relationship_hint: str = "",
     recent_bot_replies: list[str] | None = None,
+    precomputed_intent: Any = None,
+    started_at: float | None = None,
+    is_direct_mention: bool = False,
+    response_timeout_seconds: float = _DEFAULT_RESPONSE_TIMEOUT_SECONDS,
     task_exc_logger: Callable[[str, Any], Any] | None = None,
 ) -> tuple[str | None, bool, bool]:
     if not (
@@ -590,6 +618,20 @@ async def run_agent_if_enabled(
             is_group_scene=hasattr(event, "group_id") and not str(getattr(event, "group_id", "")).startswith("private_"),
         )
     )
+    ack_phrase = ""
+    if is_direct_mention:
+        group_id = str(getattr(event, "group_id", "") or "").strip() or None
+        ack_phrase = pick_ack_phrase(
+            runtime.plugin_config,
+            persona.get_group_config,
+            runtime.logger,
+            group_id=group_id,
+        )
+    ack_sender = None
+    if ack_phrase:
+        async def _ack_sender(text: str, *, _phrase: str = ack_phrase) -> None:
+            await bot.send(event, str(text or "").strip() or _phrase)
+        ack_sender = _ack_sender
     result = await run_agent(
         messages=messages,
         registry=runtime_registry,
@@ -597,7 +639,7 @@ async def run_agent_if_enabled(
         executor=executor,
         plugin_config=runtime.plugin_config,
         logger=runtime.logger,
-        max_steps=getattr(runtime.plugin_config, "personification_agent_max_steps", 7),
+        max_steps=getattr(runtime.plugin_config, "personification_agent_max_steps", 10),
         current_image_urls=current_image_urls,
         direct_image_input=direct_image_input,
         query_rewrite_context=QueryRewriteContext(
@@ -607,6 +649,12 @@ async def run_agent_if_enabled(
         repeat_clusters=list(repeat_clusters or []),
         relationship_hint=relationship_hint,
         recent_bot_replies=list(recent_bot_replies or []),
+        precomputed_intent=precomputed_intent,
+        time_budget_seconds=compute_agent_time_budget(
+            started_at=started_at,
+            total_timeout_seconds=response_timeout_seconds,
+        ),
+        ack_sender=ack_sender,
     )
     if runtime.inner_state_updater and task_exc_logger is not None:
         user_id = str(getattr(event, "user_id", "") or "")
@@ -626,10 +674,10 @@ def stale_reply_abort_reason(state: Dict[str, Any]) -> str:
     if not isinstance(entry, dict):
         return ""
     current_generation = int(entry.get("current_generation", 0) or 0)
-    if current_generation != generation:
-        return f"会话 {state.get('batch_session_key', '') or '当前会话'} 已切换到更新批次，本轮旧回复丢弃。"
     if int(entry.get("superseded_generation", 0) or 0) >= generation:
         return f"会话 {state.get('batch_session_key', '') or '当前会话'} 当前批次已被新的直呼消息抢占，旧回复丢弃。"
+    if current_generation != generation:
+        return f"会话 {state.get('batch_session_key', '') or '当前会话'} 已切换到更新批次，本轮旧回复丢弃。"
     if not bool(entry.get("newer_batch_for_current")):
         return ""
     return f"会话 {state.get('batch_session_key', '') or '当前会话'} 已出现更新批次，本轮旧回复丢弃。"
@@ -678,6 +726,9 @@ def build_base_system_prompt(
     prelude_chunks: List[str],
     context_chunks: List[str],
     postlude_chunks: List[str],
+    plugin_summary: str = "",
+    has_visual_context: bool = False,
+    photo_like: bool = False,
 ) -> str:
     profile = load_persona_profile(base_prompt)
     parts: List[str] = [base_prompt if isinstance(base_prompt, str) else ""]
@@ -691,6 +742,8 @@ def build_base_system_prompt(
     )
     if emotion_block:
         parts.append(emotion_block)
+    if plugin_summary:
+        parts.append(f"[已安装插件摘要（仅供参考）]\n{str(plugin_summary).strip()}")
     if is_private_session:
         parts.append(
             "## 私聊规则\n"
@@ -712,9 +765,15 @@ def build_base_system_prompt(
             "6. 遇到梗、复读、空耳、调侃时，先顺着气氛接一句；不要把笑点解释成“这个梗是怎么构成的”。\n"
             "7. 除非对方明确在问出处或意思，否则不要用“像是把 X 玩成 Y 了”这种分析梗结构的句式。\n"
             "8. 如果最新消息只是“在吗/还在吗/有人吗”这类心跳，只回应当前问候，不要延续旧话题补答。"
-            "9. 遇到可能是游戏/圈子黑话的词语（如“粥”=三角洲行动，“鸡”=绝地求生，“dd”=关注，“典”=嘘讽），\n若上下文无法确认含义，不要按字面理解强行接话，优先沉默或等待更多上下文再参与。"
+            "9. 遇到可能是游戏/圈子黑话的词语，若上下文无法确认含义，不要按字面理解强行接话，优先沉默或等待更多上下文再参与。"
             "10. 回复时不要把对方说的话原样重复后加感叹（如“太真实了/太直球了”），直接接话即可。"
         )
+    parts.append(
+        build_reply_style_policy_prompt(
+            has_visual_context=has_visual_context,
+            photo_like=photo_like,
+        )
+    )
     parts.append(build_prompt_injection_guard())
     parts.extend(chunk for chunk in context_chunks if chunk)
     parts.append(
@@ -726,7 +785,8 @@ def build_base_system_prompt(
         "5. [BLOCK] 仅作高风险标记参考，不要轻易触发。\n"
         "6. 不要为了迎合用户而确认不确定的事实；证据不足时直接说不确定或少说。\n"
         "7. 输出纯文本，禁止使用 markdown 格式（不要用 **加粗**、*斜体*、# 标题、- 列表符号、`代码块`等）。\n"
-        "8. 收到贴图/表情包时不要主动解释；收到真实照片时可以像群友看朋友圈一样自然回应，不需要等对方先提问。"
+        "8. 收到贴图/表情包时绝对不要对图片内容发表任何评论（包括“这图也太X了”“哈哈这个”等），"
+        "当作没看见，按对话语境继续；收到真实照片时可以像群友看朋友圈一样自然回应。"
         "表情包/梗图/截图可以当作语气线索理解，但没人问图里是什么时，不要主动做图片讲解。"
     )
     parts.extend(chunk for chunk in postlude_chunks if chunk)
@@ -742,6 +802,7 @@ __all__ = [
     "clear_image_classify_cache",
     "classify_incoming_image",
     "clone_tool_registry",
+    "compute_agent_time_budget",
     "count_user_interactions",
     "extract_reply_sender_meta",
     "get_cached_friend_ids",

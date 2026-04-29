@@ -4,7 +4,7 @@ import json
 import time
 from pathlib import Path
 
-from nonebot_plugin_personification.core import tasks_service as service
+from plugin.personification.core import tasks_service as service
 
 
 DATA_DIR = Path("data") / "personification"
@@ -84,4 +84,3 @@ async def run(operation: str, user_id: str, task_id: str = "", description: str 
     if op in {"cancel", "remove", "delete"}:
         return await run_cancel(user_id=user_id, task_id=task_id)
     return "operation 可选: create, cancel"
-

@@ -149,7 +149,8 @@ async def should_speak_in_random_chat(
     raw_message_text: str,
     message_text: str,
     message_content: str,
-    recent_context_hint: str,
+    recent_context_hint: str = "",
+    recent_context: str = "",
     relationship_hint: str,
     repeat_clusters: list[dict[str, Any]] | None,
     recent_bot_replies: list[str],
@@ -157,11 +158,14 @@ async def should_speak_in_random_chat(
     ambiguity_level: str,
     message_target: str,
     solo_speaker_follow: bool,
+    knowledge_store: Any = None,
 ) -> bool:
+    _ = knowledge_store
+    effective_recent_context = str(recent_context_hint or recent_context or "").strip()
     return await decide_random_chat_speak(
         runtime.lite_call_ai_api or runtime.call_ai_api,
         raw_message_text=raw_message_text or message_text or message_content,
-        recent_context=recent_context_hint,
+        recent_context=effective_recent_context,
         relationship_hint=relationship_hint,
         repeat_clusters=repeat_clusters,
         recent_bot_replies=recent_bot_replies,

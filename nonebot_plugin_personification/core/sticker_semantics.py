@@ -96,7 +96,7 @@ def default_sticker_semantic_hint(
     *,
     is_random_chat: bool = False,
 ) -> str:
-    if chat_intent in {"lookup", "plugin_question", "explanation"}:
+    if chat_intent in {"lookup", "plugin_question", "explanation", "image_generation"}:
         return "淡定|表达疑惑"
     if is_random_chat:
         return "搞笑|接梗"

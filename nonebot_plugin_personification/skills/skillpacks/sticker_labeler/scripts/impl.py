@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterable, Optional
 
-from nonebot_plugin_personification.core.sticker_library import (
+from plugin.personification.core.sticker_library import (
     STICKER_SCHEMA_VERSION,
     STICKER_VISION_PROMPT,
     SUPPORTED_STICKER_SUFFIXES,
@@ -20,7 +20,7 @@ from nonebot_plugin_personification.core.sticker_library import (
     resolve_sticker_dir,
     save_sticker_metadata,
 )
-from nonebot_plugin_personification.skills.skillpacks.vision_caller.scripts.impl import VisionCaller
+from plugin.personification.skills.skillpacks.vision_caller.scripts.impl import VisionCaller
 
 
 LABELING_PROMPT = STICKER_VISION_PROMPT
@@ -116,6 +116,7 @@ class StickerLabeler:
                     "ocr_text": result.ocr_text,
                     "use_hint": result.use_hint,
                     "avoid_hint": result.avoid_hint,
+                    "style": result.style,
                     "vision_route": result.vision_route,
                 },
                 model_name="",
@@ -123,7 +124,7 @@ class StickerLabeler:
                 file_hash=file_hash,
             )
         raw = await effective_vision_caller.describe(LABELING_PROMPT, image_file_to_data_url_core(file))
-        from nonebot_plugin_personification.core.sticker_library import normalize_sticker_vision_result as _nsv
+        from plugin.personification.core.sticker_library import normalize_sticker_vision_result as _nsv
         parsed = _nsv(raw, vision_route="vision_fallback")
         if not parsed.is_sticker:
             return {"is_sticker": False, "file_hash": file_hash}
@@ -170,6 +171,7 @@ class StickerLabeler:
                     success += 1
                     self.logger.info(
                         f"[sticker labeler] [{idx}/{total}] {file.name}  "
+                        f"style={entry.get('style', 'anime')} "
                         f"{entry.get('mood_tags', [])} / {entry.get('scene_tags', [])}"
                     )
                 except Exception:
@@ -222,6 +224,7 @@ class StickerLabeler:
                     success += 1
                     self.logger.info(
                         f"[sticker labeler] [relabel {idx}/{total}] {file.name} "
+                        f"style={entry.get('style', 'anime')} "
                         f"{entry.get('mood_tags', [])} / {entry.get('scene_tags', [])}"
                     )
                 except Exception as e:
@@ -358,4 +361,3 @@ def start_watchdog(
     observer.schedule(Handler(), str(sticker_dir), recursive=False)
     observer.start()
     return observer
-

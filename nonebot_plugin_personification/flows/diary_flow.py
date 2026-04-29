@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import random
 import re
 from pathlib import Path
@@ -8,6 +9,7 @@ from typing import Any, Awaitable, Callable, Optional
 
 from ..agent.inner_state import load_inner_state, update_state_from_diary
 from ..core.emotion_state import describe_group_emotion_memory, load_emotion_state
+from ..skills.skillpacks.image_gen.scripts.impl import generate_image as generate_codex_image
 
 
 def filter_sensitive_content(text: str) -> str:
@@ -40,6 +42,87 @@ def clean_generated_text(text: str) -> str:
     cleaned = re.sub(r"</?\s*output.*?>", "", cleaned, flags=re.IGNORECASE)
     cleaned = re.sub(r"</?\s*message.*?>", "", cleaned, flags=re.IGNORECASE)
     return cleaned.strip()
+
+
+def _extract_json_object(raw: str) -> dict[str, Any] | None:
+    text = str(raw or "").strip()
+    if not text:
+        return None
+    if text.startswith("```"):
+        text = re.sub(r"^```(?:json)?\s*", "", text).rstrip("`").strip()
+    try:
+        payload = json.loads(text)
+    except Exception:
+        match = re.search(r"\{[\s\S]*\}", text)
+        if not match:
+            return None
+        try:
+            payload = json.loads(match.group(0))
+        except Exception:
+            return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _trim_qzone_content(text: str, *, max_chars: int = 90) -> str:
+    cleaned = clean_generated_text(text)
+    cleaned = re.sub(r"^(POST|SKIP)\s*[|：:]\s*", "", cleaned, flags=re.IGNORECASE).strip()
+    cleaned = re.sub(r"#[^#\s]{1,24}", "", cleaned).strip()
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    if len(cleaned) <= max_chars:
+        return cleaned
+    candidate = cleaned[:max_chars]
+    for index in range(len(candidate) - 1, max(0, len(candidate) - 24), -1):
+        if candidate[index] in "。！？!?\n":
+            return candidate[: index + 1].strip()
+    return candidate.rstrip("，、,. ") + "..."
+
+
+async def _maybe_generate_qzone_image_marker(
+    *,
+    tool_caller: Any,
+    image_prompt: str,
+    logger: Any,
+) -> str:
+    prompt = str(image_prompt or "").strip()
+    if not prompt or tool_caller is None:
+        return ""
+    try:
+        result = await generate_codex_image(
+            prompt,
+            tool_caller=tool_caller,
+            size="1024x1024",
+            image_model="gpt-image-2",
+        )
+    except Exception as exc:
+        logger.warning(f"[qzone] Codex 配图生成失败: {exc}")
+        return ""
+    if not isinstance(result, dict):
+        return ""
+    b64 = str(result.get("b64_json", "") or "").strip()
+    if not b64:
+        error = str(result.get("error", "") or "").strip()
+        if error:
+            logger.warning(f"[qzone] Codex 配图生成失败: {error}")
+        return ""
+    return f"\n[IMAGE_B64]{b64}[/IMAGE_B64]"
+
+
+async def _build_qzone_post_with_optional_image(
+    *,
+    content: str,
+    image_prompt: str,
+    tool_caller: Any,
+    logger: Any,
+) -> str:
+    text = _trim_qzone_content(content)
+    if not text:
+        return ""
+    image_marker = await _maybe_generate_qzone_image_marker(
+        tool_caller=tool_caller,
+        image_prompt=image_prompt,
+        logger=logger,
+    )
+    return f"{text}{image_marker}"
 
 
 async def get_recent_chat_context(bot: Any, logger: Any) -> str:
@@ -136,7 +219,7 @@ async def generate_ai_diary(
     tool_caller: Any = None,
     data_dir: Optional[Path] = None,
 ) -> str:
-    """Generate a weekly diary entry from recent chat context."""
+    """Generate a short Qzone post from recent chat context."""
     system_prompt = load_prompt()
     chat_context = await get_recent_chat_context(bot, logger)
     emotion_hint = ""
@@ -154,27 +237,39 @@ async def generate_ai_diary(
             logger.debug(f"[diary] load emotion_state failed: {e}")
 
     base_requirements = (
-        "请写一篇自然、像真人发动态一样的周记。\n"
-        "1. 语气要符合当前角色设定，不要像总结报告。\n"
-        "2. 长度控制在 80 到 200 字之间。\n"
-        "3. 可以写聊天里看到的趣事、自己的心情、最近在意的小事。\n"
-        "4. 不要暴露这是 AI 生成，也不要列条目。\n"
-        "5. 直接输出正文，不要加标题、标签或额外说明。"
+        "请写一条自然、像真人随手发的 QQ 空间说说，不要写周记小作文。\n"
+        "输出严格 JSON：{\"content\":\"正文\",\"image_prompt\":\"可选英文配图提示词\"}。\n"
+        "1. 正文 20-80 个中文字符，短一点，像日常碎碎念。\n"
+        "2. 语气符合当前角色设定，不要像总结报告、日报、作文或公告。\n"
+        "3. 可以写聊天里看到的小事、自己的心情、突然冒出的念头。\n"
+        "4. 不要列条目、不要标题、不要 hashtag、不要说自己是 AI。\n"
+        "5. image_prompt 只有在这条说说适合配一张氛围图时填写英文画面描述；不适合就留空。"
     )
 
     if chat_context:
         rich_prompt = (
-            "请结合下面这些最近聊天内容，写一篇带一点生活感的周记。\n"
+            "请结合下面这些最近聊天内容，写一条带一点生活感的 QQ 空间说说。\n"
             "不要逐条复述聊天记录，而是把它们消化成自己的感受、吐槽或碎碎念。\n\n"
             f"{chat_context}\n\n"
             f"{emotion_hint}\n\n"
             f"{base_requirements}"
         )
-        rich_result = await _generate_once(
+        raw_rich_result = await _generate_once(
             system_prompt,
             rich_prompt,
             call_ai_api=call_ai_api,
         )
+        payload = _extract_json_object(raw_rich_result)
+        rich_result = ""
+        if payload:
+            rich_result = await _build_qzone_post_with_optional_image(
+                content=str(payload.get("content", "") or ""),
+                image_prompt=str(payload.get("image_prompt", "") or ""),
+                tool_caller=tool_caller,
+                logger=logger,
+            )
+        elif raw_rich_result:
+            rich_result = _trim_qzone_content(raw_rich_result)
         if rich_result:
             _schedule_diary_state_update(
                 diary_text=rich_result,
@@ -187,14 +282,24 @@ async def generate_ai_diary(
         logger.warning("[diary] rich prompt generation failed, fallback to basic prompt")
 
     basic_prompt = (
-        "请直接写一篇自然的短周记，像是角色自己随手发的碎碎念。\n\n"
+        "请直接写一条自然的短说说，像是角色自己随手发的碎碎念。\n\n"
         f"{base_requirements}"
     )
-    result = await _generate_once(
+    raw_result = await _generate_once(
         system_prompt,
         basic_prompt,
         call_ai_api=call_ai_api,
     )
+    payload = _extract_json_object(raw_result)
+    if payload:
+        result = await _build_qzone_post_with_optional_image(
+            content=str(payload.get("content", "") or ""),
+            image_prompt=str(payload.get("image_prompt", "") or ""),
+            tool_caller=tool_caller,
+            logger=logger,
+        )
+    else:
+        result = _trim_qzone_content(raw_result)
     if result:
         _schedule_diary_state_update(
             diary_text=result,
@@ -212,6 +317,7 @@ async def maybe_generate_proactive_qzone_post(
     call_ai_api: Callable[..., Awaitable[Optional[str]]],
     logger: Any,
     data_dir: Optional[Path] = None,
+    tool_caller: Any = None,
 ) -> str:
     """根据近期聊天与内心状态决定是否主动发一条更日常的空间动态。"""
     system_prompt = load_prompt()
@@ -254,18 +360,20 @@ async def maybe_generate_proactive_qzone_post(
 
     decision_prompt = (
         "你现在在考虑要不要发一条 QQ 空间说说。\n"
-        "请基于最近聊天内容、当前心情和挂念，判断你此刻是不是真的有想发动态的冲动。\n\n"
+        "请基于最近聊天内容、当前心情和挂念，判断你此刻是不是真的有想发动态的冲动。\n"
+        "输出严格 JSON：{\"action\":\"skip|post\",\"content\":\"正文\",\"image_prompt\":\"可选英文配图提示词\",\"reason\":\"极短原因\"}。\n\n"
         f"当前心情：{mood}\n"
         f"当前精力：{energy}\n"
         f"最近挂念：\n{pending_block}\n\n"
         f"近期群情绪记忆：\n{emotion_hint or '- 暂无明显群情绪记忆'}\n\n"
         f"最近聊天片段：\n{chat_context}\n\n"
         "要求：\n"
-        "1. 如果没有明确想说的话，就输出 SKIP|原因。\n"
-        "2. 如果想发，输出 POST|正文。\n"
-        "3. 正文要像真人随手发的空间碎碎念，40-140 字，口语化，有生活感，不要像周报或总结。\n"
+        "1. 如果没有明确想说的话，action=skip。\n"
+        "2. 如果想发，action=post，并给出 content。\n"
+        "3. 正文 15-70 个中文字符，像真人随手发的空间碎碎念，别写长篇大段。\n"
         "4. 可以带一点吐槽、感慨、突然想到的念头，但不要列表、不要标题、不要 hashtag。\n"
-        "5. 不要为了发而发，不要重复最近已经说过很多遍的话题。"
+        "5. 不要为了发而发，不要重复最近已经说过很多遍的话题。\n"
+        "6. 如果适合配图，image_prompt 写英文画面描述，要求贴合人设和正文氛围；不适合就留空。"
     )
     result = await _generate_once(
         system_prompt,
@@ -274,6 +382,16 @@ async def maybe_generate_proactive_qzone_post(
     )
     if not result:
         return ""
+    payload = _extract_json_object(result)
+    if payload:
+        if str(payload.get("action", "") or "").strip().lower() != "post":
+            return ""
+        return await _build_qzone_post_with_optional_image(
+            content=str(payload.get("content", "") or ""),
+            image_prompt=str(payload.get("image_prompt", "") or ""),
+            tool_caller=tool_caller,
+            logger=logger,
+        )
     if result.startswith("POST|"):
-        return clean_generated_text(result.split("|", 1)[1]).strip()
+        return _trim_qzone_content(result.split("|", 1)[1])
     return ""

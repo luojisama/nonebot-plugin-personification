@@ -4,7 +4,7 @@ import asyncio
 
 from ._loader import load_personification_module
 
-context_policy = load_personification_module("nonebot_plugin_personification.core.context_policy")
+context_policy = load_personification_module("plugin.personification.core.context_policy")
 
 
 def test_compress_context_if_needed_keeps_short_context_without_llm_call() -> None:
@@ -57,4 +57,3 @@ def test_compress_context_if_needed_summarizes_long_context() -> None:
     assert called is True
     assert result[0].startswith("## 较早上下文摘要")
     assert context_policy._estimate_chunks_tokens(result) <= 80
-

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from nonebot_plugin_personification.skill_runtime.runtime_api import SkillRuntime
+from plugin.personification.skill_runtime.runtime_api import SkillRuntime
 from . import impl
 
 
@@ -27,4 +27,3 @@ def build_tools(runtime: SkillRuntime):
     skills_root_raw = getattr(runtime.plugin_config, "personification_skills_path", None)
     skills_root = Path(skills_root_raw) if skills_root_raw else None
     return [impl.build_weather_tool(skills_root, runtime.logger)]
-

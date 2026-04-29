@@ -38,7 +38,8 @@ class Config(BaseModel):
     personification_tts_global_enabled: bool = True
 
     personification_agent_enabled: bool = True
-    personification_agent_max_steps: int = 7
+    personification_agent_max_steps: int = 10
+    personification_response_timeout: int = 180
     personification_image_input_mode: str = "auto"
     personification_image_detail: str = "auto"
     personification_builtin_search: bool = True
@@ -47,6 +48,7 @@ class Config(BaseModel):
     personification_tool_web_search_mode: str = "enabled"
     personification_thinking_mode: str = "none"
     personification_state_thinking_mode: str = "adaptive"
+    personification_model_overrides: Dict[str, str] = {}
     personification_data_dir: str = ""
     personification_persona_enabled: bool = True
     personification_persona_history_max: int = DEFAULT_PERSONA_HISTORY_MAX
@@ -102,8 +104,19 @@ class Config(BaseModel):
     personification_video_fallback_model: str = ""
     personification_video_fallback_auth_path: str = ""
     personification_plugin_knowledge_build_enabled: bool = False
+    personification_image_gen_enabled: bool = True
+    personification_image_gen_model: str = "gpt-image-2"
+    personification_image_gen_background_enabled: bool = True
+    personification_image_gen_timeout: int = 180
+    personification_parallel_research_enabled: bool = True
+    personification_parallel_research_lookup_enabled: bool = True
+    personification_parallel_research_max_workers: int = 6
+    personification_parallel_research_worker_timeout: int = 35
+    personification_parallel_research_total_timeout: int = 90
+    personification_parallel_research_max_tool_rounds: int = 2
     personification_qzone_enabled: bool = False
     personification_qzone_cookie: str = ""
+    # DEPRECATED: use personification_qzone_cookie.
     qzone_cookie: str = ""
     personification_qzone_proactive_enabled: bool = False
     personification_qzone_check_interval: int = 180
@@ -138,10 +151,18 @@ class Config(BaseModel):
     personification_tts_enabled: bool = False
     personification_tts_auto_enabled: bool = False
     personification_tts_auto_probability: float = 0.2
+    personification_tts_llm_decision_enabled: bool = True
+    personification_tts_decision_timeout: int = 8
+    personification_tts_builtin_safety_enabled: bool = True
+    personification_tts_forbidden_policy: str = ""
     personification_tts_api_key: str = ""
     personification_tts_api_url: str = "https://api.xiaomimimo.com/v1"
-    personification_tts_model: str = "mimo-v2-tts"
+    personification_tts_model: str = "mimo-v2.5-tts"
+    personification_tts_mode: str = "preset"
     personification_tts_default_voice: str = "mimo_default"
+    personification_tts_voice_design_prompt: str = ""
+    personification_tts_voice_clone: str = ""
+    personification_tts_voice_clone_path: str = ""
     personification_tts_default_format: str = "wav"
     personification_tts_max_chars_per_segment: int = 120
     personification_tts_timeout: int = 60
@@ -257,7 +278,15 @@ class Config(BaseModel):
             self.personification_tool_web_search_enabled = bool(self.personification_web_search)
         elif "personification_tool_web_search_enabled" in fields_set and "personification_web_search" not in fields_set:
             self.personification_web_search = bool(self.personification_tool_web_search_enabled)
-        if getattr(self, "personification_web_search", None) is not None:
+        if "qzone_cookie" in fields_set:
+            if "personification_qzone_cookie" not in fields_set:
+                self.personification_qzone_cookie = str(self.qzone_cookie or "")
+            warnings.warn(
+                "qzone_cookie 已废弃，请改用 personification_qzone_cookie",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+        if "personification_web_search" in fields_set:
             warnings.warn(
                 "personification_web_search 已废弃，请改用 skill 配置控制联网搜索",
                 DeprecationWarning,

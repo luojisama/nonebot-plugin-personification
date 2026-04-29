@@ -6,28 +6,28 @@ from contextvars import ContextVar
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Dict, List, Optional
 
-from nonebot_plugin_personification.agent.tool_registry import AgentTool
-from nonebot_plugin_personification.core.sticker_library import (
+from plugin.personification.agent.tool_registry import AgentTool
+from plugin.personification.core.sticker_library import (
     analyze_sticker_image,
     list_local_sticker_files,
     load_sticker_metadata,
     render_sticker_semantic_summary,
     resolve_sticker_dir,
 )
-from nonebot_plugin_personification.core.sticker_semantics import (
+from plugin.personification.core.sticker_semantics import (
     StickerSemanticHint,
     normalize_sticker_semantic_hint,
     parse_sticker_semantic_hint,
 )
-from nonebot_plugin_personification.core.media_understanding import analyze_images_with_route_or_fallback
-from nonebot_plugin_personification.core.sticker_feedback import get_sticker_score
-from nonebot_plugin_personification.core.image_result_cache import (
+from plugin.personification.core.media_understanding import analyze_images_with_route_or_fallback
+from plugin.personification.core.sticker_feedback import get_sticker_score
+from plugin.personification.core.image_result_cache import (
     build_image_cache_key,
     get_cached_image_result,
     normalize_cache_text,
     set_cached_image_result,
 )
-from nonebot_plugin_personification.skills.skillpacks.vision_caller.scripts.impl import VisionCaller
+from plugin.personification.skills.skillpacks.vision_caller.scripts.impl import VisionCaller
 
 
 # ---------------------------------------------------------------------------
@@ -310,6 +310,8 @@ def rank_sticker_candidates(
         if not isinstance(meta, dict):
             meta = {}
         if meta.get("is_sticker") is False:
+            continue
+        if str(meta.get("style", "anime") or "anime").strip().lower() != "anime":
             continue
         try:
             weight = max(0.0, float(meta.get("weight", 1.0) or 1.0))
@@ -858,7 +860,7 @@ def build_curate_sticker_tool(
             metadata = load_sticker_metadata(resolved_dir)
             feedback_state = None
             try:
-                from nonebot_plugin_personification.core.sticker_feedback import load_sticker_feedback
+                from plugin.personification.core.sticker_feedback import load_sticker_feedback
                 feedback_state = await load_sticker_feedback()
             except Exception:
                 pass
@@ -872,6 +874,7 @@ def build_curate_sticker_tool(
                     continue
                 entry: Dict[str, Any] = {
                     "file": fname,
+                    "style": str(meta.get("style", "anime") or "anime"),
                     "weight": round(float(meta.get("weight", 1.0) or 1.0), 2),
                     "description": str(meta.get("description", "") or "")[:60],
                     "mood_tags": list(meta.get("mood_tags", []) or [])[:3],
@@ -911,7 +914,7 @@ def build_curate_sticker_tool(
                 changed.append({"file": fname, "weight": round(w, 2)})
             if changed:
                 import asyncio as _asyncio
-                from nonebot_plugin_personification.core.sticker_library import save_sticker_metadata
+                from plugin.personification.core.sticker_library import save_sticker_metadata
                 await save_sticker_metadata(resolved_dir, metadata)
             return json.dumps({"updated": len(changed), "changes": changed}, ensure_ascii=False)
 
@@ -945,4 +948,3 @@ def build_curate_sticker_tool(
         },
         handler=_handler,
     )
-

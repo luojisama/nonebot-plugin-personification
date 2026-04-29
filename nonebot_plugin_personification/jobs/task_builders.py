@@ -85,6 +85,7 @@ def build_maybe_generate_qzone_post_task(
     load_prompt: Callable[[], Any],
     call_ai_api: Callable[..., Awaitable[str]],
     logger: Any,
+    agent_tool_caller: Any = None,
     agent_data_dir: Any = None,
 ) -> Callable[[Any], Awaitable[str]]:
     async def _maybe_generate_qzone_post(bot: Any) -> str:
@@ -94,6 +95,7 @@ def build_maybe_generate_qzone_post_task(
             call_ai_api=call_ai_api,
             logger=logger,
             data_dir=agent_data_dir,
+            tool_caller=agent_tool_caller,
         )
 
     return _maybe_generate_qzone_post

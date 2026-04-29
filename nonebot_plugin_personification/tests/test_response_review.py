@@ -4,7 +4,7 @@ from types import SimpleNamespace
 
 from ._loader import load_personification_module
 
-response_review = load_personification_module("nonebot_plugin_personification.core.response_review")
+response_review = load_personification_module("plugin.personification.core.response_review")
 
 
 def test_looks_like_recent_duplicate_detects_same_and_similar_text() -> None:
@@ -43,3 +43,8 @@ def test_arbitrate_reply_mode_handles_key_combinations() -> None:
     assert clarify == "clarify"
     assert reply == "reply"
 
+
+def test_is_agent_reply_ooc_detects_search_style_phrasing_and_urls() -> None:
+    assert response_review.is_agent_reply_ooc("根据搜索结果，先给你两条相关链接：https://example.com/very/long/path")
+    assert response_review.is_agent_reply_ooc("我查了一下，这个设定后来改过")
+    assert not response_review.is_agent_reply_ooc("这事儿大概就是后来改设定了")

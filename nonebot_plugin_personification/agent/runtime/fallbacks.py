@@ -55,7 +55,6 @@ async def select_semantic_fallback_tool(
     has_images: bool = False,
     chat_intent: str = "",
     plugin_question_intent: str = "",
-    force_lookup: bool = False,
     user_images: list[str] | None = None,
     previous_tool_name: str = "",
     previous_tool_result_text: str = "",
@@ -66,7 +65,6 @@ async def select_semantic_fallback_tool(
         has_images=has_images,
         chat_intent=chat_intent,
         plugin_question_intent=plugin_question_intent,
-        force_lookup=force_lookup,
     )
     if not query or not semantic_schemas:
         return None

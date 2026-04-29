@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 from dataclasses import dataclass
@@ -16,6 +17,18 @@ class ResponseReviewDecision:
 class ReplyArbitrationIntent:
     ambiguity_level: str = ""
     recommend_silence: bool = False
+
+
+def make_passthrough_review_decision(
+    candidate_text: str,
+    *,
+    reason: str = "passthrough",
+) -> ResponseReviewDecision:
+    return ResponseReviewDecision(
+        action="accept",
+        text=str(candidate_text or "").strip(),
+        reason=reason,
+    )
 
 
 def _to_text_list(values: Iterable[Any], *, limit: int = 4) -> list[str]:
@@ -101,6 +114,17 @@ def _looks_like_recent_duplicate(candidate_text: str, recent_bot_replies: Iterab
 
 
 _SILENCE_CONFIDENCE_THRESHOLD = 0.72
+_AGENT_REPLY_OOC_PATTERNS = re.compile(
+    r"根据(搜索|查询|检索|找到的)结果|"
+    r"(查|搜|搜索|检索|查询)了一下|"
+    r"以下是(相关|查到的|找到的)|"
+    r"(参考链接|相关链接|来源)[：:]|"
+    r"(http|https)://\S{15,}|"
+    r"这(图|张图|个表情|表情包)(也太|真的|好|太)|"
+    r"哈哈(这个|这张|这图)|"
+    r"(图|表情包)(发的|选的|真的|也太)",
+    re.IGNORECASE,
+)
 
 
 def arbitrate_reply_mode(
@@ -132,6 +156,10 @@ def arbitrate_reply_mode(
     if ambiguity == "high" and (is_private or is_direct_mention or message_target == "bot"):
         return "clarify"
     return "reply"
+
+
+def is_agent_reply_ooc(text: str) -> bool:
+    return bool(_AGENT_REPLY_OOC_PATTERNS.search(str(text or "")))
 
 
 def _parse_review_payload(raw: str) -> ResponseReviewDecision | None:
@@ -263,6 +291,43 @@ async def recover_direct_mention_reply(
     return _strip_recovered_reply_text(str(raw or ""))
 
 
+async def rewrite_agent_reply_ooc(
+    *,
+    tool_caller: Any,
+    original_text: str,
+    persona_system: str = "",
+    timeout: float = 8.0,
+) -> str:
+    if tool_caller is None:
+        return ""
+    messages: list[dict[str, Any]] = []
+    persona_hint = str(persona_system or "").strip()
+    if persona_hint:
+        messages.append({"role": "system", "content": persona_hint[:1200]})
+    messages.append(
+        {
+            "role": "system",
+            "content": (
+                "下面这句话听起来像 AI 助手而不像普通群友。"
+                "把它用你自己的口吻重说一次，60 字以内。"
+                "去掉【搜索/查询/结果/链接/来源】类表述和 URL，不要解释改写过程。"
+            ),
+        }
+    )
+    messages.append({"role": "user", "content": str(original_text or "").strip()[:600]})
+    try:
+        response = await asyncio.wait_for(
+            tool_caller.chat_with_tools(messages, [], False),
+            timeout=timeout,
+        )
+    except Exception:
+        return ""
+    rewritten = str(getattr(response, "content", "") or "").strip()
+    if not rewritten or is_agent_reply_ooc(rewritten):
+        return ""
+    return rewritten
+
+
 async def decide_random_chat_speak(
     call_ai_api: Callable[[list[dict[str, Any]]], Awaitable[Any]],
     *,
@@ -325,6 +390,9 @@ __all__ = [
     "arbitrate_reply_mode",
     "decide_random_chat_speak",
     "extract_recent_bot_reply_texts",
+    "is_agent_reply_ooc",
+    "make_passthrough_review_decision",
     "recover_direct_mention_reply",
+    "rewrite_agent_reply_ooc",
     "review_response_text",
 ]

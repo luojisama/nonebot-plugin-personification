@@ -1,10 +1,10 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Callable, Optional
+from typing import Any, Awaitable, Callable, Optional
 
-from nonebot_plugin_personification.agent.tool_registry import AgentTool
-from nonebot_plugin_personification.core.web_grounding import do_web_search as do_web_search_core
+from plugin.personification.agent.tool_registry import AgentTool
+from plugin.personification.core.web_grounding import do_web_search as do_web_search_core
 
 
 WEB_SEARCH_DESCRIPTION = """快速搜索互联网并返回已整理的摘要文本。
@@ -68,12 +68,24 @@ def build_web_search_tool(
     get_now: Callable[[], Any],
     logger: Any,
     plugin_config: Any | None = None,
+    visual_query_builder: Callable[[str, list[str]], Awaitable[str]] | None = None,
 ) -> AgentTool:
     config = load_web_search_config(skills_root)
 
-    async def _handler(query: str) -> str:
+    async def _handler(
+        query: str,
+        images: list[str] | None = None,
+        image_urls: list[str] | None = None,
+    ) -> str:
         prefix = str(config.get("search_prompt_prefix", "") or "").strip()
-        final_query = f"{prefix} {query}".strip() if prefix else query
+        final_query = f"{prefix} {query}".strip() if prefix else str(query or "").strip()
+        image_refs = []
+        for item in list(images or []) + list(image_urls or []):
+            value = str(item or "").strip()
+            if value and value not in image_refs:
+                image_refs.append(value)
+        if image_refs and visual_query_builder is not None:
+            final_query = await visual_query_builder(final_query, image_refs)
         return await do_web_search_core(
             final_query,
             get_now=get_now,
@@ -89,7 +101,17 @@ def build_web_search_tool(
                 "query": {
                     "type": "string",
                     "description": "搜索关键词，应简洁明确，支持中英文",
-                }
+                },
+                "images": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "可选图片引用；用于先提取视觉线索再搜索",
+                },
+                "image_urls": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "可选图片 URL；等同 images",
+                },
             },
             "required": ["query"],
         },
@@ -104,4 +126,3 @@ def build_web_search_tool(
             getattr(plugin_config, "personification_tool_web_search_mode", "enabled") or "enabled"
         ).strip().lower() != "disabled",
     )
-

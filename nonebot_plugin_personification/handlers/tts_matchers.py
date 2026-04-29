@@ -9,39 +9,61 @@ from nonebot.params import CommandArg
 from ..core.tts_service import extract_persona_tts_config
 
 
-def _parse_tts_command_args(raw_text: str) -> tuple[str | None, str | None, str, str | None]:
+def _parse_tts_command_args(raw_text: str) -> tuple[dict[str, str | None], str | None]:
     text = str(raw_text or "").strip()
+    empty = {
+        "mode": None,
+        "voice": None,
+        "style": None,
+        "voice_prompt": None,
+        "voice_clone": None,
+        "voice_clone_path": None,
+        "model": None,
+        "text": "",
+    }
     if not text:
-        return None, None, "", None
+        return empty, None
     try:
         tokens = shlex.split(text)
     except ValueError as e:
-        return None, None, "", f"参数解析失败: {e}"
+        return empty, f"参数解析失败: {e}"
 
-    voice: str | None = None
-    style: str | None = None
+    options = dict(empty)
     content_parts: list[str] = []
     index = 0
     while index < len(tokens):
         token = tokens[index]
-        if token.startswith("--voice="):
-            voice = token.split("=", 1)[1].strip() or None
-        elif token == "--voice":
+        if token.startswith("--") and "=" in token:
+            key, value = token[2:].split("=", 1)
+            token = f"--{key.strip()}"
+            tokens.insert(index + 1, value)
+        if token in {"--mode", "--voice", "--style", "--voice-prompt", "--design", "--clone-voice", "--voice-clone", "--clone-path", "--clone-file", "--model"}:
             if index + 1 >= len(tokens):
-                return None, None, "", "缺少 --voice 的值。"
-            voice = tokens[index + 1].strip() or None
-            index += 1
-        elif token.startswith("--style="):
-            style = token.split("=", 1)[1].strip() or None
-        elif token == "--style":
-            if index + 1 >= len(tokens):
-                return None, None, "", "缺少 --style 的值。"
-            style = tokens[index + 1].strip() or None
+                return empty, f"缺少 {token} 的值。"
+            value = tokens[index + 1].strip() or None
+            if token == "--mode":
+                options["mode"] = value
+            elif token == "--voice":
+                options["voice"] = value
+            elif token == "--style":
+                options["style"] = value
+            elif token in {"--voice-prompt", "--design"}:
+                options["voice_prompt"] = value
+                options["mode"] = options["mode"] or "design"
+            elif token in {"--clone-voice", "--voice-clone"}:
+                options["voice_clone"] = value
+                options["mode"] = options["mode"] or "clone"
+            elif token in {"--clone-path", "--clone-file"}:
+                options["voice_clone_path"] = value
+                options["mode"] = options["mode"] or "clone"
+            elif token == "--model":
+                options["model"] = value
             index += 1
         else:
             content_parts.append(token)
         index += 1
-    return voice, style, " ".join(content_parts).strip(), None
+    options["text"] = " ".join(content_parts).strip()
+    return options, None
 
 
 def register_tts_matchers(
@@ -73,11 +95,15 @@ def register_tts_matchers(
         if not tts_service.is_configured():
             await tts_cmd.finish("TTS 未配置 API Key。")
 
-        voice, style, text, error = _parse_tts_command_args(args.extract_plain_text())
+        parsed, error = _parse_tts_command_args(args.extract_plain_text())
         if error:
             await tts_cmd.finish(error)
+        text = str(parsed.get("text") or "").strip()
         if not text:
-            await tts_cmd.finish(f"用法: {main_command} [--voice 音色] [--style 风格] 文本")
+            await tts_cmd.finish(
+                f"用法: {main_command} [--mode preset|design|clone] "
+                "[--voice 音色] [--style 风格] [--voice-prompt 音色描述] [--clone-voice data:...] [--clone-path 样本路径] 文本"
+            )
 
         is_private = not isinstance(event, group_message_event_cls)
         group_style = ""
@@ -92,18 +118,48 @@ def register_tts_matchers(
             except Exception as e:
                 logger.debug(f"[tts] 读取人设配置失败: {e}")
 
+        persona_tts = extract_persona_tts_config(base_prompt)
+        tts_decision = None
+        try:
+            tts_decision = await tts_service.decide_tts_delivery(
+                text=text,
+                is_private=is_private,
+                command_triggered=True,
+                raw_message_text=text,
+                group_style=group_style,
+                fallback_style_hint=str(parsed.get("style") or ""),
+                command_options=parsed,
+                persona_tts=persona_tts,
+            )
+        except Exception as e:
+            logger.warning(f"[tts] 命令语音审查失败: {e}")
+            await tts_cmd.finish("语音审查暂时失败，先不合成语音。")
+        if tts_decision is None:
+            await tts_cmd.finish("语音审查暂时失败，先不合成语音。")
+        if tts_decision.action != "voice":
+            fallback_message = (
+                tts_decision.visible_message
+                or ("这段内容不适合合成语音。" if tts_decision.action == "block" else "这段我先不发语音。")
+            )
+            await tts_cmd.finish(fallback_message)
+
         try:
             sent = await tts_service.send_tts(
                 bot=bot,
                 event=event,
                 message_segment_cls=message_segment_cls,
                 text=text,
-                voice_hint=voice,
-                style_hint=style,
+                mode_hint=parsed.get("mode"),
+                voice_hint=parsed.get("voice"),
+                style_hint=tts_decision.style_hint or parsed.get("style"),
+                voice_prompt_hint=parsed.get("voice_prompt"),
+                voice_clone_hint=parsed.get("voice_clone"),
+                voice_clone_path_hint=parsed.get("voice_clone_path"),
+                model_hint=parsed.get("model"),
                 user_hint="请自然朗读下面的内容，整体语速略快一点，但保持自然清晰。",
                 is_private=is_private,
                 group_style=group_style,
-                persona_tts=extract_persona_tts_config(base_prompt),
+                persona_tts=persona_tts,
             )
         except Exception as e:
             logger.warning(f"[tts] 命令合成失败: {e}")

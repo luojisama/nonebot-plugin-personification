@@ -17,7 +17,7 @@ def register_weekly_diary_job(
             id="ai_weekly_diary",
             replace_existing=True,
         )
-        logger.info("拟人插件：已成功注册 AI 每周说说定时任务 (周五 19:00)")
+        logger.info("拟人插件：已成功注册 AI 空间说说定时任务 (周五 19:00)")
     except Exception as e:
         logger.error(f"拟人插件：注册定时任务失败: {e}")
 

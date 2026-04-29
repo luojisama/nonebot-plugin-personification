@@ -4,8 +4,9 @@ import os
 
 import httpx
 
-from nonebot_plugin_personification.agent.tool_registry import AgentTool
+from plugin.personification.agent.tool_registry import AgentTool
 from . import impl
+from ...vision_analyze.scripts import impl as vision_impl
 
 
 def _resolve_github_token(runtime) -> str:
@@ -20,6 +21,45 @@ def _resolve_github_token(runtime) -> str:
     return ""
 
 
+def _merge_image_refs(images=None, image_urls=None) -> list[str]:  # noqa: ANN001
+    refs: list[str] = []
+    for item in list(images or []) + list(image_urls or []):
+        value = str(item or "").strip()
+        if value and value not in refs:
+            refs.append(value)
+    return refs[:3]
+
+
+def _compact_visual_search_context(raw: str) -> str:
+    text = str(raw or "").strip()
+    if not text:
+        return ""
+    try:
+        import json
+
+        payload = json.loads(text)
+    except Exception:
+        return text[:300]
+    if not isinstance(payload, dict):
+        return text[:300]
+    parts: list[str] = []
+    summary = str(payload.get("scene_summary", "") or "").strip()
+    if summary:
+        parts.append(summary)
+    for item in list(payload.get("ocr_text") or [])[:4]:
+        value = str(item or "").strip()
+        if value:
+            parts.append(f"文字:{value}")
+    for item in list(payload.get("characters_or_entities") or [])[:4]:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name", "") or "").strip()
+        evidence = str(item.get("evidence", "") or "").strip()
+        if name:
+            parts.append(f"{name} {evidence}".strip())
+    return "；".join(parts)[:300]
+
+
 def build_tools(runtime):
     logger = getattr(runtime, "logger", None) or _SilentLogger()
     shared_client = getattr(runtime, "http_client", None)
@@ -32,6 +72,24 @@ def build_tools(runtime):
         async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as http_client:
             return await callback(http_client)
 
+    async def _augment_query_with_images(query: str, images=None, image_urls=None) -> str:  # noqa: ANN001
+        refs = _merge_image_refs(images, image_urls)
+        if not refs:
+            return str(query or "").strip()
+        try:
+            visual_raw = await vision_impl.analyze_images(
+                runtime=runtime,
+                query="为资源/网页搜索提取图片中的主体、文字、人物、作品名和关键视觉线索。",
+                images=refs,
+            )
+        except Exception as exc:
+            logger.debug(f"[resource_collector] visual query augmentation skipped: {exc}")
+            return str(query or "").strip()
+        visual_context = _compact_visual_search_context(visual_raw)
+        if not visual_context:
+            return str(query or "").strip()
+        return f"{str(query or '').strip()} 图像线索：{visual_context}".strip()
+
     async def _confirm_handler(raw_query: str = "", context_hint: str = "") -> str:
         result = await impl.confirm_resource_request(
             raw_query,
@@ -41,10 +99,18 @@ def build_tools(runtime):
         )
         return impl.dumps_confirmation_payload(result)
 
-    async def _collect_handler(query: str, resource_type: str = "通用资源", max_count: int = 5) -> str:
+    async def _collect_handler(
+        query: str,
+        resource_type: str = "通用资源",
+        max_count: int = 5,
+        images: list[str] | None = None,
+        image_urls: list[str] | None = None,
+    ) -> str:
+        augmented_query = await _augment_query_with_images(query, images, image_urls)
+
         async def _call(http_client: httpx.AsyncClient) -> str:
             return await impl.collect_resources(
-                query,
+                augmented_query,
                 resource_type=resource_type,
                 max_count=max_count,
                 http_client=http_client,
@@ -55,10 +121,17 @@ def build_tools(runtime):
 
         return await _with_client(_call)
 
-    async def _search_web_handler(query: str, limit: int = 5) -> str:
+    async def _search_web_handler(
+        query: str,
+        limit: int = 5,
+        images: list[str] | None = None,
+        image_urls: list[str] | None = None,
+    ) -> str:
+        augmented_query = await _augment_query_with_images(query, images, image_urls)
+
         async def _call(http_client: httpx.AsyncClient) -> str:
             return await impl.search_web(
-                query,
+                augmented_query,
                 limit=limit,
                 http_client=http_client,
                 logger=logger,
@@ -77,10 +150,17 @@ def build_tools(runtime):
 
         return await _with_client(_call)
 
-    async def _search_images_handler(query: str, limit: int = 5) -> str:
+    async def _search_images_handler(
+        query: str,
+        limit: int = 5,
+        images: list[str] | None = None,
+        image_urls: list[str] | None = None,
+    ) -> str:
+        augmented_query = await _augment_query_with_images(query, images, image_urls)
+
         async def _call(http_client: httpx.AsyncClient) -> str:
             return await impl.search_images(
-                query,
+                augmented_query,
                 limit=limit,
                 http_client=http_client,
                 logger=logger,
@@ -110,6 +190,8 @@ def build_tools(runtime):
                 "properties": {
                     "query": {"type": "string", "description": "搜索主题或问题"},
                     "limit": {"type": "integer", "description": "最多返回结果数，1 到 10", "default": 5},
+                    "images": {"type": "array", "items": {"type": "string"}, "description": "可选图片引用；用于先提取视觉线索再搜索"},
+                    "image_urls": {"type": "array", "items": {"type": "string"}, "description": "可选图片 URL；等同 images"},
                 },
                 "required": ["query"],
             },
@@ -155,6 +237,8 @@ def build_tools(runtime):
                 "properties": {
                     "query": {"type": "string", "description": "图片或壁纸搜索主题"},
                     "limit": {"type": "integer", "description": "最多返回结果数，1 到 10", "default": 5},
+                    "images": {"type": "array", "items": {"type": "string"}, "description": "可选图片引用；用于先提取视觉线索再搜索"},
+                    "image_urls": {"type": "array", "items": {"type": "string"}, "description": "可选图片 URL；等同 images"},
                 },
                 "required": ["query"],
             },
@@ -182,6 +266,8 @@ def build_tools(runtime):
                     "query": {"type": "string", "description": "已确认的搜索主题"},
                     "resource_type": {"type": "string", "description": "资源类型描述", "default": "通用资源"},
                     "max_count": {"type": "integer", "description": "最多返回数量，1 到 10", "default": 5},
+                    "images": {"type": "array", "items": {"type": "string"}, "description": "可选图片引用；用于先提取视觉线索再搜集资源"},
+                    "image_urls": {"type": "array", "items": {"type": "string"}, "description": "可选图片 URL；等同 images"},
                 },
                 "required": ["query"],
             },
@@ -193,4 +279,3 @@ def build_tools(runtime):
 class _SilentLogger:
     def debug(self, _msg: str) -> None:
         return None
-

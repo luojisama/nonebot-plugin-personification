@@ -3,8 +3,8 @@ from __future__ import annotations
 import json
 from typing import Any
 
-from nonebot_plugin_personification.agent.tool_registry import AgentTool
-from nonebot_plugin_personification.core.memory_store import get_memory_store
+from plugin.personification.agent.tool_registry import AgentTool
+from plugin.personification.core.memory_store import get_memory_store
 
 
 async def recall_memory(
@@ -81,4 +81,3 @@ def build_memory_recall_tool(runtime: Any) -> AgentTool:
         handler=_handler,
         enabled=lambda: True,
     )
-

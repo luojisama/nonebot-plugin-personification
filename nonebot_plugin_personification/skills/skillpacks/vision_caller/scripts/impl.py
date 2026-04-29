@@ -7,8 +7,8 @@ from typing import Any, Awaitable, Callable, Dict, List, Optional
 
 import httpx
 
-from nonebot_plugin_personification.core.image_refs import normalize_image_ref
-from nonebot_plugin_personification.skills.skillpacks.tool_caller.scripts.impl import (
+from plugin.personification.core.image_refs import normalize_image_ref
+from plugin.personification.skills.skillpacks.tool_caller.scripts.impl import (
     OpenAICodexToolCaller,
     _convert_openai_tool_to_gemini,
     _extract_gemini_text,
@@ -685,4 +685,3 @@ def build_vision_caller(config: Any) -> Optional[VisionCaller]:
     if fallback is None:
         return primary
     return FallbackVisionCaller(primary, fallback)
-

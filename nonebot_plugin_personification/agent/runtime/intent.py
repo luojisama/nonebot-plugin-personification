@@ -11,6 +11,9 @@ from ...core.message_parts import extract_text_from_parts
 from ..query_rewriter import QueryRewriteContext
 
 
+_FORWARD_MARKERS = ("[聊天记录]:", "[转发内容]:", "[Forward]:")
+
+
 def extract_latest_user_text(messages: List[dict]) -> str:
     for message in reversed(messages):
         if message.get("role") != "user":
@@ -62,6 +65,14 @@ def extract_focus_query_text(text: str) -> str:
         lines = [line.strip() for line in section.splitlines() if line.strip()]
         if lines:
             return lines[0]
+    for marker in _FORWARD_MARKERS:
+        if marker not in raw:
+            continue
+        before = raw.split(marker, 1)[0].strip()
+        lines = [line.strip() for line in before.splitlines() if line.strip()]
+        if lines:
+            return lines[-1]
+        return ""
     return raw
 
 
@@ -133,14 +144,20 @@ def extract_group_relationship_hint(messages: List[dict]) -> str:
 def extract_quoted_message_text(raw_text: str) -> str:
     raw = str(raw_text or "")
     match = re.search(r"\[引用内容.*?\]:\s*(.+)", raw, flags=re.DOTALL)
-    if not match:
-        return ""
-    quoted_block = re.split(r"\n\[聊天记录\]:|\n\[提示：", match.group(1), maxsplit=1)[0]
-    for line in quoted_block.splitlines():
-        cleaned = line.strip()
-        if cleaned:
-            return cleaned[:300]
-    return quoted_block.strip()[:300]
+    if match:
+        quoted_block = re.split(r"\n\[聊天记录\]:|\n\[提示：", match.group(1), maxsplit=1)[0]
+        for line in quoted_block.splitlines():
+            cleaned = line.strip()
+            if cleaned:
+                return cleaned[:300]
+        return quoted_block.strip()[:300]
+    for marker in _FORWARD_MARKERS:
+        if marker not in raw:
+            continue
+        block = raw.split(marker, 1)[1].strip()[:600]
+        if block:
+            return f"[转发聊天记录]: {block}"
+    return ""
 
 
 def derive_query_rewrite_context(
@@ -205,11 +222,6 @@ def messages_indicate_private_scene(messages: List[dict]) -> bool:
     return False
 
 
-def infer_chat_intent(query: str, messages: List[dict]) -> tuple[str, str]:
-    _ = query, messages
-    return "banter", ""
-
-
 async def infer_intent_decision_with_context(
     query: str,
     messages: List[dict],
@@ -261,29 +273,21 @@ _extract_latest_user_text = extract_latest_user_text
 _render_message_text = render_message_text
 _extract_focus_query_text = extract_focus_query_text
 _clean_user_query_text = clean_user_query_text
-_compact_lookup_query = compact_lookup_query
 _extract_latest_user_images = extract_latest_user_images
 _extract_group_topic_hint = extract_group_topic_hint
-_extract_quoted_message_text = extract_quoted_message_text
 _derive_query_rewrite_context = derive_query_rewrite_context
-_messages_indicate_private_scene = messages_indicate_private_scene
-_infer_chat_intent = infer_chat_intent
 _infer_intent_decision_with_context = infer_intent_decision_with_context
 _recover_followup_query_from_context = recover_followup_query_from_context
 
 
 __all__ = [
-    "_compact_lookup_query",
     "_derive_query_rewrite_context",
     "_extract_focus_query_text",
     "_extract_group_topic_hint",
     "extract_group_relationship_hint",
     "_extract_latest_user_images",
     "_extract_latest_user_text",
-    "_extract_quoted_message_text",
-    "_infer_chat_intent",
     "_infer_intent_decision_with_context",
-    "_messages_indicate_private_scene",
     "_recover_followup_query_from_context",
     "_render_message_text",
     "_clean_user_query_text",
@@ -294,7 +298,6 @@ __all__ = [
     "extract_latest_user_images",
     "extract_latest_user_text",
     "extract_quoted_message_text",
-    "infer_chat_intent",
     "infer_intent_decision_with_context",
     "messages_indicate_private_scene",
     "recover_followup_query_from_context",

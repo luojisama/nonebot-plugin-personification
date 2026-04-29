@@ -13,10 +13,10 @@ try:
     from ...vision_analyze.scripts.impl import analyze_images
     from ...wiki_search.scripts.impl import wiki_lookup_candidates
 except ImportError:  # pragma: no cover
-    from nonebot_plugin_personification.agent.tool_registry import AgentTool  # type: ignore
-    from nonebot_plugin_personification.core.web_grounding import do_web_search  # type: ignore
-    from nonebot_plugin_personification.skills.skillpacks.vision_analyze.scripts.impl import analyze_images  # type: ignore
-    from nonebot_plugin_personification.skills.skillpacks.wiki_search.scripts.impl import wiki_lookup_candidates  # type: ignore
+    from plugin.personification.agent.tool_registry import AgentTool  # type: ignore
+    from plugin.personification.core.web_grounding import do_web_search  # type: ignore
+    from plugin.personification.skills.skillpacks.vision_analyze.scripts.impl import analyze_images  # type: ignore
+    from plugin.personification.skills.skillpacks.wiki_search.scripts.impl import wiki_lookup_candidates  # type: ignore
 
 
 _TIME_SENSITIVE_QUERY_RE = re.compile(r"(最新|现在|当前|今天|刚刚|最近|进展|后续|活动|联动|版本|更新)")
@@ -311,4 +311,3 @@ def build_resolver_tool(runtime: Any) -> AgentTool:
         },
         handler=_handler,
     )
-

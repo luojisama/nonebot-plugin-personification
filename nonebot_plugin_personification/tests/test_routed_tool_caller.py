@@ -5,8 +5,8 @@ from types import SimpleNamespace
 
 from ._loader import load_personification_module
 
-ai_routes = load_personification_module("nonebot_plugin_personification.core.ai_routes")
-tool_impl = load_personification_module("nonebot_plugin_personification.skills.skillpacks.tool_caller.scripts.impl")
+ai_routes = load_personification_module("plugin.personification.core.ai_routes")
+tool_impl = load_personification_module("plugin.personification.skills.skillpacks.tool_caller.scripts.impl")
 
 
 class _FakeCaller:
@@ -73,4 +73,3 @@ def test_routed_tool_caller_routes_tool_result_back_to_originating_caller() -> N
 
     assert tool_result["caller"] == "primary"
     assert tool_result["tool_name"] == "web_search"
-

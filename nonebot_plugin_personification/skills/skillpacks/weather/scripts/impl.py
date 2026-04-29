@@ -6,7 +6,7 @@ from urllib.parse import quote
 
 import httpx
 
-from nonebot_plugin_personification.agent.tool_registry import AgentTool
+from plugin.personification.agent.tool_registry import AgentTool
 
 
 WEATHER_DESCRIPTION = """查询指定城市的实时天气信息，返回温度、天气状况、体感温度、湿度。
@@ -216,4 +216,3 @@ def build_weather_tool(skills_root: Optional[Path], logger: Any) -> AgentTool:
         },
         handler=_handler,
     )
-

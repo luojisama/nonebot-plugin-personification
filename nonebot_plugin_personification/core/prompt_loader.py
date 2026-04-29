@@ -1,3 +1,6 @@
+import copy
+import random
+import time as _time
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional, Union
 
@@ -21,6 +24,9 @@ AGENT_GUIDANCE_MARKER = "=== 轻量工具约束（对用户不可见）==="
 SKILLS_DIRECTORY_GUIDE = """
 """
 
+_YAML_CACHE: dict[str, tuple[float, float, Dict[str, Any]]] = {}
+_YAML_CACHE_TTL = 300.0
+
 
 def _resolve_candidate_path(raw_path: str) -> Path:
     path = Path(raw_path).expanduser()
@@ -30,15 +36,42 @@ def _resolve_candidate_path(raw_path: str) -> Path:
 
 
 def _load_yaml_file(path: Path, logger: Any) -> Optional[Dict[str, Any]]:
+    cache_key = str(path.resolve())
+    try:
+        current_mtime = path.stat().st_mtime
+    except OSError:
+        current_mtime = 0.0
+    now_ts = _time.monotonic()
+    cached = _YAML_CACHE.get(cache_key)
+    if cached is not None:
+        cached_mtime, cached_loaded_at, cached_data = cached
+        if cached_mtime == current_mtime and (now_ts - cached_loaded_at) < _YAML_CACHE_TTL:
+            return copy.deepcopy(cached_data)
     try:
         with open(path, "r", encoding="utf-8") as file:
             logger.info(f"拟人插件：成功加载 YAML 模板: {path.absolute()}")
             parsed = yaml.safe_load(file)
             if isinstance(parsed, dict):
-                return parsed
+                _YAML_CACHE[cache_key] = (current_mtime, now_ts, copy.deepcopy(parsed))
+                return copy.deepcopy(parsed)
     except Exception as e:
         logger.error(f"加载 YAML 模板失败 ({path}): {e}")
     return None
+
+
+def clear_yaml_prompt_cache() -> None:
+    _YAML_CACHE.clear()
+
+
+def _normalize_ack_phrases(value: Any) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    phrases: list[str] = []
+    for item in value:
+        text = str(item or "").strip()
+        if text:
+            phrases.append(text[:40])
+    return phrases
 
 
 def _append_agent_guidance(
@@ -49,7 +82,7 @@ def _append_agent_guidance(
         return content
 
     guidance = AGENT_GUIDANCE_TEMPLATE.format(
-        max_steps=getattr(plugin_config, "personification_agent_max_steps", 5),
+        max_steps=getattr(plugin_config, "personification_agent_max_steps", 10),
     )
     skills_guide = SKILLS_DIRECTORY_GUIDE.strip()
     full_guidance = guidance if not skills_guide else f"{guidance}\n\n{skills_guide}"
@@ -132,3 +165,37 @@ def load_prompt(
             pass
 
     return _append_agent_guidance(content, plugin_config)
+
+
+def load_ack_phrases(
+    plugin_config: Any,
+    get_group_config: Callable[[str], Dict[str, Any]],
+    logger: Any,
+    group_id: Optional[str] = None,
+) -> list[str]:
+    prompt_data = load_prompt(
+        plugin_config=plugin_config,
+        get_group_config=get_group_config,
+        logger=logger,
+        group_id=group_id,
+    )
+    if not isinstance(prompt_data, dict):
+        return []
+    return _normalize_ack_phrases(prompt_data.get("ack_phrases"))
+
+
+def pick_ack_phrase(
+    plugin_config: Any,
+    get_group_config: Callable[[str], Dict[str, Any]],
+    logger: Any,
+    group_id: Optional[str] = None,
+) -> str:
+    phrases = load_ack_phrases(
+        plugin_config=plugin_config,
+        get_group_config=get_group_config,
+        logger=logger,
+        group_id=group_id,
+    )
+    if not phrases:
+        return ""
+    return random.choice(phrases)

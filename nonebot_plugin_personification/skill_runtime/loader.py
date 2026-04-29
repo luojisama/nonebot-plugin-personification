@@ -189,7 +189,7 @@ async def load_builtin_skillpacks(
                         count += 1
                 if count > 0:
                     loaded += 1
-                    continue
+                continue
             except Exception as e:
                 runtime.logger.warning(f"[skillpack] build_tools failed {skill_dir.name}: {e}")
                 continue
@@ -306,7 +306,7 @@ def load_builtin_skillpacks_sync(
                         count += 1
                 if count > 0:
                     loaded += 1
-                    continue
+                continue
             except Exception as e:
                 runtime.logger.warning(f"[skillpack] build_tools failed {skill_dir.name}: {e}")
                 continue

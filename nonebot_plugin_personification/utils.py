@@ -4,6 +4,7 @@ from typing import Any, Dict, List, Optional
 
 from .core.data_store import get_data_store
 from .core.db import connect_sync
+from .core.group_roles import normalize_group_role
 from .core.group_relation_edges import update_relation_edges_from_message
 
 
@@ -133,14 +134,15 @@ def record_group_msg(
     except (TypeError, ValueError):
         image_count = 0
     visual_summary = str(safe_metadata.get("visual_summary", "") or "").strip()
+    sender_role = normalize_group_role(safe_metadata.get("sender_role", ""))
 
     with connect_sync() as conn:
         conn.execute(
             """
             INSERT INTO group_messages(
                 group_id, user_id, nickname, content, image_count, visual_summary, is_bot,
-                reply_to_msg_id, reply_to_user_id, mentioned_ids, is_at_bot, message_id, source_kind, timestamp
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                reply_to_msg_id, reply_to_user_id, mentioned_ids, is_at_bot, message_id, source_kind, sender_role, timestamp
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 str(group_id),
@@ -156,6 +158,7 @@ def record_group_msg(
                 1 if bool(safe_metadata.get("is_at_bot")) else 0,
                 str(safe_metadata.get("message_id", "") or "") or None,
                 str(safe_metadata.get("source_kind", "bot" if is_bot else "user") or "user"),
+                sender_role,
                 now_ts,
             ),
         )
@@ -230,7 +233,7 @@ def get_group_msg_by_message_id(group_id: str, message_id: str) -> Optional[Dict
         row = conn.execute(
             """
             SELECT group_id, user_id, nickname, content, image_count, visual_summary, is_bot,
-                   reply_to_msg_id, reply_to_user_id, mentioned_ids, is_at_bot, message_id, source_kind, timestamp
+                   reply_to_msg_id, reply_to_user_id, mentioned_ids, is_at_bot, message_id, source_kind, sender_role, timestamp
             FROM group_messages
             WHERE group_id=? AND message_id=?
             ORDER BY timestamp DESC
@@ -261,6 +264,7 @@ def get_group_msg_by_message_id(group_id: str, message_id: str) -> Optional[Dict
         "is_at_bot": bool(row["is_at_bot"]),
         "message_id": row["message_id"],
         "source_kind": row["source_kind"],
+        "sender_role": row["sender_role"],
     }
 
 
@@ -279,7 +283,7 @@ def get_recent_group_msgs(group_id: str, limit: int = 200, expire_hours: Optiona
         rows = conn.execute(
             f"""
             SELECT group_id, user_id, nickname, content, image_count, visual_summary, is_bot,
-                   reply_to_msg_id, reply_to_user_id, mentioned_ids, is_at_bot, message_id, source_kind, timestamp
+                   reply_to_msg_id, reply_to_user_id, mentioned_ids, is_at_bot, message_id, source_kind, sender_role, timestamp
             FROM group_messages
             WHERE {" AND ".join(clauses)}
             ORDER BY timestamp DESC
@@ -311,6 +315,7 @@ def get_recent_group_msgs(group_id: str, limit: int = 200, expire_hours: Optiona
                 "is_at_bot": bool(row["is_at_bot"]),
                 "message_id": row["message_id"],
                 "source_kind": row["source_kind"],
+                "sender_role": row["sender_role"],
             }
         )
     return messages

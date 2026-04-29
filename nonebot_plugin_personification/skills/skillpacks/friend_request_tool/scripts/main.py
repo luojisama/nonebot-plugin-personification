@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from types import SimpleNamespace
 
-from nonebot_plugin_personification.skill_runtime.runtime_api import SkillRuntime
+from plugin.personification.skill_runtime.runtime_api import SkillRuntime
 from . import impl
 
 
@@ -38,4 +38,3 @@ def build_friend_request_tool_for_runtime(
         session_interaction_count=session_interaction_count,
         is_group_scene=is_group_scene,
     )
-

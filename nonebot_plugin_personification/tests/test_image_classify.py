@@ -5,7 +5,7 @@ from types import SimpleNamespace
 
 from ._loader import load_personification_module
 
-pipeline_context = load_personification_module("nonebot_plugin_personification.handlers.reply_pipeline.pipeline_context")
+pipeline_context = load_personification_module("plugin.personification.handlers.reply_pipeline.pipeline_context")
 
 
 class _FakeCaller:
@@ -178,4 +178,3 @@ def test_classify_incoming_image_uses_size_fallback_when_no_vision_route() -> No
 
     assert result.kind == "photo"
     assert result.source == "size_fallback"
-

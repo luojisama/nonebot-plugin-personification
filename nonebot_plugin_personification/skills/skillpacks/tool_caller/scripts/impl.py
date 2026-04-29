@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
+import re
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from pathlib import Path
@@ -9,8 +11,8 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
 
-from nonebot_plugin_personification.core.image_refs import normalize_image_ref
-from nonebot_plugin_personification.core.message_parts import extract_text_from_parts, normalize_message_parts
+from plugin.personification.core.image_refs import normalize_image_ref
+from plugin.personification.core.message_parts import extract_text_from_parts, normalize_message_parts
 
 
 OPENAI_REASONING_MAP = {
@@ -73,7 +75,7 @@ class ToolCaller(ABC):
         tool_call_id: str,
         tool_name: str,
         result: str,
-    ) -> dict:
+    ) -> dict | ToolCallerResponse:
         raise NotImplementedError
 
 
@@ -371,6 +373,19 @@ def _gemini_used_builtin_search(response: Any) -> bool:
         if _obj_get(candidate, "grounding_metadata") or _obj_get(candidate, "groundingMetadata"):
             return True
     return False
+
+
+def _gemini_builtin_search_tool(model: str) -> dict:
+    if str(model or "").strip().startswith("gemini-1.5"):
+        return {
+            "google_search_retrieval": {
+                "dynamic_retrieval_config": {
+                    "mode": "MODE_DYNAMIC",
+                    "dynamic_threshold": 0.7,
+                }
+            }
+        }
+    return {"google_search": {}}
 
 
 def _anthropic_content_blocks(content: Any) -> List[dict]:
@@ -788,7 +803,6 @@ class OpenAIToolCaller(ToolCaller):
             "content": result,
         }
 
-
 class GeminiToolCaller(ToolCaller):
     def __init__(
         self,
@@ -827,7 +841,7 @@ class GeminiToolCaller(ToolCaller):
                     }
                 )
             if use_builtin_search:
-                tool_payload.append({"google_search": {}})
+                tool_payload.append(_gemini_builtin_search_tool(self.model))
 
             generation_config: Dict[str, Any] = {
                 "thinking_config": {
@@ -1438,38 +1452,15 @@ class OpenAICodexToolCaller(ToolCaller):
 
         raise RuntimeError("Codex 流式响应解析失败：未找到有效 response 数据")
 
-    async def chat_with_tools(
+    async def _request_codex_response(
         self,
-        messages: List[dict],
-        tools: List[dict],
-        use_builtin_search: bool,
-    ) -> ToolCallerResponse:
-        access_token, _ = await self._get_access_token()
-        contains_image_input = self._contains_image_input(messages)
-
-        payload: Dict[str, Any] = {
-            "model": self.model,
-            "store": False,  # Codex 后端要求无状态
-            "stream": True,
-            "instructions": self._build_instructions(messages),
-            "input": self._build_input(messages),
-        }
-        codex_tools: List[dict] = []
-        if tools:
-            # 若启用内置搜索，过滤掉同名的本地 web_search function，避免与内置工具冲突
-            filtered = [
-                t for t in tools
-                if not (
-                    use_builtin_search
-                    and (t.get("function", t).get("name") or t.get("name")) == "web_search"
-                )
-            ]
-            codex_tools.extend(self._build_tools(filtered))
-        if use_builtin_search:
-            codex_tools.append({"type": "web_search"})
-        if codex_tools:
-            payload["tools"] = codex_tools
-
+        payload: Dict[str, Any],
+        *,
+        contains_image_input: bool = False,
+        access_token: str = "",
+    ) -> dict:
+        if not access_token:
+            access_token, _ = await self._get_access_token()
         last_error: Optional[Exception] = None
         for attempt in range(2):
             try:
@@ -1555,7 +1546,327 @@ class OpenAICodexToolCaller(ToolCaller):
             if last_error is not None:
                 raise last_error
 
+        return data
+
+    async def chat_with_tools(
+        self,
+        messages: List[dict],
+        tools: List[dict],
+        use_builtin_search: bool,
+    ) -> ToolCallerResponse:
+        contains_image_input = self._contains_image_input(messages)
+
+        payload: Dict[str, Any] = {
+            "model": self.model,
+            "store": False,  # Codex 后端要求无状态
+            "stream": True,
+            "instructions": self._build_instructions(messages),
+            "input": self._build_input(messages),
+        }
+        codex_tools: List[dict] = []
+        if tools:
+            # 若启用内置搜索，过滤掉同名的本地 web_search function，避免与内置工具冲突
+            filtered = [
+                t for t in tools
+                if not (
+                    use_builtin_search
+                    and (t.get("function", t).get("name") or t.get("name")) == "web_search"
+                )
+            ]
+            codex_tools.extend(self._build_tools(filtered))
+        if use_builtin_search:
+            codex_tools.append({"type": "web_search"})
+        if codex_tools:
+            payload["tools"] = codex_tools
+
+        data = await self._request_codex_response(
+            payload,
+            contains_image_input=contains_image_input,
+        )
+        if isinstance(data, ToolCallerResponse):
+            return data
         return self._parse_response(data)
+
+    @staticmethod
+    def _normalize_image_size_hint(size: str) -> str:
+        value = str(size or "").strip()
+        if value in {"1024x1792", "1024x1536"}:
+            return "portrait"
+        if value in {"1792x1024", "1536x1024"}:
+            return "landscape"
+        if value == "auto":
+            return "auto"
+        return "square"
+
+    @staticmethod
+    def _normalize_image_generation_size(size: str) -> str:
+        value = str(size or "").strip().lower()
+        value = value.replace("×", "x").replace("*", "x")
+        value = re.sub(r"\s+", "", value)
+        aliases = {
+            "1:1": "1024x1024",
+            "square": "1024x1024",
+            "正方形": "1024x1024",
+            "方图": "1024x1024",
+            "portrait": "1024x1536",
+            "vertical": "1024x1536",
+            "竖版": "1024x1536",
+            "竖图": "1024x1536",
+            "纵向": "1024x1536",
+            "3:4": "1024x1536",
+            "2:3": "1024x1536",
+            "9:16": "1024x1536",
+            "landscape": "1536x1024",
+            "horizontal": "1536x1024",
+            "wide": "1536x1024",
+            "横版": "1536x1024",
+            "横图": "1536x1024",
+            "横向": "1536x1024",
+            "16:9": "1536x1024",
+            "4:3": "1536x1024",
+            "3:2": "1536x1024",
+        }
+        value = aliases.get(value, value)
+        if value in {
+            "1024x1024",
+            "1024x1536",
+            "1536x1024",
+            "auto",
+        }:
+            return value
+        if value == "1024x1792":
+            return "1024x1536"
+        if value == "1792x1024":
+            return "1536x1024"
+        return "1024x1024"
+
+    @staticmethod
+    def _normalize_image_generation_model(model: str) -> str:
+        value = str(model or "").strip().lower()
+        if value in {
+            "gpt-image-2",
+            "gpt-image-2-2026-04-21",
+            "gpt-image-1.5",
+            "gpt-image-1",
+            "gpt-image-1-mini",
+            "chatgpt-image-latest",
+        }:
+            return value
+        return "gpt-image-2"
+
+    @staticmethod
+    def _clean_b64_image_payload(value: str) -> str:
+        text = str(value or "").strip()
+        if not text:
+            return ""
+        if "," in text and text.lower().startswith("data:image/"):
+            text = text.split(",", 1)[1]
+        text = re.sub(r"</?image[^>]*>", "", text, flags=re.IGNORECASE).strip()
+        text = re.sub(r"\s+", "", text)
+        if len(text) < 128 or not re.fullmatch(r"[A-Za-z0-9+/=]+", text):
+            return ""
+        try:
+            base64.b64decode(text, validate=True)
+        except Exception:
+            return ""
+        return text
+
+    @classmethod
+    def _extract_image_payload_candidate(cls, value: Any) -> tuple[str, str]:
+        if value is None:
+            return "", ""
+        if isinstance(value, str):
+            text = value.strip()
+            b64 = cls._clean_b64_image_payload(text)
+            if b64:
+                return b64, ""
+            if text.lower().startswith(("http://", "https://")):
+                return "", text
+            return "", ""
+        if isinstance(value, list):
+            for item in value:
+                b64, url = cls._extract_image_payload_candidate(item)
+                if b64 or url:
+                    return b64, url
+            return "", ""
+        if isinstance(value, dict):
+            preferred_keys = (
+                "b64_json",
+                "image_base64",
+                "base64",
+                "data_url",
+                "image",
+                "output_image",
+                "image_url",
+                "url",
+                "result",
+                "data",
+                "images",
+                "content",
+            )
+            for key in preferred_keys:
+                if key in value:
+                    b64, url = cls._extract_image_payload_candidate(value.get(key))
+                    if b64 or url:
+                        return b64, url
+            for item in value.values():
+                b64, url = cls._extract_image_payload_candidate(item)
+                if b64 or url:
+                    return b64, url
+        return "", ""
+
+    @staticmethod
+    def _summarize_image_generation_response(data: Any) -> str:
+        if not isinstance(data, dict):
+            if data is None:
+                return "raw=none"
+            return f"raw_type={type(data).__name__}"
+
+        output = data.get("output", [])
+        output_items = len(output) if isinstance(output, list) else "n/a"
+        output_types: list[str] = []
+        content_types: list[str] = []
+        result_keys: list[str] = []
+        errors: list[str] = []
+
+        def _append_error(label: str, value: Any) -> None:
+            if not value:
+                return
+            if isinstance(value, dict):
+                code = str(value.get("code") or value.get("type") or value.get("status") or "").strip()
+                message = str(
+                    value.get("message")
+                    or value.get("detail")
+                    or value.get("error")
+                    or ""
+                ).strip()
+                parts = [part for part in (code, message) if part]
+                text = ": ".join(parts) if parts else json.dumps(value, ensure_ascii=False)
+            else:
+                text = str(value)
+            text = re.sub(r"\s+", " ", text).strip()
+            if len(text) > 240:
+                text = text[:237].rstrip() + "..."
+            errors.append(f"{label}={text}")
+
+        _append_error("error", data.get("error"))
+        if isinstance(output, list):
+            for item in output[:6]:
+                if not isinstance(item, dict):
+                    output_types.append(type(item).__name__)
+                    continue
+                output_types.append(str(item.get("type", "?") or "?"))
+                _append_error(f"{item.get('type', '?')}_error", item.get("error"))
+                result = item.get("result")
+                if isinstance(result, dict):
+                    result_keys.extend(str(key) for key in list(result.keys())[:6])
+                content = item.get("content")
+                if isinstance(content, list):
+                    for block in content[:6]:
+                        if isinstance(block, dict):
+                            content_types.append(str(block.get("type", "?") or "?"))
+
+        raw_keys = ",".join(str(key) for key in list(data.keys())[:8]) or "none"
+        output_type_text = ",".join(output_types) or "none"
+        content_type_text = ",".join(content_types) or "none"
+        result_key_text = ",".join(dict.fromkeys(result_keys)) or "none"
+        error_text = "; ".join(errors) or "none"
+        return (
+            f"status={data.get('status', '?')} raw_keys={raw_keys} "
+            f"output_items={output_items} output_types={output_type_text} "
+            f"content_types={content_type_text} result_keys={result_key_text} "
+            f"errors={error_text}"
+        )
+
+    async def _download_codex_image_result(self, url: str, access_token: str) -> str:
+        headers = {
+            "Authorization": f"Bearer {access_token}",
+            "Accept": "image/*,*/*",
+        }
+        async with httpx.AsyncClient(timeout=httpx.Timeout(self.timeout, connect=15.0)) as client:
+            response = await client.get(url, headers=headers)
+            response.raise_for_status()
+        payload = bytes(response.content or b"")
+        if not payload:
+            return ""
+        return base64.b64encode(payload).decode("ascii")
+
+    async def generate_image(
+        self,
+        prompt: str,
+        *,
+        size: str = "1024x1024",
+        image_model: str = "gpt-image-2",
+    ) -> dict[str, str]:
+        prompt_text = str(prompt or "").strip()
+        if not prompt_text:
+            return {"error": "empty prompt"}
+        access_token, _ = await self._get_access_token()
+        requested_size = str(size or "1024x1024").strip() or "1024x1024"
+        generation_size = self._normalize_image_generation_size(requested_size)
+        size_hint = self._normalize_image_size_hint(generation_size)
+        requested_image_model = self._normalize_image_generation_model(image_model)
+        messages = [
+            {
+                "role": "user",
+                "content": (
+                    "Generate exactly one image for the user. "
+                    "Use the image_generation tool and return no prose-only substitute.\n"
+                    f"Requested image model: {requested_image_model}.\n"
+                    f"Requested aspect/size: {size_hint} ({requested_size}).\n"
+                    f"Prompt: {prompt_text}"
+                ),
+            }
+        ]
+        image_tool: Dict[str, Any] = {
+            "type": "image_generation",
+            "model": requested_image_model,
+            "size": generation_size,
+            "quality": "auto",
+            "action": "generate",
+        }
+        payload: Dict[str, Any] = {
+            "model": self.model,
+            "store": False,
+            "stream": True,
+            "instructions": (
+                f"{_CODEX_SYSTEM_PREFIX}\n\n"
+                "You are generating a single image for a chat bot. "
+                f"Call the built-in image_generation tool using {requested_image_model} when available. "
+                "Do not answer with a prompt or instructions."
+            ),
+            "input": self._build_input(messages),
+            "tool_choice": {"type": "image_generation"},
+            "tools": [image_tool],
+        }
+        try:
+            data = await self._request_codex_response(payload, access_token=access_token)
+        except Exception as exc:
+            error_text = str(exc).lower()
+            if "model" not in error_text:
+                raise
+            fallback_tool = dict(image_tool)
+            fallback_tool.pop("model", None)
+            payload = dict(payload)
+            payload["tools"] = [fallback_tool]
+            data = await self._request_codex_response(payload, access_token=access_token)
+        output_items = list(data.get("output", []) or []) if isinstance(data, dict) else []
+        for item in output_items:
+            if not isinstance(item, dict) or item.get("type") != "image_generation_call":
+                continue
+            b64, url = self._extract_image_payload_candidate(item.get("result"))
+            if not b64 and not url:
+                b64, url = self._extract_image_payload_candidate(item)
+            if not b64 and url:
+                b64 = await self._download_codex_image_result(url, access_token)
+            if b64:
+                return {"b64_json": b64}
+        b64, url = self._extract_image_payload_candidate(data)
+        if not b64 and url:
+            b64 = await self._download_codex_image_result(url, access_token)
+        if b64:
+            return {"b64_json": b64}
+        return {"error": f"empty image response ({self._summarize_image_generation_response(data)})"}
 
     def build_tool_result_message(
         self,
@@ -1611,4 +1922,3 @@ def build_tool_caller(config: Any, supports_reasoning: Optional[bool] = None) ->
         thinking_mode=thinking_mode,
         supports_reasoning=supports_reasoning,
     )
-

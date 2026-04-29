@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from typing import Any, Callable
 
-from nonebot_plugin_personification.agent.tool_registry import AgentTool
+from plugin.personification.agent.tool_registry import AgentTool
 
 
 GROUP_INFO_DESCRIPTION = """查询 bot 当前所在的群聊列表（仅限白名单群）。
@@ -44,4 +44,3 @@ def build_group_info_tool(
         },
         handler=_handler,
     )
-

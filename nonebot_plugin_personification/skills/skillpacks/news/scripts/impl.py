@@ -5,7 +5,7 @@ from typing import Any, Iterable
 
 import httpx
 
-from nonebot_plugin_personification.agent.tool_registry import AgentTool
+from plugin.personification.agent.tool_registry import AgentTool
 
 
 BASE_URL_DEFAULT = "https://60s.viki.moe"
@@ -15,8 +15,8 @@ PLATFORM_MAP = {
     "微博": "weibo",
     "知乎": "zhihu",
     "抖音": "douyin",
-    "B站": "bilibili",
-    "哔哩哔哩": "bilibili",
+    "B站": "bili",
+    "哔哩哔哩": "bili",
 }
 
 
@@ -28,6 +28,10 @@ TRENDING_DESCRIPTION = """获取各平台实时热搜榜单。
 支持平台：微博、知乎、抖音、B站（哔哩哔哩）。
 适合场景：用户问"微博在讨论什么"、"知乎热搜是啥"、"B站最近流行什么"。
 返回 top10，可以加入自己对某个话题的看法。"""
+
+AI_NEWS_DESCRIPTION = """获取 AI 领域今日资讯。
+适合场景：用户问"AI 最近有什么新闻"、"今天 AI 圈有什么动静"、"给我来点 AI 资讯"。
+挑 1-3 条重点自然概括，不要机械逐条播报，不要说"根据 API"。"""
 
 JOKE_DESCRIPTION = """获取一条随机搞笑段子。
 适合场景：用户让你讲笑话、群聊气氛需要活跃时。
@@ -94,7 +98,8 @@ def _to_mmdd(iso_text: str) -> str:
     if not raw:
         return "未知时间"
     try:
-        dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        normalized = raw.replace("/", "-").replace("Z", "+00:00")
+        dt = datetime.fromisoformat(normalized)
         return f"{dt.month:02d}月{dt.day:02d}日"
     except Exception:
         return raw
@@ -109,6 +114,53 @@ def _as_list(value: Any) -> list[Any]:
             if isinstance(nested, list):
                 return nested
     return []
+
+
+def _extract_items(data: Any, *keys: str) -> list[Any]:
+    if isinstance(data, list):
+        return data
+    if isinstance(data, dict):
+        for key in keys:
+            nested = data.get(key)
+            if isinstance(nested, list):
+                return nested
+    return []
+
+
+def _extract_text(data: Any, *keys: str) -> str:
+    if not isinstance(data, dict):
+        return ""
+    for key in keys:
+        value = data.get(key)
+        text = str(value or "").strip()
+        if text:
+            return text
+    return ""
+
+
+def _format_epic_end_date(game: dict[str, Any]) -> str:
+    return _to_mmdd(
+        _extract_text(
+            game,
+            "free_end",
+            "end",
+            "freeEnd",
+        )
+    )
+
+
+def _format_epic_game_line(game: dict[str, Any]) -> list[str]:
+    title = _extract_text(game, "title", "name")
+    if not title:
+        return []
+    is_free_now = bool(game.get("is_free_now"))
+    end_date = _format_epic_end_date(game)
+    status = "免费至" if is_free_now else "预计免费至"
+    lines = [f"《{title}》 {status} {end_date}"]
+    desc = _extract_text(game, "description", "summary", "content")
+    if desc:
+        lines.append(desc[:50])
+    return lines
 
 
 def _iter_gold_rows(data: Any) -> Iterable[dict[str, Any]]:
@@ -269,6 +321,52 @@ def build_daily_news_tool(
     )
 
 
+def build_ai_news_tool(
+    remote_base_url: str,
+    logger: Any,
+    local_base_url: str | None = None,
+) -> AgentTool:
+    async def _handler() -> str:
+        try:
+            data = await _fetch_v2_data(
+                remote_base_url,
+                "/v2/ai-news",
+                local_base_url=local_base_url,
+            )
+            date = str(data.get("date", "今日")).strip() or "今日"
+            items = _extract_items(data, "news", "items", "list")
+            lines = [f"【AI 资讯 {date}】"]
+            for idx, item in enumerate(items[:8], 1):
+                if not isinstance(item, dict):
+                    continue
+                title = _extract_text(item, "title", "name")
+                detail = _extract_text(item, "summary", "description", "detail", "content")
+                source = _extract_text(item, "source")
+                if not title:
+                    continue
+                line = f"{idx}. {title}"
+                if source:
+                    line += f" [{source}]"
+                lines.append(line)
+                if detail:
+                    lines.append(detail[:80])
+            return "\n".join(lines) if len(lines) > 1 else "AI 资讯暂时获取失败，稍后再试。"
+        except Exception as e:
+            logger.warning(f"[news] get_ai_news 失败: {e}")
+            return "AI 资讯暂时获取失败，稍后再试。"
+
+    return AgentTool(
+        name="get_ai_news",
+        description=AI_NEWS_DESCRIPTION,
+        parameters={
+            "type": "object",
+            "properties": {},
+            "required": [],
+        },
+        handler=_handler,
+    )
+
+
 def build_trending_tool(
     remote_base_url: str,
     logger: Any,
@@ -286,15 +384,16 @@ def build_trending_tool(
                 f"/v2/{mapped}",
                 local_base_url=local_base_url,
             )
-            items = data.get("list", [])
+            items = _extract_items(data, "list", "items")
             lines = [f"【{platform_name} 热搜 Top10】"]
-            if isinstance(items, list):
-                for idx, item in enumerate(items[:10], 1):
-                    title = ""
-                    if isinstance(item, dict):
-                        title = str(item.get("title", "")).strip()
-                    if title:
-                        lines.append(f"{idx}. {title}")
+            for idx, item in enumerate(items[:10], 1):
+                title = ""
+                if isinstance(item, dict):
+                    title = _extract_text(item, "title", "name", "word", "hotword", "keyword")
+                else:
+                    title = str(item or "").strip()
+                if title:
+                    lines.append(f"{idx}. {title}")
             return "\n".join(lines)
         except Exception as e:
             logger.warning(f"[news] get_trending 失败: {e}")
@@ -323,10 +422,10 @@ def build_joke_tool(
         try:
             data = await _fetch_v2_data(
                 remote_base_url,
-                "/v2/joke",
+                "/v2/duanzi",
                 local_base_url=local_base_url,
             )
-            content = str(data.get("content", "")).strip()
+            content = _extract_text(data, "duanzi", "content", "text")
             return content or "段子暂时获取失败，等会再讲一个。"
         except Exception as e:
             logger.warning(f"[news] get_joke 失败: {e}")
@@ -353,19 +452,18 @@ def build_history_today_tool(
         try:
             data = await _fetch_v2_data(
                 remote_base_url,
-                "/v2/history",
+                "/v2/today-in-history",
                 local_base_url=local_base_url,
             )
-            items = data.get("list", data if isinstance(data, list) else [])
+            items = _extract_items(data, "items", "list")
             lines = ["【历史上的今天】"]
-            if isinstance(items, list):
-                for item in items[:5]:
-                    if not isinstance(item, dict):
-                        continue
-                    year = str(item.get("year", "")).strip()
-                    title = str(item.get("title", "")).strip()
-                    if year and title:
-                        lines.append(f"{year}年：{title}")
+            for item in items[:5]:
+                if not isinstance(item, dict):
+                    continue
+                year = str(item.get("year", "")).strip()
+                title = str(item.get("title", "")).strip()
+                if year and title:
+                    lines.append(f"{year}年：{title}")
             return "\n".join(lines)
         except Exception as e:
             logger.warning(f"[news] get_history_today 失败: {e}")
@@ -395,20 +493,13 @@ def build_epic_games_tool(
                 "/v2/epic",
                 local_base_url=local_base_url,
             )
-            games = data.get("list", data.get("games", data if isinstance(data, list) else []))
+            games = _extract_items(data, "list", "games", "items")
             lines = ["【Epic 本周免费游戏】"]
-            if isinstance(games, list):
-                for game in games:
-                    if not isinstance(game, dict):
-                        continue
-                    title = str(game.get("title", "")).strip()
-                    end_date = _to_mmdd(str(game.get("end", "")))
-                    desc = str(game.get("description", "")).strip()[:50]
-                    if title:
-                        lines.append(f"《{title}》 免费至 {end_date}")
-                        if desc:
-                            lines.append(desc)
-            return "\n".join(lines)
+            for game in games[:4]:
+                if not isinstance(game, dict):
+                    continue
+                lines.extend(_format_epic_game_line(game))
+            return "\n".join(lines) if len(lines) > 1 else "Epic 本周暂无免费游戏信息。"
         except Exception as e:
             logger.warning(f"[news] get_epic_games 失败: {e}")
             return "Epic 免费游戏信息获取失败，稍后再试。"
@@ -542,4 +633,3 @@ def build_exchange_rate_tool(
         },
         handler=_handler,
     )
-

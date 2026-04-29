@@ -4,6 +4,8 @@ import time
 from typing import Any, Callable, Optional, Tuple
 
 from ..core.message_relations import build_event_relation_metadata
+from ..core.group_roles import extract_sender_role
+from ..core.group_mute import is_group_muted
 from ..core.target_inference import TARGET_BOT, TARGET_OTHERS, infer_message_target
 
 try:
@@ -120,6 +122,9 @@ async def personification_rule(
     if isinstance(event, group_event_cls):
         group_id = str(event.group_id)
         if not is_group_whitelisted(group_id, plugin_whitelist):
+            return False
+        if is_group_muted(group_id):
+            logger.debug(f"拟人插件：群 {group_id} 处于 bot 禁言期，本轮不进入回复流程。")
             return False
 
         idle_active_state: dict[str, Any] = {}
@@ -324,6 +329,9 @@ def resolve_record_message(
     should_trigger_auto_analyze: Optional[Callable[[str, int], bool]] = None,
 ) -> Tuple[Optional[str], bool]:
     """记录群消息，返回 (group_id, should_auto_analyze)。"""
+    if bool(getattr(event, "_personification_muted_recorded", False)):
+        return None, False
+
     raw_msg, image_count, visual_summary = _extract_recordable_group_message(event)
     if not raw_msg or raw_msg.startswith("/") or len(raw_msg) >= 500:
         return None, False
@@ -354,6 +362,7 @@ def resolve_record_message(
         raw_msg,
         is_bot=is_bot_message,
         user_id=user_id,
+        sender_role=extract_sender_role(event),
         image_count=image_count,
         visual_summary=visual_summary,
         **relation_metadata,
@@ -395,6 +404,8 @@ async def poke_rule(
     group_id = str(group_id)
     if not is_group_whitelisted(group_id, plugin_whitelist):
         return False
+    if is_group_muted(group_id):
+        return False
     return random.random() < probability
 
 
@@ -424,6 +435,9 @@ async def poke_notice_rule(
     group_id = str(group_id)
     if not is_group_whitelisted(group_id, plugin_whitelist):
         logger.info(f"群 {group_id} 不在白名单 {plugin_whitelist} 或动态白名单中")
+        return False
+    if is_group_muted(group_id):
+        logger.debug(f"拟人插件：群 {group_id} 处于 bot 禁言期，忽略戳一戳响应。")
         return False
     res = random.random() < probability
     logger.info(f"戳一戳响应判定: 概率={probability}, 结果={res}")

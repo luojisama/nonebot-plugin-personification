@@ -8,9 +8,9 @@ try:
     from .....core.knowledge_store import PluginKnowledgeStore
     from .....skill_runtime.runtime_api import SkillRuntime
 except ImportError:  # pragma: no cover
-    from nonebot_plugin_personification.agent.tool_registry import AgentTool  # type: ignore
-    from nonebot_plugin_personification.core.knowledge_store import PluginKnowledgeStore  # type: ignore
-    from nonebot_plugin_personification.skill_runtime.runtime_api import SkillRuntime  # type: ignore
+    from plugin.personification.agent.tool_registry import AgentTool  # type: ignore
+    from plugin.personification.core.knowledge_store import PluginKnowledgeStore  # type: ignore
+    from plugin.personification.skill_runtime.runtime_api import SkillRuntime  # type: ignore
 
 
 LIST_PLUGINS_DESCRIPTION = """查询当前 bot 已安装的 NoneBot2 插件列表。
@@ -876,4 +876,3 @@ def build_plugin_knowledge_tools(runtime: SkillRuntime) -> list[AgentTool]:
             handler=_get_detail_handler,
         ),
     ]
-

@@ -1,6 +1,6 @@
 [project]
 name = "nonebot-plugin-shiro-personification"
-version = "0.5.1"
+version = "0.5.2"
 description = "基于群聊与私聊上下文的人设回复插件，支持作息模拟、联网检索、风格学习、主动私聊、贴图、画像与 Agent 工具调用。"
 readme = "README.md"
 requires-python = ">=3.10"

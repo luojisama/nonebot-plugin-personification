@@ -9,7 +9,7 @@ from uuid import uuid4
 
 from ._loader import load_personification_module
 
-config_manager = load_personification_module("nonebot_plugin_personification.core.config_manager")
+config_manager = load_personification_module("plugin.personification.core.config_manager")
 
 
 def _build_config(tmp_path, *, fields_set: set[str] | None = None):  # noqa: ANN001
@@ -121,4 +121,3 @@ def test_config_manager_async_update_persists_changes() -> None:
         assert cfg.personification_lite_model == "lite-from-update"
     finally:
         shutil.rmtree(temp_dir, ignore_errors=True)
-

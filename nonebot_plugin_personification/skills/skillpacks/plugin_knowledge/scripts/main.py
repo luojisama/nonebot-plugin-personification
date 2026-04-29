@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from nonebot_plugin_personification.skill_runtime.runtime_api import SkillRuntime
+from plugin.personification.skill_runtime.runtime_api import SkillRuntime
 from . import impl
 
 
@@ -62,4 +62,3 @@ async def run_get_feature_detail(
 
 def build_tools(runtime: SkillRuntime):
     return impl.build_plugin_knowledge_tools(runtime)
-

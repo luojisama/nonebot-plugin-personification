@@ -7,7 +7,7 @@ from typing import Any, Callable, Dict
 _GROUP_BATCH_DELAY_SECONDS = 1.2
 _PRIVATE_BATCH_DELAY_SECONDS = 0.8
 _MAX_BATCH_EVENTS = 8
-_PROCESS_RESPONSE_TIMEOUT_SECONDS = 75.0
+_PROCESS_RESPONSE_TIMEOUT_SECONDS = 180.0
 _DIRECT_REPLY_PREEMPT_SECONDS = 8.0
 
 
@@ -286,6 +286,7 @@ async def run_buffer_timer(
     logger: Any,
     finished_exception_cls: Any = None,
     delay: float = 0.0,
+    response_timeout_seconds: float = _PROCESS_RESPONSE_TIMEOUT_SECONDS,
 ) -> None:
     await asyncio.sleep(max(0.0, float(delay or 0.0)))
 
@@ -320,6 +321,7 @@ async def run_buffer_timer(
                         logger=logger,
                         finished_exception_cls=finished_exception_cls,
                         delay=_delay,
+                        response_timeout_seconds=response_timeout_seconds,
                     )
                 ),
             )
@@ -382,15 +384,16 @@ async def run_buffer_timer(
     }
     entry["current_trigger_type"] = trigger_type
     entry["current_is_random_chat"] = bool(state.get("is_random_chat", False))
+    timeout_seconds = max(30.0, float(response_timeout_seconds or _PROCESS_RESPONSE_TIMEOUT_SECONDS))
 
     try:
         await asyncio.wait_for(
             process_response_logic(bot, selected_event, state),
-            timeout=_PROCESS_RESPONSE_TIMEOUT_SECONDS,
+            timeout=timeout_seconds,
         )
     except asyncio.TimeoutError:
         logger.warning(
-            f"拟人插件：会话 {key} 单轮回复超时（>{_PROCESS_RESPONSE_TIMEOUT_SECONDS:.0f}s），已放弃旧批次。"
+            f"拟人插件：会话 {key} 单轮回复超时（>{timeout_seconds:.0f}s），已放弃旧批次。"
         )
     except asyncio.CancelledError:
         if int(entry.get("superseded_generation", 0) or 0) >= current_generation:
@@ -454,6 +457,7 @@ async def run_buffer_timer(
                             logger=logger,
                             finished_exception_cls=finished_exception_cls,
                             delay=_delay,
+                            response_timeout_seconds=response_timeout_seconds,
                         )
                     ),
                 )
@@ -480,6 +484,7 @@ async def run_buffer_timer(
                             logger=logger,
                             finished_exception_cls=finished_exception_cls,
                             delay=_delay,
+                            response_timeout_seconds=response_timeout_seconds,
                         )
                     ),
                 )

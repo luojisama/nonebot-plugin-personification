@@ -143,6 +143,7 @@ async def auto_collect_stickers(
                     "ocr_text": result.ocr_text,
                     "use_hint": result.use_hint,
                     "avoid_hint": result.avoid_hint,
+                    "style": result.style,
                 },
                 file_name=saved_path.stem,
                 vision_route=result.vision_route,

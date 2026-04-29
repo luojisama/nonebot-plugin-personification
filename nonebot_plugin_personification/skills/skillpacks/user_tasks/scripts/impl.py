@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from nonebot_plugin_personification.agent.inner_state import get_personification_data_dir
-from nonebot_plugin_personification.core.tasks_service import (
+from plugin.personification.agent.inner_state import get_personification_data_dir
+from plugin.personification.core.tasks_service import (
     get_user_tasks_path,
     make_cancel_task_tool,
     make_create_task_tool,
@@ -17,4 +17,3 @@ __all__ = [
     "restore_tasks_on_startup",
     "_parse_cron",
 ]
-

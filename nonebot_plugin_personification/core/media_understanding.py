@@ -11,6 +11,7 @@ from .ai_routes import resolve_video_fallback_provider
 from .image_input import is_image_input_unsupported_error, provider_supports_vision
 from .media_refs import normalize_video_ref
 from .message_parts import build_user_message_content
+from .model_router import MODEL_ROLE_STICKER, get_model_override_for_role
 from .visual_capabilities import VISUAL_ROUTE_AGENT, error_indicates_vision_unavailable, provider_supports_video
 from ..skills.skillpacks.tool_caller.scripts.impl import build_tool_caller
 
@@ -57,14 +58,29 @@ def _primary_provider_candidates(runtime: Any) -> list[dict[str, Any]]:
         except Exception:
             providers = []
     if providers:
-        return providers
+        return _apply_sticker_model_override(runtime, providers)
 
     primary = get_primary_provider_config(runtime)
     if _is_provider_usable(primary):
         payload = dict(primary)
         payload.setdefault("name", "legacy_primary")
-        return [payload]
+        return _apply_sticker_model_override(runtime, [payload])
     return []
+
+
+def _apply_sticker_model_override(runtime: Any, providers: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    plugin_config = getattr(runtime, "plugin_config", None)
+    if plugin_config is None:
+        return providers
+    model_override = get_model_override_for_role(plugin_config, MODEL_ROLE_STICKER)
+    if not model_override:
+        return providers
+    patched: list[dict[str, Any]] = []
+    for provider in providers:
+        cloned = dict(provider)
+        cloned["model"] = model_override
+        patched.append(cloned)
+    return patched
 
 
 class _ProviderConfigProxy:

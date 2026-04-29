@@ -32,6 +32,19 @@ from ..core.knowledge_builder import (
     stop_plugin_knowledge_builder,
 )
 from ..core.legacy_memory_migrator import LegacyMemoryMigrator
+from ..core.model_router import (
+    MODEL_OVERRIDE_ROLES,
+    MODEL_ROLE_AGENT,
+    MODEL_ROLE_INTENT,
+    MODEL_ROLE_LABELS,
+    MODEL_ROLE_REVIEW,
+    MODEL_ROLE_STICKER,
+    collect_available_models,
+    format_model_overrides,
+    get_model_for_role,
+    normalize_model_overrides,
+    resolve_model_role,
+)
 from ..core.runtime_config import get_runtime_load_info
 from ..utils import get_group_config, is_group_whitelisted
 
@@ -54,6 +67,8 @@ _COMMAND_ALIASES = {
     "迁移": "migrate",
     "recall": "recall",
     "召回": "recall",
+    "model": "model",
+    "模型": "model",
 }
 _SUBCOMMAND_ALIASES = {
     "list": "list",
@@ -173,6 +188,7 @@ def _root_help_text() -> str:
         "- 拟人 管理员 列表|添加|删除：管理插件管理员。",
         "- 拟人 迁移 状态|执行：查看或执行旧数据迁移。",
         "- 拟人 召回 统计：查看长期记忆召回统计。",
+        "- 拟人 模型 列表|使用|设置|重置：QQ 内热更新 intent/review/agent/sticker 四类 LLM 模型。",
         "",
         "旧命令兼容（仍可用，下面直接说明用途）：",
         "- 拟人配置：发送聊天记录形式的配置总览。",
@@ -234,6 +250,7 @@ def _format_category_help(category: str) -> str:
         "help": "帮助",
         "status": "状态",
         "recall": "召回",
+        "model": "模型",
     }
     lines = [f"{category_names.get(category, category)}："]
     for entry in entries:
@@ -444,6 +461,11 @@ async def dispatch_persona_admin_command(
             await matcher.finish(_admin_error())
         await matcher.finish(handle_recall_command(bundle, tokens=rest))
 
+    if command == "model":
+        if not can_manage_sensitive_action(event=event, superusers=bundle.superusers):
+            await matcher.finish(_admin_error())
+        await matcher.finish(handle_model_command(bundle, tokens=rest))
+
     await matcher.finish("未识别的子命令。可用“拟人 帮助”或“/persona help”查看帮助。")
 
 
@@ -461,7 +483,7 @@ def render_help(bundle: Any, *, event: Any, tokens: list[str]) -> str:
         entry = find_command_help(tuple(normalized[:2]))
         if entry is not None:
             return _format_command_help(entry.path)
-    if normalized[0] in {"config", "admin", "memory", "migrate", "help", "status", "recall"}:
+    if normalized[0] in {"config", "admin", "memory", "migrate", "help", "status", "recall", "model"}:
         return _format_category_help(normalized[0])
     config_entry = resolve_config_entry(" ".join(tokens))
     if config_entry is None:
@@ -501,10 +523,125 @@ def render_status(bundle: Any) -> str:
         f"运行时配置文件：{runtime_load_info.get('path') or '未记录'}",
         f"env 覆盖的 runtime 键：{runtime_skipped}",
         f"模型内置搜索：{format_config_value(getattr(bundle.plugin_config, 'personification_model_builtin_search_enabled', False))}",
+        "模型覆盖：" + "；".join(format_model_overrides(bundle.plugin_config)).replace("- ", ""),
         f"联网模式：{getattr(bundle.plugin_config, 'personification_tool_web_search_mode', 'enabled')}",
         f"最近后台维护：{format_timestamp(background_status.get('last_periodic_at', 0))}",
     ]
     return "\n".join(lines)
+
+
+def _default_model_for_role(bundle: Any, role: str) -> str:
+    config = bundle.plugin_config
+    primary = ""
+    provider_getter = getattr(bundle, "get_configured_api_providers", None)
+    if callable(provider_getter):
+        try:
+            providers = [item for item in list(provider_getter() or []) if isinstance(item, dict)]
+        except Exception:
+            providers = []
+        if providers:
+            primary = str(providers[0].get("model", "") or "").strip()
+    if not primary:
+        primary = str(getattr(config, "personification_model", "") or "").strip()
+    lite = str(getattr(config, "personification_lite_model", "") or "").strip()
+    if role in {MODEL_ROLE_INTENT, MODEL_ROLE_REVIEW}:
+        return lite or primary
+    if role == MODEL_ROLE_STICKER:
+        return (
+            str(getattr(config, "personification_vision_fallback_model", "") or "").strip()
+            or str(getattr(config, "personification_labeler_model", "") or "").strip()
+            or primary
+        )
+    return primary
+
+
+def _format_model_status(bundle: Any) -> str:
+    lines = ["模型路由"]
+    lines.append("当前生效：")
+    for role in MODEL_OVERRIDE_ROLES:
+        effective = get_model_for_role(
+            bundle.plugin_config,
+            role,
+            _default_model_for_role(bundle, role),
+        )
+        lines.append(f"- {role}（{MODEL_ROLE_LABELS[role]}）：{effective or '未配置'}")
+    lines.append("")
+    lines.append("当前覆盖：")
+    lines.extend(format_model_overrides(bundle.plugin_config))
+    available = collect_available_models(
+        bundle.plugin_config,
+        get_configured_api_providers=getattr(bundle, "get_configured_api_providers", None),
+    )
+    lines.append("")
+    lines.append("可用模型（按当前调用方式枚举；Codex 来源优先使用本机 /model 缓存）：")
+    if available:
+        for item in available:
+            lines.append(f"- {item['model']}（{item['source']}）")
+    else:
+        lines.append("- 未发现已配置模型")
+    lines.append("")
+    lines.append("用法：拟人 模型 使用 <model>；拟人 模型 设置 <intent|review|agent|sticker> <model>；拟人 模型 重置 [role|全部]")
+    return "\n".join(lines)
+
+
+def _save_model_overrides(bundle: Any, overrides: dict[str, str]) -> None:
+    normalized = normalize_model_overrides(overrides)
+    setattr(bundle.plugin_config, "personification_model_overrides", normalized)
+    if callable(getattr(bundle, "save_plugin_runtime_config", None)):
+        bundle.save_plugin_runtime_config()
+    reload_services = getattr(bundle, "reload_runtime_services", None)
+    if callable(reload_services):
+        reload_services()
+
+
+def handle_model_command(bundle: Any, *, tokens: list[str]) -> str:
+    action = normalize_command_word(tokens[0]) if tokens else "list"
+    raw_action = str(tokens[0] if tokens else "").strip().lower()
+    if action in {"list", "get", "status"} or raw_action in {"列表", "查看", "状态", ""}:
+        return _format_model_status(bundle)
+
+    current = normalize_model_overrides(
+        getattr(bundle.plugin_config, "personification_model_overrides", {}) or {}
+    )
+
+    if raw_action in {"use", "使用", "切换", "全部", "all"}:
+        if len(tokens) < 2:
+            return "用法：拟人 模型 使用 <model>"
+        model = " ".join(str(token) for token in tokens[1:]).strip()
+        if not model:
+            return "模型名不能为空。"
+        for role in MODEL_OVERRIDE_ROLES:
+            current[role] = model
+        _save_model_overrides(bundle, current)
+        return f"已将四类 LLM 调用统一切换到：{model}\n生效：立即生效"
+
+    if action == "set":
+        if len(tokens) < 3:
+            return "用法：拟人 模型 设置 <intent|review|agent|sticker> <model>"
+        role = resolve_model_role(tokens[1])
+        if role not in MODEL_OVERRIDE_ROLES:
+            return "未知模型阶段。可选：intent、review、agent、sticker。"
+        model = " ".join(str(token) for token in tokens[2:]).strip()
+        if not model:
+            return "模型名不能为空。"
+        current[role] = model
+        _save_model_overrides(bundle, current)
+        return f"已设置：{role}（{MODEL_ROLE_LABELS[role]}）= {model}\n生效：立即生效"
+
+    if action == "reset":
+        target = str(tokens[1] if len(tokens) >= 2 else "全部").strip().lower()
+        if target in {"", "全部", "all", "所有"}:
+            current.clear()
+            _save_model_overrides(bundle, current)
+            return "已清空全部模型覆盖。\n生效：立即生效"
+        role = resolve_model_role(target)
+        if role not in MODEL_OVERRIDE_ROLES:
+            return "未知模型阶段。可选：intent、review、agent、sticker、全部。"
+        current.pop(role, None)
+        _save_model_overrides(bundle, current)
+        return f"已重置：{role}（{MODEL_ROLE_LABELS[role]}）\n生效：立即生效"
+
+    return "用法：拟人 模型 列表｜使用 <model>｜设置 <intent|review|agent|sticker> <model>｜重置 [role|全部]"
 
 
 def handle_config_command(bundle: Any, *, event: Any, tokens: list[str]) -> str:

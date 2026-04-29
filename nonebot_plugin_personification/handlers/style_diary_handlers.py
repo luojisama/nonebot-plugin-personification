@@ -1,6 +1,15 @@
 import asyncio
 import random
+import re
 from typing import Any, Awaitable, Callable, Optional
+
+
+_IMAGE_B64_RE = re.compile(r"\[IMAGE_B64\][A-Za-z0-9+/=\r\n]+\[/IMAGE_B64\]")
+
+
+def _render_qzone_content_for_notice(content: str) -> str:
+    visible = _IMAGE_B64_RE.sub("[配图]", str(content or "")).strip()
+    return visible or "[无文本内容]"
 
 
 async def handle_background_style_analysis(
@@ -36,19 +45,23 @@ async def handle_manual_diary_command(
 ) -> None:
     """处理手动发说说命令。"""
     if not qzone_publish_available:
-        await matcher.finish("当前未启用空间说说发布能力。")
+        await matcher.finish(
+            "当前未启用 QQ 空间说说功能。\n"
+            "请在 .env.prod 中设置 personification_qzone_enabled=true 并配置 qzone_cookie 后重启。"
+        )
 
-    await matcher.send("正在刷新空间 Cookie、生成 AI 周记并发布，请稍候...")
+    await matcher.send("正在刷新空间 Cookie、生成空间说说并发布，请稍候...")
     cookie_ok, cookie_msg = await update_qzone_cookie(bot)
     if not cookie_ok:
         await matcher.send(f"空间 Cookie 自动更新失败，继续尝试使用现有 Cookie 发布：{cookie_msg}")
     diary_content = await generate_ai_diary(bot)
     if not diary_content:
-        await matcher.finish("AI 生成周记失败，请检查网络 or API 配置。")
+        await matcher.finish("AI 生成说说失败，请检查网络 or API 配置。")
 
     success, msg = await publish_qzone_shuo(diary_content, bot.self_id)
     if success:
-        await matcher.finish(f"✅ AI 说说发布成功！\n\n内容：\n{diary_content}")
+        visible_content = _render_qzone_content_for_notice(diary_content)
+        await matcher.finish(f"✅ AI 说说发布成功！\n\n内容：\n{visible_content}")
     await matcher.finish(f"❌ {msg}")
 
 

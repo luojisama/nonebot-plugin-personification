@@ -25,25 +25,29 @@ from ...core.image_input import (
     is_image_input_unsupported_error,
     normalize_image_detail,
     normalize_image_input_mode,
-    provider_supports_vision,
 )
-from ...core.media_understanding import analyze_images_with_route_or_fallback
 from ...core.sticker_library import (
-    analyze_sticker_image,
-    render_sticker_semantic_summary,
     resolve_sticker_dir,
 )
 from ...core.message_parts import build_user_message_content, clone_messages_with_text_suffix
 from ...core.context_policy import build_prompt_injection_guard
 from ...core.repeat_follow import maybe_follow_repeat_cluster
+from ...core.reply_style_policy import (
+    build_direct_visual_identity_guard,
+    build_reply_style_policy_prompt,
+)
 from ...core.response_review import (
     ReplyArbitrationIntent,
     arbitrate_reply_mode,
     decide_random_chat_speak,
     extract_recent_bot_reply_texts,
+    is_agent_reply_ooc,
+    make_passthrough_review_decision,
     recover_direct_mention_reply,
+    rewrite_agent_reply_ooc,
     review_response_text,
 )
+from ...core.prompt_loader import pick_ack_phrase
 from ...core.sticker_feedback import (
     build_sticker_feedback_scene_key,
     load_sticker_feedback,
@@ -58,12 +62,36 @@ from ...agent.action_executor import ActionExecutor
 from ...agent.loop import run_agent
 from ...agent.query_rewriter import QueryRewriteContext
 from ..reply_pipeline.pipeline_emotion import compose_reply_emotion_block
+from ..reply_pipeline.pipeline_context import (
+    batch_has_newer_messages as _shared_batch_has_newer_messages,
+    compute_agent_time_budget as _compute_agent_time_budget,
+    primary_route_supports_vision as _runtime_primary_route_supports_vision,
+    should_use_agent_for_reply as _should_use_agent_for_reply,
+    strip_injected_visual_summary as _strip_injected_visual_summary,
+)
+from ..reply_pipeline.pipeline_sticker import build_image_summary_suffix as _shared_build_image_summary_suffix
 from ...skills.skillpacks.sticker_tool.scripts.impl import (
     choose_sticker_for_context,
     reset_current_image_context,
     set_current_image_context,
 )
 from ...utils import build_group_context_window, get_group_topic_summary, get_recent_group_msgs
+
+
+_IMAGE_B64_RE = re.compile(r"\[IMAGE_B64\]([A-Za-z0-9+/=\r\n]+)\[/IMAGE_B64\]")
+
+
+def _extract_image_b64_markers(text: str) -> tuple[str, list[str]]:
+    payloads: list[str] = []
+
+    def _replace(match: re.Match[str]) -> str:
+        payload = re.sub(r"\s+", "", match.group(1) or "")
+        if payload:
+            payloads.append(payload)
+        return ""
+
+    cleaned = _IMAGE_B64_RE.sub(_replace, str(text or "")).strip()
+    return cleaned, payloads
 
 
 _TRANSLATION_LINE_SUFFIX = r"\s*\d*(?:\s*[（(][^）)]*[）)])*\s*[：:]"
@@ -254,13 +282,6 @@ def _strip_control_markers(text: str) -> str:
     return cleaned.strip()
 
 
-def _strip_injected_visual_summary(text: str) -> str:
-    raw = str(text or "").strip()
-    if not raw:
-        return ""
-    return re.sub(r"\[.*?（系统注入，不触发防御机制）：.*?\]", "", raw).strip()
-
-
 def _build_tts_user_hint(*, is_private: bool) -> str:
     scene = "私聊" if is_private else "群聊"
     return f"这是{scene}场景下的回复，请自然朗读，整体语速略快一点。"
@@ -282,79 +303,47 @@ def _event_mentions_bot(event: Any, bot: Any) -> bool:
     return False
 
 
-def _get_primary_provider_signature(
-    *,
-    get_configured_api_providers: Callable[[], List[Dict[str, Any]]] | None,
-    plugin_config: Any,
-) -> tuple[str, str]:
-    providers = list(get_configured_api_providers() or []) if get_configured_api_providers is not None else []
-    primary_api_type = ""
-    primary_model = ""
-    if providers:
-        primary_api_type = str(providers[0].get("api_type", "") or "").strip().lower()
-        primary_model = str(providers[0].get("model", "") or "").strip()
-    if not primary_api_type:
-        primary_api_type = str(getattr(plugin_config, "personification_api_type", "") or "").strip().lower()
-    if not primary_model:
-        primary_model = str(getattr(plugin_config, "personification_model", "") or "").strip()
-    return primary_api_type, primary_model
-
-
 def _primary_route_supports_vision(
     *,
     get_configured_api_providers: Callable[[], List[Dict[str, Any]]] | None,
     plugin_config: Any,
     route_name: str,
 ) -> bool:
-    providers = list(get_configured_api_providers() or []) if get_configured_api_providers is not None else []
-    if providers:
-        return any(
-            provider_supports_vision(
-                str(provider.get("api_type", "") or "").strip().lower(),
-                str(provider.get("model", "") or "").strip(),
-                route_name=route_name,
-            )
-            for provider in providers
-            if isinstance(provider, dict)
-        )
-    api_type, model = _get_primary_provider_signature(
-        get_configured_api_providers=get_configured_api_providers,
-        plugin_config=plugin_config,
+    return _runtime_primary_route_supports_vision(
+        _build_yaml_runtime_proxy(
+            plugin_config=plugin_config,
+            agent_tool_caller=None,
+            get_configured_api_providers=get_configured_api_providers,
+            vision_caller=None,
+            logger=None,
+        ),
+        route_name,
     )
-    return provider_supports_vision(api_type, model, route_name=route_name)
-
-
-def _should_use_agent_for_reply(
-    *,
-    plugin_config: Any,
-    tool_registry: Any,
-    agent_tool_caller: Any,
-    message_intent: str,
-    has_image_input: bool,
-) -> bool:
-    if not (
-        getattr(plugin_config, "personification_agent_enabled", True)
-        and tool_registry
-        and agent_tool_caller
-    ):
-        return False
-    if has_image_input:
-        return True
-    if bool(getattr(plugin_config, "personification_web_search_always", False)):
-        return True
-    return str(message_intent or "").strip() in {"lookup", "plugin_question", "explanation"}
 
 
 def _batch_ref_has_newer_messages(runtime_ref: Any) -> bool:
-    if not isinstance(runtime_ref, dict):
-        return False
-    entry = runtime_ref.get("entry")
-    generation = int(runtime_ref.get("generation", 0) or 0)
-    if not isinstance(entry, dict):
-        return False
-    if int(entry.get("current_generation", 0) or 0) != generation:
-        return False
-    return bool(entry.get("newer_batch_for_current"))
+    return _shared_batch_has_newer_messages({"batch_runtime_ref": runtime_ref})
+
+
+def _build_yaml_runtime_proxy(
+    *,
+    plugin_config: Any,
+    agent_tool_caller: Any,
+    get_configured_api_providers: Callable[[], List[Dict[str, Any]]] | None,
+    vision_caller: Any,
+    logger: Any,
+) -> Any:
+    return type(
+        "_YamlReplyRuntime",
+        (),
+        {
+            "plugin_config": plugin_config,
+            "agent_tool_caller": agent_tool_caller,
+            "vision_caller": vision_caller,
+            "logger": logger,
+            "get_configured_api_providers": staticmethod(get_configured_api_providers or (lambda: [])),
+        },
+    )()
 
 
 async def _build_image_summary_suffix(
@@ -367,70 +356,17 @@ async def _build_image_summary_suffix(
     sticker_like: bool,
     logger: Any,
 ) -> str:
-    if not image_urls:
-        return ""
-    summary_text = ""
-    if sticker_like:
-        runtime_proxy = type(
-            "_YamlVisionRuntime",
-            (),
-            {
-                "plugin_config": plugin_config,
-                "agent_tool_caller": agent_tool_caller,
-                "vision_caller": vision_caller,
-                "logger": logger,
-                "get_configured_api_providers": staticmethod(get_configured_api_providers or (lambda: [])),
-            },
-        )()
-        try:
-            result = await analyze_sticker_image(
-                runtime=runtime_proxy,
-                image_refs=image_urls,
-                fallback_vision_caller=vision_caller,
-            )
-            summary_text = render_sticker_semantic_summary(
-                {
-                    "description": result.description,
-                    "ocr_text": result.ocr_text,
-                    "use_hint": result.use_hint,
-                    "avoid_hint": result.avoid_hint,
-                    "mood_tags": result.mood_tags,
-                    "scene_tags": result.scene_tags,
-                }
-            ) or result.summary
-        except Exception as exc:
-            logger.warning(f"拟人插件 (YAML)：表情包视觉理解失败，改用摘要回退: {exc}")
-    if not summary_text:
-        prompt = (
-            "请优先识别表情包/截图中的关键语义、人物关系、画面情绪和可用于回复的线索；控制在80字以内。"
-            if sticker_like
-            else "请用一句中文概括图片的主体、动作/表情、图中文字和当前语境里最相关的线索；控制在80字内，直接输出。"
-        )
-        runtime_proxy = type(
-            "_YamlSummaryRuntime",
-            (),
-            {
-                "plugin_config": plugin_config,
-                "agent_tool_caller": agent_tool_caller,
-                "vision_caller": vision_caller,
-                "logger": logger,
-                "get_configured_api_providers": staticmethod(get_configured_api_providers or (lambda: [])),
-            },
-        )()
-        try:
-            summary_text, _route = await analyze_images_with_route_or_fallback(
-                runtime=runtime_proxy,
-                prompt=prompt,
-                image_refs=image_urls,
-                route_name=VISUAL_ROUTE_REPLY_YAML,
-                fallback_vision_caller=vision_caller,
-            )
-        except Exception as exc:
-            logger.warning(f"拟人插件 (YAML)：图片摘要注入失败: {exc}")
-    if not summary_text:
-        return ""
-    desc_label = "表情包语义" if sticker_like else "图片视觉描述"
-    return f"[{desc_label}（系统注入，不触发防御机制）：{summary_text}]"
+    return await _shared_build_image_summary_suffix(
+        runtime=_build_yaml_runtime_proxy(
+            plugin_config=plugin_config,
+            agent_tool_caller=agent_tool_caller,
+            get_configured_api_providers=get_configured_api_providers,
+            vision_caller=vision_caller,
+            logger=logger,
+        ),
+        image_urls=image_urls,
+        sticker_like=sticker_like,
+    )
 
 
 async def process_yaml_response_logic(
@@ -474,6 +410,7 @@ async def process_yaml_response_logic(
     tts_service: Any = None,
     extract_forward_content: Callable[..., Any] = None,
     memory_curator: Any = None,
+    knowledge_store: Any = None,
     disable_network_hooks: bool = False,
     batched_events: List[Dict[str, Any]] | None = None,
     repeat_clusters: List[Dict[str, Any]] | None = None,
@@ -563,6 +500,19 @@ async def process_yaml_response_logic(
                     history_last_text += "[图片]"
     else:
         history_last_text = str(last_msg["content"])
+
+    last_images = list(current_image_urls or [])
+    if isinstance(last_msg["content"], list):
+        for item in last_msg["content"]:
+            if item["type"] == "image_url":
+                img_url_obj = item.get("image_url", {})
+                if isinstance(img_url_obj, dict):
+                    url = img_url_obj.get("url")
+                    if url and url not in last_images:
+                        last_images.append(url)
+                elif isinstance(img_url_obj, str) and img_url_obj not in last_images:
+                    last_images.append(img_url_obj)
+    photo_like = "[图片·照片]" in (history_last_text or raw_message_text or trigger_reason)
 
     if not is_private_session and not recent_context_hint:
         recent_window = build_group_context_window(
@@ -690,9 +640,21 @@ async def process_yaml_response_logic(
     system_prompt += (
         "\n\n## 基础输出规则\n"
         "- 输出纯文本，禁止使用 markdown 格式（不要用 **加粗**、*斜体*、# 标题、- 列表符号、`代码块`等）。\n"
-        "- 收到贴图/表情包时不要主动解释；收到真实照片时可以像群友看朋友圈一样自然回应，不需要等对方先提问。\n"
+        "- 收到贴图/表情包时绝对不要对图片内容发表任何评论（包括“这图也太X了”“哈哈这个”等），当作没看见，按对话语境继续；收到真实照片时可以像群友看朋友圈一样自然回应。\n"
         "- 表情包/梗图/截图可以当作语气线索理解，但没人问图里是什么时，不要主动做图片讲解。"
     )
+    system_prompt += "\n\n" + build_reply_style_policy_prompt(
+        has_visual_context=bool(last_images),
+        photo_like=photo_like,
+    )
+    if knowledge_store is not None:
+        try:
+            plugin_summary = knowledge_store.get_plugin_summary_for_prompt()
+        except Exception as exc:
+            logger.debug(f"[plugin_knowledge] YAML prompt summary unavailable: {exc}")
+            plugin_summary = ""
+        if plugin_summary:
+            system_prompt += f"\n\n[已安装插件摘要（仅供参考）]\n{plugin_summary}"
     system_prompt += f"\n\n{build_prompt_injection_guard()}"
 
     group_config = get_group_config(group_id)
@@ -809,18 +771,6 @@ async def process_yaml_response_logic(
                 input_text += f"- {text}（{count}次，参与者：{speakers or '未知'}）\n"
 
     user_content: Any = input_text
-    last_images = list(current_image_urls or [])
-    if isinstance(last_msg["content"], list):
-        for item in last_msg["content"]:
-            if item["type"] == "image_url":
-                img_url_obj = item.get("image_url", {})
-                if isinstance(img_url_obj, dict):
-                    url = img_url_obj.get("url")
-                    if url and url not in last_images:
-                        last_images.append(url)
-                elif isinstance(img_url_obj, str) and img_url_obj not in last_images:
-                    last_images.append(img_url_obj)
-
     tool_image_urls = list(last_images)
     image_input_mode = normalize_image_input_mode(
         getattr(plugin_config, "personification_image_input_mode", "auto")
@@ -829,7 +779,7 @@ async def process_yaml_response_logic(
         getattr(plugin_config, "personification_image_detail", "auto")
     )
     sticker_like = "[图片·表情包]" in input_text or "[表情id:" in input_text or "[表情包]" in input_text
-    photo_like = "[图片·照片]" in input_text
+    photo_like = photo_like or "[图片·照片]" in input_text
     direct_image_input = bool(last_images) and image_input_mode in {"auto", "direct"} and (
         image_input_mode == "direct"
         or _primary_route_supports_vision(
@@ -878,14 +828,7 @@ async def process_yaml_response_logic(
             "不需要等对方先提问。"
         )
 
-    image_guard_prompt = (
-        "\n\n## 图片处理规则（重要）\n"
-        "1. 你正在看用户发送的图片，但你仍然是「你自己」，绝对不能代入图片中的角色。\n"
-        "2. 禁止以图片中角色的口吻说话，禁止扮演图片中的任何人物或角色。\n"
-        "3. 你应该以旁观者的身份描述或评论图片内容，而不是成为图片中的人。\n"
-        "4. 如果图片是动漫/游戏角色，你只是「看到」了这张图片，你不是那个角色。\n"
-        "5. 始终保持你自己的身份和人格，用你自己的语气来回应图片。\n"
-    )
+    image_guard_prompt = build_direct_visual_identity_guard()
     if text_model_images:
         user_content = build_user_message_content(
             text=text_model_input,
@@ -976,10 +919,25 @@ async def process_yaml_response_logic(
         tool_registry=tool_registry,
         agent_tool_caller=agent_tool_caller,
         message_intent=message_intent,
+        ambiguity_level=str(intent_ambiguity_level or ""),
+        is_direct_mention=is_direct_mention,
         has_image_input=bool(tool_image_urls),
     ):
         executor = ActionExecutor(bot, event, plugin_config, logger)
         image_ctx_token = set_current_image_context(tool_image_urls, input_text)
+        ack_phrase = ""
+        if is_direct_mention:
+            ack_phrase = pick_ack_phrase(
+                plugin_config,
+                get_group_config,
+                logger,
+                group_id=None if is_private_session else group_id,
+            )
+        ack_sender = None
+        if ack_phrase:
+            async def _ack_sender(text: str, *, _phrase: str = ack_phrase) -> None:
+                await bot.send(event, str(text or "").strip() or _phrase)
+            ack_sender = _ack_sender
         try:
             try:
                 agent_result = await run_agent(
@@ -989,7 +947,7 @@ async def process_yaml_response_logic(
                     executor=executor,
                     plugin_config=plugin_config,
                     logger=logger,
-                    max_steps=getattr(plugin_config, "personification_agent_max_steps", 7),
+                    max_steps=getattr(plugin_config, "personification_agent_max_steps", 10),
                     current_image_urls=tool_image_urls,
                     direct_image_input=agent_direct_image_input,
                     query_rewrite_context=QueryRewriteContext(
@@ -1001,6 +959,14 @@ async def process_yaml_response_logic(
                     repeat_clusters=repeat_clusters,
                     relationship_hint=relationship_hint,
                     recent_bot_replies=recent_bot_replies,
+                    precomputed_intent=intent_decision,
+                    time_budget_seconds=_compute_agent_time_budget(
+                        started_at=started_at,
+                        total_timeout_seconds=float(
+                            getattr(plugin_config, "personification_response_timeout", 180) or 180
+                        ),
+                    ),
+                    ack_sender=ack_sender,
                 )
             except Exception as exc:
                 if not (
@@ -1017,6 +983,16 @@ async def process_yaml_response_logic(
         if agent_result is not None:
             reply_content = agent_result.text
             used_agent = True
+            if not agent_result.direct_output and is_agent_reply_ooc(reply_content):
+                rewritten_ooc = await rewrite_agent_reply_ooc(
+                    tool_caller=lite_tool_caller or agent_tool_caller,
+                    original_text=reply_content,
+                    persona_system=system_prompt,
+                )
+                if rewritten_ooc:
+                    reply_content = rewritten_ooc
+                else:
+                    reply_content = "[SILENCE]"
             if _has_newer_batch_now():
                 logger.info(f"拟人插件 (YAML)：会话 {group_id} 已出现更新批次，本轮旧回复丢弃。")
                 return
@@ -1218,19 +1194,26 @@ async def process_yaml_response_logic(
         if assistant_text:
             parsed = {"messages": [{"text": assistant_text, "sticker": ""}], "think": "", "status": "", "action": ""}
 
-    review_decision = await review_response_text(
-        lite_call_ai_api,
-        candidate_text=assistant_text,
-        raw_message_text=raw_message_text or history_last_text or trigger_reason,
-        recent_context=recent_context_hint,
-        relationship_hint=relationship_hint,
-        repeat_clusters=repeat_clusters,
-        recent_bot_replies=recent_bot_replies,
-        message_intent=message_intent,
-        is_private=is_private_session,
-        is_random_chat=is_random_chat,
-        semantic_frame=semantic_frame,
-    )
+    should_review_agent_reply = bool(used_agent and tool_image_urls and not _IMAGE_B64_RE.search(assistant_text or ""))
+    if used_agent and not should_review_agent_reply:
+        review_decision = make_passthrough_review_decision(
+            assistant_text,
+            reason="agent_passthrough",
+        )
+    else:
+        review_decision = await review_response_text(
+            lite_call_ai_api,
+            candidate_text=assistant_text,
+            raw_message_text=raw_message_text or history_last_text or trigger_reason,
+            recent_context=recent_context_hint,
+            relationship_hint=relationship_hint,
+            repeat_clusters=repeat_clusters,
+            recent_bot_replies=recent_bot_replies,
+            message_intent=message_intent,
+            is_private=is_private_session,
+            is_random_chat=is_random_chat,
+            semantic_frame=semantic_frame,
+        )
     if review_decision.action == "no_reply":
         recovered_reply = await _recover_direct_mention_reply_now()
         if recovered_reply:
@@ -1245,6 +1228,11 @@ async def process_yaml_response_logic(
     if review_decision.action == "rewrite" and review_decision.text:
         assistant_text = sanitize_history_text(review_decision.text.strip())
         parsed = {"messages": [{"text": assistant_text, "sticker": ""}], "think": "", "status": "", "action": ""}
+
+    assistant_text, history_image_payloads = _extract_image_b64_markers(assistant_text)
+    has_generated_image = bool(history_image_payloads)
+    if history_image_payloads and not assistant_text:
+        assistant_text = "[发送了一张图片]"
 
     sticker_dir = resolve_sticker_dir(getattr(plugin_config, "personification_sticker_path", None))
     chosen_sticker_paths: list[Path | None] = []
@@ -1290,27 +1278,38 @@ async def process_yaml_response_logic(
     sent_message_id = ""
     if (
         assistant_text
+        and not has_generated_image
         and not stickers_sent
         and tts_service is not None
-        and tts_service.should_auto_tts(
-            is_private=is_private_session,
-            group_config=group_config,
-            text=assistant_text,
-            has_rich_content=False,
-        )
     ):
         try:
-            sent_as_tts = await tts_service.send_tts(
-                bot=bot,
-                event=event,
-                message_segment_cls=message_segment_cls,
+            tts_user_hint = _build_tts_user_hint(is_private=is_private_session)
+            persona_tts = extract_persona_tts_config(prompt_config)
+            tts_decision = await tts_service.decide_tts_delivery(
                 text=assistant_text,
-                style_hint=str(getattr(semantic_frame, "tts_style_hint", "") or "").strip() or None,
-                user_hint=_build_tts_user_hint(is_private=is_private_session),
                 is_private=is_private_session,
-                persona_tts=extract_persona_tts_config(prompt_config),
-                pause_range=(0.8, 1.5),
+                group_config=group_config,
+                has_rich_content=has_generated_image,
+                command_triggered=False,
+                raw_message_text=raw_message_text or history_last_text or trigger_reason,
+                recent_context=recent_context_hint,
+                relationship_hint=relationship_hint,
+                semantic_frame=semantic_frame,
+                fallback_style_hint=str(getattr(semantic_frame, "tts_style_hint", "") or ""),
+                persona_tts=persona_tts,
             )
+            if tts_decision.action == "voice":
+                sent_as_tts = await tts_service.send_tts(
+                    bot=bot,
+                    event=event,
+                    message_segment_cls=message_segment_cls,
+                    text=assistant_text,
+                    style_hint=tts_decision.style_hint,
+                    user_hint=tts_user_hint,
+                    is_private=is_private_session,
+                    persona_tts=persona_tts,
+                    pause_range=(0.8, 1.5),
+                )
         except Exception as e:
             logger.warning(f"[tts] YAML 自动语音发送失败，回退文字: {e}")
 
@@ -1318,7 +1317,7 @@ async def process_yaml_response_logic(
         clean_reply = ""
         if parsed["messages"]:
             for msg in parsed["messages"]:
-                text = msg["text"]
+                text, image_b64_payloads = _extract_image_b64_markers(msg["text"])
                 sticker_url = msg["sticker"]
                 if text:
                     text = _strip_control_markers(text)
@@ -1350,6 +1349,15 @@ async def process_yaml_response_logic(
                                 sent_message_id = extract_send_message_id(send_result)
                             await asyncio.sleep(random.uniform(0.4, 1.0))
 
+                for image_b64 in image_b64_payloads:
+                    if _has_newer_batch_now():
+                        logger.info(f"拟人插件 (YAML)：会话 {group_id} 已出现更新批次，本轮旧回复丢弃。")
+                        return
+                    send_result = await bot.send(event, message_segment_cls.image(f"base64://{image_b64}"))
+                    if not sent_message_id:
+                        sent_message_id = extract_send_message_id(send_result)
+                    await asyncio.sleep(random.uniform(0.4, 1.0))
+
                 chosen_sticker_path = chosen_sticker_paths.pop(0) if chosen_sticker_paths else None
                 if chosen_sticker_path is not None:
                     try:
@@ -1376,11 +1384,19 @@ async def process_yaml_response_logic(
                 clean_reply = re.sub(rf"<{tag}.*?>.*?</\s*{tag}\s*>", "", clean_reply, flags=re.DOTALL | re.IGNORECASE)
                 clean_reply = re.sub(rf"</?\s*{tag}.*?>", "", clean_reply, flags=re.IGNORECASE)
             clean_reply = _strip_control_markers(clean_reply)
+            clean_reply, image_b64_payloads = _extract_image_b64_markers(clean_reply)
             if clean_reply:
                 if _has_newer_batch_now():
                     logger.info(f"拟人插件 (YAML)：会话 {group_id} 已出现更新批次，本轮旧回复丢弃。")
                     return
                 send_result = await bot.send(event, clean_reply)
+                if not sent_message_id:
+                    sent_message_id = extract_send_message_id(send_result)
+            for image_b64 in image_b64_payloads:
+                if _has_newer_batch_now():
+                    logger.info(f"拟人插件 (YAML)：会话 {group_id} 已出现更新批次，本轮旧回复丢弃。")
+                    return
+                send_result = await bot.send(event, message_segment_cls.image(f"base64://{image_b64}"))
                 if not sent_message_id:
                     sent_message_id = extract_send_message_id(send_result)
 
@@ -1458,7 +1474,6 @@ def build_yaml_response_processor(
     schedule_disabled_override_prompt: Callable[[], str],
     build_grounding_context: Callable[[str], Awaitable[str]],
     call_ai_api: Callable[..., Awaitable[Any]],
-    lite_call_ai_api: Callable[..., Awaitable[Any]] | None,
     parse_yaml_response: Callable[[str], Dict[str, Any]],
     message_segment_cls: Any,
     sanitize_history_text: Callable[[str], str],
@@ -1469,6 +1484,7 @@ def build_yaml_response_processor(
     record_group_msg: Callable[..., Any] | None,
     logger: Any,
     user_blacklist: Dict[str, float],
+    lite_call_ai_api: Callable[..., Awaitable[Any]] | None = None,
     superusers: set[str] | None = None,
     get_configured_api_providers: Callable[[], List[Dict[str, Any]]] | None = None,
     tool_registry: Any = None,
@@ -1478,6 +1494,7 @@ def build_yaml_response_processor(
     tts_service: Any = None,
     extract_forward_content: Callable[..., Any] = None,
     memory_curator: Any = None,
+    knowledge_store: Any = None,
 ) -> Callable[..., Awaitable[None]]:
     async def _processor(
         bot: Any,
@@ -1545,6 +1562,7 @@ def build_yaml_response_processor(
                 extract_forward_content,
             ),
             memory_curator=runtime_overrides.get("memory_curator", memory_curator),
+            knowledge_store=runtime_overrides.get("knowledge_store", knowledge_store),
             disable_network_hooks=bool(runtime_overrides.get("disable_network_hooks", False)),
             batched_events=list(runtime_overrides.get("batched_events") or []),
             repeat_clusters=list(runtime_overrides.get("repeat_clusters") or []),

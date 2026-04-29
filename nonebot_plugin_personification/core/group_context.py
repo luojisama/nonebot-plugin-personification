@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Any
 
 from .context_policy import stringify_history_content
+from .group_roles import render_group_role_label
 
 
 def render_group_context_structured(messages: list[dict[str, Any]], trigger_msg_id: str = "") -> str:
@@ -75,6 +76,9 @@ def render_group_context_structured(messages: list[dict[str, Any]], trigger_msg_
 
         if msg.get("is_at_bot"):
             relation_parts.append("@Bot=是")
+        role_label = render_group_role_label(msg.get("sender_role", ""))
+        if role_label:
+            relation_parts.append(f"身份={role_label}")
 
         scene = str(msg.get("scene", "") or "").strip()
         scene_map = {

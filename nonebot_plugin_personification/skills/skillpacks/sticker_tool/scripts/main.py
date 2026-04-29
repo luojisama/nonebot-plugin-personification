@@ -3,8 +3,8 @@ from __future__ import annotations
 from pathlib import Path
 from types import SimpleNamespace
 
-from nonebot_plugin_personification.skill_runtime.runtime_api import SkillRuntime
-from nonebot_plugin_personification.core.sticker_library import resolve_sticker_dir
+from plugin.personification.skill_runtime.runtime_api import SkillRuntime
+from plugin.personification.core.sticker_library import resolve_sticker_dir
 from . import impl as legacy
 
 
@@ -51,7 +51,7 @@ def build_tools(runtime: SkillRuntime):
         )
 
     async def _image_web_search(query: str) -> str:
-        from nonebot_plugin_personification.core.web_grounding import do_web_search
+        from plugin.personification.core.web_grounding import do_web_search
 
         return await do_web_search(query, get_now=runtime.get_now, logger=runtime.logger)
 
@@ -60,4 +60,3 @@ def build_tools(runtime: SkillRuntime):
     if sticker_dir.exists() and sticker_dir.is_dir():
         tools.append(legacy.build_curate_sticker_tool(sticker_dir, runtime.plugin_config))
     return tools
-

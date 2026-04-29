@@ -4,9 +4,9 @@ import json
 import time
 from typing import Any, Callable
 
-from nonebot_plugin_personification.agent.tool_registry import AgentTool
-from nonebot_plugin_personification.core.data_store import get_data_store
-from nonebot_plugin_personification.core.time_ctx import get_current_day_str
+from plugin.personification.agent.tool_registry import AgentTool
+from plugin.personification.core.data_store import get_data_store
+from plugin.personification.core.time_ctx import get_current_day_str
 
 
 FRIEND_REQUEST_DESCRIPTION = """向指定用户发送好友申请。
@@ -190,4 +190,3 @@ def build_friend_request_tool(
         },
         handler=_handler,
     )
-

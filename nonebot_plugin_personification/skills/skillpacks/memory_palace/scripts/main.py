@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
-from nonebot_plugin_personification.skill_runtime.runtime_api import SkillRuntime
+from plugin.personification.skill_runtime.runtime_api import SkillRuntime
 from . import impl
 
 
@@ -13,4 +13,3 @@ async def run(query: str, scope: str = "auto") -> str:
 
 def build_tools(runtime: SkillRuntime):
     return [impl.build_memory_recall_tool(runtime)]
-

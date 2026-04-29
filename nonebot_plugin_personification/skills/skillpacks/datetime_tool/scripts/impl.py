@@ -4,7 +4,7 @@ from datetime import datetime
 from typing import Optional
 from zoneinfo import ZoneInfo
 
-from nonebot_plugin_personification.agent.tool_registry import AgentTool
+from plugin.personification.agent.tool_registry import AgentTool
 
 
 DATETIME_DESCRIPTION = """获取当前精确时间，包括日期、星期、时刻、节气信息。
@@ -108,4 +108,3 @@ def build_datetime_tool(timezone_name: str = "Asia/Shanghai") -> AgentTool:
         },
         handler=_handler,
     )
-

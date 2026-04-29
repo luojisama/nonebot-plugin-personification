@@ -1,8 +1,15 @@
-import random
+import re
 import time
 from typing import Any, Callable, Dict, Iterable
 
 from ..core.data_store import get_data_store
+
+
+_IMAGE_B64_RE = re.compile(r"\[IMAGE_B64\][A-Za-z0-9+/=\r\n]+\[/IMAGE_B64\]")
+
+
+def _compact_qzone_state_content(content: str) -> str:
+    return _IMAGE_B64_RE.sub("[配图]", str(content or "")).strip()[:200]
 
 
 async def run_daily_group_fav_report(
@@ -115,13 +122,13 @@ async def run_auto_post_diary(
     if not diary_content:
         return False
 
-    logger.info("拟人插件：正在自动发布周记说说...")
+    logger.info("拟人插件：正在自动发布空间说说...")
     success, msg = await publish_qzone_shuo(diary_content, bot.self_id)
     if success:
-        logger.info("拟人插件：每周说说发布成功！")
+        logger.info("拟人插件：空间说说发布成功！")
         return True
 
-    logger.error(f"拟人插件：每周说说发布失败：{msg}")
+    logger.error(f"拟人插件：空间说说发布失败：{msg}")
     return False
 
 
@@ -142,9 +149,7 @@ async def run_proactive_qzone_post(
     """按内心状态和近期聊天判断，是否主动发一条更日常的空间动态。"""
     if not qzone_publish_available or not qzone_proactive_enabled:
         return False
-    if random.random() > max(0.0, min(1.0, float(qzone_probability))):
-        return False
-
+    _ = qzone_probability  # 兼容旧配置；是否发布交给 LLM 决定，仍受每日上限与最小间隔限制。
     bots = get_bots()
     if not bots:
         return False
@@ -187,7 +192,7 @@ async def run_proactive_qzone_post(
     state["date"] = today
     state["count"] = int(state.get("count", 0) or 0) + 1
     state["last_post_at"] = now_ts
-    state["last_content"] = content[:200]
+    state["last_content"] = _compact_qzone_state_content(content)
     store.save_sync("qzone_post_state", state)
     logger.info("拟人插件：已根据当前状态主动发布一条空间说说。")
     return True

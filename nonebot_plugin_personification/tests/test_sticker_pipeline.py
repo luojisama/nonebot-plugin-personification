@@ -9,9 +9,9 @@ from uuid import uuid4
 
 from ._loader import load_personification_module
 
-pipeline_sticker = load_personification_module("nonebot_plugin_personification.handlers.reply_pipeline.pipeline_sticker")
-sticker_impl = load_personification_module("nonebot_plugin_personification.skills.skillpacks.sticker_tool.scripts.impl")
-sticker_feedback = load_personification_module("nonebot_plugin_personification.core.sticker_feedback")
+pipeline_sticker = load_personification_module("plugin.personification.handlers.reply_pipeline.pipeline_sticker")
+sticker_impl = load_personification_module("plugin.personification.skills.skillpacks.sticker_tool.scripts.impl")
+sticker_feedback = load_personification_module("plugin.personification.core.sticker_feedback")
 
 
 def _make_workspace_temp_dir(prefix: str) -> Path:
@@ -138,4 +138,3 @@ def test_review_pending_sticker_reaction_records_positive(monkeypatch) -> None: 
     state = asyncio.run(_run())
     assert state["items"]["cheer"]["sent_count"] == 1
     assert state["items"]["cheer"]["positive_count"] == 1
-

@@ -1,0 +1,16 @@
+name: image_gen
+enabled: true
+category: media
+entrypoint: scripts/main.py
+description: 按用户明确要求生成图片并返回给聊天。
+parameters:
+  type: object
+  properties:
+    prompt:
+      type: string
+      description: 图片生成提示词
+    size:
+      type: string
+      description: 图片尺寸
+  required:
+    - prompt

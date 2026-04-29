@@ -5,7 +5,7 @@ PERSONIFICATION_USAGE = (
     "主要能力：\n"
     "  - 群聊触发回复、随机插话与戳一戳响应\n"
     "  - 私聊自主回复与上下文记忆\n"
-    "  - 主动私聊、周记生成、群聊风格学习\n"
+    "  - 主动私聊、短说说生成、群聊风格学习\n"
     "  - 联网搜索、黑名单与运行时开关\n\n"
     "统一入口（推荐优先记这一组）：\n"
     "  - 拟人 帮助：查看所有命令、分类帮助或某个配置项说明\n"
@@ -65,7 +65,7 @@ PERSONIFICATION_USAGE = (
     "画像与语音命令：\n"
     "  - 查看画像：查看当前用户画像\n"
     "  - 刷新画像：重建当前用户画像\n"
-    "  - 说/朗读/配音 [--voice 音色] [--style 风格] 文本：输出语音\n\n"
+    "  - 说/朗读/配音 [--mode preset|design|clone] [--voice 音色] [--style 风格] [--voice-prompt 音色描述] [--clone-voice data:...] [--clone-path 样本路径] 文本：输出语音\n\n"
     "其他命令（超管）：\n"
     "  - 发个说说：触发动态/日记类输出\n\n"
     "帮助命令：\n"
@@ -159,7 +159,7 @@ def build_plugin_metadata(config_cls: type) -> PluginMetadata:
                 ],
             },
             "author": "luojisama",
-            "version": "0.5.1",
+            "version": "0.5.2",
             "pypi": "nonebot-plugin-shiro-personification",
         },
     )

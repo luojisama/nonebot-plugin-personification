@@ -418,6 +418,30 @@ class PluginKnowledgeStore:
         scored.sort(key=lambda item: (-item[0], item[1]))
         return [name for _score, name in scored[:top_k]]
 
+    def get_plugin_summary_for_prompt(self, max_chars: int = 400) -> str:
+        limit = max(0, int(max_chars or 0))
+        if limit <= 0:
+            return ""
+        index = self.load_index_sync()
+        plugins = index.get("plugins", {})
+        if not isinstance(plugins, dict):
+            return ""
+        lines: list[str] = []
+        for plugin_name in sorted(plugins):
+            meta = plugins.get(plugin_name)
+            if not isinstance(meta, dict):
+                continue
+            summary = str(meta.get("summary", "") or "").strip()
+            if not summary:
+                continue
+            display_name = str(meta.get("display_name", "") or "").strip() or str(plugin_name)
+            line = f"{display_name}: {summary}"
+            candidate = "\n".join([*lines, line]) if lines else line
+            if len(candidate) > limit:
+                break
+            lines.append(line)
+        return "\n".join(lines)[:limit].strip()
+
     @staticmethod
     def _to_search_tokens(text: str) -> list[str]:
         normalized = text.lower().replace("_", " ").replace("-", " ")

@@ -3,14 +3,14 @@ from __future__ import annotations
 import json
 from typing import Any
 
-from nonebot_plugin_personification.agent.tool_registry import AgentTool
-from nonebot_plugin_personification.core.ai_routes import build_fallback_vision_caller
-from nonebot_plugin_personification.core.media_refs import normalize_media_refs
-from nonebot_plugin_personification.core.media_understanding import (
+from plugin.personification.agent.tool_registry import AgentTool
+from plugin.personification.core.ai_routes import build_fallback_vision_caller
+from plugin.personification.core.media_refs import normalize_media_refs
+from plugin.personification.core.media_understanding import (
     analyze_images_with_route_or_fallback,
     analyze_videos_with_route_or_fallback,
 )
-from nonebot_plugin_personification.skills.skillpacks.sticker_tool.scripts.impl import get_current_image_urls
+from plugin.personification.skills.skillpacks.sticker_tool.scripts.impl import get_current_image_urls
 VISION_ANALYZE_PROMPT = """你是 ACG 场景视觉分析器。
 请基于图片和用户问题，输出一个 JSON 对象，不要输出解释性文字。
 
@@ -231,4 +231,3 @@ def build_vision_tool(runtime: Any) -> AgentTool:
         enabled=lambda: bool(getattr(runtime, "agent_tool_caller", None))
         or getattr(runtime, "vision_caller", None) is not None,
     )
-

@@ -130,6 +130,13 @@ from .profile_service import ProfileService
 from .qzone_service import build_qzone_services
 from .runtime_assembly import PluginRuntimeBundle
 from .memory_defaults import DEFAULT_PERSONA_HISTORY_MAX
+from .model_router import (
+    MODEL_ROLE_AGENT,
+    MODEL_ROLE_INTENT,
+    MODEL_ROLE_REVIEW,
+    MODEL_ROLE_STICKER,
+    get_model_override_for_role,
+)
 from .runtime_integrations import (
     build_sign_in_fallbacks,
     extract_default_bot_nickname,
@@ -258,15 +265,22 @@ def build_plugin_runtime(
     call_ai_api = build_ai_api_caller(
         plugin_config=plugin_config,
         logger=logger,
+        model_role=MODEL_ROLE_AGENT,
     )
     lite_call_ai_api = build_ai_api_caller(
         plugin_config=plugin_config,
         logger=logger,
         model_override_field_name="personification_lite_model",
+        model_role=MODEL_ROLE_REVIEW,
     )
     call_style_ai_api = call_ai_api
 
-    vision_caller = build_fallback_vision_caller(plugin_config, logger, warn=True)
+    vision_caller = build_fallback_vision_caller(
+        plugin_config,
+        logger,
+        warn=True,
+        model_override=get_model_override_for_role(plugin_config, MODEL_ROLE_STICKER),
+    )
     route_state = summarize_route_state(plugin_config, logger)
     logger.info(
         "personification: routing "
@@ -400,6 +414,7 @@ def build_plugin_runtime(
         tts_service=tts_service,
         extract_forward_content=extract_forward_message_content,
         memory_curator=memory_curator,
+        knowledge_store=knowledge_store,
     )
 
     get_custom_title = build_custom_title_getter(logger=logger)
@@ -498,7 +513,10 @@ def build_plugin_runtime(
     )
 
     def _build_dynamic_lite_tool_caller(default_caller: Any) -> Any:
-        lite_model = str(getattr(plugin_config, "personification_lite_model", "") or "").strip()
+        lite_model = (
+            get_model_override_for_role(plugin_config, MODEL_ROLE_INTENT)
+            or str(getattr(plugin_config, "personification_lite_model", "") or "").strip()
+        )
         if not lite_model:
             return default_caller
         try:
@@ -516,9 +534,15 @@ def build_plugin_runtime(
         new_agent_tool_caller = build_routed_tool_caller(
             plugin_config=plugin_config,
             logger=logger,
+            model_override=get_model_override_for_role(plugin_config, MODEL_ROLE_AGENT),
         )
         new_lite_tool_caller = _build_dynamic_lite_tool_caller(new_agent_tool_caller)
-        new_vision_caller = build_fallback_vision_caller(plugin_config, logger, warn=True)
+        new_vision_caller = build_fallback_vision_caller(
+            plugin_config,
+            logger,
+            warn=True,
+            model_override=get_model_override_for_role(plugin_config, MODEL_ROLE_STICKER),
+        )
         yaml_response_processor = build_yaml_response_processor(
             get_current_time=get_current_local_time,
             format_time_context=format_time_context,
@@ -549,6 +573,7 @@ def build_plugin_runtime(
             tts_service=tts_service,
             extract_forward_content=extract_forward_message_content,
             memory_curator=memory_curator,
+            knowledge_store=knowledge_store,
         )
         reply_processor_deps.runtime.process_yaml_response_logic = yaml_response_processor
         reply_processor_deps.runtime.agent_tool_caller = new_agent_tool_caller

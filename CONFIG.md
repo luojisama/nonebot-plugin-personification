@@ -65,6 +65,12 @@ personification_whitelist=["123456789","987654321"]
 | `personification_use_skillpacks` | `true` | `false` | 是否强制走 skillpack 体系。 |
 | `personification_github_token` | `"ghp_xxx"` | `""` | 远程 skill / GitHub 访问令牌。 |
 | `personification_plugin_knowledge_build_enabled` | `true` | `false` | 是否启用插件知识库构建能力。 |
+| `personification_parallel_research_enabled` | `true` | `true` | 是否启用并行研究工具。 |
+| `personification_parallel_research_lookup_enabled` | `true` | `true` | 是否允许并行研究用于复杂查询；关闭后主要用于生图准备。 |
+| `personification_parallel_research_max_workers` | `4` | `6` | 单次并行研究最多子 Agent 数，上限为 6。 |
+| `personification_parallel_research_worker_timeout` | `40` | `35` | 单个子 Agent 超时时间，单位秒。 |
+| `personification_parallel_research_total_timeout` | `120` | `90` | 单次并行研究总超时时间，单位秒。 |
+| `personification_parallel_research_max_tool_rounds` | `2` | `2` | 每个子 Agent 最多工具调用轮次。 |
 
 ## 主模型与专用模型
 
@@ -130,6 +136,10 @@ personification_whitelist=["123456789","987654321"]
 | `personification_video_fallback_api_key` | `"sk-xxxx"` | `""` | 视频理解回退 API Key。 |
 | `personification_video_fallback_model` | `"gpt-4o-mini"` | `""` | 视频理解回退模型。 |
 | `personification_video_fallback_auth_path` | `"C:/Users/you/.codex/auth.json"` | `""` | 视频理解回退凭证路径。 |
+| `personification_image_gen_enabled` | `true` | `true` | 是否启用图片生成 skill。 |
+| `personification_image_gen_model` | `"gpt-image-2"` | `"gpt-image-2"` | 图片生成模型名。 |
+| `personification_image_gen_background_enabled` | `true` | `true` | 是否允许后台图片生成流程。 |
+| `personification_image_gen_timeout` | `240` | `180` | 图片生成超时时间，单位秒。 |
 
 ## 用户画像与长期记忆
 
@@ -172,10 +182,18 @@ personification_whitelist=["123456789","987654321"]
 | `personification_tts_enabled` | `true` | `false` | 是否启用 TTS 功能。 |
 | `personification_tts_auto_enabled` | `true` | `false` | 是否允许自动语音回复。 |
 | `personification_tts_auto_probability` | `0.3` | `0.2` | 自动语音回复概率。 |
+| `personification_tts_llm_decision_enabled` | `true` | `true` | 是否在合成前由 LLM 决定 `voice/text/block`。 |
+| `personification_tts_decision_timeout` | `8` | `8` | TTS LLM 决策超时时间，单位秒。 |
+| `personification_tts_builtin_safety_enabled` | `true` | `true` | 是否启用内置高风险内容禁读策略。 |
+| `personification_tts_forbidden_policy` | `"不要朗读测试禁区内容"` | `""` | 自定义禁读策略文本；由 LLM 语义判断，不做本地关键词匹配。 |
 | `personification_tts_api_key` | `"tts-xxxx"` | `""` | TTS 服务 API Key。 |
 | `personification_tts_api_url` | `"https://api.xiaomimimo.com/v1"` | `"https://api.xiaomimimo.com/v1"` | TTS 服务地址。 |
-| `personification_tts_model` | `"mimo-v2-tts"` | `"mimo-v2-tts"` | TTS 模型名。 |
+| `personification_tts_model` | `"mimo-v2.5-tts"` | `"mimo-v2.5-tts"` | TTS 模型名。 |
+| `personification_tts_mode` | `"preset"` | `"preset"` | TTS 模式：`preset` / `design` / `clone`。 |
 | `personification_tts_default_voice` | `"mimo_default"` | `"mimo_default"` | 默认音色。 |
+| `personification_tts_voice_design_prompt` | `"少女声线，自然活泼"` | `""` | design 模式下的音色描述。 |
+| `personification_tts_voice_clone` | `"data:audio/wav;base64,..."` | `""` | clone 模式下的音频样本 data URL。 |
+| `personification_tts_voice_clone_path` | `"data/voice/sample.wav"` | `""` | clone 模式下的音频样本文件路径。 |
 | `personification_tts_default_format` | `"mp3"` | `"wav"` | 默认音频格式。 |
 | `personification_tts_max_chars_per_segment` | `100` | `120` | 单段 TTS 最大字符数。 |
 | `personification_tts_timeout` | `90` | `60` | TTS 请求超时，单位秒。 |
