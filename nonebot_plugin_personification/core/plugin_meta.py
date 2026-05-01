@@ -159,7 +159,7 @@ def build_plugin_metadata(config_cls: type) -> PluginMetadata:
                 ],
             },
             "author": "luojisama",
-            "version": "0.5.2",
+            "version": "0.5.3",
             "pypi": "nonebot-plugin-shiro-personification",
         },
     )

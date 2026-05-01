@@ -405,6 +405,7 @@ async def process_yaml_response_logic(
     agent_tool_caller: Any = None,
     lite_tool_caller: Any = None,
     lite_call_ai_api: Callable[..., Awaitable[Any]] | None = None,
+    review_call_ai_api: Callable[..., Awaitable[Any]] | None = None,
     current_image_urls: List[str] | None = None,
     vision_caller: Any = None,
     tts_service: Any = None,
@@ -432,6 +433,7 @@ async def process_yaml_response_logic(
     started_at = time.monotonic()
     lite_tool_caller = lite_tool_caller or agent_tool_caller
     lite_call_ai_api = lite_call_ai_api or call_ai_api
+    review_call_ai_api = review_call_ai_api or lite_call_ai_api or call_ai_api
 
     def _has_newer_batch_now() -> bool:
         return bool(has_newer_batch or _batch_ref_has_newer_messages(batch_runtime_ref))
@@ -1200,9 +1202,14 @@ async def process_yaml_response_logic(
             assistant_text,
             reason="agent_passthrough",
         )
+    elif not bool(getattr(plugin_config, "personification_response_review_enabled", False)):
+        review_decision = make_passthrough_review_decision(
+            assistant_text,
+            reason="review_disabled",
+        )
     else:
         review_decision = await review_response_text(
-            lite_call_ai_api,
+            review_call_ai_api,
             candidate_text=assistant_text,
             raw_message_text=raw_message_text or history_last_text or trigger_reason,
             recent_context=recent_context_hint,
@@ -1485,6 +1492,7 @@ def build_yaml_response_processor(
     logger: Any,
     user_blacklist: Dict[str, float],
     lite_call_ai_api: Callable[..., Awaitable[Any]] | None = None,
+    review_call_ai_api: Callable[..., Awaitable[Any]] | None = None,
     superusers: set[str] | None = None,
     get_configured_api_providers: Callable[[], List[Dict[str, Any]]] | None = None,
     tool_registry: Any = None,
@@ -1536,6 +1544,7 @@ def build_yaml_response_processor(
             build_grounding_context=build_grounding_context,
             call_ai_api=call_ai_api,
             lite_call_ai_api=lite_call_ai_api,
+            review_call_ai_api=runtime_overrides.get("review_call_ai_api", review_call_ai_api),
             parse_yaml_response=parse_yaml_response,
             message_segment_cls=message_segment_cls,
             sanitize_history_text=sanitize_history_text,

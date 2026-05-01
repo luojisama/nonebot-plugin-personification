@@ -31,3 +31,12 @@ def test_qzone_cookie_deprecated_alias_copies_to_prefixed_field() -> None:
         and "qzone_cookie" in str(item.message)
         for item in caught
     )
+
+
+def test_llm_review_features_default_disabled() -> None:
+    cfg = config_mod.Config()
+
+    assert cfg.personification_response_review_enabled is False
+    assert cfg.personification_tts_llm_decision_enabled is False
+    assert cfg.personification_response_review_model_role == "review"
+    assert cfg.personification_tts_llm_decision_model_role == "agent"

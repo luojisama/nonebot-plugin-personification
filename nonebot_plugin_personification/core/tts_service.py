@@ -117,7 +117,7 @@ class TtsService:
         return self.is_enabled() and self.is_configured()
 
     def is_style_planner_enabled(self) -> bool:
-        return bool(getattr(self.plugin_config, "personification_tts_llm_decision_enabled", True)) and self.style_planner is not None
+        return bool(getattr(self.plugin_config, "personification_tts_llm_decision_enabled", False)) and self.style_planner is not None
 
     def is_group_auto_enabled(self, group_config: dict[str, Any] | None = None) -> bool:
         config = group_config or {}
@@ -202,7 +202,7 @@ class TtsService:
             has_rich_content=has_rich_content,
         ):
             return TtsDeliveryDecision(action="text", reason="auto_gate_closed")
-        if not bool(getattr(self.plugin_config, "personification_tts_llm_decision_enabled", True)):
+        if not bool(getattr(self.plugin_config, "personification_tts_llm_decision_enabled", False)):
             if command_triggered or self.should_auto_tts(
                 is_private=is_private,
                 group_config=group_config,

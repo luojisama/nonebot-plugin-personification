@@ -226,6 +226,7 @@ class RuntimeDeps:
     agent_tool_caller: Any = None
     lite_tool_caller: Any = None
     lite_call_ai_api: Any = None
+    review_call_ai_api: Any = None
     persona_store: Any = None
     vision_caller: Any = None
     knowledge_store: Any = None
@@ -1382,9 +1383,14 @@ async def process_response_logic(bot: Any, event: Any, state: Dict[str, Any], de
                 reply_content,
                 reason="agent_passthrough",
             )
+        elif not bool(getattr(runtime.plugin_config, "personification_response_review_enabled", False)):
+            review_decision = make_passthrough_review_decision(
+                reply_content,
+                reason="review_disabled",
+            )
         else:
             review_decision = await review_response_text(
-                runtime.lite_call_ai_api or runtime.call_ai_api,
+                runtime.review_call_ai_api or runtime.lite_call_ai_api or runtime.call_ai_api,
                 candidate_text=reply_content,
                 raw_message_text=raw_message_text or message_text or message_content,
                 recent_context=recent_context_hint,

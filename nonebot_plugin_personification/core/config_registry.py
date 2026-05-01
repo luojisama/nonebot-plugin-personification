@@ -5,7 +5,7 @@ import re
 from dataclasses import dataclass
 from typing import Any, Callable, Iterable
 
-from .model_router import normalize_model_overrides
+from .model_router import MODEL_OVERRIDE_ROLES, normalize_model_overrides, resolve_model_role
 
 from .memory_defaults import (
     DEFAULT_COMPRESS_KEEP_RECENT,
@@ -122,6 +122,13 @@ def _tts_mode_parser(raw: str) -> str:
     return mapping.get(text, text)
 
 
+def _model_role_parser(raw: str) -> str:
+    role = resolve_model_role(raw)
+    if not role or role not in MODEL_OVERRIDE_ROLES:
+        raise ValueError("可选值: intent, review, agent, sticker")
+    return role
+
+
 @dataclass(frozen=True)
 class ConfigEntry:
     key: str
@@ -183,6 +190,31 @@ def _build_entries() -> list[ConfigEntry]:
             category="config",
             help_aliases=("模型覆盖", "model_overrides", "模型路由"),
             parser=lambda raw: normalize_model_overrides(_json_object_parser(raw)),
+        ),
+        ConfigEntry(
+            key="response_review_enabled",
+            field_name="personification_response_review_enabled",
+            display_name="回复 LLM 审阅",
+            value_type="bool",
+            default=False,
+            scope=GLOBAL_SCOPE,
+            description="是否在最终回复发送前调用 LLM 审阅/改写；默认关闭以减少延迟和额外 token。",
+            category="config",
+            help_aliases=("回复审阅", "llm审查", "response_review", "回复审核"),
+            parser=_bool_parser,
+        ),
+        ConfigEntry(
+            key="response_review_model_role",
+            field_name="personification_response_review_model_role",
+            display_name="回复审阅模型角色",
+            value_type="str",
+            default="review",
+            scope=GLOBAL_SCOPE,
+            description="回复 LLM 审阅使用的模型角色；agent=复用主模型，review/intent/sticker 使用对应四类模型覆盖。",
+            category="config",
+            choices=("intent", "review", "agent", "sticker"),
+            help_aliases=("回复审阅模型", "审查模型", "review_model_role", "response_review_role"),
+            parser=_model_role_parser,
         ),
         ConfigEntry(
             key="model_builtin_search_enabled",
@@ -586,12 +618,25 @@ def _build_entries() -> list[ConfigEntry]:
             field_name="personification_tts_llm_decision_enabled",
             display_name="TTS LLM 决策",
             value_type="bool",
-            default=True,
+            default=False,
             scope=GLOBAL_SCOPE,
-            description="自动语音和命令语音在合成前交由 LLM 判断 voice/text/block，并进行语义违禁阻断。",
+            description="自动语音和命令语音在合成前交由 LLM 判断 voice/text/block，并进行语义违禁阻断；默认关闭。",
             category="config",
             help_aliases=("语音LLM决策", "tts_llm_decision", "语音审查"),
             parser=_bool_parser,
+        ),
+        ConfigEntry(
+            key="tts_llm_decision_model_role",
+            field_name="personification_tts_llm_decision_model_role",
+            display_name="TTS 审查模型角色",
+            value_type="str",
+            default="agent",
+            scope=GLOBAL_SCOPE,
+            description="TTS LLM 审查使用的模型角色；agent=复用主模型，review/intent/sticker 使用对应四类模型覆盖。",
+            category="config",
+            choices=("intent", "review", "agent", "sticker"),
+            help_aliases=("语音审查模型", "tts_decision_model_role", "tts_llm_role"),
+            parser=_model_role_parser,
         ),
         ConfigEntry(
             key="tts_decision_timeout",

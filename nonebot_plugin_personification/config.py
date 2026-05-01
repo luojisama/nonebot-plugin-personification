@@ -49,6 +49,8 @@ class Config(BaseModel):
     personification_thinking_mode: str = "none"
     personification_state_thinking_mode: str = "adaptive"
     personification_model_overrides: Dict[str, str] = {}
+    personification_response_review_enabled: bool = False
+    personification_response_review_model_role: str = "review"
     personification_data_dir: str = ""
     personification_persona_enabled: bool = True
     personification_persona_history_max: int = DEFAULT_PERSONA_HISTORY_MAX
@@ -151,7 +153,8 @@ class Config(BaseModel):
     personification_tts_enabled: bool = False
     personification_tts_auto_enabled: bool = False
     personification_tts_auto_probability: float = 0.2
-    personification_tts_llm_decision_enabled: bool = True
+    personification_tts_llm_decision_enabled: bool = False
+    personification_tts_llm_decision_model_role: str = "agent"
     personification_tts_decision_timeout: int = 8
     personification_tts_builtin_safety_enabled: bool = True
     personification_tts_forbidden_policy: str = ""

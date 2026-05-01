@@ -303,6 +303,18 @@ def _can_send_background_image(executor: Any) -> bool:
     )
 
 
+def _is_likely_delivered_send_timeout(exc: Exception) -> bool:
+    # NapCat 在底层 QQ NT sendMsg 超过内部 5s 阈值时会抛 retcode=1200 invoke timeout，
+    # 但消息通常已经实际下发，再补一句"发送失败"会误导用户。
+    info = getattr(exc, "info", None)
+    if not isinstance(info, dict):
+        return False
+    if int(info.get("retcode") or 0) == 1200:
+        return True
+    haystack = f"{info.get('message', '')} {info.get('wording', '')}".lower()
+    return "invoke timeout" in haystack
+
+
 def _can_start_background_image_generation(
     *,
     registry: ToolRegistry,
@@ -498,7 +510,8 @@ async def _run_background_image_generation(
                         await executor.send_image_b64(image_b64)
                     except Exception as exc:
                         log_exception(logger, "[agent] background image send failed", exc, level="warning")
-                        await _send_background_text(executor, "图片生成好了，但发送图片失败了", logger)
+                        if not _is_likely_delivered_send_timeout(exc):
+                            await _send_background_text(executor, "图片生成好了，但发送图片失败了", logger)
                     return
                 await _send_background_text(executor, _format_image_generation_failure(str(result or "")), logger)
                 return

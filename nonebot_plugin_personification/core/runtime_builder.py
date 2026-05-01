@@ -136,6 +136,7 @@ from .model_router import (
     MODEL_ROLE_REVIEW,
     MODEL_ROLE_STICKER,
     get_model_override_for_role,
+    resolve_model_role,
 )
 from .runtime_integrations import (
     build_sign_in_fallbacks,
@@ -267,12 +268,70 @@ def build_plugin_runtime(
         logger=logger,
         model_role=MODEL_ROLE_AGENT,
     )
+    intent_call_ai_api = build_ai_api_caller(
+        plugin_config=plugin_config,
+        logger=logger,
+        model_override_field_name="personification_lite_model",
+        model_role=MODEL_ROLE_INTENT,
+    )
     lite_call_ai_api = build_ai_api_caller(
         plugin_config=plugin_config,
         logger=logger,
         model_override_field_name="personification_lite_model",
         model_role=MODEL_ROLE_REVIEW,
     )
+    sticker_call_ai_api = build_ai_api_caller(
+        plugin_config=plugin_config,
+        logger=logger,
+        model_override_field_name="personification_labeler_model",
+        model_role=MODEL_ROLE_STICKER,
+    )
+
+    def _configured_model_role(field_name: str, default_role: str) -> str:
+        raw_role = getattr(plugin_config, field_name, default_role)
+        return resolve_model_role(raw_role) or default_role
+
+    async def _call_ai_api_for_role(
+        role: str,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None = None,
+        max_tokens: int | None = None,
+        temperature: float = 0.7,
+    ) -> Any:
+        normalized_role = resolve_model_role(role) or MODEL_ROLE_AGENT
+        callers = {
+            MODEL_ROLE_AGENT: call_ai_api,
+            MODEL_ROLE_INTENT: intent_call_ai_api,
+            MODEL_ROLE_REVIEW: lite_call_ai_api,
+            MODEL_ROLE_STICKER: sticker_call_ai_api,
+        }
+        caller = callers.get(normalized_role, call_ai_api)
+        return await caller(
+            messages,
+            tools=tools,
+            max_tokens=max_tokens,
+            temperature=temperature,
+        )
+
+    async def response_review_call_ai_api(
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None = None,
+        max_tokens: int | None = None,
+        temperature: float = 0.7,
+    ) -> Any:
+        return await _call_ai_api_for_role(
+            _configured_model_role("personification_response_review_model_role", MODEL_ROLE_REVIEW),
+            messages,
+            tools=tools,
+            max_tokens=max_tokens,
+            temperature=temperature,
+        )
+
+    async def tts_decision_call_ai_api(messages: list[dict[str, Any]]) -> Any:
+        return await _call_ai_api_for_role(
+            _configured_model_role("personification_tts_llm_decision_model_role", MODEL_ROLE_AGENT),
+            messages,
+        )
     call_style_ai_api = call_ai_api
 
     vision_caller = build_fallback_vision_caller(
@@ -333,7 +392,7 @@ def build_plugin_runtime(
         logger=logger,
         get_http_client=lambda: get_shared_http_client(max_connections=20),
         data_dir=data_dir,
-        style_planner=lambda messages: call_style_ai_api(messages),
+        style_planner=tts_decision_call_ai_api,
     )
     save_plugin_runtime_config, load_plugin_runtime_config = build_runtime_config_io(
         plugin_config=plugin_config,
@@ -395,6 +454,7 @@ def build_plugin_runtime(
         build_grounding_context=build_grounding_context,
         call_ai_api=call_ai_api,
         lite_call_ai_api=lite_call_ai_api,
+        review_call_ai_api=response_review_call_ai_api,
         parse_yaml_response=parse_yaml_response,
         message_segment_cls=message_segment_cls,
         sanitize_history_text=sanitize_history_text,
@@ -481,6 +541,7 @@ def build_plugin_runtime(
             build_grounding_context=build_grounding_context,
             update_private_interaction_time=update_private_interaction_time,
             call_ai_api=call_ai_api,
+            review_call_ai_api=response_review_call_ai_api,
             lite_call_ai_api=lite_call_ai_api,
             save_plugin_runtime_config=save_plugin_runtime_config,
             user_blacklist=user_blacklist,
@@ -554,6 +615,7 @@ def build_plugin_runtime(
             build_grounding_context=build_grounding_context,
             call_ai_api=call_ai_api,
             lite_call_ai_api=lite_call_ai_api,
+            review_call_ai_api=response_review_call_ai_api,
             parse_yaml_response=parse_yaml_response,
             message_segment_cls=message_segment_cls,
             sanitize_history_text=sanitize_history_text,
@@ -579,6 +641,7 @@ def build_plugin_runtime(
         reply_processor_deps.runtime.agent_tool_caller = new_agent_tool_caller
         reply_processor_deps.runtime.lite_tool_caller = new_lite_tool_caller
         reply_processor_deps.runtime.vision_caller = new_vision_caller
+        reply_processor_deps.runtime.review_call_ai_api = response_review_call_ai_api
         if persona_store is not None:
             try:
                 persona_store.tool_caller = build_routed_tool_caller(

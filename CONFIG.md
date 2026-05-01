@@ -82,6 +82,9 @@ personification_whitelist=["123456789","987654321"]
 | `personification_api_key` | `"sk-xxxx"` | `""` | 主模型 API Key。 |
 | `personification_model` | `"gpt-4o-mini"` | `"gpt-4o-mini"` | 主回复模型。 |
 | `personification_lite_model` | `"gpt-5.4-mini"` | `""` | 轻量任务专用模型，用于意图分类、回复 review、图片分类等流程；留空回退到主模型。 |
+| `personification_model_overrides` | `{"review":"gpt-5.4-mini"}` | `{}` | 按调用阶段覆盖模型，支持 `intent` / `review` / `agent` / `sticker`。 |
+| `personification_response_review_enabled` | `true` | `false` | 是否在最终回复发送前调用 LLM 审阅/改写；默认关闭以降低延迟和额外 token。 |
+| `personification_response_review_model_role` | `"review"` | `"review"` | 回复审阅使用的模型角色，可选 `intent` / `review` / `agent` / `sticker`；`agent` 表示复用主模型。 |
 | `personification_persona_api_type` | `"openai"` | `""` | 画像模型 provider；留空沿用主模型。 |
 | `personification_persona_api_url` | `"https://api.openai.com/v1"` | `""` | 画像模型 API 地址。 |
 | `personification_persona_api_key` | `"sk-xxxx"` | `""` | 画像模型 API Key。 |
@@ -182,7 +185,8 @@ personification_whitelist=["123456789","987654321"]
 | `personification_tts_enabled` | `true` | `false` | 是否启用 TTS 功能。 |
 | `personification_tts_auto_enabled` | `true` | `false` | 是否允许自动语音回复。 |
 | `personification_tts_auto_probability` | `0.3` | `0.2` | 自动语音回复概率。 |
-| `personification_tts_llm_decision_enabled` | `true` | `true` | 是否在合成前由 LLM 决定 `voice/text/block`。 |
+| `personification_tts_llm_decision_enabled` | `true` | `false` | 是否在合成前由 LLM 决定 `voice/text/block`；默认关闭。 |
+| `personification_tts_llm_decision_model_role` | `"agent"` | `"agent"` | TTS LLM 审查使用的模型角色，可选 `intent` / `review` / `agent` / `sticker`。 |
 | `personification_tts_decision_timeout` | `8` | `8` | TTS LLM 决策超时时间，单位秒。 |
 | `personification_tts_builtin_safety_enabled` | `true` | `true` | 是否启用内置高风险内容禁读策略。 |
 | `personification_tts_forbidden_policy` | `"不要朗读测试禁区内容"` | `""` | 自定义禁读策略文本；由 LLM 语义判断，不做本地关键词匹配。 |

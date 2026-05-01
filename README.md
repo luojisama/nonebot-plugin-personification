@@ -22,7 +22,7 @@
 - **并行研究**：复杂查询和生图准备时并发聚合联网、Wiki、图片、视觉资料，最多 6 个子 Agent
 - **长期记忆**：用户画像、记忆衰减、记忆宫殿、群聊风格学习、话题摘要、上下文压缩
 - **主动行为**：主动私聊、群空闲主动发话、Qzone 说说、远程 skill 审批
-- **多模态**：贴图库自动标注、语义选图、视觉分析、视频理解、LLM 决策的 TTS 语音回复
+- **多模态**：贴图库自动标注、语义选图、视觉分析、视频理解、可选 LLM 决策的 TTS 语音回复
 - **可扩展**：内置 skillpack 体系，支持本地 / 远程 skill 加载，可对接 MCP 桥
 - **多 Provider 路由**：主模型 + 轻量模型 + 画像模型 + 风格模型 + 回退模型独立配置
 
@@ -63,7 +63,7 @@ flowchart TB
         Memory["memory_store · memory_curator<br/>memory_decay · memory_palace<br/>persona_service"]
         Context["group_context · session_store<br/>context_policy · entity_index"]
         Sticker["sticker_library<br/>sticker_semantics<br/>sticker_labeler"]
-        TTS["tts_service<br/>(LLM 决策 voice/text/block)"]
+        TTS["tts_service<br/>(TTS / 可选 LLM 决策)"]
         Background["background_intelligence<br/>evolves · knowledge_builder"]
         Qzone["qzone_service"]
     end
@@ -196,6 +196,7 @@ system: |
 | 轻量任务模型 | `personification_lite_model`（intent 分类、回复 review、图片分类） |
 | 专用模型 | `personification_persona_model` / `_style_api_model` / `_state_model` / `_compress_model` |
 | 主流程回退 | `personification_fallback_*` 一组（API/模型/凭证） |
+| 回复审阅 | `personification_response_review_enabled` / `_response_review_model_role` |
 | Codex OAuth | `personification_codex_auth_path`（`api_type="openai_codex"` 时） |
 | 思考模式 | `personification_thinking_mode` / `_state_thinking_mode` / `_thinking_budget` |
 
@@ -262,7 +263,7 @@ system: |
 | 类别 | 关键配置 |
 | --- | --- |
 | 总开关 | `personification_tts_enabled` / `_tts_global_enabled` / `_tts_auto_enabled` / `_tts_auto_probability` |
-| LLM 决策 | `personification_tts_llm_decision_enabled` / `_tts_decision_timeout` |
+| LLM 决策 | `personification_tts_llm_decision_enabled` / `_tts_llm_decision_model_role` / `_tts_decision_timeout` |
 | 安全策略 | `personification_tts_builtin_safety_enabled` / `_tts_forbidden_policy` |
 | Provider | `personification_tts_api_url` / `_tts_api_key` / `_tts_model` |
 | 音色模式 | `personification_tts_mode`（preset / design / clone）+ `_tts_default_voice` / `_tts_voice_design_prompt` / `_tts_voice_clone` / `_tts_voice_clone_path` |
@@ -320,6 +321,13 @@ system: |
 - 依赖其他插件时统一使用 `require(...)` 声明，避免因普通 `import` 提前导入导致插件加载失败。
 
 ## 更新日志
+
+### 0.5.3
+
+- 同步本地 `personification` 新增的可配置 LLM 回复审阅：默认关闭，可选择 `intent/review/agent/sticker` 模型角色。
+- TTS 的 LLM 决策默认改为关闭，并新增 `personification_tts_llm_decision_model_role` 控制审查模型角色。
+- 修复 `nonebot_plugin_localstore` 加载顺序，避免插件加载后测试器再次 `require()` 时报 “not loaded as a plugin”。
+- 后台图片发送忽略 NapCat `retcode=1200 invoke timeout` 这类通常已送达的超时，避免补发误导性的失败提示。
 
 ### 0.5.2
 

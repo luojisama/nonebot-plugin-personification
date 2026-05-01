@@ -190,6 +190,34 @@ def test_tts_delivery_decision_falls_back_to_text_when_llm_fails() -> None:
     assert "decision_failed" in decision.reason
 
 
+def test_tts_delivery_decision_disabled_does_not_call_planner_for_command() -> None:
+    called = False
+
+    async def _planner(_messages):  # noqa: ANN001
+        nonlocal called
+        called = True
+        return '{"action":"block","reason":"should_not_run"}'
+
+    service = _service(
+        style_planner=_planner,
+        personification_tts_llm_decision_enabled=False,
+    )
+
+    decision = asyncio.run(
+        service.decide_tts_delivery(
+            text="正常朗读",
+            is_private=True,
+            command_triggered=True,
+            fallback_style_hint="自然",
+        )
+    )
+
+    assert called is False
+    assert decision.action == "voice"
+    assert decision.style_hint == "自然"
+    assert decision.reason == "llm_decision_disabled"
+
+
 def test_tts_global_switch_disables_service_availability() -> None:
     service = _service(personification_tts_global_enabled=False)
 

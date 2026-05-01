@@ -34,3 +34,8 @@ def test_collect_available_models_uses_codex_model_cache() -> None:
 
     assert {"model": "gpt-5.5", "source": "Codex /model"} in models
     assert all(item["source"] != "codex_primary" for item in models)
+
+
+def test_main_model_role_alias_resolves_to_agent() -> None:
+    assert model_router.resolve_model_role("main") == model_router.MODEL_ROLE_AGENT
+    assert model_router.resolve_model_role("主模型") == model_router.MODEL_ROLE_AGENT

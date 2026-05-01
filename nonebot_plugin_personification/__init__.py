@@ -47,6 +47,15 @@ except Exception as e:
     ) from e
 
 try:
+    require("nonebot_plugin_localstore")
+except Exception as e:
+    raise RuntimeError(
+        'Cannot load required plugin "nonebot_plugin_localstore". '
+        'Install it in the active venv first, for example: '
+        '"F:\\bot\\shirotest\\.venv\\Scripts\\python.exe -m pip install nonebot-plugin-localstore".'
+    ) from e
+
+try:
     require("nonebot_plugin_htmlrender")
     from nonebot_plugin_htmlrender import md_to_pic
 except Exception as e:
