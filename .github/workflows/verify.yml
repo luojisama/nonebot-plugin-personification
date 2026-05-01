@@ -1,23 +1,17 @@
-name: Publish to PyPI
+name: Verify
 
 on:
   push:
-    tags:
-      - 'v*'
-  release:
-    types: [published]
+    branches:
+      - main
+  pull_request:
 
 jobs:
-  publish:
-    name: Build and publish to PyPI
+  smoke:
+    name: Smoke checks
     runs-on: ubuntu-latest
-    permissions:
-      id-token: write
-      contents: read
     steps:
       - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
 
       - name: Set up PDM
         uses: pdm-project/setup-pdm@v4
@@ -27,12 +21,8 @@ jobs:
       - name: Install runtime dependencies
         run: pdm install --prod
 
+      - name: Compile package
+        run: pdm run python -m compileall -q nonebot_plugin_personification
+
       - name: Smoke test plugin dependency load order
         run: pdm run python scripts/smoke_load_dependencies.py
-
-      - name: Build package
-        run: pdm build
-
-      - name: Publish package to PyPI
-        uses: pypa/gh-action-pypi-publish@release/v1
-
