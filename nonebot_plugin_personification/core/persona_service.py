@@ -6,34 +6,43 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from ..skills.skillpacks.tool_caller.scripts.impl import ToolCaller
 from .db import connect_sync
 
 
+_PERSONA_FIELD_GUIDE = """\
+要求输出格式严格如下（不要使用 Markdown 符号 / # *，每段一行或多行）：
+【职业推测】：身份/职业/学业阶段，证据不足直接写"信息不足"，不要瞎猜。
+【年龄推测】：粗略年龄段（如"20 代前半""中学生""社会人"），含判断依据。
+【性别推测】：男 / 女 / 不明；含判断依据。
+【作息特征】：活跃时段、是否昼夜颠倒、聊天密度（高频灌水 / 偶尔出没）。
+【兴趣领域】：明确观察到的兴趣（游戏 / ACG / 编程 / 学术 / 时事 / 美食 / 健身 / 学习 / 写作 / 运动等），具体到名词。
+【沟通风格】：语气特点、常用口头禅或感叹词、是否爱玩梗、表情包使用偏好、句子长度。
+【情绪基线】：常态情绪 / 抗压表现 / 容易被点燃或低落的话题。
+【社交模式】：主动还是被动、对陌生人态度、群聊还是私聊更多、是否爱 @ 别人。
+【知识结构】：能看出来的专业/技能领域（"对 Python 有较深理解""熟悉东方系列""二次元历史/作品如数家珍"等）。
+【互动建议】：和这个用户聊天的最佳方式——给一个虚拟伙伴看，告诉它该用什么语气、避开什么话题、什么时候适合主动。
+【人物描述】：用 120-180 字综合总结，把上面字段串成自然语段，描述性格、习惯、辨识度高的特征。"""
+
 PERSONA_PROMPT_NEW = """\
-你是一个专业的人格分析师和用户画像专家。
-请根据以下用户最近的聊天记录，分析该用户的特征，实话实说，不要充满谄媚和恭维。
+你是一个用户画像分析师。请基于下方聊天记录刻画该用户特征。
+要求：实话实说，不必赞美；证据不足的字段写"信息不足"，不要为了完整而编造。
 
-要求输出格式严格如下（不使用任何 Markdown 格式符号，不使用 **、# 等）：
-【职业推测】：...
-【年龄推测】：...
-【性别推测】：...
-【人物描述】：（此处要求 150-200 字左右，详细描述性格、语言风格、兴趣爱好等特征）
+{field_guide}
 
-用户聊天记录如下：
+用户聊天记录：
 {messages_block}"""
 
 PERSONA_PROMPT_UPDATE = """\
-你是一个专业的人格分析师和用户画像专家。
-该用户此前已有一份画像（见「旧画像」部分）。
-请结合旧画像和以下最新聊天记录，对画像进行更新与完善，实话实说，不要充满谄媚和恭维。
-以新记录为主要依据；旧画像中若有新记录未涉及的内容，可酌情保留或合并。
+你是一个用户画像分析师。该用户已有一份画像（见「旧画像」），现在请基于最新聊天记录"修订"它。
 
-要求输出格式严格如下（不使用任何 Markdown 格式符号，不使用 **、# 等）：
-【职业推测】：...
-【年龄推测】：...
-【性别推测】：...
-【人物描述】：（此处要求 150-200 字左右，详细描述性格、语言风格、兴趣爱好等特征）
+修订规则：
+1. 旧画像中**未被新记录推翻**的事实、判断、特征**必须保留**——不要因为新记录没提就抹除。
+2. 仅在新记录里出现**明确证据**时才更新某个字段；语气从"原 X，现 Y"的形式呈现演变。
+3. 不要为了显得有变化而编造新内容；信息不足时复用旧字段原文。
+4. 每个字段都要给出最终版本（即"保留 + 修订"后的整体），不要只写差异。
+5. 如旧画像缺失某字段（比如旧版只有 4 个字段），按新格式补全；缺乏证据的字段写"信息不足"。
+
+{field_guide}
 
 旧画像：
 {previous_persona}
@@ -42,11 +51,19 @@ PERSONA_PROMPT_UPDATE = """\
 {messages_block}"""
 
 
+def _format_persona_prompt(template: str, **kwargs: str) -> str:
+    return template.format(field_guide=_PERSONA_FIELD_GUIDE, **kwargs)
+
+
 def build_persona_prompt(messages: list[str], previous: str | None) -> str:
     messages_block = "\n".join(f"- {message}" for message in messages)
     if previous:
-        return PERSONA_PROMPT_UPDATE.format(previous_persona=previous, messages_block=messages_block)
-    return PERSONA_PROMPT_NEW.format(messages_block=messages_block)
+        return _format_persona_prompt(
+            PERSONA_PROMPT_UPDATE,
+            previous_persona=str(previous or ""),
+            messages_block=messages_block,
+        )
+    return _format_persona_prompt(PERSONA_PROMPT_NEW, messages_block=messages_block)
 
 
 @dataclass
@@ -165,7 +182,7 @@ class PersonaStore:
         self._generating.add(uid)
         try:
             previous = self.get_persona(uid)
-            result = await self._call_persona_llm(history, previous)
+            result = await self._call_persona_llm(history, previous, user_id=str(user_id))
             if not result:
                 return None
             entry = PersonaEntry(data=result, time=int(time.time()))
@@ -177,7 +194,7 @@ class PersonaStore:
     async def _generate_and_save(self, user_id: str, history: list[str]) -> None:
         try:
             previous = self.get_persona(user_id)
-            result = await self._call_persona_llm(history, previous)
+            result = await self._call_persona_llm(history, previous, user_id=str(user_id))
             if result:
                 entry = PersonaEntry(data=result, time=int(time.time()))
                 await asyncio.to_thread(self._save_persona_sync, user_id, entry, True)
@@ -210,17 +227,63 @@ class PersonaStore:
                 conn.execute("DELETE FROM persona_histories WHERE user_id=?", (user_id,))
             conn.commit()
 
-    async def _call_persona_llm(self, messages: list[str], previous: PersonaEntry | None) -> str | None:
+    async def _call_persona_llm(
+        self,
+        messages: list[str],
+        previous: PersonaEntry | None,
+        *,
+        user_id: str = "",
+    ) -> str | None:
         prompt = build_persona_prompt(messages, previous.data if previous else None)
+        retry_prompt = (
+            prompt
+            + "\n\n（提醒：请只基于上述聊天记录客观提炼字段，不要给出'抱歉'、"
+            "'作为AI'、'无法回答'等套话；信息不足的字段直接写'信息不足'。）"
+        )
+        token = None
         try:
-            response = await self._tool_caller.chat_with_tools(
-                messages=[{"role": "user", "content": prompt}],
-                tools=[],
-                use_builtin_search=False,
-            )
+            from .llm_context import reset_llm_context, set_llm_context
+
+            token = set_llm_context(purpose="user_persona", user_id=str(user_id or ""))
+        except Exception:
+            token = None
+        try:
+            from .safety_filter import SafetyRefusalError, sanitize_or_retry
+            from .token_ledger import record_response_usage
+
+            async def _first() -> Any:
+                return await self._tool_caller.chat_with_tools(
+                    messages=[{"role": "user", "content": prompt}],
+                    tools=[],
+                    use_builtin_search=False,
+                )
+
+            async def _retry() -> Any:
+                return await self._tool_caller.chat_with_tools(
+                    messages=[{"role": "user", "content": retry_prompt}],
+                    tools=[],
+                    use_builtin_search=False,
+                )
+
+            try:
+                response = await sanitize_or_retry(
+                    call=_first,
+                    retry_call=_retry,
+                    on_response=record_response_usage,
+                    logger=self._logger,
+                    purpose="user_persona",
+                )
+            except SafetyRefusalError:
+                return None
         except Exception as e:
             self._logger.warning(f"[user_persona] LLM 调用失败: {e}")
             return None
+        finally:
+            if token is not None:
+                try:
+                    reset_llm_context(token)
+                except Exception:
+                    pass
         text = str(getattr(response, "content", "") or "").strip()
         return text or None
 

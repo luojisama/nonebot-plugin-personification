@@ -9,10 +9,11 @@ from plugin.personification.core.media_refs import normalize_media_refs
 from plugin.personification.core.media_understanding import (
     analyze_images_with_route_or_fallback,
     analyze_videos_with_route_or_fallback,
+    primary_route_supports_native_video,
 )
 from plugin.personification.skills.skillpacks.sticker_tool.scripts.impl import get_current_image_urls
-VISION_ANALYZE_PROMPT = """你是 ACG 场景视觉分析器。
-请基于图片和用户问题，输出一个 JSON 对象，不要输出解释性文字。
+VISION_ANALYZE_PROMPT = """你是 ACG 场景多媒体分析器。
+请基于图片/视频和用户问题，输出一个 JSON 对象，不要输出解释性文字。
 
 字段要求：
 {
@@ -28,6 +29,7 @@ VISION_ANALYZE_PROMPT = """你是 ACG 场景视觉分析器。
 要求：
 - 候选可以多个，不要武断唯一结论
 - ACG 场景尽量区分角色、作品、组织、道具、界面元素
+- 视频要按时间顺序关注动作变化、字幕/OCR、镜头切换和关键帧线索
 - 看不准就明确写 uncertain 或留空
 - confidence 取 0 到 1"""
 
@@ -56,7 +58,7 @@ async def analyze_images(
     image_urls: list[str] | None = None,
     videos: list[str] | None = None,
 ) -> str:
-    prompt = f"{VISION_ANALYZE_PROMPT}\n\n用户问题：{str(query or '').strip() or '请分析图片'}"
+    prompt = f"{VISION_ANALYZE_PROMPT}\n\n用户问题：{str(query or '').strip() or '请分析这段媒体'}"
     raw_refs = list(images or []) + list(image_urls or [])
     if not raw_refs:
         raw_refs = get_current_image_urls()
@@ -88,19 +90,6 @@ async def analyze_images(
         )
     ):
         vision_caller = _build_fallback_vision_caller(runtime.plugin_config)
-    if vision_caller is None:
-        return json.dumps(
-            {
-                "scene_summary": "",
-                "ocr_text": [],
-                "characters_or_entities": [],
-                "franchise_candidates": [],
-                "visual_evidence": [],
-                "ambiguity_notes": ["vision_unavailable"],
-                "confidence": 0.0,
-            },
-            ensure_ascii=False,
-        )
 
     outputs: list[tuple[str, str]] = []
     if refs:
@@ -123,6 +112,7 @@ async def analyze_images(
         if video_output:
             outputs.append((video_output, video_mode))
     if not outputs:
+        video_disabled = video_mode == "video_disabled"
         return json.dumps(
             {
                 "scene_summary": "",
@@ -134,7 +124,7 @@ async def analyze_images(
                     "vision_unavailable",
                     *invalid_refs,
                     *invalid_video_refs,
-                    *(["video_understanding_disabled"] if video_refs and not bool(getattr(runtime.plugin_config, "personification_video_understanding_enabled", False)) else []),
+                    *(["video_understanding_disabled"] if video_refs and video_disabled else []),
                 ],
                 "confidence": 0.0,
             },
@@ -215,19 +205,20 @@ def build_vision_tool(runtime: Any) -> AgentTool:
     return AgentTool(
         name="vision_analyze",
         description=(
-            "分析用户当前发送的图片，适合识别人物、作品、截图界面、画面元素、OCR 文本和可能的 ACG 候选。"
-            "输出候选和证据，不强行给单一结论。"
+            "分析用户当前发送的图片或视频，适合识别人物、作品、截图界面、画面元素、OCR 文本、视频动作变化和可能的 ACG 候选。"
+            "Gemini 官方路由可直接处理视频。输出候选和证据，不强行给单一结论。"
         ),
         parameters={
             "type": "object",
             "properties": {
                 "query": {"type": "string", "description": "用户问题或分析目标"},
                 "images": {"type": "array", "items": {"type": "string"}, "description": "图片引用列表"},
-                "videos": {"type": "array", "items": {"type": "string"}, "description": "视频引用列表（当前默认关闭）"},
+                "videos": {"type": "array", "items": {"type": "string"}, "description": "视频引用列表；Gemini 官方路由可原生理解视频"},
             },
             "required": ["query"],
         },
         handler=_handler,
         enabled=lambda: bool(getattr(runtime, "agent_tool_caller", None))
-        or getattr(runtime, "vision_caller", None) is not None,
+        or getattr(runtime, "vision_caller", None) is not None
+        or primary_route_supports_native_video(runtime),
     )

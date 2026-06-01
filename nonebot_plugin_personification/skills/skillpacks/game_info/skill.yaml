@@ -1,0 +1,7 @@
+name: game_info
+enabled: true
+category: query
+entrypoint: scripts/main.py
+description: 查询指定游戏的更新公告/攻略/剧情设定/技巧，数据源含 Steam 官方与多个社区站点。
+tools:
+  - game_info

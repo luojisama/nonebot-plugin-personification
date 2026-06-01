@@ -5,6 +5,8 @@ from nonebot import on_command
 from nonebot.adapters.onebot.v11 import Bot, Message, MessageEvent
 from nonebot.params import CommandArg
 
+from .runtime_commands import handle_git_update_command as _handle_git_update_command_fn
+
 
 def register_runtime_switch_matchers(
     *,
@@ -93,6 +95,20 @@ def register_runtime_switch_matchers(
             stats_cmd,
             plugin_config=plugin_config,
         )
+
+    quota_cmd = _register_command(
+        "拟人额度",
+        aliases={"拟人 额度", "quota", "额度"},
+        permission=superuser_permission,
+        priority=5,
+        block=True,
+    )
+
+    @quota_cmd.handle()
+    async def _handle_quota(_bot: Bot, _event: MessageEvent):
+        from .runtime_commands import handle_quota_command
+
+        await handle_quota_command(quota_cmd, plugin_config=plugin_config)
 
     install_remote_skill_cmd = _register_command(
         "安装远程技能",
@@ -273,6 +289,18 @@ def register_runtime_switch_matchers(
             get_knowledge_build_task=get_knowledge_build_task,
         )
 
+    git_update_cmd = _register_command(
+        "拟人更新",
+        aliases={"插件更新", "拟人插件更新"},
+        permission=superuser_permission,
+        priority=5,
+        block=True,
+    )
+
+    @git_update_cmd.handle()
+    async def _handle_git_update(bot: Bot, event: MessageEvent):
+        await _handle_git_update_command_fn(git_update_cmd, bot=bot, event=event, logger=logger)
+
     return {
         "personification_help_cmd": personification_help_cmd,
         "reload_config_cmd": reload_config_cmd,
@@ -288,4 +316,5 @@ def register_runtime_switch_matchers(
         "clear_plugin_knowledge_cmd": clear_plugin_knowledge_cmd,
         "plugin_knowledge_status_cmd": plugin_knowledge_status_cmd,
         "plugin_knowledge_error_cmd": plugin_knowledge_error_cmd,
+        "git_update_cmd": git_update_cmd,
     }

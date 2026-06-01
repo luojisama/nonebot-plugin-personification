@@ -26,6 +26,16 @@ def _managed_field_names() -> list[str]:
 
 
 def _collect_explicit_env_fields(plugin_config: Any) -> set[str]:
+    """收集所有 .env / OS 环境变量 / pydantic 中显式声明的 personification_ 字段。
+
+    被 _save_unlocked / _load_unlocked 用作"哪些字段属于 env 来源、不应被 env.json 覆盖
+    或持久化"的判定。
+
+    历史 bug：ConfigManager 早期只看 __pydantic_fields_set__ + os.environ，没读 .env 文件。
+    服务器场景下 NoneBot 包装层可能不传递 fields_set，导致 env.json 中过去由 admin
+    命令 / 模型路由 持久化的旧 api_pools 在重启后无条件覆盖 .env.prod 的新值。
+    现统一与 runtime_config._collect_explicit_env_fields 行为一致。
+    """
     explicit: set[str] = set()
     raw_fields = getattr(plugin_config, "__pydantic_fields_set__", None)
     if isinstance(raw_fields, Iterable):
@@ -38,6 +48,13 @@ def _collect_explicit_env_fields(plugin_config: Any) -> set[str]:
         lowered = str(key or "").strip().lower()
         if lowered.startswith("personification_"):
             explicit.add(lowered)
+    # 兜底：直接扫描 .env / .env.prod 文件，确保被 env 文件显式声明的字段
+    # 永远不会被 env.json 持久化层覆盖。复用 runtime_config 的同名函数避免重复。
+    try:
+        from .runtime_config import _collect_env_file_keys
+        explicit.update(_collect_env_file_keys())
+    except Exception:
+        pass
     return explicit
 
 
@@ -154,15 +171,28 @@ class ConfigManager:
         }
 
     def _save_unlocked(self) -> None:
-        payload = {
-            field_name: getattr(self.plugin_config, field_name, None)
-            for field_name in _managed_field_names()
-        }
+        # 关键约束：env.json 只持久化"不在 .env / 环境变量里"的运行时字段。
+        # 任何被 .env 显式声明的字段，env.json 中不应保留旧值（否则将来 .env 删除时
+        # 旧值会反咬复活），保存时直接剔除。
+        explicit_fields = _collect_explicit_env_fields(self.plugin_config)
+        payload: dict[str, Any] = {}
+        skipped_fields: list[str] = []
+        for field_name in _managed_field_names():
+            if field_name in explicit_fields:
+                skipped_fields.append(field_name)
+                continue
+            payload[field_name] = getattr(self.plugin_config, field_name, None)
         try:
             _write_payload_atomic(self.path, payload)
         except Exception as exc:
             if self.logger is not None:
                 self.logger.warning(f"personification: save env config failed path={self.path}: {exc}")
+            return
+        if skipped_fields and self.logger is not None:
+            self.logger.info(
+                "personification: env config save skipped fields managed by .env: "
+                + ", ".join(sorted(skipped_fields))
+            )
 
     def _load_unlocked(self) -> None:
         info = _new_load_info(self.path)
@@ -197,6 +227,27 @@ class ConfigManager:
             info["applied_fields"].append(field_name)
         info["loaded"] = True
         _set_env_config_info(self.plugin_config, info)
+        if info["skipped_fields"]:
+            if self.logger is not None:
+                self.logger.info(
+                    "personification: env.json respected .env explicit fields; skipped="
+                    + ", ".join(sorted(info["skipped_fields"]))
+                )
+            # 自动迁移：env.json 中还残留着已经迁到 .env 的字段
+            # 这是历史 admin 命令热切留下的脏数据，会让以后 .env 删除后旧值反咬。
+            # 立即重写 env.json 把这些字段剔除（_save_unlocked 已会跳过 explicit 字段）。
+            stale_in_file = [f for f in info["skipped_fields"] if f in payload]
+            if stale_in_file:
+                if self.logger is not None:
+                    self.logger.warning(
+                        "personification: env.json contains stale fields shadowed by .env; "
+                        f"cleaning up: {', '.join(sorted(stale_in_file))}"
+                    )
+                try:
+                    self._save_unlocked()
+                except Exception as exc:
+                    if self.logger is not None:
+                        self.logger.warning(f"personification: env.json cleanup failed: {exc}")
 
 
 def save_managed_env_config(plugin_config: Any, logger: Any) -> None:

@@ -7,10 +7,12 @@ from ...agent.inner_state import (
     update_inner_state_after_chat,
 )
 from ...agent.tool_registry import AgentTool, ToolRegistry
+from ...agent.runtime.tool_catalog import apply_tool_metadata_defaults
 from ...skill_runtime.loader import load_builtin_skillpacks_sync
 from ...skill_runtime.runtime_api import SkillRuntime
 from ..ai_routes import build_routed_tool_caller
 from ..file_sender import build_file_sender
+from ..llm_context import current_llm_context
 from ..model_router import (
     MODEL_ROLE_AGENT,
     MODEL_ROLE_INTENT,
@@ -18,6 +20,7 @@ from ..model_router import (
 )
 from ..session_store import init_session_store
 from ..tasks_service import make_cancel_task_tool, make_create_task_tool
+from ..web_fetch import WebFetchError, fetch_web_page
 from ..web_grounding import do_web_search as do_web_search_core
 from ...utils import init_utils_config
 from ..sticker_library import resolve_sticker_dir
@@ -185,6 +188,14 @@ def build_agent_tool_registry(
             )
         )
 
+    if memory_store is not None and bool(getattr(plugin_config, "personification_memory_enabled", True)):
+        registry.register(
+            _build_recall_user_memory_tool(memory_store, plugin_config, logger)
+        )
+
+    if bool(getattr(plugin_config, "personification_tool_web_fetch_enabled", True)):
+        registry.register(_build_web_fetch_tool(plugin_config, logger))
+
     if scheduler is not None and data_dir is not None:
         _bot_caller: Callable[[dict], Any] | None = None
         if get_bots is not None:
@@ -274,6 +285,7 @@ def build_agent_tool_registry(
         registry.register(build_gold_price_tool(_60s_base, logger, _60s_local_base))
         registry.register(build_baike_tool(_60s_base, logger, _60s_local_base))
         registry.register(build_exchange_rate_tool(_60s_base, logger, _60s_local_base))
+    apply_tool_metadata_defaults(registry)
     return registry
 
 
@@ -306,6 +318,126 @@ def _build_get_persona_tool(persona_store: Any, max_chars: int = 120) -> AgentTo
     )
 
 
+def _build_recall_user_memory_tool(memory_store: Any, plugin_config: Any, logger: Any) -> AgentTool:
+    import json as _json
+
+    async def _handler(query: str, days: int = 30, limit: int = 8) -> str:
+        ctx = current_llm_context()
+        user_id = str(ctx.get("user_id", "") or "").strip()
+        if not user_id:
+            return _json.dumps({"query": query, "memories": [], "note": "无法确定当前用户，跳过记忆召回"}, ensure_ascii=False)
+        try:
+            memories = memory_store.recall_memories(
+                query=query,
+                scope="auto",
+                user_id=user_id,
+                limit=max(1, min(int(limit or 8), 20)),
+                mode="auto",
+                context_type="private",
+            )
+        except Exception as exc:
+            logger.debug(f"[recall_user_memory] recall failed: {exc}")
+            memories = []
+        from ..search_ranker import build_time_hint
+        items = []
+        for m in memories[:max(1, int(limit or 8))]:
+            summary = str(m.get("summary", "") or "").strip()
+            if not summary:
+                continue
+            time_hint = str(m.get("time_hint", "") or build_time_hint(float(m.get("time_created", 0) or 0))).strip()
+            memory_type = str(m.get("memory_type", "") or "").strip()
+            items.append(f"[{time_hint}] {summary}（{memory_type}）")
+        if not items:
+            return _json.dumps({"query": query, "memories": []}, ensure_ascii=False)
+        return _json.dumps({"query": query, "memories": items}, ensure_ascii=False)
+
+    return AgentTool(
+        name="recall_user_memory",
+        description=(
+            "当用户询问 '你记得我...吗/上次/之前/前几天/复述' 等涉及"
+            "跨对话历史时调用。按 user_id 召回该用户在过去 N 天内的 episodic"
+            "记忆与所有 semantic 记忆，用于回答记忆类问题。"
+            "不要用 search_plugin_knowledge 处理用户记忆问题。"
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "自然语言查询，例如用户原话"},
+                "days": {"type": "integer", "description": "回溯天数，默认30", "default": 30},
+                "limit": {"type": "integer", "description": "返回记忆条数上限，默认8", "default": 8},
+            },
+            "required": ["query"],
+        },
+        handler=_handler,
+        local=True,
+        enabled=lambda: bool(getattr(plugin_config, "personification_memory_enabled", True)),
+    )
+
+
+def _build_web_fetch_tool(plugin_config: Any, logger: Any) -> AgentTool:
+    import json as _json
+
+    async def _handler(url: str, max_chars: int = 3000) -> str:
+        blocked = list(
+            getattr(plugin_config, "personification_tool_web_fetch_blocked_domains", []) or []
+        )
+        timeout = float(
+            getattr(plugin_config, "personification_tool_web_fetch_timeout", 60.0) or 60.0
+        )
+        proxy = str(getattr(plugin_config, "personification_web_proxy", "") or "").strip()
+        try:
+            result = await fetch_web_page(
+                url,
+                timeout=timeout,
+                max_chars=int(max_chars or 3000),
+                blocked_domains=blocked or None,
+                proxy=proxy or None,
+            )
+        except WebFetchError as exc:
+            logger.debug(f"[web_fetch] {exc}")
+            return _json.dumps({"error": str(exc), "url": str(url or "")}, ensure_ascii=False)
+        except Exception as exc:
+            logger.warning(f"[web_fetch] unexpected error: {exc}")
+            return _json.dumps(
+                {"error": f"未知错误：{exc}", "url": str(url or "")}, ensure_ascii=False
+            )
+        return _json.dumps(result, ensure_ascii=False)
+
+    return AgentTool(
+        name="web_fetch",
+        description=(
+            "抓取指定 URL 的网页正文。"
+            "当用户给出具体链接（含 http/https 的 URL）希望你阅读、总结、解释"
+            "或回答页面里的具体内容时调用。"
+            "与 web_search 的区别：web_search 是按关键词搜索摘要，"
+            "web_fetch 是直接打开用户给的 URL 把正文抓回来。"
+            "默认抓取 3000 字（max_chars 可调，上限 8000），整体超时 60 秒；"
+            "拒绝内网/本地地址，仅支持 http/https。"
+            "返回 JSON 含 url/title/text/status_code，失败时含 error 字段。"
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "url": {
+                    "type": "string",
+                    "description": "要抓取的完整 URL，必须以 http:// 或 https:// 开头",
+                },
+                "max_chars": {
+                    "type": "integer",
+                    "description": "返回正文的最大字符数，默认 3000，上限 8000",
+                    "default": 3000,
+                },
+            },
+            "required": ["url"],
+        },
+        handler=_handler,
+        local=True,
+        enabled=lambda: bool(
+            getattr(plugin_config, "personification_tool_web_fetch_enabled", True)
+        ),
+    )
+
+
 def _build_agent_tool_caller(plugin_config: Any, logger: Any) -> Any:
     return build_routed_tool_caller(
         plugin_config=plugin_config,
@@ -315,6 +447,23 @@ def _build_agent_tool_caller(plugin_config: Any, logger: Any) -> Any:
 
 
 def _build_lite_tool_caller(plugin_config: Any, logger: Any, default_caller: Any = None) -> Any:
+    # P10：严格主模型模式下，所有 lite 路径都共用主模型，避免偶尔降级到弱模型
+    # 导致 bot "突然变傻"。默认开启；要恢复旧行为把此开关关掉即可。
+    if bool(getattr(plugin_config, "personification_strict_main_model", True)):
+        if logger is not None:
+            try:
+                configured_lite = str(getattr(plugin_config, "personification_lite_model", "") or "").strip()
+                if configured_lite:
+                    logger.warning(
+                        f"[strict_main_model] 已启用，配置的 personification_lite_model="
+                        f"{configured_lite!r} 将被忽略；要恢复 lite 路径请把 "
+                        f"personification_strict_main_model 关闭。"
+                    )
+                else:
+                    logger.info("[strict_main_model] 启用：lite_tool_caller 复用主模型 caller")
+            except Exception:
+                pass
+        return default_caller
     lite_model = (
         get_model_override_for_role(plugin_config, MODEL_ROLE_INTENT)
         or str(getattr(plugin_config, "personification_lite_model", "") or "").strip()

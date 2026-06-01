@@ -29,6 +29,7 @@ async def recall_memory(
         user_id=str(user_id or ""),
         group_id=str(group_id or ""),
         mode=str(mode or "auto"),
+        context_type="group" if str(group_id or "").strip() else "private",
     )
     background_intelligence = getattr(runtime, "background_intelligence", None)
     if background_intelligence is not None:

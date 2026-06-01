@@ -3,16 +3,23 @@ from __future__ import annotations
 import asyncio as _asyncio
 import random
 import re as _re
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Dict, Iterable, Optional
 
 from ..agent.inner_state import DEFAULT_STATE, load_inner_state
+from ..core.context_policy import strip_response_control_markers
 from ..core.emotion_state import (
     describe_group_emotion_memory,
     describe_user_emotion_memory,
     load_emotion_state,
 )
+from ..core.session_store import (
+    append_session_message,
+    build_private_session_id,
+    get_session_messages,
+)
+from ..core.context_policy import stringify_history_content
 from ..skills.skillpacks.datetime_tool.scripts.impl import get_current_datetime_info
 from ..utils import get_group_topic_summary
 
@@ -38,7 +45,10 @@ PROACTIVE_DECISION_PROMPT = """[角色设定]
 
 [候选联系人]
 {candidates_formatted}
-（格式：昵称 / 好感度{fav} / 上次聊天：{last_chat} / 关系温度：{warmth}）
+（格式：昵称 / 好感度{fav} / 上次聊天：{last_chat} / 关系温度：{warmth}；好感度只作语气参考，不是联系门槛）
+
+[最近主动私聊历史]
+{recent_proactive_history}
 
 [今日发送限制]
 今天已主动发送：{today_count} 次（上限 {daily_limit} 次）
@@ -56,15 +66,31 @@ SEND|{{user_id}}|{{消息内容}}
 SKIP|{{原因（给自己的备注，如"现在没什么想说的"）}}
 
 消息内容要求：
-- 不超过50字
-- 用角色口吻，自然、真实，像真人突然想到发消息
+- 8-42 字，宁可更短；像真人随手发，不是工整结尾
+- 允许跳跃：可以省略主语、可以未完结、可以加"刚刚我..."这种实时感开头
+- 用角色口吻，自然、真实，像突然想到发一句，不像任务提醒或客服回访
 - 如果有悬挂念头与这个人有关，优先以此为话头
+- 如果对方画像或最近私聊里有可接的具体点子（兴趣/职业/最近话题），优先 SEND，不要保守地一律 SKIP
+- 只有在最近你单方面连续发过 2 次以上消息对方没接、或确实无话可说时，才 SKIP
+- 不要复读最近主动私聊历史里的话题、句式或疑问
 - 不要发"你好""在吗""最近怎么样"这类没有内容的开场白
-- 可以分享刚刚看到的有意思的事、某个想法、问一个具体的问题
-- 如果候选人的画像摘要提到了对方的兴趣、职业或最近话题，优先以此为切入点
+- 可以分享刚刚看到的很小的日常、某个一闪而过的想法，或问一个具体但不压迫的问题
+- 不要编造对方没说过的"上次"
 - 禁止使用的开场句式："最近怎么样"、"在吗"、"你好"、"有没有..."、"大家..."
 - 禁止任何以"哇"或"哎呀"开头的句子
+- 避免模板感句式：不要连续使用"你之前不是..."、"上次那个..."、"我这边突然想到..."这类回访口吻
 """
+
+GROUP_IDLE_MODE_DECISION_PROMPT = """你正在决定怎样回应群里的冷场，已经准备好一段话题：「{topic}」。
+群风格：{group_style}
+
+你的任务：从下面三种模式选一种，输出严格 JSON（不带 ```、不带额外解释）：
+1) text  —— 只发文字话题（适合需要明确表达的场景）
+2) sticker —— 只发一张表情包替代文字（适合纯气氛带动、群已经在玩梗时）
+3) combo —— 文字 + 一张配图表情包（适合情绪强烈、想强化效果时）
+
+输出格式：{{"mode":"text|sticker|combo","mood":"<2-6 字情绪/场景标签，如 调侃 / 困倦 / 兴奋 / 无奈>"}}"""
+
 
 GROUP_IDLE_TOPIC_PROMPT = """[角色设定]
 {system_prompt}
@@ -92,8 +118,8 @@ GROUP_IDLE_TOPIC_PROMPT = """[角色设定]
 群里已经冷场了一段时间。作为群成员，主动说一句话来打破沉默。
 
 [写作要求]
-- 不超过 30 字，越短越好
-- 优先结合"近期群聊话题"做延伸或转折，没有则结合时段氛围
+- 不超过 30 字，越短越好；标点能省就省
+- 可以与"近期群聊话题"接续，也可以**完全跳到**一个不相关的小观察，像真人突然走神又开口
 - 可以是反问、感慨、没头没尾的吐槽，不必是完整句子
 - 约三分之一概率带一点自我状态，如"刚睡醒""在摸鱼""有点饿"
 - 语气随意，像群里比较熟的人突然有句话想说
@@ -139,7 +165,109 @@ def _normalize_user_state(now: datetime, user_state: Dict[str, Any]) -> Dict[str
     normalized.setdefault("count", 0)
     normalized.setdefault("last_interaction", 0)
     normalized.setdefault("last_proactive_at", 0)
+    history = normalized.get("proactive_history")
+    normalized["proactive_history"] = history if isinstance(history, list) else []
+    normalized.setdefault("last_proactive_message", "")
     return normalized
+
+
+def _has_unanswered_proactive_message(user_state: dict[str, Any]) -> bool:
+    last_proactive_at = float(user_state.get("last_proactive_at", 0) or 0)
+    if last_proactive_at <= 0:
+        return False
+    last_interaction = float(user_state.get("last_interaction", 0) or 0)
+    return last_interaction <= last_proactive_at
+
+
+def _append_proactive_history(
+    user_state: dict[str, Any],
+    *,
+    message: str,
+    sent_at: float,
+    max_items: int = 8,
+) -> None:
+    text = str(message or "").strip()
+    if not text:
+        return
+    history = user_state.setdefault("proactive_history", [])
+    if not isinstance(history, list):
+        history = []
+        user_state["proactive_history"] = history
+    history.append({"at": float(sent_at or 0), "message": text[:120]})
+    user_state["proactive_history"] = history[-max(1, int(max_items)) :]
+    user_state["last_proactive_message"] = text[:120]
+
+
+def _format_proactive_history_for_state(user_state: dict[str, Any], *, max_items: int = 4) -> str:
+    history = user_state.get("proactive_history")
+    if not isinstance(history, list) or not history:
+        last_message = str(user_state.get("last_proactive_message", "") or "").strip()
+        return f"- {last_message}" if last_message else ""
+    lines: list[str] = []
+    for item in history[-max(1, int(max_items)) :]:
+        if not isinstance(item, dict):
+            continue
+        message = str(item.get("message", "") or "").strip()
+        if not message:
+            continue
+        ts = float(item.get("at", 0) or 0)
+        when = _format_last_chat(ts) if ts else "未知时间"
+        lines.append(f"- {when}：{message[:80]}")
+    return "\n".join(lines)
+
+
+def _format_recent_proactive_history(
+    proactive_state: dict[str, dict[str, Any]],
+    *,
+    max_users: int = 6,
+    max_items_per_user: int = 3,
+) -> str:
+    rows: list[tuple[float, str]] = []
+    for user_id, raw_state in proactive_state.items():
+        if str(user_id).startswith("group_") or not isinstance(raw_state, dict):
+            continue
+        state = _normalize_user_state(datetime(2000, 1, 1), raw_state)
+        last_at = float(state.get("last_proactive_at", 0) or 0)
+        rendered = _format_proactive_history_for_state(state, max_items=max_items_per_user)
+        if rendered:
+            rows.append((last_at, f"{user_id}：\n{rendered}"))
+    if not rows:
+        return "- 暂无"
+    rows.sort(key=lambda item: item[0], reverse=True)
+    return "\n".join(text for _, text in rows[: max(1, int(max_users))])
+
+
+def _format_recent_private_context(user_id: str, *, limit: int = 6, max_chars: int = 280) -> str:
+    try:
+        messages = get_session_messages(build_private_session_id(str(user_id)))
+    except Exception:
+        return ""
+    lines: list[str] = []
+    for msg in messages[-max(1, int(limit)) :]:
+        if not isinstance(msg, dict):
+            continue
+        content = stringify_history_content(msg.get("content", "")).strip()
+        if not content:
+            continue
+        role = str(msg.get("role", "") or "")
+        speaker = "对方" if role == "user" else "你" if role == "assistant" else "上下文"
+        lines.append(f"{speaker}: {content[:80]}")
+    text = "\n".join(lines).strip()
+    return text[:max(1, int(max_chars))]
+
+
+def _enrich_candidates_with_recent_context(
+    candidates: list[dict],
+    proactive_state: dict[str, dict[str, Any]],
+) -> None:
+    for item in candidates:
+        user_id = str(item.get("user_id", "") or "")
+        if not user_id:
+            continue
+        raw_state = proactive_state.get(user_id, {})
+        state = _normalize_user_state(datetime(2000, 1, 1), raw_state if isinstance(raw_state, dict) else {})
+        item["recent_proactive_history"] = _format_proactive_history_for_state(state)
+        item["recent_private_context"] = _format_recent_private_context(user_id)
 
 
 def _format_pending_thoughts(pending_thoughts: Iterable[dict]) -> str:
@@ -189,7 +317,9 @@ def _build_candidates(
     friend_ids: set[str],
     persona_store: Any = None,
     persona_snippet_max_chars: int = 80,
+    require_user_profile: bool = True,
 ) -> list[dict]:
+    _ = threshold  # 兼容旧配置；主动私聊不再按高好感度准入。
     candidates: list[dict] = []
     now_ts = now.timestamp()
     idle_seconds = max(0.0, float(idle_hours)) * 3600
@@ -205,10 +335,10 @@ def _build_candidates(
             continue
 
         favorability = float(user_data.get("favorability", 0.0) or 0.0)
-        if favorability < float(threshold):
-            continue
 
         user_state = _normalize_user_state(now, proactive_state.get(str(user_id), {}))
+        if _has_unanswered_proactive_message(user_state):
+            continue
         last_interaction = float(user_state.get("last_interaction", 0) or 0)
         if idle_seconds and last_interaction and now_ts - last_interaction < idle_seconds:
             continue
@@ -221,6 +351,8 @@ def _build_candidates(
                 str(user_id),
                 max_chars=max(1, int(persona_snippet_max_chars)),
             )
+        if require_user_profile and not persona_snippet:
+            continue
         candidates.append(
             {
                 "user_id": str(user_id),
@@ -230,10 +362,18 @@ def _build_candidates(
                 "warmth": _find_relation_warmth(inner_state, nickname, str(user_id)),
                 "persona_snippet": persona_snippet,
                 "emotion_memory": describe_user_emotion_memory(emotion_state or {}, str(user_id)),
+                "last_interaction_ts": last_interaction,
             }
         )
 
-    candidates.sort(key=lambda item: item["favorability"], reverse=True)
+    candidates.sort(
+        key=lambda item: (
+            bool(item.get("persona_snippet")),
+            bool(item.get("emotion_memory")),
+            float(item.get("last_interaction_ts", 0) or 0),
+        ),
+        reverse=True,
+    )
     return candidates[:10]
 
 
@@ -247,6 +387,7 @@ def _build_fallback_candidates(
     idle_hours: float,
     persona_store: Any = None,
     persona_snippet_max_chars: int = 80,
+    require_user_profile: bool = True,
 ) -> list[dict]:
     candidates: list[dict] = []
     now_ts = now.timestamp()
@@ -254,6 +395,8 @@ def _build_fallback_candidates(
 
     for user_id, profile in friend_profiles.items():
         user_state = _normalize_user_state(now, proactive_state.get(str(user_id), {}))
+        if _has_unanswered_proactive_message(user_state):
+            continue
         last_interaction = float(user_state.get("last_interaction", 0) or 0)
         if not last_interaction:
             continue
@@ -267,6 +410,8 @@ def _build_fallback_candidates(
                 str(user_id),
                 max_chars=max(1, int(persona_snippet_max_chars)),
             )
+        if require_user_profile and not persona_snippet:
+            continue
         candidates.append(
             {
                 "user_id": str(user_id),
@@ -283,6 +428,7 @@ def _build_fallback_candidates(
     candidates.sort(
         key=lambda item: (
             bool(item.get("persona_snippet")),
+            bool(item.get("emotion_memory")),
             float(item.get("last_interaction_ts", 0) or 0),
         ),
         reverse=True,
@@ -332,12 +478,23 @@ def _format_candidates(candidates: Iterable[dict]) -> str:
         emotion_memory = str(item.get("emotion_memory", "") or "").strip()
         if emotion_memory:
             line += f" / 近期情绪：{emotion_memory}"
+        private_context = str(item.get("recent_private_context", "") or "").strip()
+        if private_context:
+            line += f"\n  最近私聊：{private_context}"
+        proactive_history = str(item.get("recent_proactive_history", "") or "").strip()
+        if proactive_history:
+            line += f"\n  你最近主动发过：{proactive_history}"
         lines.append(line)
     return "\n".join(lines) if lines else "- 无可联系对象"
 
 
 def _parse_decision(result: str) -> tuple[str, str, str]:
     text = (result or "").strip()
+    # 先把 LLM 可能加的思维链 XML 剥掉，让 SEND|/SKIP| 协议在裸文本上识别。
+    inner = _strip_xml_message_content(text)
+    if inner and ("SEND|" in inner or "SKIP|" in inner):
+        text = inner
+    text = strip_response_control_markers(text)
     if text.startswith("SEND|"):
         _, user_id, message = (text.split("|", 2) + ["", ""])[:3]
         return "SEND", user_id.strip(), message.strip()
@@ -449,6 +606,149 @@ def _increment_group_idle_count(
     proactive_state[key] = state
 
 
+async def _decide_idle_output_mode(
+    *,
+    call_ai_api: Callable[..., Awaitable[Optional[str]]],
+    topic: str,
+    group_style: str,
+    logger: Any,
+    group_id: str,
+) -> tuple[str, str]:
+    """J4 phase-1: 用 LLM 决定群水群输出模式 (text/sticker/combo) 和情绪标签。
+    返回 (mode, mood_hint)；任何失败都 fallback 到 ('text', '')。
+    """
+    prompt = GROUP_IDLE_MODE_DECISION_PROMPT.format(
+        topic=str(topic or "")[:120],
+        group_style=str(group_style or "")[:60],
+    )
+    token = None
+    try:
+        from ..core.llm_context import reset_llm_context, set_llm_context
+
+        token = set_llm_context(
+            purpose="proactive_group_idle_mode",
+            group_id=str(group_id or ""),
+        )
+    except Exception:
+        token = None
+    try:
+        raw = await call_ai_api([{"role": "user", "content": prompt}])
+    except Exception as e:
+        logger.debug(f"[group_idle] mode decision LLM call failed: {e}")
+        return ("text", "")
+    finally:
+        if token is not None:
+            try:
+                reset_llm_context(token)
+            except Exception:
+                pass
+    if not raw:
+        return ("text", "")
+    import json as _json
+    import re as _re
+
+    candidate = str(raw).strip()
+    # 容错：剥掉可能的 ```json 包装
+    candidate = _re.sub(r"^```(?:json)?\s*", "", candidate)
+    candidate = _re.sub(r"\s*```\s*$", "", candidate)
+    try:
+        data = _json.loads(candidate)
+    except Exception:
+        match = _re.search(r"\{[^{}]*\}", candidate)
+        if not match:
+            return ("text", "")
+        try:
+            data = _json.loads(match.group(0))
+        except Exception:
+            return ("text", "")
+    if not isinstance(data, dict):
+        return ("text", "")
+    mode = str(data.get("mode", "text") or "text").strip().lower()
+    if mode not in {"text", "sticker", "combo"}:
+        mode = "text"
+    mood = str(data.get("mood", "") or "").strip()[:24]
+    return (mode, mood)
+
+
+async def _try_send_idle_sticker(
+    *,
+    bot: Any,
+    group_id: str,
+    runtime_bundle: Any,
+    plugin_config: Any,
+    mood_hint: str,
+    topic_text_fallback: str,
+    logger: Any,
+) -> bool:
+    """J4: 在群里发一张语义匹配 mood_hint 的表情包；失败返 False 让调用方回退到文本。"""
+    try:
+        from ..core.sticker_library import (
+            list_local_sticker_files,
+            load_sticker_metadata,
+            resolve_sticker_dir,
+        )
+        from ..core.sticker_feedback import (
+            get_sticker_decay_multiplier,
+            load_sticker_feedback,
+            record_sticker_sent,
+        )
+    except Exception as e:
+        logger.debug(f"[group_idle] sticker imports failed: {e}")
+        return False
+    try:
+        sticker_dir = resolve_sticker_dir(getattr(plugin_config, "personification_sticker_path", None))
+        files = list_local_sticker_files(sticker_dir, include_gif=True)
+        if not files:
+            return False
+        metadata = load_sticker_metadata(sticker_dir)
+        # 拉一次 feedback state 算衰减倍数
+        try:
+            feedback_state = await load_sticker_feedback()
+        except Exception:
+            feedback_state = {}
+        # 简单匹配：按 mood_tags / scene_tags 命中 hint 关键字，结合衰减权重
+        hint_text = (str(mood_hint or "") + " " + str(topic_text_fallback or "")).strip()
+        scored: list[tuple[float, str]] = []
+        for file_path in files:
+            entry = metadata.get(file_path.name) or {}
+            if not isinstance(entry, dict):
+                continue
+            score = 0.0
+            for tag in list(entry.get("mood_tags", []) or []) + list(entry.get("scene_tags", []) or []):
+                if str(tag).strip() and str(tag).strip() in hint_text:
+                    score += 1.0
+            if not score:
+                # 至少要有 description 才候选，跳过未打标
+                if not entry.get("description"):
+                    continue
+                score = 0.2
+            weight = float(entry.get("weight", 1.0) or 1.0)
+            try:
+                decay = float(get_sticker_decay_multiplier(file_path.name, feedback_state))
+            except Exception:
+                decay = 1.0
+            scored.append((score * weight * decay, file_path.name))
+        if not scored:
+            return False
+        scored.sort(key=lambda x: x[0], reverse=True)
+        best_name = scored[0][1]
+        best_path = sticker_dir / best_name
+        if not best_path.exists():
+            return False
+        # OneBot v11 CQ 码发送
+        cq = f"[CQ:image,file=file:///{best_path.resolve().as_posix().lstrip('/')}]"
+        await bot.send_group_msg(group_id=int(group_id), message=cq)
+        try:
+            await record_sticker_sent(best_name)
+        except Exception:
+            pass
+        logger.info(f"[group_idle] 群 {group_id} 选发表情包 {best_name}（mood_hint='{mood_hint[:20]}'）")
+        return True
+    except Exception as e:
+        logger.warning(f"[group_idle] sticker send failed for group {group_id}: {e}")
+        return False
+
+
 async def run_proactive_messaging(
     *,
     plugin_config: Any,
@@ -472,11 +772,15 @@ async def run_proactive_messaging(
 ) -> bool:
     _ = get_user_data, get_level_name, get_activity_status, parse_yaml_response, agent_tool_caller
 
+    from ..core import proactive_diagnostics as _diag
+
     if not getattr(plugin_config, "personification_proactive_enabled", True):
+        _diag.record(scope="private", outcome=_diag.SKIP_DISABLED, detail={"reason": "proactive_enabled=False"})
         return False
     if not sign_in_available and not bool(
         getattr(plugin_config, "personification_proactive_without_signin", True)
     ):
+        _diag.record(scope="private", outcome=_diag.SKIP_OTHER, detail={"reason": "no_signin"})
         return False
     allow_unsuitable_prob = float(
         max(
@@ -519,11 +823,26 @@ async def run_proactive_messaging(
     min_interval = max(1, int(getattr(plugin_config, "personification_proactive_interval", 30)))
     if total_today_count >= daily_limit:
         save_proactive_state(proactive_state)
+        _diag.record(
+            scope="private",
+            outcome=_diag.SKIP_DAILY_LIMIT,
+            detail={"today_count": total_today_count, "daily_limit": daily_limit},
+            next_eligible_at=(now.replace(hour=0, minute=0, second=0) + timedelta(days=1)).timestamp(),
+        )
         return False
 
     now_ts = now.timestamp()
     if last_proactive_at and now_ts - last_proactive_at < min_interval * 60:
         save_proactive_state(proactive_state)
+        _diag.record(
+            scope="private",
+            outcome=_diag.SKIP_COOLDOWN,
+            detail={
+                "since_last_seconds": int(now_ts - last_proactive_at),
+                "min_interval_minutes": min_interval,
+            },
+            next_eligible_at=last_proactive_at + min_interval * 60,
+        )
         return False
 
     inner_state = dict(DEFAULT_STATE)
@@ -543,6 +862,7 @@ async def run_proactive_messaging(
         getattr(plugin_config, "personification_persona_snippet_max_chars", 150)
     )
     idle_hours = float(getattr(plugin_config, "personification_proactive_idle_hours", 24.0))
+    require_user_profile = bool(getattr(plugin_config, "personification_proactive_require_user_profile", True))
     if sign_in_available:
         all_user_data = load_data() or {}
         candidates = _build_candidates(
@@ -556,6 +876,7 @@ async def run_proactive_messaging(
             friend_ids=friend_ids,
             persona_store=persona_store,
             persona_snippet_max_chars=persona_snippet_max_chars,
+            require_user_profile=require_user_profile,
         )
     else:
         candidates = _build_fallback_candidates(
@@ -567,10 +888,12 @@ async def run_proactive_messaging(
             idle_hours=idle_hours,
             persona_store=persona_store,
             persona_snippet_max_chars=persona_snippet_max_chars,
+            require_user_profile=require_user_profile,
         )
     if not candidates:
         save_proactive_state(proactive_state)
         return False
+    _enrich_candidates_with_recent_context(candidates, proactive_state)
 
     system_prompt = _extract_system_prompt(load_prompt())
     timezone_name = getattr(plugin_config, "personification_timezone", "Asia/Shanghai")
@@ -592,6 +915,7 @@ async def run_proactive_messaging(
         emotion_memory_formatted=emotion_memory_formatted,
         datetime_info=datetime_info,
         candidates_formatted=_format_candidates(candidates),
+        recent_proactive_history=_format_recent_proactive_history(proactive_state),
         fav="fav",
         last_chat="last_chat",
         warmth="warmth",
@@ -602,16 +926,36 @@ async def run_proactive_messaging(
         user_id="user_id",
     )
 
-    decision = await call_ai_api(
-        [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
-        ]
-    )
+    _purpose_token = None
+    try:
+        from ..core.llm_context import reset_llm_context, set_llm_context
+
+        _purpose_token = set_llm_context(purpose="proactive_private")
+    except Exception:
+        _purpose_token = None
+    try:
+        decision = await call_ai_api(
+            [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ]
+        )
+    finally:
+        if _purpose_token is not None:
+            try:
+                reset_llm_context(_purpose_token)
+            except Exception:
+                pass
     action, target_user_id, payload = _parse_decision(decision or "")
     payload = _strip_xml_message_content(payload)
     if action != "SEND" or not target_user_id or not payload:
         save_proactive_state(proactive_state)
+        _diag.record(
+            scope="private",
+            outcome=_diag.SKIP_LLM_DECIDED,
+            target=target_user_id,
+            detail={"action": action, "raw_decision_len": len(str(decision or ""))},
+        )
         return False
 
     target = next((item for item in candidates if item["user_id"] == target_user_id), None)
@@ -630,14 +974,37 @@ async def run_proactive_messaging(
     )
     if random.random() > proactive_probability:
         save_proactive_state(proactive_state)
+        _diag.record(
+            scope="private",
+            outcome=_diag.SKIP_PROBABILITY,
+            target=target_user_id,
+            detail={"probability": proactive_probability},
+        )
         return False
 
     await bot.send_private_msg(user_id=int(target_user_id), message=payload)
+    _diag.record(
+        scope="private",
+        outcome=_diag.OUTCOME_SENT,
+        target=target_user_id,
+        detail={"len": len(payload)},
+    )
 
     user_state = _normalize_user_state(now, proactive_state.get(target_user_id, {}))
     user_state["count"] = int(user_state.get("count", 0) or 0) + 1
     user_state["last_proactive_at"] = now_ts
+    _append_proactive_history(user_state, message=payload, sent_at=now_ts)
     proactive_state[target_user_id] = user_state
+    try:
+        append_session_message(
+            build_private_session_id(target_user_id),
+            "assistant",
+            payload,
+            source_kind="proactive_private",
+            speaker="你",
+        )
+    except Exception as e:
+        logger.warning(f"[proactive] append proactive private history failed: {e}")
     save_proactive_state(proactive_state)
     return True
 
@@ -806,6 +1173,16 @@ async def run_group_idle_topic(
                 superuser_context=superuser_context,
             )
 
+            _gi_token = None
+            try:
+                from ..core.llm_context import reset_llm_context, set_llm_context
+
+                _gi_token = set_llm_context(
+                    purpose="proactive_group_idle",
+                    group_id=str(group_id or ""),
+                )
+            except Exception:
+                _gi_token = None
             try:
                 topic = await call_ai_api(
                     [
@@ -816,6 +1193,12 @@ async def run_group_idle_topic(
             except Exception as e:
                 logger.warning(f"[group_idle] call_ai_api failed for group {group_id}: {e}")
                 continue
+            finally:
+                if _gi_token is not None:
+                    try:
+                        reset_llm_context(_gi_token)
+                    except Exception:
+                        pass
 
             topic = _strip_xml_message_content(topic or "")
             if not topic or topic.startswith("[") or len(topic) < 2:
@@ -828,8 +1211,57 @@ async def run_group_idle_topic(
             if random.random() > proactive_probability:
                 continue
 
+            # J4 阶段二：决定模式 text / sticker / combo（按概率门控避免每次都多花 token）
+            mode_decision_prob = float(
+                max(0.0, min(1.0, getattr(
+                    plugin_config,
+                    "personification_group_idle_mode_decision_prob",
+                    0.4,
+                )))
+            )
+            chosen_mode = "text"
+            sticker_mood_hint = ""
+            if random.random() < mode_decision_prob:
+                chosen_mode, sticker_mood_hint = await _decide_idle_output_mode(
+                    call_ai_api=call_ai_api,
+                    topic=topic,
+                    group_style=group_style,
+                    logger=logger,
+                    group_id=group_id,
+                )
+
             try:
-                await bot.send_group_msg(group_id=int(group_id), message=topic)
+                # 根据 chosen_mode 决定发送方式
+                if chosen_mode == "sticker":
+                    sticker_sent = await _try_send_idle_sticker(
+                        bot=bot,
+                        group_id=group_id,
+                        runtime_bundle=getattr(plugin_config, "_runtime_bundle_ref", None),
+                        plugin_config=plugin_config,
+                        mood_hint=sticker_mood_hint or topic,
+                        topic_text_fallback=topic,
+                        logger=logger,
+                    )
+                    if not sticker_sent:
+                        # 表情包发送失败回退到文本
+                        await bot.send_group_msg(group_id=int(group_id), message=topic)
+                    elif chosen_mode == "combo":
+                        # combo 已在 _try_send_idle_sticker 内发了表情，这里不再补
+                        pass
+                elif chosen_mode == "combo":
+                    await bot.send_group_msg(group_id=int(group_id), message=topic)
+                    # 异步追加 sticker（不阻塞回 sent_count 计数）
+                    await _try_send_idle_sticker(
+                        bot=bot,
+                        group_id=group_id,
+                        runtime_bundle=getattr(plugin_config, "_runtime_bundle_ref", None),
+                        plugin_config=plugin_config,
+                        mood_hint=sticker_mood_hint or topic,
+                        topic_text_fallback="",
+                        logger=logger,
+                    )
+                else:
+                    await bot.send_group_msg(group_id=int(group_id), message=topic)
                 sent_now = get_now()
                 sent_now_ts = sent_now.timestamp()
                 sent_today = sent_now.strftime("%Y-%m-%d")

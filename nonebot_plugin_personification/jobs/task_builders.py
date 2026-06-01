@@ -60,6 +60,8 @@ def build_proactive_qzone_post_task(
     maybe_generate_qzone_post: Callable[[Any], Awaitable[str]],
     publish_qzone_shuo: Any,
     logger: Any,
+    qzone_quiet_hour_start: int = 0,
+    qzone_quiet_hour_end: int = 7,
 ) -> Callable[[], Awaitable[bool]]:
     async def _proactive_qzone_post() -> bool:
         return await run_proactive_qzone_post(
@@ -74,9 +76,60 @@ def build_proactive_qzone_post_task(
             maybe_generate_qzone_post=maybe_generate_qzone_post,
             publish_qzone_shuo=publish_qzone_shuo,
             logger=logger,
+            quiet_hour_start=qzone_quiet_hour_start,
+            quiet_hour_end=qzone_quiet_hour_end,
         )
 
     return _proactive_qzone_post
+
+
+def build_qzone_social_scan_task(
+    *,
+    run_qzone_social_scan: Callable[..., Awaitable[dict[str, Any]]],
+    qzone_publish_available: bool,
+    qzone_social_enabled: bool,
+    get_bots: Callable[[], dict[str, Any]],
+    update_qzone_cookie: Any,
+    scan_qzone_social_feeds: Callable[..., Awaitable[dict[str, Any]]],
+    logger: Any,
+) -> Callable[..., Awaitable[dict[str, Any]]]:
+    async def _qzone_social_scan(target_user_id: str = "", force: bool = False) -> dict[str, Any]:
+        return await run_qzone_social_scan(
+            qzone_publish_available=qzone_publish_available,
+            qzone_social_enabled=qzone_social_enabled,
+            get_bots=get_bots,
+            update_qzone_cookie=update_qzone_cookie,
+            scan_qzone_social_feeds=scan_qzone_social_feeds,
+            logger=logger,
+            target_user_id=target_user_id,
+            force=force,
+        )
+
+    return _qzone_social_scan
+
+
+def build_qzone_inbound_poll_task(
+    *,
+    run_qzone_inbound_poll: Callable[..., Awaitable[dict[str, Any]]],
+    qzone_publish_available: bool,
+    qzone_inbound_enabled: bool,
+    get_bots: Callable[[], dict[str, Any]],
+    update_qzone_cookie: Any,
+    poll_qzone_inbound_messages: Callable[[Any], Awaitable[dict[str, Any]]],
+    logger: Any,
+) -> Callable[..., Awaitable[dict[str, Any]]]:
+    async def _qzone_inbound_poll(force: bool = False) -> dict[str, Any]:
+        return await run_qzone_inbound_poll(
+            qzone_publish_available=qzone_publish_available,
+            qzone_inbound_enabled=qzone_inbound_enabled,
+            get_bots=get_bots,
+            update_qzone_cookie=update_qzone_cookie,
+            poll_qzone_inbound_messages=poll_qzone_inbound_messages,
+            logger=logger,
+            force=force,
+        )
+
+    return _qzone_inbound_poll
 
 
 def build_maybe_generate_qzone_post_task(

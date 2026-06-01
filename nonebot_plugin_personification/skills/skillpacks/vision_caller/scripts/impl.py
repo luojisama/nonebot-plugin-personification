@@ -8,20 +8,52 @@ from typing import Any, Awaitable, Callable, Dict, List, Optional
 import httpx
 
 from plugin.personification.core.image_refs import normalize_image_ref
-from plugin.personification.skills.skillpacks.tool_caller.scripts.impl import (
-    OpenAICodexToolCaller,
-    _convert_openai_tool_to_gemini,
-    _extract_gemini_text,
-    _extract_gemini_tool_calls,
-    _normalize_api_type,
-    _normalize_codex_model_name,
-    _normalize_openai_base_url,
-    _obj_get,
-    _split_data_url,
-)
+from plugin.personification.core.time_ctx import build_current_time_context_block
 
 
 logger = logging.getLogger(__name__)
+
+
+def _tool_impl() -> Any:
+    from plugin.personification.skills.skillpacks.tool_caller.scripts import impl
+
+    return impl
+
+
+def _convert_openai_tool_to_gemini(tool: Any) -> Any:
+    return _tool_impl()._convert_openai_tool_to_gemini(tool)
+
+
+def _extract_gemini_text(data: Any) -> str:
+    return _tool_impl()._extract_gemini_text(data)
+
+
+def _extract_gemini_tool_calls(data: Any) -> list[Any]:
+    return _tool_impl()._extract_gemini_tool_calls(data)
+
+
+def _normalize_api_type(api_type: Any) -> str:
+    return _tool_impl()._normalize_api_type(api_type)
+
+
+def _normalize_codex_model_name(model: Any) -> str:
+    return _tool_impl()._normalize_codex_model_name(model)
+
+
+def _normalize_openai_base_url(base_url: Any) -> str:
+    return _tool_impl()._normalize_openai_base_url(base_url)
+
+
+def _obj_get(obj: Any, key: str, default: Any = None) -> Any:
+    return _tool_impl()._obj_get(obj, key, default)
+
+
+def _split_data_url(value: Any) -> tuple[str, str] | None:
+    return _tool_impl()._split_data_url(value)
+
+
+def _prompt_with_time_context(prompt: str) -> str:
+    return f"{build_current_time_context_block()}\n\n{str(prompt or '').strip()}"
 
 
 def _provider_model_is_compatible(api_type: str, model: str) -> bool:
@@ -86,7 +118,7 @@ class OpenAIVisionCaller(VisionCaller):
                     {
                         "role": "user",
                         "content": [
-                            {"type": "text", "text": prompt},
+                            {"type": "text", "text": _prompt_with_time_context(prompt)},
                             {"type": "image_url", "image_url": {"url": normalized_image_url}},
                         ],
                     }
@@ -113,7 +145,7 @@ class OpenAIVisionCaller(VisionCaller):
             {
                 "role": "user",
                 "content": [
-                    {"type": "text", "text": prompt},
+                    {"type": "text", "text": _prompt_with_time_context(prompt)},
                     {"type": "image_url", "image_url": {"url": normalized_image_url}},
                 ],
             }
@@ -247,7 +279,7 @@ class GeminiVisionCaller(VisionCaller):
 
     def _request_parts(self, prompt: str, image_url: str) -> List[Dict[str, Any]]:
         return [
-            {"text": prompt},
+            {"text": _prompt_with_time_context(prompt)},
             self._gemini_image_part(image_url),
         ]
 
@@ -385,7 +417,7 @@ class AnthropicVisionCaller(VisionCaller):
                 {
                     "role": "user",
                     "content": [
-                        {"type": "text", "text": prompt},
+                        {"type": "text", "text": _prompt_with_time_context(prompt)},
                         _anthropic_image_block(normalized_image_url),
                     ],
                 }
@@ -420,7 +452,7 @@ class CodexVisionCaller(VisionCaller):
         self.model = _normalize_codex_model_name(model)
         self.auth_path = str(auth_path or "").strip()
         self.timeout = timeout
-        self._caller = OpenAICodexToolCaller(
+        self._caller = _tool_impl().OpenAICodexToolCaller(
             model=self.model,
             auth_path=self.auth_path,
             timeout=self.timeout,

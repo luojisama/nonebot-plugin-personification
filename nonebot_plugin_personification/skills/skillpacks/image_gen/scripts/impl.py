@@ -3,6 +3,8 @@ from __future__ import annotations
 import re
 from typing import Any
 
+from plugin.personification.core.image_refs import normalize_image_refs
+
 
 _IMAGE_SIZE_ALIASES = {
     "1024x1024": "1024x1024",
@@ -68,6 +70,9 @@ async def generate_image(
     size: str = "1024x1024",
     image_model: str = "gpt-image-2",
     timeout: float | None = None,
+    images: list[str] | None = None,
+    image_urls: list[str] | None = None,
+    reference_mode: str = "auto",
 ) -> dict[str, str]:
     """通过 Codex 后端调用模型独有的 image_generation 托管工具生成图片。"""
     prompt_text = str(prompt or "").strip()
@@ -104,12 +109,21 @@ async def generate_image(
                 )
                 _DEDICATED_CODEX_CALLERS[key] = dedicated
             caller = dedicated
+    raw_refs = list(images or []) + list(image_urls or [])
+    reference_images, reference_problems = normalize_image_refs(raw_refs, limit=3)
     result = await caller.generate_image(
         prompt_text,
         size=normalize_image_generation_size(str(size or "1024x1024")),
         image_model=str(image_model or "gpt-image-2").strip() or "gpt-image-2",
+        images=reference_images,
+        reference_mode=str(reference_mode or "auto").strip() or "auto",
     )
-    return result if isinstance(result, dict) else {"error": "invalid image response"}
+    if not isinstance(result, dict):
+        return {"error": "invalid image response"}
+    if reference_problems and "warning" not in result:
+        result = dict(result)
+        result["warning"] = "some reference images were ignored: " + ", ".join(reference_problems[:3])
+    return result
 
 
 __all__ = [

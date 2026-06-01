@@ -47,10 +47,40 @@ def _extract_plain_text(event: Any) -> str:
             elif seg_type == "mface":
                 parts.append(str(data.get("summary", "") or ""))
             elif seg_type == "face":
-                parts.append(f"[表情id:{str(data.get('id', '') or '').strip()}]")
+                from ..core.qq_face_names import render_face_token
+
+                parts.append(render_face_token(data.get("id", "")))
     except Exception:
         return ""
     return "".join(parts).strip()
+
+
+def _is_sticker_only_event(event: Any) -> bool:
+    """判断一条消息是否「纯表情」（只有 face/mface/image 段，无实质文本）。
+
+    按 segment type 判定，不靠占位符文本匹配——避免把表情误当成复读内容。
+    """
+    message = getattr(event, "message", None)
+    if message is None:
+        return False
+    saw_sticker = False
+    try:
+        for seg in message:
+            seg_type = getattr(seg, "type", None)
+            data = getattr(seg, "data", {}) or {}
+            if seg_type == "text":
+                if str(data.get("text", "") or "").strip():
+                    return False
+            elif seg_type in {"face", "mface", "image"}:
+                saw_sticker = True
+            elif seg_type in {"at", "reply"}:
+                continue
+            else:
+                # 其它段（语音、视频、json 卡片等）不算纯表情
+                return False
+    except Exception:
+        return False
+    return saw_sticker
 
 
 def _normalize_repeat_key(text: str) -> str:
@@ -119,7 +149,11 @@ def _serialize_batched_event(item: dict[str, Any]) -> dict[str, Any]:
 def _build_repeat_clusters(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
     clusters: dict[str, dict[str, Any]] = {}
     for item in items:
-        text = _extract_plain_text(item.get("event"))
+        event = item.get("event")
+        # 纯表情消息不参与复读簇统计：多人刷表情不应被当成「反复在说」而触发吐槽/跟读。
+        if _is_sticker_only_event(event):
+            continue
+        text = _extract_plain_text(event)
         key = _normalize_repeat_key(text)
         if not key:
             continue
@@ -518,9 +552,10 @@ async def handle_reply_event(
     entry["delay"] = delay
 
     bot_self_id = str(getattr(bot, "self_id", "") or "")
+    is_private_session = not isinstance(event, group_message_event_cls)
     is_direct_mention = _is_direct_mention(event, bot_self_id)
     is_reply_to_bot = _is_reply_to_bot(event, bot_self_id)
-    immediate_flush = bool(is_direct_mention or is_reply_to_bot)
+    immediate_flush = bool(is_private_session or is_direct_mention or is_reply_to_bot)
     now_ts = time.monotonic()
     item = {
         "event": event,

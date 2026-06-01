@@ -13,7 +13,16 @@ from .media_refs import normalize_video_ref
 from .message_parts import build_user_message_content
 from .model_router import MODEL_ROLE_STICKER, get_model_override_for_role
 from .visual_capabilities import VISUAL_ROUTE_AGENT, error_indicates_vision_unavailable, provider_supports_video
-from ..skills.skillpacks.tool_caller.scripts.impl import build_tool_caller
+
+
+def build_tool_caller(config: Any) -> Any:
+    from ..skills.skillpacks.tool_caller.scripts.impl import build_tool_caller
+
+    return build_tool_caller(config)
+
+
+def _build_tool_caller(config: Any) -> Any:
+    return build_tool_caller(config)
 
 
 _VIDEO_INLINE_MAX_BYTES = 20 * 1024 * 1024
@@ -32,8 +41,12 @@ def _normalize_media_api_type(api_type: str) -> str:
     value = str(api_type or "").strip().lower().replace("-", "_")
     if value in {"gemini", "gemini_official"}:
         return "gemini_official"
+    if value in {"gemini_cli", "geminicli", "antigravity_cli", "antigravity", "agy", "agy_cli"}:
+        return "antigravity_cli"
     if value in {"openai_codex", "codex"}:
         return "openai_codex"
+    if value in {"claude_code", "claudecode", "claude_cli"}:
+        return "claude_code"
     if value == "anthropic":
         return "anthropic"
     return "openai"
@@ -44,7 +57,7 @@ def _is_provider_usable(provider: dict[str, Any]) -> bool:
     model = str(provider.get("model", "") or "").strip()
     if not model:
         return False
-    if api_type == "openai_codex":
+    if api_type in {"openai_codex", "gemini_cli", "antigravity_cli", "claude_code"}:
         return True
     return bool(str(provider.get("api_key", "") or "").strip())
 
@@ -99,6 +112,16 @@ class _ProviderConfigProxy:
             return self._provider.get("model", "")
         if name == "personification_codex_auth_path":
             return self._provider.get("auth_path", "")
+        if name == "personification_gemini_cli_auth_path":
+            return self._provider.get("auth_path", "")
+        if name == "personification_gemini_cli_project":
+            return self._provider.get("project", "")
+        if name == "personification_antigravity_cli_auth_path":
+            return self._provider.get("auth_path", "")
+        if name == "personification_antigravity_cli_project":
+            return self._provider.get("project", "")
+        if name == "personification_claude_code_auth_path":
+            return self._provider.get("auth_path", "")
         if name == "personification_thinking_mode":
             return getattr(self._original, name, "none")
         return getattr(self._original, name)
@@ -137,14 +160,37 @@ def get_primary_provider_config(runtime: Any) -> dict[str, str]:
             "api_key": str(primary.get("api_key", "") or ""),
             "model": str(primary.get("model", "") or ""),
             "auth_path": str(primary.get("auth_path", "") or ""),
+            "project": str(primary.get("project", "") or ""),
         }
     plugin_config = getattr(runtime, "plugin_config", None)
+    api_type = str(getattr(plugin_config, "personification_api_type", "") or "")
+    normalized_type = _normalize_media_api_type(api_type)
+    if normalized_type == "openai_codex":
+        auth_path = str(getattr(plugin_config, "personification_codex_auth_path", "") or "")
+    elif normalized_type == "gemini_cli":
+        auth_path = str(getattr(plugin_config, "personification_gemini_cli_auth_path", "") or "")
+    elif normalized_type == "antigravity_cli":
+        auth_path = str(getattr(plugin_config, "personification_antigravity_cli_auth_path", "") or "")
+    elif normalized_type == "claude_code":
+        auth_path = str(getattr(plugin_config, "personification_claude_code_auth_path", "") or "")
+    else:
+        auth_path = ""
     return {
-        "api_type": str(getattr(plugin_config, "personification_api_type", "") or ""),
+        "api_type": api_type,
         "api_url": str(getattr(plugin_config, "personification_api_url", "") or ""),
         "api_key": str(getattr(plugin_config, "personification_api_key", "") or ""),
         "model": str(getattr(plugin_config, "personification_model", "") or ""),
-        "auth_path": str(getattr(plugin_config, "personification_codex_auth_path", "") or ""),
+        "auth_path": auth_path,
+        "project": str(
+            getattr(
+                plugin_config,
+                "personification_antigravity_cli_project"
+                if normalized_type == "antigravity_cli"
+                else "personification_gemini_cli_project",
+                "",
+            )
+            or ""
+        ),
     }
 
 
@@ -166,7 +212,7 @@ async def _try_primary_image_routes(
         if not provider_supports_vision(api_type, model, route_name=route_name):
             continue
         try:
-            caller = build_tool_caller(_ProviderConfigProxy(plugin_config, provider))
+            caller = _build_tool_caller(_ProviderConfigProxy(plugin_config, provider))
             response = await caller.chat_with_tools(
                 messages=[
                     {
@@ -226,6 +272,23 @@ async def _try_primary_video_routes(
         if not _invalid_media_text(result):
             return str(result or "").strip()
     return ""
+
+
+def primary_route_supports_native_video(
+    runtime: Any,
+    *,
+    route_name: str = VISUAL_ROUTE_AGENT,
+) -> bool:
+    for provider in _primary_provider_candidates(runtime):
+        api_type = str(provider.get("api_type", "") or "")
+        model = str(provider.get("model", "") or "")
+        if _normalize_media_api_type(api_type) != "gemini_official":
+            continue
+        if not str(provider.get("api_key", "") or "").strip():
+            continue
+        if provider_supports_video(api_type, model, route_name=route_name):
+            return True
+    return False
 
 
 def get_primary_provider_signature(runtime: Any) -> tuple[str, str]:
@@ -410,7 +473,10 @@ async def analyze_videos_with_route_or_fallback(
     if not refs:
         return "", "missing_videos"
     plugin_config = getattr(runtime, "plugin_config", None)
-    if plugin_config is None or not bool(getattr(plugin_config, "personification_video_understanding_enabled", False)):
+    if plugin_config is None:
+        return "", "video_disabled"
+    video_enabled = bool(getattr(plugin_config, "personification_video_understanding_enabled", False))
+    if not video_enabled and not primary_route_supports_native_video(runtime, route_name=route_name):
         return "", "video_disabled"
 
     primary_result = await _try_primary_video_routes(
@@ -446,4 +512,5 @@ __all__ = [
     "analyze_videos_with_route_or_fallback",
     "get_primary_provider_config",
     "get_primary_provider_signature",
+    "primary_route_supports_native_video",
 ]

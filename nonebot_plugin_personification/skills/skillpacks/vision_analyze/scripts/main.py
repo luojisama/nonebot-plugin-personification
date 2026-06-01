@@ -6,9 +6,13 @@ from plugin.personification.skill_runtime.runtime_api import SkillRuntime
 from . import impl
 
 
-async def run(query: str, images: list[str] | None = None) -> str:
+async def run(
+    query: str,
+    images: list[str] | None = None,
+    videos: list[str] | None = None,
+) -> str:
     runtime = SkillRuntime(plugin_config=SimpleNamespace(), logger=None, get_now=lambda: None)
-    return await impl.analyze_images(runtime=runtime, query=query, images=images)
+    return await impl.analyze_images(runtime=runtime, query=query, images=images, videos=videos)
 
 
 def build_tools(runtime: SkillRuntime):

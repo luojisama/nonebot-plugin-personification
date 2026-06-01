@@ -267,3 +267,175 @@ personification_whitelist=["123456789","987654321"]
 - `nonebot-plugin-shiro-signin` 目前暂未发布，因此本插件不会将其作为必装依赖。
 - 未安装签到联动插件时，相关好感度、黑名单、称号联动功能会自动降级，不影响主插件加载。
 - 文档中仍保留相关配置与命令说明，是为了兼容后续联动发布以及已有本地集成环境。
+
+## 0.6.0 新增配置项
+
+> 以下为本次全量同步新增的配置项，均为可选；未设置时使用下表默认值。所有项均以 `personification_` 前缀通过 `.env` 或环境变量配置。
+
+### 联网检索与研究
+
+| 配置项 | 默认值 | 备注 |
+| --- | --- | --- |
+| `personification_cross_verify_enabled` | `false` | 是否启用多源交叉校验（实验）。 |
+| `personification_deep_research_v2_enabled` | `false` | 是否启用深度研究 v2（实验）。 |
+| `personification_evidence_synthesizer_enabled` | `false` | 是否启用证据综合器（实验）。 |
+| `personification_free_search_engines` | `["wikipedia", "searxng", "duckduckgo"]` | 免费搜索引擎链顺序（无需配置即可用）。 |
+| `personification_parallel_research_pages_per_worker` | `20` | 并行研究每个子 Agent 抓取的页面上限。 |
+| `personification_searxng_instances` | `[]` | 自建/公共 SearXNG 实例地址列表。 |
+| `personification_tool_web_fetch_enabled` | `true` | 是否启用网页正文抓取工具。 |
+| `personification_tool_web_fetch_timeout` | `60` | 网页抓取超时（秒）。 |
+| `personification_web_proxy` | `""` | 联网检索/抓取使用的 HTTP 出站代理，缓解 DNS 污染。 |
+| `personification_web_search_max_results` | `6` | 单次联网检索返回的最大结果数。 |
+| `personification_web_search_snippet_chars` | `400` | 每条检索结果摘要保留的字符数。 |
+
+### 游戏资讯 (game_info)
+
+| 配置项 | 默认值 | 备注 |
+| --- | --- | --- |
+| `personification_game_info_community_sites` | `None` | 补充的游戏社区站点（字符串或列表）。 |
+| `personification_game_info_enabled` | `true` | 是否启用游戏资讯聚合 skill。 |
+| `personification_game_info_timeout` | `15.0` | 游戏资讯多源拉取超时（秒）。 |
+
+### QQ 空间联动 (qzone)
+
+| 配置项 | 默认值 | 备注 |
+| --- | --- | --- |
+| `personification_qzone_inbound_check_interval` | `3` | 入站轮询间隔（分钟）。 |
+| `personification_qzone_inbound_enabled` | `true` | 是否启用入站评论/回复轮询。 |
+| `personification_qzone_inbound_max_comments_per_feed` | `20` | 单条动态处理的评论上限。 |
+| `personification_qzone_inbound_max_feeds_per_scan` | `20` | 入站单次扫描动态上限。 |
+| `personification_qzone_outbound_reply_check_interval` | `3` | 出站回复轮询间隔（分钟）。 |
+| `personification_qzone_outbound_reply_enabled` | `true` | 是否对自己说说下的评论进行回复。 |
+| `personification_qzone_outbound_reply_lookback_hours` | `72.0` | 出站回复回看时间窗（小时）。 |
+| `personification_qzone_outbound_reply_max_feeds` | `30` | 出站回复单次处理动态上限。 |
+| `personification_qzone_quiet_hour_end` | `7` | 空间互动静默结束时刻（0-23）。 |
+| `personification_qzone_quiet_hour_start` | `0` | 空间互动静默开始时刻（0-23）。 |
+| `personification_qzone_social_check_interval` | `30` | 好友动态扫描间隔（分钟）。 |
+| `personification_qzone_social_comment_limit` | `0` | 单轮评论上限（0 为不限）。 |
+| `personification_qzone_social_enabled` | `true` | 是否启用好友动态扫描与互动。 |
+| `personification_qzone_social_like_limit` | `0` | 单轮点赞上限（0 为不限）。 |
+| `personification_qzone_social_max_feeds_per_scan` | `5` | 单次扫描处理的动态条数上限。 |
+| `personification_qzone_social_per_friend_limit` | `0` | 对单个好友的互动上限（0 为不限）。 |
+| `personification_qzone_social_scope` | `"recent_interactions"` | 动态扫描范围（recent_interactions/all 等）。 |
+| `personification_qzone_third_party_chime_in_enabled` | `true` | 是否允许在他人动态下第三方插话。 |
+
+### 群知识库与群风格自建
+
+| 配置项 | 默认值 | 备注 |
+| --- | --- | --- |
+| `personification_active_learning_daily_quota` | `5` | 主动学习每日配额。 |
+| `personification_active_learning_enabled` | `false` | 是否启用主动学习（实验）。 |
+| `personification_group_knowledge_autobuild_enabled` | `true` | 是否自动后台构建群知识。 |
+| `personification_group_knowledge_daily_limit` | `6` | 群知识每日自建次数上限。 |
+| `personification_group_knowledge_enabled` | `false` | 是否启用群知识库能力。 |
+| `personification_group_knowledge_interval_hours` | `4` | 群知识自建间隔（小时）。 |
+| `personification_group_knowledge_min_messages` | `50` | 触发群知识构建的最少消息数。 |
+| `personification_group_style_autobuild_enabled` | `true` | 是否自动学习群聊风格。 |
+| `personification_group_style_daily_limit` | `2` | 群风格每日自建次数上限。 |
+| `personification_group_style_interval_hours` | `12` | 群风格自建间隔（小时）。 |
+| `personification_group_style_min_messages` | `100` | 触发群风格学习的最少消息数。 |
+| `personification_lorebook_enabled` | `false` | 是否启用世界书/设定集（lorebook）。 |
+
+### 社交智能（主动场景）
+
+| 配置项 | 默认值 | 备注 |
+| --- | --- | --- |
+| `personification_group_idle_mode_decision_prob` | `0.4` | 群空闲时触发主动发话的决策概率。 |
+| `personification_peer_bot_ids` | `[]` | 同伴 Bot 的 QQ 列表（用于多 Bot 协同/避让）。 |
+| `personification_social_daily_quota_per_user` | `2` | 每用户每日主动触达配额。 |
+| `personification_social_evening_greeting_enabled` | `true` | 是否启用晚间问候。 |
+| `personification_social_evening_hour` | `22` | 晚间问候触发时刻。 |
+| `personification_social_festival_cooldown_seconds` | `82800` | 节日祝福冷却（秒）。 |
+| `personification_social_festival_enabled` | `true` | 是否启用节日祝福。 |
+| `personification_social_festival_hour` | `9` | 节日祝福触发时刻。 |
+| `personification_social_festival_max_recipients` | `20` | 单次节日祝福最大接收人数。 |
+| `personification_social_gate_enabled` | `true` | 社交主动行为统一闸门。 |
+| `personification_social_greeting_cooldown_seconds` | `64800` | 问候冷却（秒）。 |
+| `personification_social_greeting_max_recipients` | `8` | 单轮问候最大接收人数。 |
+| `personification_social_intelligence_enabled` | `false` | 社交智能总开关（节日/问候/资讯/话题）。 |
+| `personification_social_morning_greeting_enabled` | `true` | 是否启用清晨问候。 |
+| `personification_social_morning_hour` | `8` | 清晨问候触发时刻。 |
+| `personification_social_news_cooldown_seconds` | `72000` | 资讯推送冷却（秒）。 |
+| `personification_social_news_enabled` | `false` | 是否启用定时资讯推送。 |
+| `personification_social_news_groups` | `[]` | 资讯推送目标群列表。 |
+| `personification_social_news_hour` | `9` | 资讯推送时刻。 |
+| `personification_social_news_source` | `"daily"` | 资讯来源（如 daily）。 |
+| `personification_social_news_users` | `[]` | 资讯推送目标用户列表。 |
+| `personification_social_topic_followup_cooldown_seconds` | `43200` | 话题延续冷却（秒）。 |
+| `personification_social_topic_followup_enabled` | `true` | 是否启用话题延续主动发话。 |
+| `personification_social_topic_followup_window_hours` | `24` | 话题延续回看窗口（小时）。 |
+| `personification_social_topic_scan_interval_minutes` | `60` | 话题扫描间隔（分钟）。 |
+
+### 记忆 / 画像 / 关系
+
+| 配置项 | 默认值 | 备注 |
+| --- | --- | --- |
+| `personification_embedding_provider` | `"hash_bow"` | 嵌入向量提供者（hash_bow 为本地免依赖默认）。 |
+| `personification_persona_responder_json_enabled` | `false` | 人设回复是否走 JSON 结构化模式。 |
+| `personification_proactive_require_user_profile` | `true` | 主动私聊是否要求已有用户画像。 |
+| `personification_real_embedding_enabled` | `false` | 是否启用真实嵌入模型（需对应 Provider）。 |
+| `personification_relation_evolution_daily_quota` | `10` | 关系演化每日配额。 |
+| `personification_relation_evolution_enabled` | `false` | 是否启用关系演化（实验）。 |
+
+### Provider 路由与 CLI 凭据
+
+| 配置项 | 默认值 | 备注 |
+| --- | --- | --- |
+| `personification_antigravity_cli_auth_path` | `""` | Antigravity CLI 凭据路径。 |
+| `personification_antigravity_cli_project` | `""` | Antigravity CLI 项目标识。 |
+| `personification_antigravity_cli_proxy` | `""` | Antigravity CLI 专用代理（独立于环境变量）。 |
+| `personification_claude_code_auth_path` | `""` | Claude Code 凭据路径。 |
+| `personification_gemini_cli_auth_path` | `""` | Gemini CLI 凭据路径。 |
+| `personification_gemini_cli_project` | `""` | Gemini CLI 项目标识。 |
+| `personification_provider_dynamic_priority_enabled` | `true` | 是否启用 Provider 动态优先级（时延+成功率）。 |
+| `personification_provider_health_min_samples` | `3` | 参与健康度评估的最小样本数。 |
+| `personification_response_timeout` | `180` | 单次回复生成总超时（秒）。 |
+| `personification_strict_main_model` | `true` | 是否严格使用主模型（关闭回退降级）。 |
+
+### 配额管理 (quota)
+
+| 配置项 | 默认值 | 备注 |
+| --- | --- | --- |
+| `personification_quota_anthropic_monthly_tokens` | `0` | Anthropic 月度 token 配额（0 为不限）。 |
+| `personification_quota_codex_monthly_tokens` | `0` | Codex 月度 token 配额（0 为不限）。 |
+| `personification_quota_gemini_cli_monthly_tokens` | `0` | Gemini CLI 月度 token 配额（0 为不限）。 |
+| `personification_quota_openai_monthly_tokens` | `0` | OpenAI 月度 token 配额（0 为不限）。 |
+
+### git 自动更新与镜像
+
+| 配置项 | 默认值 | 备注 |
+| --- | --- | --- |
+| `personification_git_auto_update` | `false` | 是否启用 git 自动更新（默认关闭）。 |
+| `personification_git_auto_update_interval` | `60` | 自动更新检查间隔（分钟）。 |
+| `personification_git_mirror_prefix` | `""` | 单个 git 镜像前缀。 |
+| `personification_git_mirror_prefixes` | `[` | git 镜像前缀列表，并行探测，失败回退 ghproxy。 |
+
+### 图片与生图安全
+
+| 配置项 | 默认值 | 备注 |
+| --- | --- | --- |
+| `personification_image_gen_nanobanan_model` | `"gemini-3-pro-image-preview"` | 生图所用的 nanobanana/gemini 图像模型名。 |
+| `personification_image_host_allowlist` | `[]` | 用户图片输入允许的安全域名白名单。 |
+
+### 贴图库
+
+| 配置项 | 默认值 | 备注 |
+| --- | --- | --- |
+| `personification_sticker_collect_cooldown_seconds` | `60` | 贴图收集冷却（秒）。 |
+| `personification_sticker_collect_meme_policy` | `"reject"` | 梗图收集策略（reject/accept 等）。 |
+| `personification_sticker_collect_min_confidence` | `0.7` | 贴图收集最低置信度。 |
+| `personification_sticker_collect_sample_rate` | `0.5` | 贴图收集采样率。 |
+| `personification_sticker_curator_enabled` | `false` | 是否启用贴图库定期整理。 |
+| `personification_sticker_curator_interval_days` | `3` | 贴图库整理间隔（天）。 |
+| `personification_sticker_library_hard_limit` | `1200` | 贴图库硬上限。 |
+| `personification_sticker_library_soft_limit` | `800` | 贴图库软上限（触发清理）。 |
+| `personification_sticker_per_mood_limit` | `50` | 每种情绪标签保留的贴图上限。 |
+| `personification_sticker_second_judge_enabled` | `false` | 是否启用贴图二次判定。 |
+| `personification_sticker_vision_max` | `3` | 单次贴图视觉分析的最大图片数。 |
+
+### 回合规划（实验）
+
+| 配置项 | 默认值 | 备注 |
+| --- | --- | --- |
+| `personification_turn_planner_enabled` | `false` | 是否启用回合规划器（实验）。 |
+| `personification_turn_planner_shadow_enabled` | `false` | 回合规划器影子模式（仅记录不生效）。 |

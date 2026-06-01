@@ -1,10 +1,17 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from dataclasses import dataclass
 from typing import Any
 
 from ...agent.inner_state import DEFAULT_STATE as DEFAULT_INNER_STATE, get_personification_data_dir, load_inner_state
+from ...agent.runtime.planner import (
+    plan_turn_with_llm,
+    turn_plan_from_semantic_frame,
+    turn_plan_to_semantic_frame,
+)
+from ...agent.runtime.tool_catalog import registry_planner_metadata
 from ...core.chat_intent import infer_turn_semantic_frame_with_llm
 from ...core.emotion_state import (
     build_turn_emotion_prompt_block,
@@ -13,10 +20,10 @@ from ...core.emotion_state import (
     render_inner_state_hint,
     update_emotion_state_after_turn,
 )
+from ...core.metrics import record_counter, record_timing
 from ...core.prompts import load_prompt
 from ...core.response_review import (
     arbitrate_reply_mode,
-    decide_random_chat_speak,
     extract_recent_bot_reply_texts,
 )
 from .pipeline_context import batch_has_newer_messages
@@ -77,6 +84,7 @@ async def prepare_reply_semantics(
     repeat_clusters: list[dict[str, Any]] | None,
     message_target: str,
     solo_speaker_follow: bool,
+    has_images: bool = False,
 ) -> PreparedReplySemantics:
     recent_bot_replies = extract_recent_bot_reply_texts(recent_window if not is_private_session else [])
     data_dir = get_personification_data_dir(runtime.plugin_config)
@@ -100,17 +108,110 @@ async def prepare_reply_semantics(
         user_id=user_id,
         group_id="" if is_private_session else str(group_id),
     )
-    semantic_frame = await infer_turn_semantic_frame_with_llm(
-        raw_message_text or current_agent_message_content,
-        is_group=not is_private_session,
-        is_random_chat=is_random_chat,
-        tool_caller=runtime.lite_tool_caller or runtime.agent_tool_caller,
-        recent_context=recent_context_hint,
-        relationship_hint=relationship_hint,
-        repeat_clusters=repeat_clusters,
-        current_inner_state=render_inner_state_hint(inner_state),
-        current_emotion_state=emotion_memory_hint,
+    planner_enabled = bool(getattr(runtime.plugin_config, "personification_turn_planner_enabled", False))
+    planner_shadow_enabled = bool(
+        getattr(runtime.plugin_config, "personification_turn_planner_shadow_enabled", False)
     )
+    planner_available_tools: list[dict[str, Any]] = []
+    if planner_enabled or planner_shadow_enabled:
+        try:
+            planner_available_tools = registry_planner_metadata(runtime.tool_registry)
+        except Exception:
+            planner_available_tools = []
+
+    group_knowledge_hint = ""
+    if not is_private_session and bool(getattr(runtime.plugin_config, "personification_group_knowledge_enabled", False)):
+        try:
+            from ...core.group_knowledge import query_group_knowledge, format_group_knowledge_hint
+            entries = query_group_knowledge(
+                getattr(runtime, "memory_store", None),
+                str(group_id),
+                raw_message_text or current_agent_message_content,
+                top_k=8,
+            )
+            group_knowledge_hint = format_group_knowledge_hint(entries)
+        except Exception:
+            group_knowledge_hint = ""
+
+    turn_plan = None
+    if planner_enabled:
+        started_at = time.monotonic()
+        turn_plan = await plan_turn_with_llm(
+            raw_message_text or current_agent_message_content,
+            is_group=not is_private_session,
+            is_random_chat=is_random_chat,
+            is_direct_mention=is_direct_mention,
+            has_images=has_images,
+            message_target=message_target,
+            tool_caller=runtime.lite_tool_caller or runtime.agent_tool_caller,
+            recent_context=recent_context_hint,
+            relationship_hint=relationship_hint,
+            repeat_clusters=repeat_clusters,
+            current_inner_state=render_inner_state_hint(inner_state),
+            current_emotion_state=emotion_memory_hint,
+            available_tools=planner_available_tools,
+            group_knowledge_hint=group_knowledge_hint,
+        )
+        record_counter(
+            "turn_planner.plan_total",
+            mode="enabled",
+            action=turn_plan.reply_action,
+            output_mode=turn_plan.output_mode,
+        )
+        record_timing("turn_planner.plan_ms", (time.monotonic() - started_at) * 1000.0, mode="enabled")
+        semantic_frame = turn_plan_to_semantic_frame(turn_plan)
+    else:
+        semantic_frame = await infer_turn_semantic_frame_with_llm(
+            raw_message_text or current_agent_message_content,
+            is_group=not is_private_session,
+            is_random_chat=is_random_chat,
+            tool_caller=runtime.lite_tool_caller or runtime.agent_tool_caller,
+            recent_context=recent_context_hint,
+            relationship_hint=relationship_hint,
+            repeat_clusters=repeat_clusters,
+            current_inner_state=render_inner_state_hint(inner_state),
+            current_emotion_state=emotion_memory_hint,
+        )
+        turn_plan = turn_plan_from_semantic_frame(
+            semantic_frame,
+            has_images=has_images,
+            message_target=message_target,
+        )
+        try:
+            semantic_frame.turn_plan = turn_plan
+            semantic_frame.output_mode = turn_plan.output_mode
+            semantic_frame.session_goal = turn_plan.session_goal
+        except Exception:
+            pass
+        if planner_shadow_enabled:
+            started_at = time.monotonic()
+            shadow_plan = await plan_turn_with_llm(
+                raw_message_text or current_agent_message_content,
+                is_group=not is_private_session,
+                is_random_chat=is_random_chat,
+                is_direct_mention=is_direct_mention,
+                has_images=has_images,
+                message_target=message_target,
+                tool_caller=runtime.lite_tool_caller or runtime.agent_tool_caller,
+                recent_context=recent_context_hint,
+                relationship_hint=relationship_hint,
+                repeat_clusters=repeat_clusters,
+                current_inner_state=render_inner_state_hint(inner_state),
+                current_emotion_state=emotion_memory_hint,
+                available_tools=planner_available_tools,
+                group_knowledge_hint=group_knowledge_hint,
+            )
+            record_counter(
+                "turn_planner.plan_total",
+                mode="shadow",
+                action=shadow_plan.reply_action,
+                output_mode=shadow_plan.output_mode,
+            )
+            if shadow_plan.reply_action != turn_plan.reply_action:
+                record_counter("turn_planner.diff_total", field="reply_action")
+            if shadow_plan.output_mode != turn_plan.output_mode:
+                record_counter("turn_planner.diff_total", field="output_mode")
+            record_timing("turn_planner.plan_ms", (time.monotonic() - started_at) * 1000.0, mode="shadow")
     intent_decision = semantic_frame.to_intent_decision()
     message_intent = intent_decision.chat_intent
     arbitration = arbitrate_reply_mode(
@@ -142,39 +243,19 @@ async def prepare_reply_semantics(
     )
 
 
-async def should_speak_in_random_chat(
+def should_speak_in_random_chat(
     *,
-    runtime: Any,
     state: dict[str, Any],
-    raw_message_text: str,
-    message_text: str,
-    message_content: str,
-    recent_context_hint: str = "",
-    recent_context: str = "",
-    relationship_hint: str,
-    repeat_clusters: list[dict[str, Any]] | None,
-    recent_bot_replies: list[str],
-    message_intent: str,
-    ambiguity_level: str,
     message_target: str,
     solo_speaker_follow: bool,
-    knowledge_store: Any = None,
 ) -> bool:
-    _ = knowledge_store
-    effective_recent_context = str(recent_context_hint or recent_context or "").strip()
-    return await decide_random_chat_speak(
-        runtime.lite_call_ai_api or runtime.call_ai_api,
-        raw_message_text=raw_message_text or message_text or message_content,
-        recent_context=effective_recent_context,
-        relationship_hint=relationship_hint,
-        repeat_clusters=repeat_clusters,
-        recent_bot_replies=recent_bot_replies,
-        has_newer_batch=batch_has_newer_messages(state),
-        message_intent=message_intent,
-        ambiguity_level=ambiguity_level,
-        message_target=str(message_target or ""),
-        solo_speaker_follow=solo_speaker_follow,
-    )
+    if batch_has_newer_messages(state):
+        return False
+    if solo_speaker_follow:
+        return True
+    if str(message_target or "").strip() == "bot":
+        return True
+    return True
 
 
 async def persist_reply_emotion_state(

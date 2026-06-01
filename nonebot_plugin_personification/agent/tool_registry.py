@@ -16,6 +16,20 @@ class AgentTool:
     handler: ToolHandler
     local: bool = True
     enabled: EnabledChecker = field(default=lambda: True)
+    metadata: dict[str, Any] = field(default_factory=dict)
+    per_session_quota: int = 0  # 0 表示无上限；M6 用
+
+
+def _override_is_disabled(name: str) -> bool:
+    """延迟 import 以避免循环依赖（agent → core 早期阶段未就绪时容错）。"""
+    try:
+        from ..core.skill_overrides import is_disabled
+    except Exception:
+        return False
+    try:
+        return bool(is_disabled(name))
+    except Exception:
+        return False
 
 
 class ToolRegistry:
@@ -28,9 +42,14 @@ class ToolRegistry:
     def get(self, name: str) -> Optional[AgentTool]:
         return self._tools.get(name)
 
+    def all(self) -> List[AgentTool]:
+        return list(self._tools.values())
+
     def active(self) -> List[AgentTool]:
         active_tools: List[AgentTool] = []
         for tool in self._tools.values():
+            if _override_is_disabled(tool.name):
+                continue
             try:
                 if tool.enabled():
                     active_tools.append(tool)

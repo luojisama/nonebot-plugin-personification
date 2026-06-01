@@ -1,0 +1,104 @@
+from __future__ import annotations
+
+from typing import Any
+
+from fastapi import APIRouter, Depends, HTTPException, Query
+
+from ..deps import AdminIdentity, require_admin
+
+
+def _knowledge_store(runtime) -> Any | None:
+    """从 runtime_bundle 嵌套路径取 PluginKnowledgeStore 实例。"""
+    bundle = getattr(runtime, "runtime_bundle", None)
+    if bundle is None:
+        return None
+    deps = getattr(bundle, "reply_processor_deps", None)
+    if deps is None:
+        return None
+    inner = getattr(deps, "runtime", None)
+    if inner is None:
+        return None
+    return getattr(inner, "knowledge_store", None)
+
+
+def build_plugin_knowledge_router(*, runtime) -> APIRouter:
+    router = APIRouter(prefix="/api/plugin-knowledge", tags=["plugin_knowledge"])
+
+    @router.get("/list")
+    async def list_all(_: AdminIdentity = Depends(require_admin)) -> dict:
+        store = _knowledge_store(runtime)
+        if store is None:
+            return {"plugins": [], "total": 0, "available": False}
+        try:
+            index = store.load_index_sync()
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=f"加载索引失败：{exc}")
+        plugins_map = index.get("plugins", {}) if isinstance(index, dict) else {}
+        items: list[dict[str, Any]] = []
+        for name, meta in plugins_map.items():
+            if not isinstance(meta, dict):
+                continue
+            items.append(
+                {
+                    "plugin_name": str(name),
+                    "display_name": str(meta.get("display_name", "") or ""),
+                    "summary": str(meta.get("summary", "") or "")[:200],
+                    "keywords": list(meta.get("keywords", []) or [])[:8],
+                    "category": str(meta.get("category", "") or ""),
+                    "has_runtime_data": bool(meta.get("has_runtime_data", False)),
+                    "has_source_data": bool(meta.get("has_source_data", False)),
+                    "source_file_count": int(meta.get("source_file_count", 0) or 0),
+                    "source_chunk_count": int(meta.get("source_chunk_count", 0) or 0),
+                    "updated_at": str(meta.get("updated_at", "") or ""),
+                }
+            )
+        items.sort(key=lambda x: (x["category"] or "~", x["plugin_name"]))
+        return {"plugins": items, "total": len(items), "available": True}
+
+    @router.get("/detail/{plugin_name}")
+    async def detail(plugin_name: str, _: AdminIdentity = Depends(require_admin)) -> dict:
+        store = _knowledge_store(runtime)
+        if store is None:
+            raise HTTPException(status_code=503, detail="knowledge_store 未就绪")
+        try:
+            entry = store.load_plugin_entry_sync(plugin_name)
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=f"读取详情失败：{exc}")
+        if entry is None:
+            raise HTTPException(status_code=404, detail=f"找不到插件 {plugin_name}")
+        runtime_snapshot = None
+        source_snapshot = None
+        try:
+            runtime_snapshot = store.load_runtime_snapshot_sync(plugin_name)
+        except Exception:
+            runtime_snapshot = None
+        try:
+            source_snapshot = store.load_source_snapshot_sync(plugin_name)
+        except Exception:
+            source_snapshot = None
+        return {
+            "plugin_name": plugin_name,
+            "entry": entry,
+            "runtime_snapshot": runtime_snapshot,
+            "source_snapshot": source_snapshot,
+        }
+
+    @router.get("/search")
+    async def search(
+        q: str = Query("", min_length=0),
+        top_k: int = Query(10, ge=1, le=50),
+        _: AdminIdentity = Depends(require_admin),
+    ) -> dict:
+        store = _knowledge_store(runtime)
+        if store is None:
+            return {"results": [], "query": q, "available": False}
+        query = q.strip()
+        if not query:
+            return {"results": [], "query": q, "available": True}
+        try:
+            names = store.search_plugins(query, top_k=top_k)
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=f"搜索失败：{exc}")
+        return {"results": list(names), "query": q, "available": True}
+
+    return router

@@ -34,6 +34,10 @@ class Config(BaseModel):
     personification_whitelist: List[str] = []
     personification_probability: float = 0.30
 
+    # 其他机器人 / Q 群管家的 user_id（用于 peer_awareness 检测），
+    # 命中后本轮静默，避免 bot 与管家互相对话。
+    personification_peer_bot_ids: List[str] = []
+
     personification_global_enabled: bool = True
     personification_tts_global_enabled: bool = True
 
@@ -42,15 +46,117 @@ class Config(BaseModel):
     personification_response_timeout: int = 180
     personification_image_input_mode: str = "auto"
     personification_image_detail: str = "auto"
+    personification_sticker_vision_max: int = 3
     personification_builtin_search: bool = True
-    personification_model_builtin_search_enabled: bool = False
+    # 默认启用：Gemini/Anthropic/OpenAICodex 等支持的 caller 会直接用 provider 原生
+    # 联网搜索（google_search / web_search_20250305 / web_search_options），无需任何 key。
+    # 不支持的 provider 自动回落到外部 web_search 工具。可在 WebUI 关回 False。
+    personification_model_builtin_search_enabled: bool = True
     personification_tool_web_search_enabled: bool = True
     personification_tool_web_search_mode: str = "enabled"
+    personification_tool_web_fetch_enabled: bool = True
+    personification_tool_web_fetch_timeout: int = 60
+    # 免配置联网搜索引擎链（按顺序并行调用，合并去重）。可选项：wikipedia / searxng / duckduckgo。
+    personification_free_search_engines: List[str] = ["wikipedia", "searxng", "duckduckgo"]
+    # SearXNG 公共实例池，留空则用 core/free_search.py:DEFAULT_SEARXNG_INSTANCES。
+    personification_searxng_instances: List[str] = []
+    # web_search 返回给 LLM 的结果上限（top-N 渲染）与单条 snippet 字符上限。
+    personification_web_search_max_results: int = 6
+    personification_web_search_snippet_chars: int = 400
+    # web_fetch / web_search 走哪个 HTTP 代理（http://host:port）。
+    # 国内服务器抓取被 DNS 污染/墙的站点（如 Cloudflare 前置站点、海外 API）时，
+    # 设置后请求走代理、由代理侧解析 DNS 并连接，绕开本地污染。
+    # 非空时 web_fetch 会跳过"本地 DNS 解析到内网就拒绝"的判断（仍拦截字面内网 IP）。
+    # 留空 = 直连 + 本地 DNS SSRF 校验。
+    personification_web_proxy: str = ""
+    # Antigravity CLI 调用走哪个 HTTP 代理（http://host:port）。
+    # 非空时所有 antigravity v1internal / OAuth refresh 请求都强制走它，
+    # 不依赖 HTTPS_PROXY / HTTP_PROXY 环境变量（bot 进程未必继承终端 env）。
+    # 留空 = 沿用 httpx 的环境变量解析（trust_env 默认 True）。
+    personification_antigravity_cli_proxy: str = ""
+    # /拟人更新 走的 git 镜像反代列表（GitHub 在国内不稳时按顺序探测）。
+    # 直连失败时：并行 HEAD 探测每一项的联通性，按列表顺序选第一个能通的，
+    # 用 -c url.X.insteadOf 临时改写重试 fetch/pull，不污染全局 git config。
+    # 留空 = 关闭镜像 fallback，只走直连。
+    personification_git_mirror_prefixes: List[str] = [
+        "https://ghproxy.com",
+        "https://gh-proxy.com",
+        "https://mirror.ghproxy.com",
+        "https://hub.gitmirror.com",
+    ]
+    # 单个镜像配置（向后兼容；非空时会自动并入 prefixes 末尾）
+    personification_git_mirror_prefix: str = ""
+    # Provider 动态优先级（基于真实请求 latency / success_rate 自动调整排序）
+    personification_provider_dynamic_priority_enabled: bool = True
+    # 样本数 < min_samples 时仍用配置的 base priority，避免冷启动 fluke
+    personification_provider_health_min_samples: int = 3
+    # ──────────── Social Intelligence（主动社交框架）────────────
+    # 总开关：默认关闭，配置好场景后再打开避免上线就乱发
+    personification_social_intelligence_enabled: bool = False
+    # LLM 闸门：开启则每次发送前用 lite_model 二次决策"现在合不合适"
+    personification_social_gate_enabled: bool = True
+    # 每用户每日最多收到的主动社交消息数（跨场景共享）
+    personification_social_daily_quota_per_user: int = 2
+    # 早安问候 cron 时点
+    personification_social_morning_hour: int = 8
+    personification_social_morning_greeting_enabled: bool = True
+    # 晚安问候 cron 时点
+    personification_social_evening_hour: int = 22
+    personification_social_evening_greeting_enabled: bool = True
+    # 单场景冷却（默认 18 小时，避免一天给同一人发两次早安）
+    personification_social_greeting_cooldown_seconds: int = 64800
+    # 早晚问候每次最多发给多少人（按 persona updated_at 取最近活跃的）
+    personification_social_greeting_max_recipients: int = 8
+    # 定时新闻推送
+    personification_social_news_enabled: bool = False
+    personification_social_news_hour: int = 9
+    personification_social_news_users: List[str] = []
+    personification_social_news_groups: List[str] = []
+    # 新闻来源：daily / ai / history
+    personification_social_news_source: str = "daily"
+    personification_social_news_cooldown_seconds: int = 72000
+    # 话题延续：扫描间隔（分钟）+ 跟进窗口（承诺时间 ± N 小时内才跟进）
+    personification_social_topic_followup_enabled: bool = True
+    personification_social_topic_scan_interval_minutes: int = 60
+    personification_social_topic_followup_window_hours: int = 24
+    personification_social_topic_followup_cooldown_seconds: int = 43200
+    # 节日祝福：公历节日 + 生日（从 persona 抽取）
+    personification_social_festival_enabled: bool = True
+    personification_social_festival_hour: int = 9
+    personification_social_festival_max_recipients: int = 20
+    personification_social_festival_cooldown_seconds: int = 82800
     personification_thinking_mode: str = "none"
     personification_state_thinking_mode: str = "adaptive"
     personification_model_overrides: Dict[str, str] = {}
     personification_response_review_enabled: bool = False
     personification_response_review_model_role: str = "review"
+    personification_turn_planner_enabled: bool = False
+    personification_turn_planner_shadow_enabled: bool = False
+    personification_evidence_synthesizer_enabled: bool = False
+    personification_cross_verify_enabled: bool = False
+    personification_lorebook_enabled: bool = False
+    personification_group_knowledge_enabled: bool = False
+    personification_group_knowledge_autobuild_enabled: bool = True
+    personification_group_knowledge_interval_hours: int = 4
+    personification_group_knowledge_daily_limit: int = 6
+    personification_group_knowledge_min_messages: int = 50
+    personification_qzone_quiet_hour_start: int = 0
+    personification_qzone_quiet_hour_end: int = 7
+    # Provider 月度额度（本地记账，3 家 provider 无官方 quota API；0=不限额仅显示用量）
+    personification_quota_anthropic_monthly_tokens: int = 0
+    personification_quota_openai_monthly_tokens: int = 0
+    personification_quota_gemini_cli_monthly_tokens: int = 0
+    personification_quota_codex_monthly_tokens: int = 0
+    personification_group_style_autobuild_enabled: bool = True
+    personification_group_style_interval_hours: int = 12
+    personification_group_style_daily_limit: int = 2
+    personification_group_style_min_messages: int = 100
+    personification_image_host_allowlist: List[str] = []
+    personification_active_learning_enabled: bool = False
+    personification_active_learning_daily_quota: int = 5
+    personification_relation_evolution_enabled: bool = False
+    personification_relation_evolution_daily_quota: int = 10
+    personification_persona_responder_json_enabled: bool = False
     personification_data_dir: str = ""
     personification_persona_enabled: bool = True
     personification_persona_history_max: int = DEFAULT_PERSONA_HISTORY_MAX
@@ -59,6 +165,8 @@ class Config(BaseModel):
     personification_persona_prompt_max_chars: int = 120
     personification_memory_enabled: bool = True
     personification_memory_palace_enabled: bool = False
+    personification_real_embedding_enabled: bool = False
+    personification_embedding_provider: str = "hash_bow"
     personification_memory_decay_enabled: bool = True
     personification_memory_consolidation_enabled: bool = True
     personification_memory_recall_top_k: int = DEFAULT_MEMORY_RECALL_TOP_K
@@ -82,6 +190,7 @@ class Config(BaseModel):
     personification_use_skillpacks: bool = False
     personification_timezone: str = "Asia/Shanghai"
     personification_sticker_semantic: bool = True
+    personification_sticker_collect_meme_policy: str = "reject"
     personification_weather_api: str = "wttr"
     personification_labeler_enabled: bool = True
     personification_labeler_api_type: str = "openai"
@@ -108,23 +217,42 @@ class Config(BaseModel):
     personification_plugin_knowledge_build_enabled: bool = False
     personification_image_gen_enabled: bool = True
     personification_image_gen_model: str = "gpt-image-2"
+    personification_image_gen_nanobanan_model: str = "gemini-3-pro-image-preview"
     personification_image_gen_background_enabled: bool = True
     personification_image_gen_timeout: int = 180
     personification_parallel_research_enabled: bool = True
+    personification_deep_research_v2_enabled: bool = False
     personification_parallel_research_lookup_enabled: bool = True
     personification_parallel_research_max_workers: int = 6
     personification_parallel_research_worker_timeout: int = 35
     personification_parallel_research_total_timeout: int = 90
     personification_parallel_research_max_tool_rounds: int = 2
+    personification_parallel_research_pages_per_worker: int = 20
     personification_qzone_enabled: bool = False
     personification_qzone_cookie: str = ""
     # DEPRECATED: use personification_qzone_cookie.
     qzone_cookie: str = ""
-    personification_qzone_proactive_enabled: bool = False
-    personification_qzone_check_interval: int = 180
-    personification_qzone_daily_limit: int = 2
+    personification_qzone_proactive_enabled: bool = True
+    personification_qzone_check_interval: int = 30
+    personification_qzone_daily_limit: int = 3
     personification_qzone_probability: float = 0.35
-    personification_qzone_min_interval_hours: float = 8.0
+    personification_qzone_min_interval_hours: float = 6.0
+    personification_qzone_social_enabled: bool = True
+    personification_qzone_social_check_interval: int = 30
+    personification_qzone_social_scope: str = "recent_interactions"
+    personification_qzone_social_like_limit: int = 0
+    personification_qzone_social_comment_limit: int = 0
+    personification_qzone_social_per_friend_limit: int = 0
+    personification_qzone_social_max_feeds_per_scan: int = 5
+    personification_qzone_third_party_chime_in_enabled: bool = True
+    personification_qzone_inbound_enabled: bool = True
+    personification_qzone_inbound_check_interval: int = 3
+    personification_qzone_inbound_max_feeds_per_scan: int = 20
+    personification_qzone_inbound_max_comments_per_feed: int = 20
+    personification_qzone_outbound_reply_enabled: bool = True
+    personification_qzone_outbound_reply_check_interval: int = 3
+    personification_qzone_outbound_reply_max_feeds: int = 30
+    personification_qzone_outbound_reply_lookback_hours: float = 72.0
     personification_image_search_api_key: str = ""
     personification_github_token: str = ""
     personification_web_search_always: bool = False
@@ -132,6 +260,11 @@ class Config(BaseModel):
     personification_wiki_enabled: bool = True
     personification_wiki_fandom_enabled: bool = True
     personification_fandom_wikis: Optional[Union[str, Dict[str, str]]] = None
+    # 游戏信息工具（game_info）：聚合更新公告/攻略/剧情/技巧，数据源含 Steam 官方与社区。
+    personification_game_info_enabled: bool = True
+    personification_game_info_timeout: float = 15.0
+    # 攻略/技巧定向搜索时附加的社区站点白名单（覆盖默认）；留空用内置默认列表。
+    personification_game_info_community_sites: Optional[Union[str, List[str]]] = None
 
     personification_api_pools: Optional[Union[str, List[Dict[str, Any]]]] = None
     personification_api_type: str = "openai"
@@ -142,6 +275,10 @@ class Config(BaseModel):
     # 留空时 fallback 到主模型，无需额外配置。
     # 建议值：与主模型同 provider 的 mini 版本（如 gpt-4.1-mini / gpt-5.4-mini）。
     personification_lite_model: str = ""
+    # 严格主模型模式：开启后忽略 lite_model 配置，所有 intent / review / 闸门 /
+    # 表情决策都走主模型，避免 cooldown / 网关失败时降级到弱模型导致 bot 突然变傻。
+    # 代价是 token 消耗更高。要回到旧行为把这个关掉。
+    personification_strict_main_model: bool = True
     personification_persona_api_type: str = ""
     personification_persona_api_url: str = ""
     personification_persona_api_key: str = ""
@@ -210,14 +347,24 @@ class Config(BaseModel):
 
     personification_sticker_path: Optional[str] = "data/stickers"
     personification_sticker_probability: float = 0.24
+    personification_sticker_library_soft_limit: int = 800
+    personification_sticker_library_hard_limit: int = 1200
+    personification_sticker_per_mood_limit: int = 50
+    personification_sticker_collect_cooldown_seconds: int = 60
+    personification_sticker_collect_sample_rate: float = 0.5
+    personification_sticker_collect_min_confidence: float = 0.7
+    personification_sticker_second_judge_enabled: bool = False
+    personification_sticker_curator_enabled: bool = False
+    personification_sticker_curator_interval_days: int = 3
 
     personification_poke_probability: float = 0.35
     # DEPRECATED: replaced by the agent web_search skill configuration.
     personification_web_search: bool = True
     personification_schedule_global: bool = False
 
-    personification_proactive_enabled: bool = False
+    personification_proactive_enabled: bool = True
     personification_proactive_threshold: float = 60.0
+    personification_proactive_require_user_profile: bool = True
     personification_proactive_daily_limit: int = 3
     personification_proactive_interval: int = 30
     personification_proactive_probability: float = 0.18
@@ -232,6 +379,8 @@ class Config(BaseModel):
     personification_group_idle_check_interval: int = 15
     # 每个群每天最多主动发话次数（默认 1）
     personification_group_idle_daily_limit: int = 1
+    # J4: 主动水群两阶段——多大概率额外跑一次"决定模式"LLM call，0=永远纯文本（旧行为）
+    personification_group_idle_mode_decision_prob: float = 0.4
     # Bot 刚接过话后，保留一段“活跃窗口”，更容易继续顺着当前话题聊
     personification_group_chat_active_minutes: int = 12
     personification_group_chat_follow_probability: float = 0.96
@@ -260,10 +409,34 @@ class Config(BaseModel):
     personification_60s_local_api_base: str = "http://127.0.0.1:4399"
     personification_60s_enabled: bool = True
 
+    # git 自动更新配置
+    personification_git_auto_update: bool = False
+    personification_git_auto_update_interval: int = 60
+
     # OpenAI Codex OAuth 配置
     # personification_api_type = "openai_codex" 时生效
     # 留空则自动按优先级查找 ~/.codex/auth.json
     personification_codex_auth_path: str = ""
+
+    # gemini-cli OAuth 配置
+    # personification_api_type = "gemini_cli" 时生效
+    # 留空则按 ~/.gemini/oauth_creds.json、$GEMINI_HOME 等顺序查找
+    personification_gemini_cli_auth_path: str = ""
+    # cloudaicompanionProject；留空时通过 v1internal:loadCodeAssist 自动解析并缓存
+    personification_gemini_cli_project: str = ""
+
+    # Antigravity CLI OAuth 配置
+    # personification_api_type = "antigravity_cli" 时生效
+    # 留空则按 ~/.gemini/antigravity-cli、$ANTIGRAVITY_CLI_HOME 等顺序查找；
+    # 若仍未找到，会兼容回退到 gemini-cli OAuth 凭证。
+    personification_antigravity_cli_auth_path: str = ""
+    # Antigravity/Gemini companion project；留空时先自动解析，再兼容 gemini-cli/gcloud 配置。
+    personification_antigravity_cli_project: str = ""
+
+    # claude-code OAuth 配置
+    # personification_api_type = "claude_code" 时生效
+    # 留空则按 ~/.claude/.credentials.json、$CLAUDE_CONFIG_DIR 等顺序查找
+    personification_claude_code_auth_path: str = ""
 
     def model_post_init(self, __context: Any) -> None:
         fields_set = getattr(self, "__pydantic_fields_set__", set())

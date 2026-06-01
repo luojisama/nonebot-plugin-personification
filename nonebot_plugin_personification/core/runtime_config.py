@@ -1,5 +1,6 @@
 import json
 import os
+import re
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -14,8 +15,110 @@ def get_runtime_config_path(plugin_config: Any) -> Path:
     return Path(get_data_dir(plugin_config)) / "runtime_config.json"
 
 
+def _iter_env_file_candidates() -> list[Path]:
+    candidates: list[Path] = []
+    cwd = Path.cwd()
+    candidates.extend([cwd] + list(cwd.parents)[:5])
+    plugin_root = Path(__file__).resolve().parent.parent
+    candidates.extend([plugin_root] + list(plugin_root.parents)[:5])
+    paths: list[Path] = []
+    seen_dirs: set[str] = set()
+    for d in candidates:
+        key = str(d)
+        if key in seen_dirs:
+            continue
+        seen_dirs.add(key)
+        for name in (".env.prod", ".env"):
+            p = d / name
+            if p.exists() and p not in paths:
+                paths.append(p)
+    return paths
+
+
+def _parse_env_assignment(lines: list[str], start: int) -> tuple[str, str, int] | None:
+    raw_line = lines[start]
+    stripped = raw_line.strip()
+    if not stripped or stripped.startswith("#") or "=" not in stripped:
+        return None
+    key, raw_value = stripped.split("=", 1)
+    key = key.strip()
+    if not key:
+        return None
+    value = raw_value.strip()
+    if value and value[0] in {"'", '"'}:
+        quote = value[0]
+        body = value[1:]
+        if body.endswith(quote) and not body.endswith("\\" + quote):
+            return key, body[:-1], start
+        collected = [body]
+        index = start + 1
+        while index < len(lines):
+            part = lines[index]
+            if part.rstrip().endswith(quote) and not part.rstrip().endswith("\\" + quote):
+                collected.append(part.rstrip()[:-1])
+                return key, "\n".join(collected), index
+            collected.append(part)
+            index += 1
+        return key, "\n".join(collected), index - 1
+    return key, value, start
+
+
+def read_env_file_value(key: str) -> str:
+    target = str(key or "").strip().lower()
+    if not target:
+        return ""
+    for path in _iter_env_file_candidates():
+        try:
+            lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+        except Exception:
+            continue
+        index = 0
+        while index < len(lines):
+            parsed = _parse_env_assignment(lines, index)
+            if parsed is None:
+                index += 1
+                continue
+            parsed_key, value, end_index = parsed
+            if parsed_key.strip().lower() == target:
+                return value.strip()
+            index = max(index + 1, end_index + 1)
+    return ""
+
+
+def _collect_env_file_keys() -> set[str]:
+    """直接读取 .env.prod / .env 文件，提取显式设置的 personification_ 字段名。
+
+    不依赖 pydantic __pydantic_fields_set__（NoneBot2 通过文件加载时该 set 可能
+    不包含文件来源字段），改为直接扫描 env 文件，确保 .env.prod 里的字段拥有比
+    runtime_config.json 更高优先级。
+
+    搜索范围：cwd 及其向上 5 层目录 + 插件文件位置向上 5 层目录。这样无论 bot
+    通过 systemd / cd / docker 等何种方式启动，cwd 不在 bot 根目录时也能找到
+    .env.prod。
+    """
+    found: set[str] = set()
+    for path in _iter_env_file_candidates():
+        try:
+            lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+        except Exception:
+            continue
+        index = 0
+        while index < len(lines):
+            parsed = _parse_env_assignment(lines, index)
+            if parsed is None:
+                index += 1
+                continue
+            key_field, _value, end_index = parsed
+            key_field = key_field.strip().lower()
+            if key_field.startswith("personification_"):
+                found.add(key_field)
+            index = max(index + 1, end_index + 1)
+    return found
+
+
 def _collect_explicit_env_fields(plugin_config: Any) -> set[str]:
     explicit: set[str] = set()
+    # 1. pydantic __pydantic_fields_set__（对 env 变量可靠，对 .env 文件不一定）
     raw_fields = getattr(plugin_config, "__pydantic_fields_set__", None)
     if isinstance(raw_fields, Iterable):
         explicit.update(
@@ -23,10 +126,13 @@ def _collect_explicit_env_fields(plugin_config: Any) -> set[str]:
             for field in raw_fields
             if str(field or "").strip().startswith("personification_")
         )
+    # 2. 操作系统环境变量
     for key in os.environ.keys():
         lowered = str(key or "").strip().lower()
         if lowered.startswith("personification_"):
             explicit.add(lowered)
+    # 3. 直接读取 .env.prod / .env 文件（确保 .env.prod 里的字段不被 runtime 覆盖）
+    explicit.update(_collect_env_file_keys())
     return explicit
 
 

@@ -6,6 +6,9 @@ import re
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Iterable
 
+from ..agent.runtime.planner import OUTPUT_MODE_LENGTHS
+
+
 @dataclass(frozen=True)
 class ResponseReviewDecision:
     action: str
@@ -67,28 +70,17 @@ def _render_semantic_frame_hint(semantic_frame: Any) -> str:
             "expression_style": str(getattr(semantic_frame, "expression_style", "") or ""),
             "emotion_intensity": str(getattr(semantic_frame, "emotion_intensity", "") or ""),
             "domain_focus": str(getattr(semantic_frame, "domain_focus", "") or ""),
+            "persona_info_added": str(getattr(semantic_frame, "persona_response_info_added", "") or ""),
+            "persona_echoed_user_phrase": bool(getattr(semantic_frame, "persona_response_echoed_user_phrase", False)),
         },
         ensure_ascii=False,
     )
 
 
-def _strip_recovered_reply_text(raw: str) -> str:
-    text = str(raw or "").strip()
-    if not text:
-        return ""
-    message_match = re.search(r"<message.*?>(.*?)</\s*message\s*>", text, flags=re.DOTALL | re.IGNORECASE)
-    if message_match:
-        text = message_match.group(1).strip()
-    text = (
-        text.replace("[NO_REPLY]", "").replace("<NO_REPLY>", "")
-        .replace("[SILENCE]", "").replace("<SILENCE>", "")
-        .strip()
-    )
-    text = re.sub(r"</?(?:output|message|status|think|action)\b.*?>", "", text, flags=re.IGNORECASE).strip()
-    if not text:
-        return ""
-    first_line = next((line.strip() for line in text.splitlines() if line.strip()), "")
-    return first_line[:120]
+def _output_mode_hint(semantic_frame: Any) -> str:
+    output_mode = str(getattr(semantic_frame, "output_mode", "") or "").strip() or "chat_short"
+    min_chars, max_chars = OUTPUT_MODE_LENGTHS.get(output_mode, OUTPUT_MODE_LENGTHS["chat_short"])
+    return f"output_mode={output_mode}, 建议长度={min_chars}-{max_chars}字"
 
 
 def _normalize_reply_fingerprint(text: str) -> str:
@@ -198,6 +190,7 @@ async def review_response_text(
     message_intent: str = "",
     is_private: bool = False,
     is_random_chat: bool = False,
+    is_direct_mention: bool = False,
     semantic_frame: Any = None,
 ) -> ResponseReviewDecision:
     candidate = str(candidate_text or "").strip()
@@ -206,6 +199,7 @@ async def review_response_text(
     if recent_bot_replies and _looks_like_recent_duplicate(candidate, recent_bot_replies):
         return ResponseReviewDecision(action="no_reply", text="", reason="recent_duplicate")
     semantic_hint = _render_semantic_frame_hint(semantic_frame)
+    output_mode_hint = _output_mode_hint(semantic_frame)
     review_messages = [
         {
             "role": "system",
@@ -215,9 +209,11 @@ async def review_response_text(
                 "如果内容偏解释腔、AI味重、误解对象、和当前话题不贴，输出 "
                 "{\"action\":\"rewrite\",\"text\":\"改写后的最终回复\",\"reason\":\"...\"}。"
                 "如果这轮更适合沉默，输出 {\"action\":\"no_reply\",\"text\":\"\",\"reason\":\"...\"}。"
+                f"{'当前是直呼/提及 bot 的消息，禁止输出 no_reply。' if is_direct_mention else ''}"
                 "普通短句 banter、顺着上一句接话、轻量吐槽，优先 accept 或 rewrite，不要轻易 no_reply。"
                 "只输出 JSON，不要解释。"
-                "\n## 必须 rewrite 的 AI 味回复模式（重点检查）\n1. 「回声评论」：把用户说的话原样重复后加“太真实了/太直球了/太 X 了吧/真的假的”等感叹——必须改写为不重复原话的短句接话。\n2. 「安抚式客服腒」：以“别这么说/已经很够用了/不要这样想/你很棒的”开头——改写为自然接话。\n3. 「旁白式观察」：类似“真去做了啊/真的行动了/居然真的 XX 了”的旁白——改写为参与式短句。\n4. 「梗分析腒」：用“像是把 X 玩成 Y 了/意思就是/可以理解成”解释梗结构——改写为直接接梗。\n改写原则：去掉对用户发言的复述和分析，直接给一句自然接话，15字以内为佳。"
+                "\n## 必须 rewrite 的 AI 味回复模式（重点检查）\n1. 「回声评论」：把用户说的话原样重复后加“太真实了/太直球了/太 X 了吧/真的假的”等感叹——必须改写为不重复原话的短句接话。\n2. 候选回复中超过 3 个连续字与用户原话重叠，且没有新增信息或立场——必须 rewrite。\n3. 候选只是在用感叹词复述用户语义，没有新事实、延续话题、转向或明确态度——必须 rewrite。\n4. 「安抚式客服腔」：以“别这么说/已经很够用了/不要这样想/你很棒的”开头——改写为自然接话。\n5. 「旁白式观察」：类似“真去做了啊/真的行动了/居然真的 XX 了”的旁白——改写为参与式短句。\n6. 「梗分析腔」：用“像是把 X 玩成 Y 了/意思就是/可以理解成”解释梗结构——改写为直接接梗。\n改写原则：去掉对用户发言的复述和分析，按 output_mode 的长度要求输出；改写后不得引入新的回声模式。"
+                "\n如果语义情绪帧里 persona_info_added=tone_only 且 persona_echoed_user_phrase=true，也必须 rewrite。"
             ),
         },
         {
@@ -229,6 +225,7 @@ async def review_response_text(
                 f"最近上下文：{str(recent_context or '').strip()[:500] or '[EMPTY]'}\n"
                 f"互动关系：{str(relationship_hint or '').strip()[:320] or '[EMPTY]'}\n"
                 f"语义情绪帧：{semantic_hint or '[EMPTY]'}\n"
+                f"输出模式：{output_mode_hint}\n"
                 f"复读线索：{json.dumps(list(repeat_clusters or [])[:3], ensure_ascii=False)}\n"
                 f"最近 bot 发言：{json.dumps(_to_text_list(recent_bot_replies or []), ensure_ascii=False)}\n"
                 f"候选回复：{candidate}\n"
@@ -246,49 +243,10 @@ async def review_response_text(
     if parsed.action == "rewrite" and parsed.text:
         return ResponseReviewDecision(action="rewrite", text=parsed.text, reason=parsed.reason)
     if parsed.action == "no_reply":
+        if is_direct_mention:
+            return ResponseReviewDecision(action="accept", text=candidate, reason=parsed.reason or "direct_mention_no_reply_blocked")
         return ResponseReviewDecision(action="no_reply", text="", reason=parsed.reason)
     return ResponseReviewDecision(action="accept", text=candidate, reason=parsed.reason)
-
-
-async def recover_direct_mention_reply(
-    call_ai_api: Callable[[list[dict[str, Any]]], Awaitable[Any]],
-    *,
-    raw_message_text: str,
-    recent_context: str = "",
-    relationship_hint: str = "",
-    recent_bot_replies: list[str] | None = None,
-    semantic_frame: Any = None,
-    is_direct_mention: bool = False,
-) -> str:
-    if not is_direct_mention:
-        return ""
-    semantic_hint = _render_semantic_frame_hint(semantic_frame)
-    repair_messages = [
-        {
-            "role": "system",
-            "content": (
-                "这是一次直呼 bot 的真实对话。上一轮错误地掉进了沉默/空回复。"
-                "现在只补一条最终回复。必须回复，不要输出 [SILENCE]、[NO_REPLY]、JSON、XML、解释或道歉。"
-                "语气像正常群友/私聊对象顺手回一句，不超过24字。"
-            ),
-        },
-        {
-            "role": "user",
-            "content": (
-                f"当前原话：{str(raw_message_text or '').strip()[:240] or '[EMPTY]'}\n"
-                f"最近上下文：{str(recent_context or '').strip()[:500] or '[EMPTY]'}\n"
-                f"互动关系：{str(relationship_hint or '').strip()[:320] or '[EMPTY]'}\n"
-                f"语义情绪帧：{semantic_hint or '[EMPTY]'}\n"
-                f"最近 bot 发言：{json.dumps(_to_text_list(recent_bot_replies or []), ensure_ascii=False)}\n"
-                "直接输出最终回复。"
-            ),
-        },
-    ]
-    try:
-        raw = await call_ai_api(repair_messages)
-    except Exception:
-        return ""
-    return _strip_recovered_reply_text(str(raw or ""))
 
 
 async def rewrite_agent_reply_ooc(
@@ -297,9 +255,11 @@ async def rewrite_agent_reply_ooc(
     original_text: str,
     persona_system: str = "",
     timeout: float = 8.0,
+    output_mode: str = "chat_short",
 ) -> str:
     if tool_caller is None:
         return ""
+    min_chars, max_chars = OUTPUT_MODE_LENGTHS.get(output_mode, OUTPUT_MODE_LENGTHS["chat_short"])
     messages: list[dict[str, Any]] = []
     persona_hint = str(persona_system or "").strip()
     if persona_hint:
@@ -309,7 +269,7 @@ async def rewrite_agent_reply_ooc(
             "role": "system",
             "content": (
                 "下面这句话听起来像 AI 助手而不像普通群友。"
-                "把它用你自己的口吻重说一次，60 字以内。"
+                f"把它用你自己的口吻重说一次，{min_chars}-{max_chars} 字以内。"
                 "去掉【搜索/查询/结果/链接/来源】类表述和 URL，不要解释改写过程。"
             ),
         }
@@ -328,71 +288,12 @@ async def rewrite_agent_reply_ooc(
     return rewritten
 
 
-async def decide_random_chat_speak(
-    call_ai_api: Callable[[list[dict[str, Any]]], Awaitable[Any]],
-    *,
-    raw_message_text: str,
-    recent_context: str = "",
-    relationship_hint: str = "",
-    repeat_clusters: list[dict[str, Any]] | None = None,
-    recent_bot_replies: list[str] | None = None,
-    has_newer_batch: bool = False,
-    message_intent: str = "",
-    ambiguity_level: str = "",
-    message_target: str = "",
-    solo_speaker_follow: bool = False,
-) -> bool:
-    if has_newer_batch:
-        return False
-    if solo_speaker_follow:
-        return True
-    if str(message_target or "").strip() == "bot":
-        return True
-    review_messages = [
-        {
-            "role": "system",
-            "content": (
-                "你是群聊随机插话判定器。"
-                "判断 bot 这轮是否应该顺势说一句。"
-                "如果该沉默，输出 JSON：{\"action\":\"no_reply\",\"reason\":\"...\"}。"
-                "如果适合顺势接话，输出 JSON：{\"action\":\"speak\",\"reason\":\"...\"}。"
-                "只输出 JSON。"
-            ),
-        },
-        {
-            "role": "user",
-            "content": (
-                f"当前原话：{str(raw_message_text or '').strip()[:240] or '[EMPTY]'}\n"
-                f"消息意图：{str(message_intent or '').strip() or 'unknown'}\n"
-                f"歧义等级：{str(ambiguity_level or '').strip() or 'unknown'}\n"
-                f"消息目标：{str(message_target or '').strip() or 'unknown'}\n"
-                f"最近上下文：{str(recent_context or '').strip()[:500] or '[EMPTY]'}\n"
-                f"互动关系：{str(relationship_hint or '').strip()[:320] or '[EMPTY]'}\n"
-                f"复读线索：{json.dumps(list(repeat_clusters or [])[:3], ensure_ascii=False)}\n"
-                f"最近 bot 发言：{json.dumps(_to_text_list(recent_bot_replies or []), ensure_ascii=False)}\n"
-                "要求：短句接梗、顺手问候、复读跟一句通常允许 speak；"
-                "只有这轮明显像群员彼此聊天、bot 插话会显得突兀、或者 bot 刚说过类似内容时才选 no_reply。"
-            ),
-        },
-    ]
-    try:
-        raw = await call_ai_api(review_messages)
-    except Exception:
-        return True
-    parsed = _parse_review_payload(str(raw or ""))
-    if parsed is None:
-        return True
-    return parsed.action == "speak"
-
-
 __all__ = [
     "ResponseReviewDecision",
     "arbitrate_reply_mode",
-    "decide_random_chat_speak",
     "extract_recent_bot_reply_texts",
     "is_agent_reply_ooc",
     "make_passthrough_review_decision",
-    "recover_direct_mention_reply",
     "rewrite_agent_reply_ooc",
     "review_response_text",
 ]

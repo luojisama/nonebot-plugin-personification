@@ -6,6 +6,7 @@ from ..provider_router import call_ai_api as call_ai_api_core
 from ..provider_router import (
     get_configured_api_providers as get_configured_api_providers_core,
 )
+from ..gemini_profile import should_enable_default_builtin_search
 from ..model_router import get_model_override_for_role
 from ..runtime_state import is_msg_processed as is_msg_processed_core
 from ..web_grounding import (
@@ -142,24 +143,23 @@ def build_ai_api_caller(
         tools: Optional[List[Dict[str, Any]]] = None,
         max_tokens: Optional[int] = None,
         temperature: float = 0.7,
+        use_builtin_search: Optional[bool] = None,
     ) -> Optional[str]:
         model_override = ""
         if model_role:
             model_override = get_model_override_for_role(plugin_config, model_role)
         if not model_override and model_override_field_name:
             model_override = str(getattr(plugin_config, model_override_field_name, "") or "").strip()
+        default_builtin_search = should_enable_default_builtin_search(
+            plugin_config,
+            get_configured_api_providers=lambda: get_configured_api_providers_core(plugin_config, logger),
+        )
         response = await call_ai_api_core(
             messages,
             plugin_config=plugin_config,
             logger=logger,
             tools=tools,
-            use_builtin_search=bool(
-                getattr(
-                    plugin_config,
-                    "personification_model_builtin_search_enabled",
-                    getattr(plugin_config, "personification_builtin_search", True),
-                )
-            ),
+            use_builtin_search=default_builtin_search if use_builtin_search is None else bool(use_builtin_search),
             model_override=model_override,
         )
         _ = max_tokens, temperature

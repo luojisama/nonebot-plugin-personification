@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import json
+import re
 import time
 from typing import Any
 
@@ -45,8 +47,10 @@ from ..core.model_router import (
     normalize_model_overrides,
     resolve_model_role,
 )
+from ..core.provider_router import get_provider_failure_snapshot, normalize_api_type, parse_api_pool_config
 from ..core.runtime_config import get_runtime_load_info
 from ..utils import get_group_config, is_group_whitelisted
+from .runtime_commands import handle_git_update_command as _handle_git_update_command
 
 
 _GROUP_CONFIG_NAMESPACE = "group_config"
@@ -69,6 +73,21 @@ _COMMAND_ALIASES = {
     "召回": "recall",
     "model": "model",
     "模型": "model",
+    "scheduler": "scheduler",
+    "schedule": "scheduler",
+    "定时": "scheduler",
+    "任务": "scheduler",
+    "qzone": "qzone",
+    "空间": "qzone",
+    "说说": "qzone",
+    "update": "update",
+    "更新": "update",
+    "升级": "update",
+    "sticker": "sticker",
+    "表情包": "sticker",
+    "lore": "lore",
+    "设定": "lore",
+    "lorebook": "lore",
 }
 _SUBCOMMAND_ALIASES = {
     "list": "list",
@@ -85,6 +104,16 @@ _SUBCOMMAND_ALIASES = {
     "删除": "remove",
     "run": "run",
     "执行": "run",
+    "scan": "run",
+    "扫描": "run",
+    "test": "test",
+    "测试": "test",
+    "message": "message",
+    "messages": "message",
+    "inbox": "message",
+    "消息": "message",
+    "留言": "message",
+    "收消息": "message",
     "status": "status",
     "状态": "status",
     "stats": "stats",
@@ -98,6 +127,13 @@ _SUBCOMMAND_ALIASES = {
     "crystal": "crystal",
     "结晶": "crystal",
     "运行": "run",
+    "curate": "curate",
+    "整理": "curate",
+    "clean": "clean",
+    "清理": "clean",
+    "rollback": "rollback",
+    "回滚": "rollback",
+    "设定": "set",
 }
 _COMPOUND_TOKEN_ALIASES = {
     "配置列表": ("配置", "列表"),
@@ -120,6 +156,16 @@ _COMPOUND_TOKEN_ALIASES = {
     "迁移状态": ("迁移", "状态"),
     "迁移执行": ("迁移", "执行"),
     "召回统计": ("召回", "统计"),
+    "定时状态": ("定时", "状态"),
+    "任务状态": ("定时", "状态"),
+    "空间状态": ("空间", "状态"),
+    "空间扫描": ("空间", "扫描"),
+    "空间测试": ("空间", "测试"),
+    "空间消息": ("空间", "消息"),
+    "空间留言": ("空间", "消息"),
+    "空间收消息": ("空间", "消息"),
+    "模型路由": ("模型", "路由"),
+    "模型调用": ("模型", "路由"),
 }
 
 
@@ -151,6 +197,19 @@ def format_timestamp(ts: float) -> str:
     if not ts:
         return "未记录"
     return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(float(ts)))
+
+
+def _format_duration(seconds: float) -> str:
+    total = max(0, int(round(float(seconds or 0))))
+    if total <= 0:
+        return "0秒"
+    minutes, sec = divmod(total, 60)
+    hours, minutes = divmod(minutes, 60)
+    if hours:
+        return f"{hours}时{minutes}分"
+    if minutes:
+        return f"{minutes}分{sec}秒"
+    return f"{sec}秒"
 
 
 def _scope_label(scope: str) -> str:
@@ -188,7 +247,10 @@ def _root_help_text() -> str:
         "- 拟人 管理员 列表|添加|删除：管理插件管理员。",
         "- 拟人 迁移 状态|执行：查看或执行旧数据迁移。",
         "- 拟人 召回 统计：查看长期记忆召回统计。",
-        "- 拟人 模型 列表|使用|设置|重置：QQ 内热更新 intent/review/agent/sticker 四类 LLM 模型。",
+        "- 拟人 模型 列表|路由|使用|设置|重置：QQ 内热更新主 provider 和各阶段模型。",
+        "- 拟人 定时 状态：查看定时任务注册状态、下次运行时间和功能开关。",
+        "- 拟人 空间 状态|测试 <QQ号/@用户>：查看空间任务状态，或对指定好友空间执行一次测试互动扫描。",
+        "- 拟人 表情包 整理|清理|回滚：整理表情包库（去重/去低质量）、清理过期 trash、回滚最近一次整理。",
         "",
         "旧命令兼容（仍可用，下面直接说明用途）：",
         "- 拟人配置：发送聊天记录形式的配置总览。",
@@ -251,6 +313,8 @@ def _format_category_help(category: str) -> str:
         "status": "状态",
         "recall": "召回",
         "model": "模型",
+        "scheduler": "定时任务",
+        "qzone": "QQ 空间",
     }
     lines = [f"{category_names.get(category, category)}："]
     for entry in entries:
@@ -416,12 +480,96 @@ def _normalize_help_tokens(tokens: list[str]) -> list[str]:
     return [normalize_command_word(token) for token in expanded if str(token or "").strip()]
 
 
+async def handle_sticker_command(bundle: Any, *, event: Any, tokens: list[str]) -> str:
+    subcommand = normalize_command_word(tokens[0]) if tokens else ""
+    if subcommand not in {"curate", "clean", "rollback"}:
+        return "用法：拟人 表情包 整理｜清理｜回滚"
+
+    if subcommand == "curate":
+        try:
+            from ..core.sticker_curator import run_sticker_curation
+        except ImportError:
+            return "表情包馆长模块加载失败。"
+        result = await run_sticker_curation(runtime=bundle.runtime)
+        return "\n".join(result.details) if result.details else "整理完成。"
+
+    if subcommand == "clean":
+        try:
+            from ..core.sticker_curator import clean_trash_expired
+            from ..core.sticker_library import resolve_sticker_dir
+        except ImportError:
+            return "表情包馆长模块加载失败。"
+        sticker_dir = resolve_sticker_dir(getattr(bundle.runtime.plugin_config, "personification_sticker_path", None))
+        removed = clean_trash_expired(sticker_dir)
+        return f"已清理过期 trash 目录，共删除 {removed} 个过期批次。"
+
+    if subcommand in {"rollback", "回滚"}:
+        try:
+            from ..core.sticker_curator import rollback_last_curation
+            from ..core.sticker_library import resolve_sticker_dir
+        except ImportError:
+            return "表情包馆长模块加载失败。"
+        sticker_dir = resolve_sticker_dir(getattr(bundle.runtime.plugin_config, "personification_sticker_path", None))
+        result = rollback_last_curation(sticker_dir)
+        return "\n".join(result.details) if result.details else "回滚完成。"
+
+    return "未知子命令。"
+
+
+async def handle_lore_command(bundle: Any, *, tokens: list[str]) -> str:
+    subcommand = normalize_command_word(tokens[0]) if tokens else ""
+    if subcommand not in {"set", "remove", "list"}:
+        return "用法：拟人 设定 <主题> <立场>｜列出设定｜删除设定 <主题>"
+
+    try:
+        from ..core.persona_knowledge import add_lorebook_entry, list_lorebook_entries, remove_lorebook_entry
+    except ImportError:
+        return "人格知识库模块加载失败。"
+
+    memory_store = getattr(bundle.runtime, "memory_store", None)
+    if not memory_store:
+        return "记忆存储不可用。"
+
+    if subcommand == "list":
+        entries = await list_lorebook_entries(memory_store)
+        if not entries:
+            return "当前没有人格设定。"
+        lines = ["当前人格设定："]
+        for entry in entries:
+            topic = str(entry.get("topic", "") or entry.get("summary", "")).strip()[:80]
+            stance = str(entry.get("stance", "") or "").strip()[:120]
+            lines.append(f"- {topic}: {stance}")
+        return "\n".join(lines)
+
+    if subcommand == "remove":
+        topic = " ".join(str(t) for t in tokens[1:]).strip() if len(tokens) > 1 else ""
+        if not topic:
+            return "请指定要删除的设定主题。"
+        success = await remove_lorebook_entry(memory_store, topic)
+        return f"已删除设定「{topic}」。" if success else f"未找到设定「{topic}」。"
+
+    if subcommand == "set":
+        if len(tokens) < 3:
+            return "用法：拟人 设定 <主题> <立场>"
+        topic = str(tokens[1] or "").strip()
+        stance = " ".join(str(t) for t in tokens[2:]).strip()
+        if not topic or not stance:
+            return "主题和立场均不能为空。"
+        triggers = " ".join(tokens[1:]).strip()
+        await add_lorebook_entry(memory_store, topic=topic, stance=stance, triggers=triggers)
+        return f"已设定「{topic}」：{stance}"
+
+    return "未知子命令。"
+
+
 async def dispatch_persona_admin_command(
     matcher: Any,
     *,
+    bot: Any = None,
     bundle: Any,
     event: Any,
     arg_text: str,
+    arg_message: Any = None,
 ) -> None:
     tokens = tokenize_command_args(arg_text)
     if not tokens:
@@ -466,7 +614,35 @@ async def dispatch_persona_admin_command(
             await matcher.finish(_admin_error())
         await matcher.finish(handle_model_command(bundle, tokens=rest))
 
-    await matcher.finish("未识别的子命令。可用“拟人 帮助”或“/persona help”查看帮助。")
+    if command == "scheduler":
+        if not can_manage_sensitive_action(event=event, superusers=bundle.superusers):
+            await matcher.finish(_admin_error())
+        await matcher.finish(handle_scheduler_command(bundle, tokens=rest))
+
+    if command == "qzone":
+        if not can_manage_sensitive_action(event=event, superusers=bundle.superusers):
+            await matcher.finish(_admin_error())
+        await matcher.finish(await handle_qzone_command(bundle, event=event, tokens=rest, arg_message=arg_message))
+
+    if command == "sticker":
+        if not can_manage_sensitive_action(event=event, superusers=bundle.superusers):
+            await matcher.finish(_admin_error())
+        await matcher.finish(await handle_sticker_command(bundle, event=event, tokens=rest))
+        return
+
+    if command == "lore":
+        if not can_manage_sensitive_action(event=event, superusers=bundle.superusers):
+            await matcher.finish(_admin_error())
+        await matcher.finish(await handle_lore_command(bundle, tokens=rest))
+        return
+
+    if command == "update":
+        if not can_manage_sensitive_action(event=event, superusers=bundle.superusers):
+            await matcher.finish(_admin_error())
+        await _handle_git_update_command(matcher, bot=bot, event=event, logger=bundle.logger)
+        return
+
+    await matcher.finish("未识别的子命令。可用“拟人 帮助”或”/persona help”查看帮助。")
 
 
 def render_help(bundle: Any, *, event: Any, tokens: list[str]) -> str:
@@ -483,7 +659,7 @@ def render_help(bundle: Any, *, event: Any, tokens: list[str]) -> str:
         entry = find_command_help(tuple(normalized[:2]))
         if entry is not None:
             return _format_command_help(entry.path)
-    if normalized[0] in {"config", "admin", "memory", "migrate", "help", "status", "recall", "model"}:
+    if normalized[0] in {"config", "admin", "memory", "migrate", "help", "status", "recall", "model", "scheduler", "qzone", "update"}:
         return _format_category_help(normalized[0])
     config_entry = resolve_config_entry(" ".join(tokens))
     if config_entry is None:
@@ -495,6 +671,136 @@ def render_help(bundle: Any, *, event: Any, tokens: list[str]) -> str:
     if command_entry is not None:
         return _format_command_help(command_entry.path)
     return "未找到对应帮助。可用“拟人 帮助”查看总览。"
+
+
+def _load_data_store_namespace(name: str) -> dict[str, Any]:
+    try:
+        from ..core.data_store import get_data_store
+
+        payload = get_data_store().load_sync(name)
+    except Exception:
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _render_qzone_status_summary(bundle: Any) -> str:
+    post_state = _load_data_store_namespace("qzone_post_state")
+    social_state = _load_data_store_namespace("qzone_social_state")
+    qzone_enabled = "开" if bool(getattr(bundle.plugin_config, "personification_qzone_enabled", False)) else "关"
+    proactive_enabled = "开" if bool(getattr(bundle.plugin_config, "personification_qzone_proactive_enabled", False)) else "关"
+    social_enabled = "开" if bool(getattr(bundle.plugin_config, "personification_qzone_social_enabled", False)) else "关"
+    inbound_enabled = "开" if bool(getattr(bundle.plugin_config, "personification_qzone_inbound_enabled", True)) else "关"
+    return (
+        f"QQ空间：总开关 {qzone_enabled}，主动发说说 {proactive_enabled}"
+        f"（今日 {int(post_state.get('count', 0) or 0)} 条），好友互动 {social_enabled}"
+        f"（赞 {int(social_state.get('like_count', 0) or 0)} / 评 {int(social_state.get('comment_count', 0) or 0)}），"
+        f"空间消息 {inbound_enabled}"
+    )
+
+
+def render_qzone_status(bundle: Any) -> str:
+    post_state = _load_data_store_namespace("qzone_post_state")
+    social_state = _load_data_store_namespace("qzone_social_state")
+    last_result = social_state.get("last_result") if isinstance(social_state.get("last_result"), dict) else {}
+    last_inbound_result = (
+        social_state.get("last_inbound_result")
+        if isinstance(social_state.get("last_inbound_result"), dict)
+        else {}
+    )
+    lines = [
+        "QQ 空间状态",
+        f"总开关：{'开' if bool(getattr(bundle.plugin_config, 'personification_qzone_enabled', False)) else '关'}",
+        f"主动发说说：{'开' if bool(getattr(bundle.plugin_config, 'personification_qzone_proactive_enabled', False)) else '关'}",
+        f"主动发说说频率：每 {getattr(bundle.plugin_config, 'personification_qzone_check_interval', 90)} 分钟检查，"
+        f"每日最多 {getattr(bundle.plugin_config, 'personification_qzone_daily_limit', 3)} 条，"
+        f"最小间隔 {getattr(bundle.plugin_config, 'personification_qzone_min_interval_hours', 6.0)} 小时",
+        f"今日已发：{int(post_state.get('count', 0) or 0)} 条",
+        f"上次发说说：{format_timestamp(float(post_state.get('last_post_at', 0) or 0))}",
+        f"上次内容：{post_state.get('last_content') or '无'}",
+        "",
+        f"好友空间互动：{'开' if bool(getattr(bundle.plugin_config, 'personification_qzone_social_enabled', False)) else '关'}",
+        f"扫描范围：{getattr(bundle.plugin_config, 'personification_qzone_social_scope', 'recent_interactions')}",
+        f"扫描间隔：{getattr(bundle.plugin_config, 'personification_qzone_social_check_interval', 120)} 分钟",
+        f"单次动态数：{getattr(bundle.plugin_config, 'personification_qzone_social_max_feeds_per_scan', 10)}",
+        f"点赞上限：{getattr(bundle.plugin_config, 'personification_qzone_social_like_limit', 0)}（0=无上限）",
+        f"评论上限：{getattr(bundle.plugin_config, 'personification_qzone_social_comment_limit', 0)}（0=无上限）",
+        f"单好友上限：{getattr(bundle.plugin_config, 'personification_qzone_social_per_friend_limit', 0)}（0=无上限）",
+        f"今日点赞/评论：{int(social_state.get('like_count', 0) or 0)} / {int(social_state.get('comment_count', 0) or 0)}",
+        f"上次扫描：{format_timestamp(float(social_state.get('last_scan_at', 0) or 0))}",
+        f"上次结果：用户 {last_result.get('scanned_users', 0)}，动态 {last_result.get('feeds_seen', 0)}，"
+        f"点赞 {last_result.get('liked', 0)}，评论 {last_result.get('commented', 0)}，"
+        f"留言 {last_result.get('inbound_comments', 0)}，回复 {last_result.get('replied', 0)}，"
+        f"画像补充 {last_result.get('profile_records', 0)}，忽略 {last_result.get('ignored', 0)}，失败 {last_result.get('failed', 0)}",
+        f"最近失败：{social_state.get('last_error') or '无'}",
+        "",
+        f"空间消息轮询：{'开' if bool(getattr(bundle.plugin_config, 'personification_qzone_inbound_enabled', True)) else '关'}",
+        f"消息轮询间隔：{getattr(bundle.plugin_config, 'personification_qzone_inbound_check_interval', 3)} 分钟",
+        f"单次检查说说：{getattr(bundle.plugin_config, 'personification_qzone_inbound_max_feeds_per_scan', 20)}",
+        f"单说说留言：{getattr(bundle.plugin_config, 'personification_qzone_inbound_max_comments_per_feed', 20)}",
+        f"上次消息轮询：{format_timestamp(float(social_state.get('last_inbound_scan_at', 0) or 0))}",
+        f"上次消息结果：说说 {last_inbound_result.get('feeds_seen', 0)}，"
+        f"留言 {last_inbound_result.get('inbound_comments', 0)}，"
+        f"回复 {last_inbound_result.get('replied', 0)}，"
+        f"画像补充 {last_inbound_result.get('profile_records', 0)}，失败 {last_inbound_result.get('failed', 0)}",
+        f"最近消息失败：{social_state.get('last_inbound_error') or '无'}",
+    ]
+    return "\n".join(lines)
+
+
+def _extract_at_user_id_from_message(arg_message: Any) -> str:
+    if arg_message is None:
+        return ""
+    try:
+        segments = list(arg_message)
+    except Exception:
+        segments = []
+    for segment in segments:
+        seg_type = str(getattr(segment, "type", "") or "")
+        data = getattr(segment, "data", None)
+        if data is None and isinstance(segment, dict):
+            seg_type = str(segment.get("type", "") or "")
+            data = segment.get("data")
+        if seg_type != "at" or not isinstance(data, dict):
+            continue
+        qq = str(data.get("qq", "") or "").strip()
+        if qq and qq.lower() != "all":
+            return qq
+    raw = str(arg_message or "")
+    match = re.search(r"\[CQ:at,qq=(\d+)\]", raw)
+    return match.group(1) if match else ""
+
+
+def _extract_qzone_target_user_id(tokens: list[str], arg_message: Any = None) -> str:
+    at_user_id = _extract_at_user_id_from_message(arg_message)
+    if at_user_id:
+        return at_user_id
+    for token in tokens:
+        match = re.search(r"\d{5,12}", str(token or ""))
+        if match:
+            return match.group(0)
+    return ""
+
+
+def _format_qzone_scan_result(result: dict[str, Any]) -> str:
+    if not isinstance(result, dict):
+        return "空间扫描未返回有效结果。"
+    lines = [
+        "空间互动扫描结果",
+        f"状态：{'成功' if result.get('ok') else '跳过/失败'}",
+        f"目标：{result.get('target_user_id') or '最近互动好友'}",
+        f"扫描用户：{result.get('scanned_users', 0)}",
+        f"读取动态：{result.get('feeds_seen', 0)}",
+        f"点赞：{result.get('liked', 0)}",
+        f"评论：{result.get('commented', 0)}",
+        f"收到留言：{result.get('inbound_comments', 0)}",
+        f"回复留言：{result.get('replied', 0)}",
+        f"画像补充：{result.get('profile_records', 0)}",
+        f"忽略：{result.get('ignored', 0)}",
+        f"失败：{result.get('failed', 0)}",
+    ]
+    if result.get("last_error"):
+        lines.append(f"最近错误：{result.get('last_error')}")
+    return "\n".join(lines)
 
 
 def render_status(bundle: Any) -> str:
@@ -526,7 +832,98 @@ def render_status(bundle: Any) -> str:
         "模型覆盖：" + "；".join(format_model_overrides(bundle.plugin_config)).replace("- ", ""),
         f"联网模式：{getattr(bundle.plugin_config, 'personification_tool_web_search_mode', 'enabled')}",
         f"最近后台维护：{format_timestamp(background_status.get('last_periodic_at', 0))}",
+        _render_qzone_status_summary(bundle),
+        _render_scheduler_status_summary(bundle),
     ]
+    return "\n".join(lines)
+
+
+_SCHEDULER_EXPECTED_JOBS: tuple[tuple[str, str, str], ...] = (
+    ("personification_daily_fav_report", "每日群好感统计", ""),
+    ("ai_weekly_diary", "每周空间说说", "personification_qzone_enabled"),
+    ("personification_proactive_messaging", "主动私聊", "personification_proactive_enabled"),
+    ("personification_group_idle_topic", "群空闲发话", "personification_group_idle_enabled"),
+    ("personification_proactive_qzone", "主动空间动态", "personification_qzone_proactive_enabled"),
+    ("personification_qzone_social_scan", "好友空间互动", "personification_qzone_social_enabled"),
+    ("personification_qzone_inbound_poll", "空间消息轮询", "personification_qzone_inbound_enabled"),
+    ("personification_background_intelligence", "后台智能维护", ""),
+)
+
+
+def _format_scheduler_time(value: Any) -> str:
+    if value is None:
+        return "未计划"
+    if hasattr(value, "strftime"):
+        try:
+            return value.strftime("%Y-%m-%d %H:%M:%S %Z").strip()
+        except Exception:
+            pass
+    return str(value)
+
+
+def _get_scheduler_jobs(bundle: Any) -> list[Any]:
+    scheduler = getattr(bundle, "scheduler", None)
+    if scheduler is None:
+        return []
+    getter = getattr(scheduler, "get_jobs", None)
+    if not callable(getter):
+        return []
+    try:
+        return list(getter() or [])
+    except Exception:
+        return []
+
+
+def _scheduler_running_text(bundle: Any) -> str:
+    scheduler = getattr(bundle, "scheduler", None)
+    if scheduler is None:
+        return "未初始化"
+    running = getattr(scheduler, "running", None)
+    if running is None:
+        state = getattr(scheduler, "state", None)
+        return f"未知(state={state})" if state is not None else "未知"
+    return "运行中" if bool(running) else "未运行"
+
+
+def _expected_job_enabled(bundle: Any, flag_field: str) -> str:
+    if not flag_field:
+        return "应注册"
+    enabled = bool(getattr(bundle.plugin_config, flag_field, False))
+    return "开" if enabled else "关"
+
+
+def _render_scheduler_status_summary(bundle: Any) -> str:
+    jobs = _get_scheduler_jobs(bundle)
+    job_ids = {str(getattr(job, "id", "") or "") for job in jobs}
+    expected_ids = {job_id for job_id, _, flag in _SCHEDULER_EXPECTED_JOBS if not flag or bool(getattr(bundle.plugin_config, flag, False))}
+    missing = sorted(job_id for job_id in expected_ids if job_id not in job_ids)
+    return f"定时任务：{_scheduler_running_text(bundle)}，已注册 {len(jobs)} 个，缺失 {len(missing)} 个"
+
+
+def render_scheduler_status(bundle: Any) -> str:
+    jobs = _get_scheduler_jobs(bundle)
+    by_id = {str(getattr(job, "id", "") or ""): job for job in jobs}
+    lines = [
+        "定时任务状态",
+        f"Scheduler：{_scheduler_running_text(bundle)}",
+        f"已注册任务数：{len(jobs)}",
+    ]
+    for job_id, label, flag_field in _SCHEDULER_EXPECTED_JOBS:
+        job = by_id.get(job_id)
+        enabled_text = _expected_job_enabled(bundle, flag_field)
+        if job is None:
+            lines.append(f"- {label}：未注册（开关：{enabled_text}，id={job_id}）")
+            continue
+        trigger = str(getattr(job, "trigger", "") or "未知触发器")
+        next_run = _format_scheduler_time(getattr(job, "next_run_time", None))
+        lines.append(f"- {label}：已注册（开关：{enabled_text}，下次：{next_run}，触发：{trigger}，id={job_id}）")
+    extra_jobs = [job for job in jobs if str(getattr(job, "id", "") or "") not in {item[0] for item in _SCHEDULER_EXPECTED_JOBS}]
+    if extra_jobs:
+        lines.append("其他任务：")
+        for job in extra_jobs[:12]:
+            lines.append(
+                f"- {getattr(job, 'id', 'unknown')}：下次 {_format_scheduler_time(getattr(job, 'next_run_time', None))}"
+            )
     return "\n".join(lines)
 
 
@@ -555,8 +952,209 @@ def _default_model_for_role(bundle: Any, role: str) -> str:
     return primary
 
 
+def _parse_api_pool_config(raw_config: Any) -> list[dict[str, Any]]:
+    return [dict(item) for item in parse_api_pool_config(raw_config) if isinstance(item, dict)]
+
+
+def _current_api_pool_config(bundle: Any) -> list[dict[str, Any]]:
+    pools = _parse_api_pool_config(getattr(bundle.plugin_config, "personification_api_pools", None))
+    provider_getter = getattr(bundle, "get_configured_api_providers", None)
+    if not callable(provider_getter):
+        return pools
+    try:
+        providers = list(provider_getter() or [])
+    except Exception:
+        providers = []
+    normalized = [dict(item) for item in providers if isinstance(item, dict)]
+    if normalized and len(normalized) > len(pools):
+        return normalized
+    if pools:
+        return pools
+    return normalized
+
+
+def _default_route_model(api_type: str, config: Any) -> str:
+    normalized = normalize_api_type(api_type)
+    if normalized == "openai_codex":
+        return str(getattr(config, "personification_model", "") or "").strip() or "gpt-5.3-codex"
+    if normalized == "gemini_cli":
+        return "auto-gemini-3"
+    if normalized == "antigravity_cli":
+        return "auto-gemini-3"
+    if normalized == "claude_code":
+        return "claude-opus-4-7"
+    return str(getattr(config, "personification_model", "") or "").strip()
+
+
+def _default_route_auth_path(api_type: str, config: Any) -> str:
+    normalized = normalize_api_type(api_type)
+    if normalized == "openai_codex":
+        return str(getattr(config, "personification_codex_auth_path", "") or "").strip() or "~/.codex/auth.json"
+    if normalized == "gemini_cli":
+        return str(getattr(config, "personification_gemini_cli_auth_path", "") or "").strip() or "~/.gemini/oauth_creds.json"
+    if normalized == "antigravity_cli":
+        return (
+            str(getattr(config, "personification_antigravity_cli_auth_path", "") or "").strip()
+            or "~/.gemini/antigravity-cli/oauth_creds.json"
+        )
+    if normalized == "claude_code":
+        return str(getattr(config, "personification_claude_code_auth_path", "") or "").strip() or "~/.claude/.credentials.json"
+    return ""
+
+
+def _route_target_matches(provider: dict[str, Any], target: str, normalized_target: str) -> bool:
+    name = str(provider.get("name", "") or "").strip().lower()
+    api_type = normalize_api_type(provider.get("api_type"))
+    raw = str(target or "").strip().lower()
+    return bool(raw and name == raw) or bool(normalized_target and api_type == normalized_target)
+
+
+def _new_route_provider(api_type: str, model: str, config: Any) -> dict[str, Any]:
+    normalized = normalize_api_type(api_type)
+    provider = {
+        "name": f"{normalized}_primary" if normalized else "custom_primary",
+        "api_type": normalized,
+        "api_url": "",
+        "api_key": "",
+        "model": model or _default_route_model(normalized, config),
+        "auth_path": _default_route_auth_path(normalized, config),
+        "enabled": True,
+        "supports_native_search": True,
+        "priority": 1,
+    }
+    if normalized == "gemini_cli":
+        provider["project"] = str(getattr(config, "personification_gemini_cli_project", "") or "").strip()
+    elif normalized == "antigravity_cli":
+        provider["project"] = str(getattr(config, "personification_antigravity_cli_project", "") or "").strip()
+    return provider
+
+
+def _format_provider_line(provider: dict[str, Any], failure_state: dict[str, Any] | None = None) -> str:
+    name = str(provider.get("name", "") or "unnamed")
+    api_type = str(provider.get("api_type", "") or "unset")
+    model = str(provider.get("model", "") or "未配置")
+    priority = provider.get("priority", "-")
+    enabled = "开" if provider.get("enabled", True) else "关"
+    status = ""
+    if failure_state:
+        remaining = float(failure_state.get("cooldown_remaining", 0) or 0)
+        if remaining > 0:
+            label = "限流冷却" if failure_state.get("rate_limited") else "失败冷却"
+            status = f"，状态={label} {_format_duration(remaining)}"
+        elif failure_state.get("last_error"):
+            status = "，状态=最近失败，已可重试"
+    return f"- {name}（{api_type}:{model}，priority={priority}，enabled={enabled}{status}）"
+
+
+def _save_route_config(bundle: Any, providers: list[dict[str, Any]]) -> None:
+    setattr(bundle.plugin_config, "personification_api_pools", providers)
+    setattr(bundle.plugin_config, "personification_model_overrides", {})
+    if callable(getattr(bundle, "save_plugin_runtime_config", None)):
+        bundle.save_plugin_runtime_config()
+    reload_services = getattr(bundle, "reload_runtime_services", None)
+    if callable(reload_services):
+        reload_services()
+
+
+def _switch_primary_provider_route(bundle: Any, *, target: str, model: str = "") -> str:
+    raw_target = str(target or "").strip()
+    normalized_target = normalize_api_type(raw_target)
+    if not raw_target:
+        return "用法：拟人 模型 路由 <provider_name|api_type> [model]"
+    if normalized_target == "openai" and raw_target.lower() not in {"openai", "openai_official"}:
+        normalized_target = ""
+
+    existing = _current_api_pool_config(bundle)
+    selected_index: int | None = None
+    for index, provider in enumerate(existing):
+        if _route_target_matches(provider, raw_target, normalized_target):
+            selected_index = index
+            break
+
+    if selected_index is None:
+        if not normalized_target:
+            names = [str(item.get("name", "") or "").strip() for item in existing if item.get("name")]
+            hint = "、".join(names[:8]) if names else "无"
+            return f"没找到这个 provider：{raw_target}\n可用 provider：{hint}\n也可以直接写 api_type：antigravity_cli、gemini_cli、claude_code、openai_codex。"
+        selected = _new_route_provider(normalized_target, model, bundle.plugin_config)
+        existing.insert(0, selected)
+        selected_index = 0
+    else:
+        selected = dict(existing[selected_index])
+        selected["api_type"] = normalize_api_type(selected.get("api_type"))
+        if model:
+            selected["model"] = model
+        elif not str(selected.get("model", "") or "").strip():
+            selected["model"] = _default_route_model(selected["api_type"], bundle.plugin_config)
+        if not str(selected.get("auth_path", "") or "").strip():
+            auth_path = _default_route_auth_path(selected["api_type"], bundle.plugin_config)
+            if auth_path:
+                selected["auth_path"] = auth_path
+        if selected["api_type"] == "gemini_cli" and "project" not in selected:
+            selected["project"] = str(getattr(bundle.plugin_config, "personification_gemini_cli_project", "") or "").strip()
+        if selected["api_type"] == "antigravity_cli" and "project" not in selected:
+            selected["project"] = str(getattr(bundle.plugin_config, "personification_antigravity_cli_project", "") or "").strip()
+        selected["enabled"] = True
+        existing[selected_index] = selected
+
+    ordered: list[dict[str, Any]] = []
+    selected = dict(existing[selected_index])
+    selected["priority"] = 1
+    selected["enabled"] = True
+    ordered.append(selected)
+    next_priority = 2
+    selected_name = str(selected.get("name", "") or "")
+    for index, provider in enumerate(existing):
+        if index == selected_index:
+            continue
+        item = dict(provider)
+        if selected_name and str(item.get("name", "") or "") == selected_name:
+            continue
+        item["api_type"] = normalize_api_type(item.get("api_type"))
+        item["priority"] = next_priority
+        next_priority += 1
+        ordered.append(item)
+
+    _save_route_config(bundle, ordered)
+    return (
+        "已热切主 provider："
+        f"{selected.get('name')}（{selected.get('api_type')}:{selected.get('model') or '未配置'}）\n"
+        "已清空模型覆盖，避免把旧 GPT 模型名套到新 provider。\n"
+        "生效：立即生效；如果 .env.prod 显式设置 personification_api_pools，重启后仍以 .env.prod 为准。"
+    )
+
+
 def _format_model_status(bundle: Any) -> str:
+    from ..core.runtime_config import _collect_env_file_keys
     lines = ["模型路由"]
+    providers = _current_api_pool_config(bundle)
+    env_file_keys = _collect_env_file_keys()
+    pool_from_env = "personification_api_pools" in env_file_keys
+    source_label = "来源：.env.prod/.env" if pool_from_env else "来源：runtime_config（.env.prod 未设置此项）"
+    # 诊断信息：raw 配置的类型/长度/解析后数量，方便排查 .env 多行 JSON 解析失败问题
+    raw_pools = getattr(bundle.plugin_config, "personification_api_pools", None)
+    if raw_pools is None:
+        raw_info = "raw=None"
+    elif isinstance(raw_pools, str):
+        raw_info = f"raw=str(len={len(raw_pools)}) head={raw_pools[:80]!r}"
+    elif isinstance(raw_pools, list):
+        names = []
+        for item in raw_pools[:5]:
+            if isinstance(item, dict):
+                names.append(str(item.get("name", "?")))
+        raw_info = f"raw=list(len={len(raw_pools)}) names={names}"
+    else:
+        raw_info = f"raw={type(raw_pools).__name__}"
+    lines.append(f"诊断：{raw_info}; 解析后 provider 数={len(providers)}")
+    lines.append(f"当前 provider（{source_label}）：")
+    provider_failures = get_provider_failure_snapshot()
+    if providers:
+        for provider in providers[:8]:
+            provider_name = str(provider.get("name", "") or "")
+            lines.append(_format_provider_line(provider, provider_failures.get(provider_name)))
+    else:
+        lines.append("- 未配置")
+    lines.append("")
     lines.append("当前生效：")
     for role in MODEL_OVERRIDE_ROLES:
         effective = get_model_for_role(
@@ -580,7 +1178,7 @@ def _format_model_status(bundle: Any) -> str:
     else:
         lines.append("- 未发现已配置模型")
     lines.append("")
-    lines.append("用法：拟人 模型 使用 <model>；拟人 模型 设置 <intent|review|agent|sticker> <model>；拟人 模型 重置 [role|全部]")
+    lines.append("用法：拟人 模型 路由 <provider_name|api_type> [model]；拟人 模型 使用 <model>；拟人 模型 设置 <intent|review|agent|sticker> <model>；拟人 模型 重置 [role|全部]")
     return "\n".join(lines)
 
 
@@ -599,6 +1197,13 @@ def handle_model_command(bundle: Any, *, tokens: list[str]) -> str:
     raw_action = str(tokens[0] if tokens else "").strip().lower()
     if action in {"list", "get", "status"} or raw_action in {"列表", "查看", "状态", ""}:
         return _format_model_status(bundle)
+
+    if raw_action in {"route", "路由", "主路由", "provider", "供应商", "调用"}:
+        if len(tokens) < 2:
+            return "用法：拟人 模型 路由 <provider_name|api_type> [model]"
+        target = str(tokens[1] or "").strip()
+        model = " ".join(str(token) for token in tokens[2:]).strip()
+        return _switch_primary_provider_route(bundle, target=target, model=model)
 
     current = normalize_model_overrides(
         getattr(bundle.plugin_config, "personification_model_overrides", {}) or {}
@@ -641,7 +1246,46 @@ def handle_model_command(bundle: Any, *, tokens: list[str]) -> str:
         _save_model_overrides(bundle, current)
         return f"已重置：{role}（{MODEL_ROLE_LABELS[role]}）\n生效：立即生效"
 
-    return "用法：拟人 模型 列表｜使用 <model>｜设置 <intent|review|agent|sticker> <model>｜重置 [role|全部]"
+    return "用法：拟人 模型 列表｜路由 <provider_name|api_type> [model]｜使用 <model>｜设置 <intent|review|agent|sticker> <model>｜重置 [role|全部]"
+
+
+def handle_scheduler_command(bundle: Any, *, tokens: list[str]) -> str:
+    action = normalize_command_word(tokens[0]) if tokens else "status"
+    if action in {"status", "list", "get"}:
+        return render_scheduler_status(bundle)
+    return "用法：拟人 定时 状态"
+
+
+async def handle_qzone_command(
+    bundle: Any,
+    *,
+    event: Any,
+    tokens: list[str],
+    arg_message: Any = None,
+) -> str:
+    _ = event
+    action = normalize_command_word(tokens[0]) if tokens else "status"
+    if action in {"status", "list", "get"}:
+        return render_qzone_status(bundle)
+    if action in {"run", "test"}:
+        target_user_id = _extract_qzone_target_user_id(tokens[1:] if len(tokens) > 1 else [], arg_message)
+        if action == "test" and not target_user_id:
+            return "用法：拟人 空间 测试 <QQ号/@用户>"
+        scanner = getattr(bundle, "qzone_social_scan", None)
+        if not callable(scanner):
+            return "好友空间互动扫描任务未初始化。请确认 personification_qzone_enabled=true 后重启。"
+        try:
+            result = await scanner(target_user_id=target_user_id, force=(action == "test"))
+        except TypeError:
+            result = await scanner(target_user_id)
+        return _format_qzone_scan_result(result if isinstance(result, dict) else {})
+    if action == "message":
+        poller = getattr(bundle, "qzone_inbound_poll", None)
+        if not callable(poller):
+            return "空间消息轮询任务未初始化。请确认 personification_qzone_enabled=true 后重启。"
+        result = await poller(force=True)
+        return _format_qzone_scan_result(result if isinstance(result, dict) else {})
+    return "用法：拟人 空间 状态｜扫描｜测试 <QQ号/@用户>｜消息"
 
 
 def handle_config_command(bundle: Any, *, event: Any, tokens: list[str]) -> str:

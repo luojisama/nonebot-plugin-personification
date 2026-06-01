@@ -23,15 +23,19 @@ class BackgroundIntelligence:
         memory_decay_scheduler: Any,
         logger: Any = None,
         migrator_factory: Callable[[], Any] | None = None,
+        call_ai_api: Callable[..., Any] | None = None,
     ) -> None:
         self.plugin_config = plugin_config
         self.memory_store = memory_store
         self.memory_decay_scheduler = memory_decay_scheduler
         self.logger = logger
         self.migrator_factory = migrator_factory
-        self.evolves_engine = EvolvesEngine(memory_store, logger=logger)
+        self.evolves_engine = EvolvesEngine(memory_store, logger=logger, call_ai_api=call_ai_api)
         self._pending_tasks: dict[str, asyncio.Task[Any]] = {}
         self._task_lock = asyncio.Lock()
+
+    def set_evolves_call_ai_api(self, call_ai_api: Callable[..., Any] | None) -> None:
+        self.evolves_engine.set_call_ai_api(call_ai_api)
 
     def enabled(self) -> bool:
         return bool(getattr(self.plugin_config, "personification_background_intelligence_enabled", True))
@@ -137,8 +141,7 @@ class BackgroundIntelligence:
             if not memory_id:
                 continue
             processed += 1
-            decisions = await asyncio.to_thread(
-                self.evolves_engine.process_memory,
+            decisions = await self.evolves_engine.process_memory_async(
                 memory_id,
                 group_id=str(group_id or ""),
             )
@@ -228,8 +231,7 @@ class BackgroundIntelligence:
 
     async def _handle_new_memory(self, *, memory_id: str, group_id: str) -> None:
         if self.evolves_enabled():
-            await asyncio.to_thread(
-                self.evolves_engine.process_memory,
+            await self.evolves_engine.process_memory_async(
                 memory_id,
                 group_id=group_id,
             )

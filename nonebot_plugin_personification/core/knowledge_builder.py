@@ -15,7 +15,6 @@ from .plugin_inspector import (
     scan_runtime_data,
 )
 from ..agent.inner_state import get_personification_data_dir
-from ..skills.skillpacks.tool_caller.scripts.impl import ToolCaller
 
 
 def _now_iso() -> str:

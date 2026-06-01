@@ -4,16 +4,29 @@ import threading
 from dataclasses import dataclass
 from typing import Any, Iterable, Optional
 
-from ..skills.skillpacks.tool_caller.scripts.impl import (
-    ToolCaller,
-    ToolCallerResponse,
-    build_tool_caller,
-)
-from ..skills.skillpacks.vision_caller.scripts.impl import build_vision_caller
-
 
 _EMITTED_ROUTE_WARNINGS: set[str] = set()
 _ROUTE_WARNING_LOCK = threading.RLock()
+
+
+def _tool_caller_impl() -> Any:
+    from ..skills.skillpacks.tool_caller.scripts import impl
+
+    return impl
+
+
+def _build_tool_caller(config: Any) -> Any:
+    return _tool_caller_impl().build_tool_caller(config)
+
+
+def _tool_caller_response_cls() -> Any:
+    return _tool_caller_impl().ToolCallerResponse
+
+
+def _build_vision_caller(config: Any) -> Any:
+    from ..skills.skillpacks.vision_caller.scripts.impl import build_vision_caller
+
+    return build_vision_caller(config)
 
 
 @dataclass(frozen=True)
@@ -31,6 +44,12 @@ def _normalize_api_type(api_type: str) -> str:
         return "anthropic"
     if value in {"openai_codex", "codex"}:
         return "openai_codex"
+    if value in {"gemini_cli", "geminicli"}:
+        return "gemini_cli"
+    if value in {"antigravity_cli", "antigravity", "agy", "agy_cli"}:
+        return "antigravity_cli"
+    if value in {"claude_code", "claudecode", "claude_cli"}:
+        return "claude_code"
     return "openai"
 
 
@@ -52,9 +71,9 @@ def _provider_model_is_compatible(api_type: str, model: str) -> bool:
         return False
     if normalized_type == "openai_codex":
         return not normalized_model.startswith(("gemini", "claude"))
-    if normalized_type == "gemini_official":
+    if normalized_type in {"gemini_official", "gemini_cli", "antigravity_cli"}:
         return not normalized_model.startswith(("gpt-", "claude"))
-    if normalized_type == "anthropic":
+    if normalized_type in {"anthropic", "claude_code"}:
         return not normalized_model.startswith(("gpt-", "gemini"))
     return True
 
@@ -67,7 +86,7 @@ def _provider_is_usable(provider: dict[str, Any] | None) -> bool:
         return False
     if not _provider_model_is_compatible(api_type, model):
         return False
-    if api_type == "openai_codex":
+    if api_type in {"openai_codex", "gemini_cli", "antigravity_cli", "claude_code"}:
         return True
     return bool(str(payload.get("api_key", "") or "").strip())
 
@@ -460,11 +479,23 @@ class _ProviderConfigProxy:
             return self._provider.get("api_url", "")
         if name == "personification_api_key":
             return self._provider.get("api_key", "")
+        if name == "personification_proxy":
+            return self._provider.get("proxy", "")
         if name == "personification_model":
             if self._model_override:
                 return self._model_override
             return self._provider.get("model", "")
         if name == "personification_codex_auth_path":
+            return self._provider.get("auth_path", "")
+        if name == "personification_gemini_cli_auth_path":
+            return self._provider.get("auth_path", "")
+        if name == "personification_gemini_cli_project":
+            return self._provider.get("project", "")
+        if name == "personification_antigravity_cli_auth_path":
+            return self._provider.get("auth_path", "")
+        if name == "personification_antigravity_cli_project":
+            return self._provider.get("project", "")
+        if name == "personification_claude_code_auth_path":
             return self._provider.get("auth_path", "")
         if name == "personification_thinking_mode" and self._thinking_mode_override:
             return self._thinking_mode_override
@@ -489,7 +520,7 @@ def _is_invalid_tool_response(response: ToolCallerResponse) -> bool:
     return True
 
 
-class RoutedToolCaller(ToolCaller):
+class RoutedToolCaller:
     def __init__(
         self,
         *,
@@ -532,7 +563,7 @@ class RoutedToolCaller(ToolCaller):
                     self._tool_call_callers[call_id] = caller
             return response
         if saw_vision_unavailable:
-            return ToolCallerResponse(
+            return _tool_caller_response_cls()(
                 finish_reason="stop",
                 content="",
                 tool_calls=[],
@@ -541,7 +572,7 @@ class RoutedToolCaller(ToolCaller):
             )
         if last_error is not None:
             raise last_error
-        return ToolCallerResponse(
+        return _tool_caller_response_cls()(
             finish_reason="stop",
             content="",
             tool_calls=[],
@@ -571,7 +602,7 @@ def build_routed_tool_caller(
 ) -> ToolCaller:
     providers = _get_primary_provider_list(plugin_config, logger)
     primary_callers = [
-        build_tool_caller(
+        _build_tool_caller(
             _ProviderConfigProxy(
                 plugin_config,
                 provider,
@@ -587,7 +618,7 @@ def build_routed_tool_caller(
         fallback_signature = _provider_signature(fallback_resolution.provider)
         primary_signatures = {_provider_signature(provider) for provider in providers}
         if fallback_signature not in primary_signatures:
-            fallback_caller = build_tool_caller(
+            fallback_caller = _build_tool_caller(
                 _ProviderConfigProxy(
                     plugin_config,
                     fallback_resolution.provider,
@@ -596,7 +627,7 @@ def build_routed_tool_caller(
                 )
             )
     if not primary_callers and fallback_caller is None:
-        return build_tool_caller(plugin_config)
+        return _build_tool_caller(plugin_config)
     return RoutedToolCaller(
         primary_callers=primary_callers,
         fallback_caller=fallback_caller,
@@ -646,7 +677,7 @@ def build_fallback_vision_caller(
                 return False
             return getattr(self._original, name)
 
-    return build_vision_caller(_FallbackVisionConfig(plugin_config, resolution.provider))
+    return _build_vision_caller(_FallbackVisionConfig(plugin_config, resolution.provider))
 
 
 __all__ = [

@@ -172,6 +172,59 @@ def get_sticker_feedback_bonus(sticker_name: str, state: dict[str, Any] | None =
     return round((score - 0.5) * 4.0, 3)
 
 
+# 衰减权重：发过的表情包短期内被压制，避免高 weight 反复中签。
+# - 1 小时内：multiplier = 0.3（强烈压制）
+# - 1-24 小时：线性从 0.3 恢复到 1.0
+# - ≥24 小时：1.0（完全恢复）
+_DECAY_FLOOR = 0.3
+_DECAY_FULL_RECOVERY_HOURS = 24.0
+_DECAY_GRACE_HOURS = 1.0
+
+
+def _parse_last_sent_at(raw: str) -> float:
+    """把 '2026-05-18 14:23:00' 解析为 epoch 秒；失败返 0。"""
+    text = str(raw or "").strip()
+    if not text:
+        return 0.0
+    try:
+        return datetime.strptime(text, "%Y-%m-%d %H:%M:%S").timestamp()
+    except ValueError:
+        pass
+    try:
+        return datetime.fromisoformat(text.replace("Z", "+00:00")).timestamp()
+    except Exception:
+        return 0.0
+
+
+def get_sticker_decay_multiplier(
+    sticker_name: str,
+    state: dict[str, Any] | None = None,
+    *,
+    now_ts: float | None = None,
+) -> float:
+    """根据上次发送时间返回 0.3~1.0 的乘子，用于抑制刚刚发过的表情包再次被选。
+
+    用法：在表情包选择器打分阶段乘以本系数：
+        final_score = base_weight * feedback_score * get_sticker_decay_multiplier(name)
+    """
+    payload = _normalize_state(state)
+    entry = dict(payload.get("items", {}) or {}).get(str(sticker_name or "").strip())
+    if not isinstance(entry, dict):
+        return 1.0
+    last_sent_ts = _parse_last_sent_at(entry.get("last_sent_at", ""))
+    if last_sent_ts <= 0:
+        return 1.0
+    current_ts = float(now_ts) if now_ts is not None else time.time()
+    hours_since = max(0.0, (current_ts - last_sent_ts) / 3600.0)
+    if hours_since < _DECAY_GRACE_HOURS:
+        return _DECAY_FLOOR
+    if hours_since >= _DECAY_FULL_RECOVERY_HOURS:
+        return 1.0
+    # 线性插值 0.3 → 1.0
+    progress = (hours_since - _DECAY_GRACE_HOURS) / (_DECAY_FULL_RECOVERY_HOURS - _DECAY_GRACE_HOURS)
+    return round(_DECAY_FLOOR + (1.0 - _DECAY_FLOOR) * progress, 3)
+
+
 def _parse_reaction_verdict(raw: Any) -> str:
     text = str(raw or "").strip().lower()
     if re.search(r"\bpositive\b", text):
@@ -236,6 +289,7 @@ async def record_sticker_feedback(
 
 __all__ = [
     "build_sticker_feedback_scene_key",
+    "get_sticker_decay_multiplier",
     "get_sticker_feedback_bonus",
     "get_sticker_score",
     "load_sticker_feedback",

@@ -60,6 +60,7 @@ DDL_STATEMENTS = (
         mentioned_ids    TEXT NOT NULL DEFAULT '[]',
         is_at_bot        INTEGER NOT NULL DEFAULT 0,
         message_id       TEXT DEFAULT NULL,
+        thread_id        TEXT NOT NULL DEFAULT '',
         source_kind      TEXT NOT NULL DEFAULT 'user',
         sender_role      TEXT NOT NULL DEFAULT '',
         timestamp   REAL    NOT NULL
@@ -68,6 +69,24 @@ DDL_STATEMENTS = (
     """
     CREATE INDEX IF NOT EXISTS idx_group_messages_group
         ON group_messages(group_id, timestamp)
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS idx_group_messages_thread
+        ON group_messages(group_id, thread_id, timestamp)
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS conversation_threads (
+        thread_id      TEXT PRIMARY KEY,
+        group_id       TEXT NOT NULL,
+        topic_summary  TEXT NOT NULL DEFAULT '',
+        participants   TEXT NOT NULL DEFAULT '[]',
+        created_at     REAL NOT NULL,
+        last_active_at REAL NOT NULL
+    )
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS idx_conversation_threads_group
+        ON conversation_threads(group_id, last_active_at DESC)
     """,
     """
     CREATE TABLE IF NOT EXISTS group_relation_edges (
@@ -119,6 +138,118 @@ DDL_STATEMENTS = (
         PRIMARY KEY (user_id, task_id)
     )
     """,
+    """
+    CREATE TABLE IF NOT EXISTS token_usage_ledger (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        bucket_day TEXT NOT NULL,
+        group_id TEXT NOT NULL DEFAULT '',
+        user_id TEXT NOT NULL DEFAULT '',
+        model TEXT NOT NULL DEFAULT '',
+        purpose TEXT NOT NULL DEFAULT '',
+        prompt_tokens INTEGER NOT NULL DEFAULT 0,
+        completion_tokens INTEGER NOT NULL DEFAULT 0,
+        total_tokens INTEGER NOT NULL DEFAULT 0,
+        call_count INTEGER NOT NULL DEFAULT 0,
+        updated_at REAL NOT NULL
+    )
+    """,
+    """
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_token_usage_bucket
+        ON token_usage_ledger(bucket_day, group_id, user_id, model, purpose)
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS idx_token_usage_day ON token_usage_ledger(bucket_day)
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS idx_token_usage_group ON token_usage_ledger(group_id, bucket_day)
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS group_style_snapshots (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        group_id TEXT NOT NULL,
+        style_text TEXT NOT NULL DEFAULT '',
+        style_json TEXT NOT NULL DEFAULT '{}',
+        created_at REAL NOT NULL DEFAULT 0
+    )
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS idx_group_style_gid_ts
+        ON group_style_snapshots(group_id, created_at DESC)
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS webui_audit_log (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        ts REAL NOT NULL,
+        action TEXT NOT NULL,
+        qq TEXT NOT NULL DEFAULT '',
+        device_id TEXT NOT NULL DEFAULT '',
+        target TEXT NOT NULL DEFAULT '',
+        ip_hash TEXT NOT NULL DEFAULT '',
+        detail TEXT NOT NULL DEFAULT '{}',
+        outcome TEXT NOT NULL DEFAULT 'ok'
+    )
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS idx_webui_audit_ts ON webui_audit_log(ts DESC)
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS idx_webui_audit_action ON webui_audit_log(action, ts DESC)
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS proactive_diagnostics (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        ts REAL NOT NULL,
+        scope TEXT NOT NULL,            -- 'private' / 'group_idle' / 'qzone'
+        target TEXT NOT NULL DEFAULT '', -- user_id / group_id / ''
+        outcome TEXT NOT NULL,          -- 'sent' / 'skip_X' (X = reason code)
+        detail TEXT NOT NULL DEFAULT '{}',
+        next_eligible_at REAL DEFAULT NULL
+    )
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS idx_proactive_diag_ts ON proactive_diagnostics(ts DESC)
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS idx_proactive_diag_scope ON proactive_diagnostics(scope, ts DESC)
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS provider_health_stats (
+        provider_name    TEXT PRIMARY KEY,
+        sample_count     INTEGER NOT NULL DEFAULT 0,
+        success_count    INTEGER NOT NULL DEFAULT 0,
+        failure_count    INTEGER NOT NULL DEFAULT 0,
+        avg_latency_ms   REAL NOT NULL DEFAULT 0,
+        last_request_at  REAL DEFAULT NULL,
+        last_success_at  REAL DEFAULT NULL,
+        last_failure_at  REAL DEFAULT NULL,
+        last_error_kind  TEXT NOT NULL DEFAULT '',
+        last_seen_at     REAL NOT NULL DEFAULT 0
+    )
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS idx_provider_health_seen ON provider_health_stats(last_seen_at)
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS meme_dictionary (
+        term TEXT NOT NULL,
+        aliases TEXT NOT NULL DEFAULT '[]',
+        meaning TEXT NOT NULL DEFAULT '',
+        tone TEXT NOT NULL DEFAULT '[]',
+        risk_level TEXT NOT NULL DEFAULT 'low',
+        examples TEXT NOT NULL DEFAULT '[]',
+        scope TEXT NOT NULL DEFAULT 'public',
+        group_id TEXT NOT NULL DEFAULT '',
+        confidence REAL NOT NULL DEFAULT 0,
+        evidence_message_ids TEXT NOT NULL DEFAULT '[]',
+        safe_usage TEXT NOT NULL DEFAULT '',
+        updated_at REAL NOT NULL,
+        PRIMARY KEY(scope, group_id, term)
+    )
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS idx_meme_dictionary_scope
+        ON meme_dictionary(scope, group_id, updated_at DESC)
+    """,
 )
 
 
@@ -159,21 +290,54 @@ def _table_columns(conn: sqlite3.Connection, table_name: str) -> set[str]:
 
 def _ensure_group_message_schema(conn: sqlite3.Connection) -> None:
     columns = _table_columns(conn, "group_messages")
+    if not columns:
+        return  # table not created yet; DDL loop will create it with all columns
     if "image_count" not in columns:
         conn.execute("ALTER TABLE group_messages ADD COLUMN image_count INTEGER NOT NULL DEFAULT 0")
     if "visual_summary" not in columns:
         conn.execute("ALTER TABLE group_messages ADD COLUMN visual_summary TEXT NOT NULL DEFAULT ''")
     if "sender_role" not in columns:
         conn.execute("ALTER TABLE group_messages ADD COLUMN sender_role TEXT NOT NULL DEFAULT ''")
+    if "thread_id" not in columns:
+        conn.execute("ALTER TABLE group_messages ADD COLUMN thread_id TEXT NOT NULL DEFAULT ''")
+
+
+def _ensure_group_style_schema(conn: sqlite3.Connection) -> None:
+    """旧版 group_style_snapshots 以 group_id 为 PK 仅存最新；新版改多行 + created_at 索引保留历史。
+    若检测到旧 schema（无 id 列）则 DROP 重建。旧表无写入方，无数据丢失风险。
+    """
+    columns = _table_columns(conn, "group_style_snapshots")
+    if not columns:
+        return
+    if "id" not in columns or "created_at" not in columns:
+        conn.execute("DROP TABLE IF EXISTS group_style_snapshots")
+        conn.execute(
+            """
+            CREATE TABLE group_style_snapshots (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                group_id TEXT NOT NULL,
+                style_text TEXT NOT NULL DEFAULT '',
+                style_json TEXT NOT NULL DEFAULT '{}',
+                created_at REAL NOT NULL DEFAULT 0
+            )
+            """
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_group_style_gid_ts ON group_style_snapshots(group_id, created_at DESC)"
+        )
 
 
 def init_db_sync(data_dir: str | Path) -> Path:
     global _db_path
     _db_path = Path(data_dir) / DB_FILENAME
     with connect_sync(_db_path) as conn:
+        # 先迁移老表 schema，避免 DDL 循环里 CREATE INDEX 引用新列时
+        # 老表（缺该列）抛 OperationalError。
+        _ensure_group_style_schema(conn)
+        _ensure_group_message_schema(conn)
+        conn.commit()  # 让迁移立即可见，下面的 DDL CREATE INDEX 才能引用新列
         for ddl in DDL_STATEMENTS:
             conn.execute(ddl)
-        _ensure_group_message_schema(conn)
         conn.commit()
     return _db_path
 

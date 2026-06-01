@@ -18,6 +18,7 @@ PERSONIFICATION_USAGE = (
     "  - 拟人 记忆 状态|补建|衰减|演化|结晶 执行：管理记忆系统\n"
     "  - 拟人 迁移 状态|执行：查看或执行旧数据迁移\n"
     "  - 拟人 召回 统计：查看长期记忆召回统计\n"
+    "  - 拟人 空间 状态|测试 <QQ号/@用户>|消息：查看 QQ 空间任务、测试好友空间互动或立即轮询空间留言\n"
     "  - 英文前缀：/persona；中文前缀：拟人 / 人格\n"
     "  - 兼容简写：拟人 配置列表 / 配置查看 / 配置设置 / 配置重置 / 记忆状态 / 召回统计\n\n"
     "全局开关命令（超管）：\n"
@@ -67,7 +68,12 @@ PERSONIFICATION_USAGE = (
     "  - 刷新画像：重建当前用户画像\n"
     "  - 说/朗读/配音 [--mode preset|design|clone] [--voice 音色] [--style 风格] [--voice-prompt 音色描述] [--clone-voice data:...] [--clone-path 样本路径] 文本：输出语音\n\n"
     "其他命令（超管）：\n"
-    "  - 发个说说：触发动态/日记类输出\n\n"
+    "  - 发个说说：触发动态/日记类输出\n"
+    "  - 拟人 更新 / 拟人更新：检查并拉取插件最新版本\n\n"
+    "QQ 空间命令（超管）：\n"
+    "  - 拟人 空间 状态：查看主动发空间与好友空间互动状态\n"
+    "  - 拟人 空间 测试 <QQ号/@用户>：指定好友执行一次空间读取与 LLM 互动测试\n"
+    "  - 拟人 空间 消息：立即轮询 Bot 自己空间下的新留言\n\n"
     "帮助命令：\n"
     "  - 拟人帮助\n"
     "  - 拟人命令\n"
@@ -83,11 +89,11 @@ def build_plugin_usage_text() -> str:
 def build_plugin_metadata(config_cls: type) -> PluginMetadata:
     return PluginMetadata(
         name="拟人化聊天",
-        description="基于群聊与私聊上下文的人设回复插件，支持作息模拟、联网检索、风格学习、主动私聊、贴图、画像与 Agent 工具调用。",
+        description="基于群聊与私聊上下文的人设回复插件，支持作息模拟、联网检索、风格学习与主动私聊。",
         usage=build_plugin_usage_text(),
         config=config_cls,
         type="application",
-        homepage="https://github.com/luojisama/nonebot-plugin-personification",
+        homepage="https://github.com/shirosaki/shirotest",
         supported_adapters={"~onebot.v11"},
         extra={
             "help_commands": ["拟人帮助", "拟人命令", "拟人管理命令", "拟人 帮助", "/persona help"],
@@ -100,6 +106,7 @@ def build_plugin_metadata(config_cls: type) -> PluginMetadata:
                     "/persona memory",
                     "/persona migrate",
                     "/persona recall",
+                    "/persona qzone",
                 ],
                 "global_admin": [
                     "拟人开关",
@@ -113,6 +120,7 @@ def build_plugin_metadata(config_cls: type) -> PluginMetadata:
                     "插件知识库错误",
                     "删除插件知识库",
                     "清空插件知识库",
+                    "拟人更新",
                 ],
                 "group_admin": [
                     "开启拟人",
@@ -156,10 +164,10 @@ def build_plugin_metadata(config_cls: type) -> PluginMetadata:
                 ],
                 "diary_admin": [
                     "发个说说",
+                    "拟人 空间 状态",
+                    "拟人 空间 测试",
                 ],
             },
-            "author": "luojisama",
-            "version": "0.5.3",
-            "pypi": "nonebot-plugin-shiro-personification",
+            "dev_doc": "D:/bot/nonebot/shiro002/dev/拟人.md",
         },
     )

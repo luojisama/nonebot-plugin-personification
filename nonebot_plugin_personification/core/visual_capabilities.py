@@ -120,16 +120,31 @@ def error_indicates_vision_unavailable(error: Any) -> bool:
 
 
 def heuristic_supports_vision(api_type: str, model: str | None = None) -> bool:
+    """判断 provider 是否支持视觉输入（接收 image_url 类型 content）。
+
+    api_type 仅描述协议格式（openai/anthropic/gemini 等），不代表上游模型一定支持视觉。
+    例如 api_type=openai + model=deepseek-v4-flash（第三方网关）协议是 OpenAI 但模型不
+    支持视觉。**必须 api_type + model 双重判定。**
+
+    注意：antigravity_cli 不在硬编码白名单中，因为其底层走的是 OAuth 转发，
+    不同账号 / 路由配置下视觉能力差异较大。它的视觉能力**只信任探测结果**，
+    探测未通过时这里返回 False，让 provider_router 提前剥离 image parts。
+    """
     api = str(api_type or "").strip().lower().replace("-", "_")
     model_text = str(model or "").strip().lower()
     if api == "openai_codex":
         return "codex" in model_text
-    if api in {"openai", "openai_like", "openai_compatible", "anthropic", "gemini", "gemini_official"}:
+    # 官方 Anthropic / Gemini API：所有当前模型都支持视觉
+    if api in {"anthropic", "gemini", "gemini_official", "gemini_cli", "claude_code"}:
         return True
+    # 显式视觉模型关键字
     if "vision" in model_text:
         return True
-    if any(token in model_text for token in ("gpt-4o", "gpt-5", "gemini", "claude")):
+    # 已知支持视觉的官方模型家族（按 model 名匹配，不看 api_type）
+    if any(token in model_text for token in ("gpt-4o", "gpt-4-turbo", "gpt-5", "gpt-image", "gemini", "claude")):
         return True
+    # api_type=openai/antigravity_cli 但 model 名不在已知视觉列表（如 deepseek、qwen、kimi、yi、glm
+    # 等第三方网关）→ 默认不支持视觉，避免把 image_url 直接发过去 400
     return False
 
 
@@ -141,7 +156,7 @@ def _probe_response_matches_expected(content: str) -> bool:
 def heuristic_supports_video(api_type: str, model: str | None = None) -> bool:
     api = str(api_type or "").strip().lower().replace("-", "_")
     model_text = str(model or "").strip().lower()
-    if api in {"gemini", "gemini_official"}:
+    if api in {"gemini", "gemini_official", "gemini_cli", "antigravity_cli"}:
         return True
     return "gemini" in model_text
 
@@ -188,6 +203,16 @@ def _clone_provider_config(original: Any, provider: Dict[str, Any]) -> Any:
             if name == "personification_model":
                 return self._selected.get("model", "")
             if name == "personification_codex_auth_path":
+                return self._selected.get("auth_path", "")
+            if name == "personification_gemini_cli_auth_path":
+                return self._selected.get("auth_path", "")
+            if name == "personification_gemini_cli_project":
+                return self._selected.get("project", "")
+            if name == "personification_antigravity_cli_auth_path":
+                return self._selected.get("auth_path", "")
+            if name == "personification_antigravity_cli_project":
+                return self._selected.get("project", "")
+            if name == "personification_claude_code_auth_path":
                 return self._selected.get("auth_path", "")
             return getattr(self._base, name)
 

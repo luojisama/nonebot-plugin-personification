@@ -6,7 +6,6 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from ..core.message_parts import build_user_message_content
-from ..skills.skillpacks.tool_caller.scripts.impl import ToolCaller
 
 
 _JSON_BLOCK_RE = re.compile(r"\{.*\}", re.S)

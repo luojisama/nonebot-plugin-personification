@@ -14,16 +14,24 @@ from ...core.time_ctx import get_configured_now
 from ..tool_registry import ToolRegistry
 from ...core.message_parts import extract_text_from_parts
 from ...core.web_grounding import merge_grounding_topic
-from ...skills.skillpacks.tool_caller.scripts.impl import (
-    AnthropicToolCaller,
-    GeminiToolCaller,
-    OpenAICodexToolCaller,
-    ToolCaller,
-)
 from .constants import (
     DEFAULT_AGENT_MAX_STEPS,
-    MAX_EMPTY_LOOKUP_RECOVERY_ROUNDS,
-    MAX_PROMISED_LOOKUP_NO_TOOL_ROUNDS,
+)
+from .executor import _execute_tool_with_retries
+from .evidence import (
+    EvidenceSynthesis,
+    build_tool_result_record as _build_tool_result_record,
+    evidence_synthesizer_enabled as _evidence_synthesizer_enabled,
+    plan_for_evidence as _plan_for_evidence,
+    render_evidence_guidance as _evidence_guidance,
+    synthesize_evidence_with_llm,
+)
+from .image_generation import (
+    _IMAGE_GENERATION_TOOL_NAME,
+    _can_start_background_image_generation,
+    _extract_image_b64_tool_result,
+    _generate_image_generation_status_reply,
+    _start_background_image_generation,
 )
 from .intent import (
     _clean_user_query_text,
@@ -49,6 +57,14 @@ from .tool_selection import (
     _select_tool_schemas,
     _semantic_tool_guidance,
 )
+from .wrappers import (
+    _IMAGE_B64_TOOL_RESULT_RE,
+    _extract_persona_system_prompt,
+    _format_image_generation_failure,
+    _is_direct_media_tool_result,
+    _render_tool_result_for_user,
+    _wrap_tool_result_in_persona,
+)
 from .fallbacks import (
     _cancel_task_safely,
     _inject_background_tool_result,
@@ -59,24 +75,6 @@ from .fallbacks import (
 )
 
 
-_SHORT_CONFIRMATION_HINTS = frozenset([
-    "好", "好的", "好啊", "好呀", "行", "行啊", "可以", "可以的",
-    "嗯", "嗯嗯", "要", "要的", "来", "来吧", "安排", "整理吧",
-    "发我", "发吧", "给我", "给我吧",
-])
-_DEFERRED_LOOKUP_STRONG_PATTERNS = (
-    re.compile(r"(我|这边).{0,8}(去|先|再)?(查|搜|找|看)(一下|下|看)?"),
-    re.compile(r"(稍等|等我|你等下|先别急).{0,8}(查|搜|找|看)"),
-    re.compile(r"(我|这边).{0,12}(换个关键词|继续搜|继续找|再搜|再找)"),
-)
-_DEFERRED_LOOKUP_WEAK_HINTS = (
-    "查一下", "查下", "搜一下", "搜下", "找一下", "找下", "看一下", "看下",
-    "继续找", "继续搜", "换个关键词", "再搜", "再找", "稍等", "等我", "我去查", "我去找", "我去搜",
-)
-_LOOKUP_FINAL_REPLY_HINTS = (
-        "先给你", "先整理", "我整理了", "结论是", "建议你", "可以直接", "答案是",
-    "你可以", "建议改搜", "补充更具体", "更具体一点",
-)
 _QUERY_REWRITE_TOOL_NAMES = frozenset(
     {
         "parallel_research",
@@ -95,18 +93,29 @@ _RETRYABLE_LOOKUP_TOOLS = frozenset(
 )
 _TIME_SENSITIVE_SEARCH_TOOLS = frozenset({"web_search", "search_web"})
 _TIME_SENSITIVE_RE = re.compile("\u6700\u65b0|\u8fd1\u671f|\u73b0\u5728|\u4eca\u5e74|\u4eca\u5929|\u5f53\u524d|latest|recent|now", re.IGNORECASE)
-_IMAGE_B64_TOOL_RESULT_RE = re.compile(r"\[IMAGE_B64\]([A-Za-z0-9+/=\r\n]+)\[/IMAGE_B64\]")
-_IMAGE_GENERATION_TOOL_NAME = "generate_image"
-_IMAGE_FAILURE_DIAGNOSTIC_HINTS = (
-    "empty image response",
-    "raw_keys=",
-    "output_items=",
-    "output_types=",
-    "content_types=",
-    "result_keys=",
-)
-_IMAGE_GENERATION_BACKGROUND_MAX_STEPS = 5
-_IMAGE_GENERATION_STATUS_TIMEOUT_SECONDS = 8.0
+
+
+async def _spawn_active_learning(
+    *,
+    tool_caller: Any,
+    memory_store: Any,
+    uncertainty_notes: list[str],
+    group_id: str,
+    research_followup_query: str,
+    plugin_config: Any,
+) -> None:
+    try:
+        from ...core.active_learning import run_active_learning
+        await run_active_learning(
+            tool_caller=tool_caller,
+            memory_store=memory_store,
+            uncertainty_notes=uncertainty_notes,
+            group_id=group_id,
+            research_followup_query=research_followup_query,
+            plugin_config=plugin_config,
+        )
+    except Exception:
+        pass
 
 
 def _maybe_inject_date_to_query(tool_name: str, args: dict[str, Any]) -> dict[str, Any]:
@@ -154,6 +163,15 @@ _BANTER_BLOCKED_TOOL_NAMES = frozenset(
     | set(_PLUGIN_KNOWLEDGE_TOOL_NAMES)
     | {"vision_analyze", "analyze_image", "resolve_acg_entity"}
 )
+_BUILTIN_SEARCH_CALLER_NAMES = frozenset({
+    "GeminiToolCaller",
+    "AnthropicToolCaller",
+    "OpenAICodexToolCaller",
+    # 三个 CLI 协议 caller 内部也已注入对应原生 search 工具（impl.py:3203/3741/4005）
+    "GeminiCliToolCaller",
+    "AntigravityCliToolCaller",
+    "ClaudeCodeToolCaller",
+})
 
 
 @dataclass
@@ -191,78 +209,6 @@ def _summarize_tool_response_raw(raw: Any) -> str:
     )
 
 
-async def _classify_deferred_lookup_reply(
-    *,
-    tool_caller: ToolCaller,
-    user_query_text: str,
-    assistant_reply_text: str,
-    previous_tool_name: str = "",
-    previous_tool_result_text: str = "",
-) -> bool:
-    reply = str(assistant_reply_text or "").strip()
-    if not reply:
-        return False
-
-    response = await tool_caller.chat_with_tools(
-        [
-            {
-                "role": "system",
-                "content": (
-                    "你是回复状态分类器。"
-                    "判断 assistant 当前草稿到底是在直接给最终答案，还是只是在承诺继续搜索/继续查找。"
-                    "如果草稿本质上是在说还要继续搜、继续换关键词、继续找资料，而没有真正完成答复，只输出 RETRY_SEARCH。"
-                    "如果草稿已经是可直接发给用户的最终答复，或者明确结束搜索并给出结论/建议，只输出 FINAL_ANSWER。"
-                    "禁止输出解释、标点、JSON、其他文本。"
-                ),
-            },
-            {
-                "role": "user",
-                "content": (
-                    f"用户需求：{str(user_query_text or '').strip() or '[EMPTY]'}\n"
-                    f"assistant 草稿：{reply}\n"
-                    f"上一轮工具：{str(previous_tool_name or '').strip() or '[NONE]'}\n"
-                    f"上一轮工具结果摘要：{str(previous_tool_result_text or '').strip()[:600] or '[NONE]'}"
-                ),
-            },
-        ],
-        [],
-        False,
-    )
-    decision = str(response.content or "").strip().upper()
-    return decision == "RETRY_SEARCH"
-
-
-def _looks_like_deferred_lookup_reply(text: str) -> bool:
-    reply = str(text or "").strip()
-    if not reply:
-        return False
-    if any(hint in reply for hint in _LOOKUP_FINAL_REPLY_HINTS):
-        return False
-    return any(pattern.search(reply) for pattern in _DEFERRED_LOOKUP_STRONG_PATTERNS)
-
-
-def _should_classify_deferred_lookup_reply(
-    *,
-    assistant_reply_text: str,
-    previous_tool_name: str = "",
-    previous_tool_result_text: str = "",
-) -> bool:
-    if not str(assistant_reply_text or "").strip():
-        return False
-    return bool(str(previous_tool_name or "").strip())
-
-
-def _looks_like_short_confirmation(text: str) -> bool:
-    normalized = re.sub(r"[\s，。！？、,.!?：:~～]+", "", str(text or "").strip().lower())
-    if not normalized:
-        return False
-    if normalized in _SHORT_CONFIRMATION_HINTS:
-        return True
-    return len(normalized) <= 4 and normalized in {
-        "好", "行", "嗯", "要", "来", "可", "ok", "yes",
-    }
-
-
 async def _invoke_tool_handler(
     *,
     tool_name: str,
@@ -289,448 +235,6 @@ def _tool_timeout_result(tool_name: str) -> str:
     return "工具调用失败：超时"
 
 
-def _extract_image_b64_tool_result(result_text: str) -> str:
-    match = _IMAGE_B64_TOOL_RESULT_RE.search(str(result_text or ""))
-    if not match:
-        return ""
-    return re.sub(r"\s+", "", match.group(1) or "").strip()
-
-
-def _can_send_background_image(executor: Any) -> bool:
-    return bool(
-        callable(getattr(executor, "send_image_b64", None))
-        and callable(getattr(executor, "send_text", None))
-    )
-
-
-def _is_likely_delivered_send_timeout(exc: Exception) -> bool:
-    # NapCat 在底层 QQ NT sendMsg 超过内部 5s 阈值时会抛 retcode=1200 invoke timeout，
-    # 但消息通常已经实际下发，再补一句"发送失败"会误导用户。
-    info = getattr(exc, "info", None)
-    if not isinstance(info, dict):
-        return False
-    if int(info.get("retcode") or 0) == 1200:
-        return True
-    haystack = f"{info.get('message', '')} {info.get('wording', '')}".lower()
-    return "invoke timeout" in haystack
-
-
-def _can_start_background_image_generation(
-    *,
-    registry: ToolRegistry,
-    executor: Any,
-    user_request: str,
-) -> bool:
-    return bool(
-        _can_send_background_image(executor)
-        and registry.get(_IMAGE_GENERATION_TOOL_NAME) is not None
-        and str(user_request or "").strip()
-    )
-
-
-def _clone_messages_for_background(messages: List[dict]) -> list[dict]:
-    return [dict(message) for message in list(messages or []) if isinstance(message, dict)]
-
-
-def _clean_image_generation_status_reply(text: str) -> str:
-    reply = _IMAGE_B64_TOOL_RESULT_RE.sub("", str(text or "")).strip()
-    if reply in {"[NO_REPLY]", "<NO_REPLY>", "[SILENCE]", "<SILENCE>"}:
-        return reply
-    return reply
-
-
-async def _generate_image_generation_status_reply(
-    *,
-    tool_caller: ToolCaller,
-    messages: List[dict],
-    user_request: str,
-    logger: Any,
-) -> str:
-    status_messages = _clone_messages_for_background(messages)
-    status_messages.append(
-        {
-            "role": "system",
-            "content": (
-                "当前用户的需求会进入图片生成流程。"
-                "你只负责按人设和当前对话，给用户一句自然、很短的即时回应。"
-                "不要固定模板，不要解释工具流程，不要暴露后台、检索、prompt、模型等实现细节。"
-                "如果此刻不适合回复，可以只输出 [NO_REPLY]。"
-                f"\n用户图片需求：{str(user_request or '').strip()[:500]}"
-            ),
-        }
-    )
-    try:
-        response = await asyncio.wait_for(
-            tool_caller.chat_with_tools(
-                status_messages,
-                [],
-                False,
-            ),
-            timeout=_IMAGE_GENERATION_STATUS_TIMEOUT_SECONDS,
-        )
-    except Exception as exc:
-        log_exception(logger, "[agent] image generation status reply failed", exc, level="debug")
-        return ""
-    if getattr(response, "tool_calls", None):
-        return ""
-    return _clean_image_generation_status_reply(str(getattr(response, "content", "") or ""))
-
-
-def _build_background_image_generation_messages(
-    *,
-    messages: List[dict],
-    user_request: str,
-) -> list[dict]:
-    planning_messages = _clone_messages_for_background(messages)
-    planning_messages.append(
-        {
-            "role": "system",
-            "content": (
-                "你现在负责准备并执行图片生成，不是在写聊天回复。"
-                "先理解用户真正想要的画面、主体、风格、用途、文字和限制。"
-                "如有必要，优先调用 parallel_research 并行聚合图片参考、百科/设定和联网资料；"
-                "也可自行调用联网搜索、图片搜索、资源搜集、百科/实体解析、视觉理解等工具补充事实和参考图线索；"
-                "如果需求已经足够明确，也可以不检索。"
-                "拿到足够上下文后，必须调用 generate_image。"
-                "调用 generate_image 时，由你组装完整、可执行的生图 prompt，"
-                "把检索/参考图得到的关键信息消化进画面描述，不要只原样转述用户一句话。"
-                "size 也由你根据构图需求从工具允许值中选择。"
-                "不要向用户输出制作步骤；图片生成失败或需要澄清时，才输出一句自然说明。"
-                "如果调用了 parallel_research 或其他上下文工具，请先阅读结果，"
-                "把 must_include、must_avoid、prompt_hints 等关键约束吸收到最终 prompt，再调用 generate_image。"
-                f"\n用户图片需求：{str(user_request or '').strip()[:1000]}"
-            ),
-        }
-    )
-    return planning_messages
-
-
-async def _send_background_text(executor: Any, text: str, logger: Any) -> None:
-    content = str(text or "").strip()
-    if not content:
-        return
-    try:
-        await executor.send_text(content)
-    except Exception as exc:
-        log_exception(logger, "[agent] background image text send failed", exc, level="warning")
-
-
-async def _run_background_image_generation(
-    *,
-    registry: ToolRegistry,
-    executor: Any,
-    tool_caller: ToolCaller,
-    messages: List[dict],
-    user_request: str,
-    rewritten_query: ContextualQueryRewrite | None,
-    user_images: list[str],
-    use_builtin_search: bool,
-    logger: Any,
-) -> None:
-    if registry.get(_IMAGE_GENERATION_TOOL_NAME) is None:
-        await _send_background_text(executor, "图片生成失败：工具不可用", logger)
-        return
-    background_messages = _build_background_image_generation_messages(
-        messages=messages,
-        user_request=user_request,
-    )
-    last_tool_name = ""
-    last_tool_result_text = ""
-    for step in range(_IMAGE_GENERATION_BACKGROUND_MAX_STEPS):
-        active_schemas = _select_tool_schemas(
-            registry,
-            has_images=bool(user_images),
-            chat_intent="image_generation",
-            plugin_question_intent="",
-        )
-        try:
-            response = await tool_caller.chat_with_tools(
-                background_messages,
-                active_schemas,
-                use_builtin_search,
-            )
-        except Exception as exc:
-            log_exception(logger, "[agent] background image planning failed", exc, level="warning")
-            await _send_background_text(executor, f"图片生成失败：{exc}", logger)
-            return
-        content = str(getattr(response, "content", "") or "").strip()
-        tool_calls = list(getattr(response, "tool_calls", []) or [])
-        logger.info(
-            f"[agent] background_image step={step + 1} "
-            f"tool_calls={len(tool_calls)} content_len={len(content)}"
-        )
-        if not tool_calls:
-            if content:
-                await _send_background_text(executor, content, logger)
-            else:
-                await _send_background_text(executor, "图片生成失败：模型没有完成图片生成", logger)
-            return
-        background_messages.append(
-            {
-                "role": "assistant",
-                "content": content,
-                "tool_calls": [
-                    {
-                        "id": tool_call.id,
-                        "type": "function",
-                        "function": {
-                            "name": tool_call.name,
-                            "arguments": json.dumps(tool_call.arguments, ensure_ascii=False),
-                        },
-                    }
-                    for tool_call in tool_calls
-                ],
-            }
-        )
-        for tool_call in tool_calls:
-            logger.info(f"[agent] background_image tool_call name={tool_call.name}")
-            tool_args, result = await _execute_tool_with_retries(
-                registry=registry,
-                tool_name=tool_call.name,
-                tool_args=dict(tool_call.arguments or {}),
-                rewritten_query=None,
-                user_images=user_images,
-                previous_tool_name=last_tool_name,
-                previous_tool_result_text=last_tool_result_text,
-                logger=logger,
-                budget_deadline=None,
-            )
-            _ = tool_args
-            last_tool_name = str(tool_call.name or "").strip()
-            if str(result or "").strip():
-                last_tool_result_text = str(result).strip()
-            logger.info(
-                f"[agent] background_image tool_result name={tool_call.name} "
-                f"preview={str(result).replace(chr(10), ' ')[:220]}"
-            )
-            if last_tool_name == _IMAGE_GENERATION_TOOL_NAME:
-                image_b64 = _extract_image_b64_tool_result(str(result or ""))
-                if image_b64:
-                    try:
-                        await executor.send_image_b64(image_b64)
-                    except Exception as exc:
-                        log_exception(logger, "[agent] background image send failed", exc, level="warning")
-                        if not _is_likely_delivered_send_timeout(exc):
-                            await _send_background_text(executor, "图片生成好了，但发送图片失败了", logger)
-                    return
-                await _send_background_text(executor, _format_image_generation_failure(str(result or "")), logger)
-                return
-            background_messages.append(
-                tool_caller.build_tool_result_message(
-                    tool_call.id,
-                    tool_call.name,
-                    result,
-                )
-            )
-    if last_tool_result_text:
-        await _send_background_text(executor, "图片生成失败：模型没有继续完成生图调用", logger)
-        return
-    await _send_background_text(executor, "图片生成失败：模型没有开始生图调用", logger)
-
-
-def _start_background_image_generation(
-    *,
-    registry: ToolRegistry,
-    executor: Any,
-    tool_caller: ToolCaller,
-    messages: List[dict],
-    user_request: str,
-    rewritten_query: ContextualQueryRewrite | None,
-    user_images: list[str],
-    use_builtin_search: bool,
-    logger: Any,
-) -> bool:
-    request_text = str(user_request or "").strip()
-    if not _can_start_background_image_generation(
-        registry=registry,
-        executor=executor,
-        user_request=request_text,
-    ):
-        return False
-    task = asyncio.create_task(
-        _run_background_image_generation(
-            registry=registry,
-            executor=executor,
-            tool_caller=tool_caller,
-            messages=_clone_messages_for_background(messages),
-            user_request=request_text,
-            rewritten_query=rewritten_query,
-            user_images=list(user_images or []),
-            use_builtin_search=use_builtin_search,
-            logger=logger,
-        )
-    )
-
-    def _done(done_task: asyncio.Task) -> None:
-        if done_task.cancelled():
-            return
-        try:
-            exc = done_task.exception()
-        except asyncio.InvalidStateError:
-            return
-        if exc is not None:
-            log_exception(logger, "[agent] background image generation task crashed", exc, level="warning")
-
-    task.add_done_callback(_done)
-    return True
-
-
-async def _execute_tool_with_retries(
-    *,
-    registry: ToolRegistry,
-    tool_name: str,
-    tool_args: dict[str, Any],
-    rewritten_query: ContextualQueryRewrite | None,
-    user_images: list[str],
-    previous_tool_name: str = "",
-    previous_tool_result_text: str = "",
-    logger: Any,
-    budget_deadline: float | None = None,
-) -> tuple[dict[str, Any], str]:
-    tool = registry.get(tool_name)
-    if tool is None:
-        record_counter("agent.tool_fail_total", tool=tool_name, reason="missing")
-        return dict(tool_args or {}), f"工具 {tool_name} 不存在"
-
-    tool_args = _maybe_inject_date_to_query(tool_name, dict(tool_args or {}))
-    query_variants = _query_variants_for_tool(
-        tool_name=tool_name,
-        tool_args=tool_args,
-        rewritten_query=rewritten_query,
-    )
-    if not query_variants:
-        query_variants = [_clean_user_query_text(tool_args.get("query", ""))]
-    last_args = dict(tool_args or {})
-    last_result = ""
-    for index, query in enumerate(query_variants or [""]):
-        attempt_args = dict(tool_args or {})
-        if query:
-            attempt_args["query"] = query
-        attempt_args = _rewrite_tool_args(
-            registry=registry,
-            tool_name=tool_name,
-            tool_args=attempt_args,
-            rewritten_query=rewritten_query,
-            user_images=user_images,
-            previous_tool_name=previous_tool_name,
-            previous_tool_result_text=previous_tool_result_text,
-        )
-        attempt_args = _sanitize_tool_args_for_schema(
-            registry=registry,
-            tool_name=tool_name,
-            tool_args=attempt_args,
-        )
-        last_args = attempt_args
-        remaining_timeout = _remaining_time_budget_seconds(budget_deadline)
-        if remaining_timeout is not None and remaining_timeout <= 0.0:
-            record_counter("agent.tool_fail_total", tool=tool_name, reason="timeout")
-            record_timing("agent.tool_exec_ms", 0, tool=tool_name, status="timeout")
-            logger.warning(f"[agent] tool {tool_name} skipped because time budget was exhausted")
-            last_result = _tool_timeout_result(tool_name)
-            break
-        started_at = time.monotonic()
-        try:
-            invoke_coro = _invoke_tool_handler(
-                tool_name=tool_name,
-                tool=tool,
-                tool_args=attempt_args,
-            )
-            if remaining_timeout is None:
-                last_result = await invoke_coro
-            else:
-                last_result = await asyncio.wait_for(invoke_coro, timeout=remaining_timeout)
-        except asyncio.TimeoutError:
-            elapsed_ms = int((time.monotonic() - started_at) * 1000)
-            record_counter("agent.tool_fail_total", tool=tool_name, reason="timeout")
-            record_timing("agent.tool_exec_ms", elapsed_ms, tool=tool_name, status="timeout")
-            last_result = _tool_timeout_result(tool_name)
-            logger.warning(f"[agent] tool {tool_name} timed out after {elapsed_ms}ms")
-            break
-        except Exception as e:
-            elapsed_ms = int((time.monotonic() - started_at) * 1000)
-            record_counter("agent.tool_fail_total", tool=tool_name, reason="exception")
-            record_timing("agent.tool_exec_ms", elapsed_ms, tool=tool_name, status="fail")
-            last_result = f"工具调用失败：{e}"
-            log_exception(
-                logger,
-                f"[agent] tool {tool_name} error after {elapsed_ms}ms",
-                e,
-            )
-            break
-        elapsed_ms = int((time.monotonic() - started_at) * 1000)
-        record_counter("agent.tool_ok_total", tool=tool_name)
-        record_timing("agent.tool_exec_ms", elapsed_ms, tool=tool_name, status="ok")
-        logger.info(
-            f"[agent] tool_exec name={tool_name} attempt={index + 1}/{len(query_variants or [''])} "
-            f"elapsed_ms={elapsed_ms} result_len={len(str(last_result or ''))}"
-        )
-        if index > 0:
-            logger.info(f"[agent] retry {tool_name} with candidate={attempt_args.get('query', '')}")
-        if tool_name not in _RETRYABLE_LOOKUP_TOOLS or not _tool_result_indicates_empty(last_result):
-            break
-    return last_args, last_result
-
-
-def _render_tool_result_for_user(tool_name: str, result_text: str, query: str) -> str:
-    raw = str(result_text or "").strip()
-    if not raw:
-        return json.dumps({"status": "no_result", "query": _clean_user_query_text(query)}, ensure_ascii=False)
-
-    if tool_name == "collect_resources":
-        return raw
-
-    payload = _parse_json_tool_result(raw)
-    if not isinstance(payload, dict):
-        return raw
-
-    results = payload.get("results", [])
-    if not isinstance(results, list) or not results:
-        subject = _clean_user_query_text(query) or str(payload.get("query", "") or "这个主题").strip()
-        return json.dumps({"status": "no_result", "query": subject}, ensure_ascii=False)
-
-    lines: list[str] = []
-    subject = _clean_user_query_text(query) or str(payload.get("query", "") or "这个主题").strip()
-    lines.append(f"先给你整理 {min(len(results), 3)} 条「{subject}」参考：")
-    for index, item in enumerate(results[:3], start=1):
-        if not isinstance(item, dict):
-            continue
-        title = str(item.get("title", "") or item.get("full_name", "") or item.get("url", "")).strip()
-        snippet = str(item.get("snippet", "") or "").strip()
-        url = str(item.get("url", "") or "").strip()
-        source = str(item.get("source", "") or "").strip()
-        line = f"{index}. {title}"
-        if source:
-            line += f" [{source}]"
-        lines.append(line)
-        if snippet:
-            lines.append(snippet[:120])
-        if url:
-            lines.append(url)
-    return "\n".join(lines).strip()
-
-
-def _is_direct_media_tool_result(tool_name: str, result_text: str) -> bool:
-    return str(tool_name or "").strip() == _IMAGE_GENERATION_TOOL_NAME and bool(
-        _IMAGE_B64_TOOL_RESULT_RE.search(str(result_text or ""))
-    )
-
-
-def _format_image_generation_failure(result_text: str) -> str:
-    text = str(result_text or "").strip()
-    if not text:
-        return "图片生成失败：工具没有返回图片数据"
-    detail = text
-    if detail.startswith("图片生成失败"):
-        detail = detail.removeprefix("图片生成失败").lstrip("：: \t\r\n")
-    detail = re.sub(r"\s+", " ", detail).strip()
-    lowered = detail.lower()
-    if not detail:
-        return "图片生成失败：工具没有返回图片数据"
-    if any(hint in lowered for hint in _IMAGE_FAILURE_DIAGNOSTIC_HINTS):
-        return "图片生成失败：图片服务没有返回图片数据"
-    if len(detail) > 80:
-        detail = detail[:77].rstrip() + "..."
-    return f"图片生成失败：{detail}"
 
 
 def _direct_tool_result_agent_result(
@@ -738,7 +242,7 @@ def _direct_tool_result_agent_result(
     tool_name: str,
     result_text: str,
     pending_actions: List[dict],
-) -> AgentResult | None:
+) -> "AgentResult | None":
     text = str(result_text or "").strip()
     normalized_tool_name = str(tool_name or "").strip()
     if _is_direct_media_tool_result(normalized_tool_name, text):
@@ -758,66 +262,15 @@ def _direct_tool_result_agent_result(
     return None
 
 
-def _extract_persona_system_prompt(messages: List[dict]) -> str:
-    for message in messages:
-        if str(message.get("role", "") or "").strip() != "system":
-            continue
-        content = _render_message_text(message.get("content", ""))
-        if len(content) >= 200:
-            return content[:1200]
-    return ""
-
-
-async def _wrap_tool_result_in_persona(
-    *,
-    tool_caller: ToolCaller,
-    rendered_tool_result: str,
-    user_query_text: str,
-    persona_system: str = "",
-) -> str:
-    fallback_text = str(rendered_tool_result or "").strip()
-    if not fallback_text:
-        return ""
-    wrap_messages: list[dict[str, Any]] = []
-    if persona_system:
-        wrap_messages.append({"role": "system", "content": persona_system[:1200]})
-    wrap_messages.append(
-        {
-            "role": "system",
-            "content": (
-                "把下面的搜索/工具结果用你自己的口吻自然说给对方。"
-                "像群友顺手接话，不要暴露搜索、查询、工具、来源、链接这些中间过程。"
-                "不要列 URL，不要说“根据搜索结果”“我查了一下”。"
-                "控制在 60 字以内。"
-            ),
-        }
-    )
-    wrap_messages.append(
-        {
-            "role": "user",
-            "content": f"查询：{str(user_query_text or '').strip()[:200]}\n工具结果：{fallback_text[:1000]}",
-        }
-    )
-    try:
-        response = await asyncio.wait_for(
-            tool_caller.chat_with_tools(
-                wrap_messages,
-                [],
-                False,
-            ),
-            timeout=10.0,
-        )
-    except Exception:
-        return fallback_text
-    wrapped_text = str(getattr(response, "content", "") or "").strip()
-    return wrapped_text or fallback_text
-
-
 def _tool_signature(tool_name: str, tool_args: dict[str, Any]) -> str:
     return (
         f"{str(tool_name or '').strip()}:"
         f"{json.dumps(tool_args or {}, ensure_ascii=False, sort_keys=True, separators=(',', ':'))}"
     )
+
+
+def _caller_supports_builtin_search(tool_caller: Any) -> bool:
+    return tool_caller.__class__.__name__ in _BUILTIN_SEARCH_CALLER_NAMES
 
 
 async def _safe_ack(
@@ -834,7 +287,7 @@ async def _safe_ack(
 async def run_agent(
     messages: List[dict],
     registry: ToolRegistry,
-    tool_caller: ToolCaller,
+    tool_caller: Any,
     executor: Any,
     plugin_config: Any,
     logger: Any,
@@ -846,6 +299,10 @@ async def run_agent(
     relationship_hint: str = "",
     recent_bot_replies: list[str] | None = None,
     precomputed_intent: Any = None,
+    turn_plan: Any = None,
+    candidate_memories: list[dict[str, Any]] | None = None,
+    url_summaries: list[str] | None = None,
+    quote_chain: list[dict[str, Any]] | None = None,
     time_budget_seconds: float | None = None,
     ack_sender: Callable[[str], Awaitable[None]] | None = None,
 ) -> AgentResult:
@@ -857,7 +314,7 @@ async def run_agent(
                 getattr(plugin_config, "personification_builtin_search", True),
             )
         )
-        and isinstance(tool_caller, (GeminiToolCaller, AnthropicToolCaller, OpenAICodexToolCaller))
+        and _caller_supports_builtin_search(tool_caller)
     )
     pending_actions: List[dict] = []
     last_tool_name = ""
@@ -865,8 +322,11 @@ async def run_agent(
     last_fallback_signature = ""
     empty_lookup_tools: set[str] = set()
     semantic_fallback_attempted = False
-    empty_lookup_recovery_rounds = 0
-    promised_lookup_no_tool_rounds = 0
+    tool_result_records: list[dict[str, Any]] = []
+    evidence_synthesis_rounds = 0
+    last_evidence_tool_count = 0
+    max_evidence_synthesis_rounds = 2
+    pending_evidence_followup_query = ""
     user_text = _extract_latest_user_text(messages)
     focus_query_text = _clean_user_query_text(_extract_focus_query_text(user_text))
     contextual_query_text = _recover_followup_query_from_context(user_text, focus_query_text)
@@ -894,6 +354,7 @@ async def run_agent(
     chat_intent = intent_decision.chat_intent
     plugin_query_intent = intent_decision.plugin_question_intent if chat_intent == "plugin_question" else ""
     runtime_chat_intent = chat_intent
+    evidence_turn_plan = _plan_for_evidence(turn_plan, intent_decision, has_images=bool(user_images))
     effective_max_steps = _normalize_agent_max_steps(
         max_steps if max_steps is not None else getattr(plugin_config, "personification_agent_max_steps", DEFAULT_AGENT_MAX_STEPS)
     )
@@ -989,6 +450,22 @@ async def run_agent(
             ),
         }
     )
+    messages.append(
+        {
+            "role": "system",
+            "content": (
+                "群聊里通常多个话题并行：A 群友讨论地震、B 群友讨论自己的近况、C 群友在闲扯，"
+                "时间相近不代表语义相关。\n"
+                "硬性规则：\n"
+                "1. 你回复的是上下文中标记为「当前消息」的那一条；其它发言只是背景，不要把它们的内容拿来回答当前问题。\n"
+                "2. 不要把不同人说的关键词（地名、人名、状态）跨话题拼接。"
+                "比如 A 在说地震位置是「广西柳州」，同时 B 在说「我家在浙江」，"
+                "当 C 问「这次地震严重吗」时，你只能基于 A 的位置信息回答，绝不能说「浙江有震感」。\n"
+                "3. 引用某人状态前先问自己：这个状态是不是当前消息的语境？如果不是，就不要写进去。\n"
+                "4. 拿不准时宁可简短、含糊或承认不知道，也不要把无关上下文糊上去。"
+            ),
+        }
+    )
     if runtime_chat_intent == "banter":
         messages.append(
             {
@@ -1079,6 +556,64 @@ async def run_agent(
             }
         )
 
+    async def _append_evidence_guidance_if_needed(*, draft_answer_text: str = "") -> EvidenceSynthesis | None:
+        nonlocal evidence_synthesis_rounds, last_evidence_tool_count, semantic_fallback_attempted, pending_evidence_followup_query
+        if not _evidence_synthesizer_enabled(plugin_config):
+            return None
+        if evidence_synthesis_rounds >= max_evidence_synthesis_rounds:
+            return None
+        if not tool_result_records or len(tool_result_records) <= last_evidence_tool_count:
+            return None
+        started_at = time.monotonic()
+        evidence = await synthesize_evidence_with_llm(
+            tool_caller=tool_caller,
+            turn_plan=evidence_turn_plan,
+            candidate_memories=list(candidate_memories or [])[:12],
+            tool_results=tool_result_records[:8],
+            draft_answer_text=draft_answer_text,
+            url_summaries=list(url_summaries or [])[:5],
+            group_context=context_hint,
+            quote_chain=list(quote_chain or [])[:8],
+            cross_verify_enabled=bool(getattr(plugin_config, "personification_cross_verify_enabled", False)),
+        )
+        evidence_synthesis_rounds += 1
+        last_evidence_tool_count = len(tool_result_records)
+        record_counter(
+            "evidence_synthesizer.synthesis_total",
+            needs_more_research=bool(evidence.needs_more_research),
+            memory_style=evidence.memory_inject_style,
+        )
+        record_timing(
+            "evidence_synthesizer.synthesis_ms",
+            (time.monotonic() - started_at) * 1000.0,
+        )
+        messages.append({"role": "system", "content": _evidence_guidance(evidence)})
+        if evidence.needs_more_research:
+            semantic_fallback_attempted = False
+            pending_evidence_followup_query = str(evidence.research_followup_query or "").strip()
+        logger.info(
+            "[agent] evidence synthesis "
+            f"round={evidence_synthesis_rounds} selected_memories={len(evidence.selected_memory_ids)} "
+            f"needs_more_research={evidence.needs_more_research}"
+        )
+        if evidence.uncertainty_notes and bool(getattr(plugin_config, "personification_active_learning_enabled", False)):
+            try:
+                group_scope = str(context_hint or "").replace("group:", "").split(",")[0].strip() or "unknown"
+                _learning_query = str(evidence.research_followup_query or evidence.uncertainty_notes[0]).strip()
+                asyncio.create_task(
+                    _spawn_active_learning(
+                        tool_caller=tool_caller,
+                        memory_store=getattr(executor, "memory_store", None),
+                        uncertainty_notes=evidence.uncertainty_notes,
+                        group_id=group_scope,
+                        research_followup_query=_learning_query,
+                        plugin_config=plugin_config,
+                    )
+                )
+            except Exception:
+                pass
+        return evidence
+
     for _step in range(effective_max_steps):
         if budget_deadline is not None and time.monotonic() >= budget_deadline:
             logger.warning(
@@ -1104,6 +639,7 @@ async def run_agent(
                         rendered_tool_result=rendered_tool_result,
                         user_query_text=user_query_text,
                         persona_system=_extract_persona_system_prompt(messages),
+                        turn_plan=turn_plan,
                     ),
                     pending_actions=pending_actions,
                     direct_output=False,
@@ -1113,6 +649,7 @@ async def run_agent(
                 text="[NO_REPLY]",
                 pending_actions=pending_actions,
             )
+        await _append_evidence_guidance_if_needed()
         active_schemas = _select_tool_schemas(
             registry,
             has_images=bool(user_images),
@@ -1133,6 +670,39 @@ async def run_agent(
             use_builtin_search,
         )
         model_elapsed_ms = int((time.monotonic() - model_started_at) * 1000)
+        try:
+            usage = getattr(response, "usage", None) or {}
+            if isinstance(usage, dict) and (usage.get("prompt_tokens") or usage.get("completion_tokens")):
+                from ...core import llm_context as _llm_ctx
+                from ...core import token_ledger as _ledger
+
+                ctx = _llm_ctx.current_llm_context()
+                # 从 tool_caller 类名推导 provider，比从 model 名推导更准确
+                # （特别针对 Codex 使用 chatgpt OAuth、model 字段含 "gpt" 易误判的情况）
+                caller_cls = type(tool_caller).__name__.lower()
+                if "codex" in caller_cls:
+                    provider_label = "codex"
+                elif "anthropic" in caller_cls or "claudecode" in caller_cls or "claude" in caller_cls:
+                    provider_label = "anthropic"
+                elif "geminicli" in caller_cls:
+                    provider_label = "gemini"
+                elif "gemini" in caller_cls:
+                    provider_label = "gemini"
+                elif "openai" in caller_cls:
+                    provider_label = "openai"
+                else:
+                    provider_label = ""  # 让 token_ledger 从 model 名自行推导
+                _ledger.record_llm_call(
+                    model=str(getattr(response, "model_used", "") or ""),
+                    prompt_tokens=int(usage.get("prompt_tokens", 0) or 0),
+                    completion_tokens=int(usage.get("completion_tokens", 0) or 0),
+                    group_id=str(ctx.get("group_id", "") or ""),
+                    user_id=str(ctx.get("user_id", "") or ""),
+                    purpose=str(ctx.get("purpose", "") or "agent"),
+                    provider=provider_label,
+                )
+        except Exception:
+            pass
         content_len = len(str(response.content or "").strip())
         logger.info(
             f"[agent] step={_step + 1} finish_reason={response.finish_reason} "
@@ -1144,22 +714,9 @@ async def run_agent(
                 "[agent] provider returned empty stop response "
                 + _summarize_tool_response_raw(response.raw)
             )
-        promised_lookup = False
         if response.finish_reason == "stop" and not response.tool_calls and content_len > 0:
-            if runtime_chat_intent != "banter" and _looks_like_deferred_lookup_reply(response.content):
-                promised_lookup = True
-            elif runtime_chat_intent != "banter" and _should_classify_deferred_lookup_reply(
-                assistant_reply_text=response.content,
-                previous_tool_name=last_tool_name,
-                previous_tool_result_text=last_tool_result_text,
-            ):
-                promised_lookup = await _classify_deferred_lookup_reply(
-                    tool_caller=tool_caller,
-                    user_query_text=user_query_text,
-                    assistant_reply_text=response.content,
-                    previous_tool_name=last_tool_name,
-                    previous_tool_result_text=last_tool_result_text,
-                )
+            if _evidence_synthesizer_enabled(plugin_config) and has_tool_call:
+                await _append_evidence_guidance_if_needed(draft_answer_text=str(response.content or ""))
         if response.finish_reason == "stop":
             if runtime_chat_intent == "banter" and not response.tool_calls and content_len > 0:
                 return AgentResult(
@@ -1198,7 +755,6 @@ async def run_agent(
                         step=_step + 1,
                     )
                     has_tool_call = True
-                    promised_lookup_no_tool_rounds = 0
                     last_tool_name = bg_name
                     last_tool_result_text = bg_result
                     logger.info("[agent] injected background vision fallback result")
@@ -1211,17 +767,18 @@ async def run_agent(
                 and bool(user_query_text)
                 and (
                     not has_tool_call
-                    or promised_lookup
+                    or bool(pending_evidence_followup_query)
                     or content_len == 0
                     or response.vision_unavailable
                 )
             )
             if should_run_fallback_lookup:
                 semantic_fallback_attempted = True
+                fallback_query_text = pending_evidence_followup_query or user_query_text
                 fallback_lookup = await _select_semantic_fallback_tool(
                     tool_caller=tool_caller,
                     registry=registry,
-                    user_query_text=user_query_text,
+                    user_query_text=fallback_query_text,
                     rewritten_query=rewritten_query,
                     draft_answer_text=response.content,
                     context_hint=context_hint,
@@ -1232,6 +789,8 @@ async def run_agent(
                     previous_tool_name=last_tool_name,
                     previous_tool_result_text=last_tool_result_text,
                 )
+                if fallback_lookup is None and pending_evidence_followup_query:
+                    pending_evidence_followup_query = ""
             if fallback_lookup is not None:
                 fallback_name, fallback_args = fallback_lookup
                 if fallback_name in empty_lookup_tools:
@@ -1289,13 +848,21 @@ async def run_agent(
                         if str(fallback_result or "").strip():
                             last_tool_result_text = str(fallback_result).strip()
                         has_tool_call = True
-                        promised_lookup_no_tool_rounds = 0
+                        pending_evidence_followup_query = ""
+                        tool_result_records.append(
+                            _build_tool_result_record(
+                                tool_name=fallback_name,
+                                tool_args=fallback_args,
+                                result=fallback_result,
+                            )
+                        )
                         semantic_fallback_attempted = False
                         logger.info(f"[agent] fallback tool_call name={fallback_name}")
+                        await _append_evidence_guidance_if_needed()
                         continue
                     logger.info(f"[agent] semantic fallback selected unavailable tool: {fallback_name}")
             if (
-                (content_len == 0 or promised_lookup)
+                content_len == 0
                 and bool(
                     getattr(
                         plugin_config,
@@ -1326,108 +893,10 @@ async def run_agent(
                         step=_step + 1,
                     )
                     has_tool_call = True
-                    promised_lookup_no_tool_rounds = 0
                     last_tool_name = bg_name
                     last_tool_result_text = bg_result
                     logger.info("[agent] awaited background vision fallback result")
                     continue
-            if promised_lookup and not has_tool_call:
-                if promised_lookup_no_tool_rounds >= MAX_PROMISED_LOOKUP_NO_TOOL_ROUNDS:
-                    logger.info("[agent] deferred lookup no-tool retry exhausted, returning current content")
-                    if content_len > 0:
-                        return AgentResult(
-                            text=str(response.content or "").strip(),
-                            pending_actions=pending_actions,
-                            bypass_length_limits=False,
-                        )
-                    return AgentResult(
-                        text="[NO_REPLY]",
-                        pending_actions=pending_actions,
-                    )
-                promised_lookup_no_tool_rounds += 1
-                messages.append(
-                    {
-                        "role": "system",
-                        "content": (
-                            f"你刚才口头承诺要查，但没有调用工具。这是第 {promised_lookup_no_tool_rounds}/{MAX_PROMISED_LOOKUP_NO_TOOL_ROUNDS} 次纠正。"
-                            "不要口头承诺你会去查。"
-                            "如果不需要工具，就直接基于现有上下文回答；"
-                            "如果需要工具，就直接调用。"
-                        ),
-                    }
-                )
-                logger.info("[agent] deferred lookup reply without tool call, forcing direct answer rewrite")
-                continue
-            if promised_lookup and has_tool_call and previous_tool_empty:
-                if empty_lookup_recovery_rounds < MAX_EMPTY_LOOKUP_RECOVERY_ROUNDS:
-                    empty_lookup_recovery_rounds += 1
-                    semantic_fallback_attempted = False
-                    messages.append(
-                        {
-                            "role": "system",
-                            "content": (
-                                f"上一轮工具没有命中有效结果。当前是第 {empty_lookup_recovery_rounds}/{MAX_EMPTY_LOOKUP_RECOVERY_ROUNDS} 次重试。"
-                                "不要只说你还要继续找。"
-                                "如果还能换查询策略或改用别的工具，就直接调用；"
-                                "否则直接明确说明暂时没找到，并给出 2 到 3 个更好的搜索方向。"
-                            ),
-                        }
-                    )
-                    logger.info(
-                        f"[agent] empty lookup recovery round={empty_lookup_recovery_rounds}, reopening agent loop"
-                    )
-                    continue
-                messages.append(
-                    {
-                        "role": "system",
-                        "content": (
-                            "你刚才已经连续多次调用工具，但结果为空或无命中，已达到重试上限。"
-                            "现在不要继续口头承诺，也不要再发起新搜索。"
-                            "必须直接向用户说明暂时没找到可靠结果，并给出更好的搜索方向或让用户补充更具体目标。"
-                        ),
-                    }
-                )
-                logger.info("[agent] empty lookup retries exhausted, forcing final direct answer")
-                continue
-            if promised_lookup and has_tool_call and last_tool_result_text:
-                logger.info("[agent] deferred lookup reply after tool result, returning last tool result directly")
-                direct_result = _direct_tool_result_agent_result(
-                    tool_name=last_tool_name,
-                    result_text=last_tool_result_text,
-                    pending_actions=pending_actions,
-                )
-                if direct_result is not None:
-                    return direct_result
-                rendered_tool_result = _render_tool_result_for_user(
-                    last_tool_name,
-                    last_tool_result_text,
-                    user_query_text,
-                )
-                return AgentResult(
-                    text=await _wrap_tool_result_in_persona(
-                        tool_caller=tool_caller,
-                        rendered_tool_result=rendered_tool_result,
-                        user_query_text=user_query_text,
-                        persona_system=_extract_persona_system_prompt(messages),
-                    ),
-                    pending_actions=pending_actions,
-                    direct_output=False,
-                    bypass_length_limits=False,
-                )
-            if promised_lookup and has_tool_call:
-                messages.append(
-                    {
-                        "role": "system",
-                        "content": (
-                            "你已经拿到了工具结果。"
-                            "现在必须基于现有结果直接回答，给出简短摘要；"
-                            "如果是攻略、教程、资料请求，再附上 2 到 4 条参考链接。"
-                            "禁止继续说“我去找”“我给你找”“等我查”。"
-                        ),
-                    }
-                )
-                logger.info("[agent] deferred lookup reply after tool result, forcing final answer")
-                continue
             if content_len == 0:
                 return AgentResult(
                     text="[NO_REPLY]",
@@ -1446,7 +915,9 @@ async def run_agent(
             messages.append(
                 {
                     "role": "assistant",
-                    "content": response.content or "",
+                    # 必须用空字符串而非 None：部分严格 provider（Rust 反序列化）
+                    # 会把 null 当作"缺失字段"直接 400 拒绝。
+                    "content": response.content if response.content else "",
                     "tool_calls": [
                         {
                             "id": tool_call.id,
@@ -1463,16 +934,16 @@ async def run_agent(
 
         for tool_call in response.tool_calls:
             has_tool_call = True
-            promised_lookup_no_tool_rounds = 0
             logger.info(f"[agent] tool_call name={tool_call.name}")
             tool = registry.get(tool_call.name)
+            tool_args = dict(tool_call.arguments or {})
             if tool is None:
                 result = f"工具 {tool_call.name} 不存在"
             else:
                 tool_args, result = await _execute_tool_with_retries(
                     registry=registry,
                     tool_name=tool_call.name,
-                    tool_args=dict(tool_call.arguments or {}),
+                    tool_args=tool_args,
                     rewritten_query=rewritten_query,
                     user_images=user_images,
                     previous_tool_name=last_tool_name,
@@ -1492,6 +963,13 @@ async def run_agent(
             last_tool_name = str(tool_call.name or "").strip()
             if str(result or "").strip():
                 last_tool_result_text = str(result).strip()
+            tool_result_records.append(
+                _build_tool_result_record(
+                    tool_name=last_tool_name,
+                    tool_args=tool_args,
+                    result=result,
+                )
+            )
             if last_tool_name in _RETRYABLE_LOOKUP_TOOLS:
                 if _tool_result_indicates_empty(result):
                     empty_lookup_tools.add(last_tool_name)
@@ -1513,6 +991,7 @@ async def run_agent(
                     result,
                 )
             )
+            await _append_evidence_guidance_if_needed()
 
     logger.warning("[agent] MAX_STEPS reached")
     if last_tool_result_text:
@@ -1535,6 +1014,7 @@ async def run_agent(
                 rendered_tool_result=rendered_tool_result,
                 user_query_text=user_query_text,
                 persona_system=_extract_persona_system_prompt(messages),
+                turn_plan=turn_plan,
             ),
             pending_actions=pending_actions,
             direct_output=False,

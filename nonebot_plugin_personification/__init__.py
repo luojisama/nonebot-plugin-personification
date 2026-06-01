@@ -71,6 +71,7 @@ from .core.knowledge_builder import (
 )
 from .core.plugin_meta import build_plugin_metadata
 from .core.plugin_runtime import build_plugin_runtime
+from .core.qzone_startup import refresh_qzone_cookie_on_available_bot
 from .core.runtime_state import close_shared_http_client
 from .core.ai_routes import (
     build_routed_tool_caller,
@@ -90,6 +91,7 @@ from .core.visual_capabilities import (
 from .flows import setup_flows
 from .handlers import setup_all_matchers
 from .handlers.persona_commands import setup_persona_matchers
+from .handlers.runtime_commands import check_git_update_available, perform_git_pull
 from .jobs import setup_jobs
 from .schedule import get_current_local_time
 from .agent.inner_state import get_personification_data_dir
@@ -107,6 +109,7 @@ _sticker_labeler_observer = None
 _knowledge_build_task: asyncio.Task | None = None
 _visual_probe_task: asyncio.Task | None = None
 _llm_warmup_task: asyncio.Task | None = None
+_qzone_cookie_refresh_task: asyncio.Task | None = None
 runtime_bundle = None
 flow_handles: dict[str, object] = {}
 job_handles: dict[str, object] = {}
@@ -251,6 +254,31 @@ def _start_llm_warmup_background() -> None:
     task.add_done_callback(_clear_warmup_task)
 
 
+async def _refresh_qzone_cookie_background() -> None:
+    bundle = _require_runtime_bundle()
+    await refresh_qzone_cookie_on_available_bot(
+        enabled=bool(getattr(plugin_config, "personification_qzone_enabled", False)),
+        get_bots=get_bots,
+        update_qzone_cookie=bundle.update_qzone_cookie,
+        logger=logger,
+    )
+
+
+def _start_qzone_cookie_refresh_background() -> None:
+    global _qzone_cookie_refresh_task
+    if _qzone_cookie_refresh_task is not None and not _qzone_cookie_refresh_task.done():
+        return
+    task = asyncio.create_task(_refresh_qzone_cookie_background())
+    _qzone_cookie_refresh_task = task
+
+    def _clear_qzone_cookie_refresh_task(done_task: asyncio.Task) -> None:
+        global _qzone_cookie_refresh_task
+        if _qzone_cookie_refresh_task is done_task:
+            _qzone_cookie_refresh_task = None
+
+    task.add_done_callback(_clear_qzone_cookie_refresh_task)
+
+
 @get_driver().on_startup
 async def _init_personification_runtime() -> None:
     global runtime_bundle, flow_handles, job_handles, matcher_handles
@@ -295,6 +323,51 @@ async def _init_personification_runtime() -> None:
             check_group_idle_topic=flow_handles.get("check_group_idle_topic"),
         ),
     )
+    runtime_bundle.qzone_social_scan = job_handles.get("qzone_social_scan")
+    runtime_bundle.qzone_inbound_poll = job_handles.get("qzone_inbound_poll")
+    _start_qzone_cookie_refresh_background()
+
+    if bool(getattr(plugin_config, "personification_git_auto_update", False)):
+        _git_update_interval = max(
+            10,
+            int(getattr(plugin_config, "personification_git_auto_update_interval", 60) or 60),
+        )
+
+        async def _auto_git_update_job() -> None:
+            try:
+                has_update, _local, _remote = await check_git_update_available()
+                if not has_update:
+                    return
+                ok, msg = await perform_git_pull()
+                if ok:
+                    logger.info(f"[git_auto_update] 已自动更新拟人插件：{msg}")
+                    _bots = get_bots()
+                    for _bot in _bots.values():
+                        for _su in superusers:
+                            try:
+                                await _bot.send_private_msg(
+                                    user_id=int(_su),
+                                    message=f"✅ 拟人插件已自动更新，请重启 Bot 生效。\n{msg}",
+                                )
+                            except Exception:
+                                pass
+                        break
+                else:
+                    logger.warning(f"[git_auto_update] 自动更新失败：{msg}")
+            except Exception as _exc:
+                logger.warning(f"[git_auto_update] 检查或拉取失败：{_exc}")
+
+        try:
+            scheduler.add_job(
+                _auto_git_update_job,
+                "interval",
+                minutes=_git_update_interval,
+                id="personification_git_auto_update",
+                replace_existing=True,
+            )
+            logger.info(f"拟人插件：已注册 git 自动更新任务，间隔 {_git_update_interval} 分钟")
+        except Exception as _e:
+            logger.warning(f"拟人插件：注册 git 自动更新任务失败：{_e}")
 
     matcher_handles = setup_all_matchers(
         deps=runtime_bundle.make_matcher_setup_deps(
@@ -330,6 +403,122 @@ async def _init_personification_persona_store() -> None:
         return
     await bundle.persona_store.load()
     logger.info("[user_persona] 画像数据已加载")
+
+
+@get_driver().on_startup
+async def _apply_personification_image_host_allowlist() -> None:
+    try:
+        from .handlers.reply_pipeline.pipeline_sticker import set_image_host_allowlist
+
+        raw = getattr(plugin_config, "personification_image_host_allowlist", []) or []
+        set_image_host_allowlist(raw)
+        if raw:
+            logger.info(f"[image_safety] 已加载用户图片域名白名单: {list(raw)}")
+    except Exception as exc:
+        logger.warning(f"[image_safety] 加载图片域名白名单失败: {exc}")
+
+
+@get_driver().on_startup
+async def _register_personification_group_knowledge() -> None:
+    bundle = _require_runtime_bundle()
+    try:
+        from .core.group_knowledge_autobuild import (
+            register_group_knowledge_autobuild_job,
+            register_propose_group_knowledge_tool,
+        )
+        from .core.group_style_autobuild import register_group_style_autobuild_job
+    except Exception as exc:
+        logger.warning(f"[group_knowledge] 加载失败：{exc}")
+        return
+    registry = getattr(bundle, "tool_registry", None)
+    memory_store = getattr(bundle, "memory_store", None)
+    if registry is not None and memory_store is not None:
+        register_propose_group_knowledge_tool(
+            registry=registry,
+            memory_store=memory_store,
+            logger=logger,
+        )
+    deps = getattr(bundle, "reply_processor_deps", None)
+    runtime_inner = getattr(deps, "runtime", None) if deps is not None else None
+    tool_caller = getattr(runtime_inner, "agent_tool_caller", None) if runtime_inner is not None else None
+    if memory_store is not None and tool_caller is not None:
+        register_group_knowledge_autobuild_job(
+            scheduler=scheduler,
+            plugin_config=plugin_config,
+            memory_store=memory_store,
+            tool_caller=tool_caller,
+            logger=logger,
+        )
+        register_group_style_autobuild_job(
+            scheduler=scheduler,
+            plugin_config=plugin_config,
+            memory_store=memory_store,
+            tool_caller=tool_caller,
+            logger=logger,
+        )
+    try:
+        from .core.memory_summarizer import register_memory_summarizer_jobs
+
+        register_memory_summarizer_jobs(
+            scheduler=scheduler,
+            plugin_config=plugin_config,
+            memory_store=memory_store,
+            tool_caller=tool_caller,
+            logger=logger,
+        )
+    except Exception as exc:
+        logger.warning(f"[memory_summarizer] 注册失败：{exc}")
+
+
+@get_driver().on_startup
+async def _install_personification_webui() -> None:
+    from .webui import install_webui
+    from .core.admin_acl import load_plugin_admins
+    from .core.notify import startup_notify_admins
+
+    installed = install_webui(
+        plugin_config=plugin_config,
+        superusers=superusers,
+        get_bots=get_bots,
+        logger=logger,
+        runtime_bundle=runtime_bundle,
+    )
+    if not installed:
+        return
+    # 启动期清理过期设备 token 与旧审计日志
+    try:
+        from .core import webui_audit_log, webui_auth_store
+
+        pruned = webui_auth_store.prune_expired_devices()
+        if pruned:
+            logger.info(f"[webui] 启动期清理过期设备 token: {pruned} 条")
+        webui_audit_log.prune_old_entries()
+    except Exception as exc:
+        logger.warning(f"[webui] 启动期清理失败：{exc}")
+
+    driver_config = get_driver().config
+    host = str(getattr(driver_config, "host", "") or "127.0.0.1")
+    port = int(getattr(driver_config, "port", 8080) or 8080)
+    if host in {"0.0.0.0", "::"}:
+        display_host = "<本机或局域网 IP>"
+    else:
+        display_host = host
+    webui_url = f"http://{display_host}:{port}/personification/"
+    logger.info(f"拟人插件 WebUI: {webui_url}（监听 {host}:{port}）")
+    try:
+        notify_message = (
+            "【拟人插件 WebUI】已启动\n"
+            f"访问地址：{webui_url}\n"
+            "使用 QQ 号登录，验证码会通过本对话推送。"
+        )
+        await startup_notify_admins(
+            get_bots=get_bots,
+            superusers=superusers,
+            plugin_admins=load_plugin_admins(),
+            message=notify_message,
+        )
+    except Exception as exc:
+        logger.warning(f"拟人插件 WebUI 启动通知失败：{exc}")
 
 
 @get_driver().on_startup
@@ -502,9 +691,38 @@ async def _init_plugin_knowledge() -> None:
         )
 
 
+@get_driver().on_startup
+async def _setup_social_intelligence() -> None:
+    """注册主动社交场景到 APScheduler。默认总开关关闭，开了才真触发。"""
+    bundle = _require_runtime_bundle()
+    try:
+        from .flows.social_intelligence import (
+            SocialContext,
+            setup_social_intelligence_jobs,
+        )
+
+        ctx = SocialContext(
+            plugin_config=plugin_config,
+            logger=logger,
+            get_bots=get_bots,
+            get_whitelisted_groups=bundle._get_whitelisted_groups,
+            tool_caller=bundle.reply_processor_deps.runtime.agent_tool_caller,
+            persona_store=bundle.persona_store,
+            data_dir=get_personification_data_dir(plugin_config),
+            get_now=get_current_local_time,
+        )
+        registered = setup_social_intelligence_jobs(scheduler=scheduler, ctx=ctx)
+        if registered > 0:
+            logger.info(f"[social] 已注册 {registered} 个主动社交触发器")
+        else:
+            logger.info("[social] 未注册任何主动社交触发器（开关关闭或场景被禁用）")
+    except Exception as exc:
+        logger.error(f"[social] setup_social_intelligence_jobs 失败：{exc}")
+
+
 @get_driver().on_shutdown
 async def _close_personification_runtime() -> None:
-    global _sticker_labeler_observer, _knowledge_build_task, _visual_probe_task, runtime_bundle
+    global _sticker_labeler_observer, _knowledge_build_task, _visual_probe_task, _qzone_cookie_refresh_task, runtime_bundle
     if _sticker_labeler_observer is not None:
         _sticker_labeler_observer.stop()
         _sticker_labeler_observer.join()
@@ -516,6 +734,13 @@ async def _close_personification_runtime() -> None:
         except asyncio.CancelledError:
             pass
     _visual_probe_task = None
+    if _qzone_cookie_refresh_task is not None and not _qzone_cookie_refresh_task.done():
+        _qzone_cookie_refresh_task.cancel()
+        try:
+            await _qzone_cookie_refresh_task
+        except asyncio.CancelledError:
+            pass
+    _qzone_cookie_refresh_task = None
     await stop_plugin_knowledge_builder(
         logger=logger,
         knowledge_store=(

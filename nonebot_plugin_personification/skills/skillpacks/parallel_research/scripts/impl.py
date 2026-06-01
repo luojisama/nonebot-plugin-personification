@@ -20,9 +20,16 @@ from plugin.personification.skills.skillpacks.wiki_search.scripts.main import re
 
 
 _HARD_MAX_WORKERS = 6
+_HARD_MAX_WORKERS_V2 = 8
 _DEFAULT_WORKER_TIMEOUT_SECONDS = 35.0
 _DEFAULT_TOTAL_TIMEOUT_SECONDS = 90.0
 _DEFAULT_MAX_TOOL_ROUNDS = 2
+_DEFAULT_PAGES_PER_WORKER = 20
+_RESEARCH_LEVELS: dict[str, dict[str, int | float]] = {
+    "low": {"workers": 4, "pages_per_worker": 10, "total_timeout": 60.0, "max_tool_rounds": 2},
+    "medium": {"workers": 6, "pages_per_worker": 20, "total_timeout": 120.0, "max_tool_rounds": 2},
+    "high": {"workers": 8, "pages_per_worker": 40, "total_timeout": 300.0, "max_tool_rounds": 3},
+}
 _READ_ONLY_TOOL_NAMES = frozenset(
     {
         "web_search",
@@ -42,6 +49,16 @@ class ResearchWorkerPlan:
     goal: str
     focus: list[str]
     preferred_tools: list[str]
+
+
+@dataclass(slots=True)
+class ResearchLimits:
+    max_workers: int
+    worker_timeout: float
+    total_timeout: float
+    max_tool_rounds: int
+    pages_per_worker: int
+    level: str
 
 
 class _SilentLogger:
@@ -73,6 +90,97 @@ def _normalize_float(value: Any, *, default: float, lower: float, upper: float) 
     except (TypeError, ValueError):
         number = default
     return max(lower, min(upper, number))
+
+
+def _normalize_research_level(value: Any) -> str:
+    level = str(value or "").strip().lower()
+    return level if level in _RESEARCH_LEVELS else "medium"
+
+
+def _resolve_research_limits(
+    *,
+    plugin_config: Any,
+    max_workers: int | None,
+    research_level: str,
+) -> ResearchLimits:
+    v2_enabled = bool(getattr(plugin_config, "personification_deep_research_v2_enabled", False))
+    if not v2_enabled:
+        config_max_workers = _normalize_int(
+            getattr(plugin_config, "personification_parallel_research_max_workers", 6),
+            default=6,
+            lower=0,
+            upper=_HARD_MAX_WORKERS,
+        )
+        return ResearchLimits(
+            max_workers=_normalize_int(
+                max_workers if max_workers is not None else config_max_workers,
+                default=config_max_workers,
+                lower=0,
+                upper=min(config_max_workers, _HARD_MAX_WORKERS),
+            ),
+            worker_timeout=_normalize_float(
+                getattr(plugin_config, "personification_parallel_research_worker_timeout", _DEFAULT_WORKER_TIMEOUT_SECONDS),
+                default=_DEFAULT_WORKER_TIMEOUT_SECONDS,
+                lower=5.0,
+                upper=180.0,
+            ),
+            total_timeout=_normalize_float(
+                getattr(plugin_config, "personification_parallel_research_total_timeout", _DEFAULT_TOTAL_TIMEOUT_SECONDS),
+                default=_DEFAULT_TOTAL_TIMEOUT_SECONDS,
+                lower=10.0,
+                upper=300.0,
+            ),
+            max_tool_rounds=_normalize_int(
+                getattr(plugin_config, "personification_parallel_research_max_tool_rounds", _DEFAULT_MAX_TOOL_ROUNDS),
+                default=_DEFAULT_MAX_TOOL_ROUNDS,
+                lower=0,
+                upper=4,
+            ),
+            pages_per_worker=_normalize_int(
+                getattr(plugin_config, "personification_parallel_research_pages_per_worker", _DEFAULT_PAGES_PER_WORKER),
+                default=_DEFAULT_PAGES_PER_WORKER,
+                lower=1,
+                upper=40,
+            ),
+            level="legacy",
+        )
+    level = _normalize_research_level(research_level)
+    profile = _RESEARCH_LEVELS[level]
+    profile_workers = int(profile["workers"])
+    requested_workers = max_workers if max_workers is not None else profile_workers
+    return ResearchLimits(
+        max_workers=_normalize_int(
+            requested_workers,
+            default=profile_workers,
+            lower=0,
+            upper=_HARD_MAX_WORKERS_V2,
+        ),
+        worker_timeout=_normalize_float(
+            getattr(plugin_config, "personification_parallel_research_worker_timeout", _DEFAULT_WORKER_TIMEOUT_SECONDS),
+            default=_DEFAULT_WORKER_TIMEOUT_SECONDS,
+            lower=5.0,
+            upper=180.0,
+        ),
+        total_timeout=_normalize_float(
+            profile["total_timeout"],
+            default=float(profile["total_timeout"]),
+            lower=10.0,
+            upper=300.0,
+        ),
+        max_tool_rounds=_normalize_int(
+            profile["max_tool_rounds"],
+            default=int(profile["max_tool_rounds"]),
+            lower=0,
+            upper=4,
+        ),
+        pages_per_worker=_normalize_int(
+            profile["pages_per_worker"],
+            default=int(profile["pages_per_worker"]),
+            lower=1,
+            upper=40,
+        ),
+        level=level,
+    )
 
 
 def _merge_image_refs(images: list[str] | None = None, image_urls: list[str] | None = None) -> list[str]:
@@ -581,6 +689,7 @@ async def _run_worker(
     tool_caller: Any,
     registry: ToolRegistry,
     max_tool_rounds: int,
+    pages_per_worker: int = _DEFAULT_PAGES_PER_WORKER,
 ) -> dict[str, Any]:
     active_tools = [
         tool
@@ -597,10 +706,11 @@ async def _run_worker(
             "content": (
                 "你是 parallel_research 的一个只读研究子Agent。"
                 "你只能围绕自己的角色和目标做资料查询，不要生成图片，不要聊天，不要写执行过程。"
+                "如果需要联网，按 pages_per_worker 规划多页阅读；同一 URL 不要重复请求。"
                 "工具调用结束后严格输出 JSON："
                 '{"role":"","goal":"","findings":["..."],"facts":["..."],"visual_refs":["..."],'
                 '"prompt_hints":["..."],"must_include":["..."],"must_avoid":["..."],'
-                '"source_notes":["..."],"confidence":"low|medium|high"}'
+                '"source_notes":["..."],"sources":["..."],"conflicts":["..."],"confidence":"low|medium|high"}'
             ),
         },
         {
@@ -615,6 +725,7 @@ async def _run_worker(
                     "purpose": purpose,
                     "context": context,
                     "has_images": bool(images),
+                    "pages_per_worker": max(1, int(pages_per_worker or _DEFAULT_PAGES_PER_WORKER)),
                 }
             ),
         },
@@ -640,6 +751,8 @@ async def _run_worker(
                 "must_include": [],
                 "must_avoid": [],
                 "source_notes": ["worker_returned_plain_text"] if content else ["worker_returned_empty"],
+                "sources": [],
+                "conflicts": [],
                 "confidence": "low" if not content else "medium",
             }
         if _round >= max_tool_rounds:
@@ -696,7 +809,42 @@ async def _run_worker(
         "must_include": [],
         "must_avoid": [],
         "source_notes": ["worker_reached_tool_round_limit"],
+        "sources": [],
+        "conflicts": [],
         "confidence": "low",
+    }
+
+
+def _coerce_text_items(value: Any, *, limit: int = 20, max_chars: int = 300) -> list[str]:
+    values = [value] if isinstance(value, str) else value
+    if not isinstance(values, list):
+        return []
+    items: list[str] = []
+    for raw in values:
+        text = str(raw or "").strip()
+        if text and text not in items:
+            items.append(text[:max_chars])
+        if len(items) >= limit:
+            break
+    return items
+
+
+def _cross_verify_worker_facts(worker_results: list[dict[str, Any]]) -> dict[str, list[str]]:
+    fact_sources: dict[str, set[str]] = {}
+    for index, result in enumerate(worker_results):
+        role = str(result.get("role", "") or f"worker_{index + 1}").strip()
+        for fact in _coerce_text_items(result.get("facts", []), limit=20, max_chars=280):
+            fact_sources.setdefault(fact, set()).add(role)
+    verified: list[str] = []
+    single_source: list[str] = []
+    for fact, roles in fact_sources.items():
+        if len(roles) >= 2:
+            verified.append(fact)
+        else:
+            single_source.append(fact)
+    return {
+        "verified_facts": verified[:12],
+        "single_source_facts": single_source[:12],
     }
 
 
@@ -706,6 +854,8 @@ def _fallback_aggregate(*, query: str, purpose: str, plans: list[ResearchWorkerP
     prompt_hints: list[str] = []
     must_include: list[str] = []
     must_avoid: list[str] = []
+    sources: list[str] = []
+    conflicts: list[str] = []
     source_notes = list(notes)
     for result in worker_results:
         for key, target in (
@@ -714,24 +864,17 @@ def _fallback_aggregate(*, query: str, purpose: str, plans: list[ResearchWorkerP
             ("prompt_hints", prompt_hints),
             ("must_include", must_include),
             ("must_avoid", must_avoid),
+            ("sources", sources),
+            ("conflicts", conflicts),
             ("source_notes", source_notes),
         ):
-            values = result.get(key, [])
-            if isinstance(values, str):
-                values = [values]
-            if isinstance(values, list):
-                for value in values:
-                    text = str(value or "").strip()
-                    if text and text not in target:
-                        target.append(text)
-        findings = result.get("findings", [])
-        if isinstance(findings, str):
-            findings = [findings]
-        if isinstance(findings, list):
-            for value in findings[:3]:
-                text = str(value or "").strip()
-                if text and text not in facts:
-                    facts.append(text[:280])
+            for text in _coerce_text_items(result.get(key, [])):
+                if text not in target:
+                    target.append(text)
+        for text in _coerce_text_items(result.get("findings", []), limit=3, max_chars=280):
+            if text not in facts:
+                facts.append(text)
+    verification = _cross_verify_worker_facts(worker_results)
     return {
         "summary": f"已围绕「{query}」完成并行研究。" if worker_results else f"「{query}」未启动额外研究。",
         "purpose": purpose,
@@ -740,6 +883,10 @@ def _fallback_aggregate(*, query: str, purpose: str, plans: list[ResearchWorkerP
             for plan in plans
         ],
         "facts": facts[:10],
+        "verified_facts": verification["verified_facts"],
+        "single_source_facts": verification["single_source_facts"],
+        "conflicts": conflicts[:10],
+        "sources": sources[:12],
         "visual_refs": visual_refs[:10],
         "prompt_hints": prompt_hints[:10],
         "must_include": must_include[:10],
@@ -777,6 +924,7 @@ async def _aggregate_results(
                     "你是并行研究结果聚合器。基于用户需求、研究计划和各子Agent结果，"
                     "合并成给外层 LLM 使用的稳定 JSON。不要编造来源，不要掩盖不确定性。"
                     "严格输出 JSON，字段：summary,purpose,research_plan,facts,visual_refs,"
+                    "verified_facts,single_source_facts,conflicts,sources,"
                     "prompt_hints,must_include,must_avoid,source_notes,confidence。"
                 ),
             },
@@ -800,6 +948,10 @@ async def _aggregate_results(
     for key in (
         "summary",
         "facts",
+        "verified_facts",
+        "single_source_facts",
+        "conflicts",
+        "sources",
         "visual_refs",
         "prompt_hints",
         "must_include",
@@ -834,6 +986,7 @@ async def parallel_research(
     images: list[str] | None = None,
     image_urls: list[str] | None = None,
     max_workers: int | None = None,
+    research_level: str = "medium",
 ) -> str:
     plugin_config = getattr(runtime, "plugin_config", None)
     tool_caller = getattr(runtime, "tool_caller", None)
@@ -845,6 +998,10 @@ async def parallel_research(
                 "purpose": str(purpose or "lookup"),
                 "research_plan": [],
                 "facts": [],
+                "verified_facts": [],
+                "single_source_facts": [],
+                "conflicts": [],
+                "sources": [],
                 "visual_refs": [],
                 "prompt_hints": [],
                 "must_include": [],
@@ -853,35 +1010,10 @@ async def parallel_research(
                 "confidence": "low",
             }
         )
-    config_max_workers = _normalize_int(
-        getattr(plugin_config, "personification_parallel_research_max_workers", 6),
-        default=6,
-        lower=0,
-        upper=_HARD_MAX_WORKERS,
-    )
-    effective_max_workers = _normalize_int(
-        max_workers if max_workers is not None else config_max_workers,
-        default=config_max_workers,
-        lower=0,
-        upper=min(config_max_workers, _HARD_MAX_WORKERS),
-    )
-    worker_timeout = _normalize_float(
-        getattr(plugin_config, "personification_parallel_research_worker_timeout", _DEFAULT_WORKER_TIMEOUT_SECONDS),
-        default=_DEFAULT_WORKER_TIMEOUT_SECONDS,
-        lower=5.0,
-        upper=180.0,
-    )
-    total_timeout = _normalize_float(
-        getattr(plugin_config, "personification_parallel_research_total_timeout", _DEFAULT_TOTAL_TIMEOUT_SECONDS),
-        default=_DEFAULT_TOTAL_TIMEOUT_SECONDS,
-        lower=10.0,
-        upper=300.0,
-    )
-    max_tool_rounds = _normalize_int(
-        getattr(plugin_config, "personification_parallel_research_max_tool_rounds", _DEFAULT_MAX_TOOL_ROUNDS),
-        default=_DEFAULT_MAX_TOOL_ROUNDS,
-        lower=0,
-        upper=4,
+    limits = _resolve_research_limits(
+        plugin_config=plugin_config,
+        max_workers=max_workers,
+        research_level=research_level,
     )
     focus_items = [str(item or "").strip() for item in list(focus or []) if str(item or "").strip()][:12]
     image_refs = _merge_image_refs(images, image_urls)
@@ -890,11 +1022,11 @@ async def parallel_research(
 
     started_at = time.monotonic()
     notes: list[str] = []
-    if effective_max_workers <= 0:
+    if limits.max_workers <= 0:
         plans = []
         notes.append("max_workers_zero")
     else:
-        planner_timeout = min(12.0, max(4.0, total_timeout * 0.18))
+        planner_timeout = min(12.0, max(4.0, limits.total_timeout * 0.18))
         plans = await _plan_workers(
             query=query_text,
             purpose=purpose_text,
@@ -902,13 +1034,13 @@ async def parallel_research(
             focus=focus_items,
             images=image_refs,
             tool_caller=tool_caller,
-            max_workers=effective_max_workers,
+            max_workers=limits.max_workers,
             timeout=planner_timeout,
         )
     registry = _build_readonly_registry(runtime)
     worker_results: list[dict[str, Any]] = []
     if plans and tool_caller is not None:
-        remaining_total = max(1.0, total_timeout - (time.monotonic() - started_at))
+        remaining_total = max(1.0, limits.total_timeout - (time.monotonic() - started_at))
         tasks = [
             asyncio.create_task(
                 asyncio.wait_for(
@@ -920,9 +1052,10 @@ async def parallel_research(
                         images=image_refs,
                         tool_caller=tool_caller,
                         registry=registry,
-                        max_tool_rounds=max_tool_rounds,
+                        max_tool_rounds=limits.max_tool_rounds,
+                        pages_per_worker=limits.pages_per_worker,
                     ),
-                    timeout=worker_timeout,
+                    timeout=limits.worker_timeout,
                 )
             )
             for plan in plans
@@ -949,17 +1082,20 @@ async def parallel_research(
         notes.append("tool_caller_unavailable")
 
     if not plans:
+        fallback_payload = _fallback_aggregate(
+            query=query_text,
+            purpose=purpose_text,
+            plans=plans,
+            worker_results=worker_results,
+            notes=notes,
+        )
+        fallback_payload["research_level"] = limits.level
+        fallback_payload["pages_per_worker"] = limits.pages_per_worker
         return _render_result(
-            _fallback_aggregate(
-                query=query_text,
-                purpose=purpose_text,
-                plans=plans,
-                worker_results=worker_results,
-                notes=notes,
-            )
+            fallback_payload
         )
 
-    remaining_for_aggregate = max(3.0, total_timeout - (time.monotonic() - started_at))
+    remaining_for_aggregate = max(3.0, limits.total_timeout - (time.monotonic() - started_at))
     aggregate = await _aggregate_results(
         query=query_text,
         purpose=purpose_text,
@@ -970,6 +1106,8 @@ async def parallel_research(
         tool_caller=tool_caller,
         timeout=min(15.0, remaining_for_aggregate),
     )
+    aggregate["research_level"] = limits.level
+    aggregate["pages_per_worker"] = limits.pages_per_worker
     return _render_result(aggregate)
 
 

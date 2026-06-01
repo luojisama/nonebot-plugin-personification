@@ -20,10 +20,24 @@ from ...core.image_input import (
 from ...core.metrics import record_counter, record_timing
 from ...core.message_parts import build_user_message_content, clone_messages_with_text_suffix
 from ...core.message_relations import extract_send_message_id
-from ...core.context_policy import compress_context_if_needed
+from ...core.context_policy import (
+    compress_context_if_needed,
+    has_silence_control_marker,
+    strip_response_control_markers,
+)
+from ...core.gemini_profile import (
+    context_keep_recent_for_route,
+    context_token_budget_for_route,
+    should_enable_default_builtin_search,
+)
+from ...flows.yaml_parser import parse_yaml_response
+from ...agent.runtime.responder import (
+    apply_persona_response_to_semantic_frame,
+    parse_persona_response,
+    with_persona_responder_instruction,
+)
 from ...core.prompt_hooks import HookContext, get_hook_registry
-from ...core.group_relations import summarize_group_relationships
-from ...core.group_context import render_group_context_structured
+from ...core.group_context import build_group_conversation_context, render_group_conversation_context
 from ...core.group_mute import refresh_bot_group_mute_state
 from ...core.group_roles import extract_sender_role
 from ...core.target_inference import TARGET_OTHERS, infer_message_target
@@ -33,7 +47,6 @@ from ...core.reply_style_policy import build_direct_visual_identity_guard
 from ...core.response_review import (
     is_agent_reply_ooc,
     make_passthrough_review_decision,
-    recover_direct_mention_reply,
     rewrite_agent_reply_ooc,
     review_response_text,
 )
@@ -55,14 +68,16 @@ from ..event_rules import _extract_recordable_group_message, split_segment_if_lo
 from .pipeline_context import (
     batch_has_newer_messages as _batch_has_newer_messages,
     build_base_system_prompt as _build_base_system_prompt,
+    build_confidence_style_instruction as _build_confidence_style_instruction,
+    build_scenario_instruction as _build_scenario_instruction,
     build_final_visible_reply_text as _build_final_visible_reply_text,
     build_group_session_relation_metadata as _build_group_session_relation_metadata,
     build_tts_user_hint as _build_tts_user_hint,
     count_user_interactions as _count_user_interactions,
     extract_reply_sender_meta as _extract_reply_sender_meta,
+    fold_consecutive_sticker_placeholders as _fold_consecutive_sticker_placeholders,
     get_primary_provider_signature as _get_primary_provider_signature,
     looks_like_photo_message as _looks_like_photo_message,
-    looks_like_sticker_message as _looks_like_sticker_message,
     primary_route_supports_vision as _primary_route_supports_vision,
     private_history_window_limit as _private_history_window_limit,
     restore_current_user_message_content as _restore_current_user_message_content,
@@ -158,7 +173,7 @@ def _record_muted_group_message(
         **build_event_relation_metadata(
             event,
             bot_self_id=bot_self_id,
-            source_kind="bot" if bot_self_id and user_id == bot_self_id else "user",
+            source_kind="plugin" if bot_self_id and user_id == bot_self_id else "user",
         ),
     )
     try:
@@ -276,6 +291,16 @@ async def process_response_logic(bot: Any, event: Any, state: Dict[str, Any], de
     types = deps.types
     started_at = time.monotonic()
 
+    try:
+        from ...core.llm_context import set_llm_context
+        set_llm_context(
+            group_id=str(getattr(event, "group_id", "") or ""),
+            user_id=str(getattr(event, "user_id", "") or ""),
+            purpose="reply",
+        )
+    except Exception:
+        pass
+
     if hasattr(event, "message_id") and runtime.is_msg_processed(event.message_id):
         return
 
@@ -288,6 +313,7 @@ async def process_response_logic(bot: Any, event: Any, state: Dict[str, Any], de
     sender_name = ""
     trigger_reason = ""
     image_urls: List[str] = []
+    sticker_image_urls: List[str] = []
     sticker_candidates: List[IncomingStickerCandidate] = []
     stop_reply_due_to_gif = [False]
     is_direct_mention = False
@@ -382,8 +408,9 @@ async def process_response_logic(bot: Any, event: Any, state: Dict[str, Any], de
             if seg.type == "text":
                 message_text_parts.append(seg.data.get("text", ""))
             elif seg.type == "face":
-                face_id = seg.data.get("id", "")
-                message_text_parts.append(f"[表情id:{face_id}]")
+                from ...core.qq_face_names import render_face_token
+
+                message_text_parts.append(render_face_token(seg.data.get("id", "")))
             elif seg.type == "mface":
                 await _extract_mface_from_segment(
                     seg,
@@ -393,6 +420,7 @@ async def process_response_logic(bot: Any, event: Any, state: Dict[str, Any], de
                     sticker_candidates_ref=sticker_candidates,
                     logger=runtime.logger,
                     stop_reply_ref=stop_reply_due_to_gif,
+                    sticker_image_urls=sticker_image_urls,
                 )
             elif seg.type == "image":
                 await _extract_images_from_segment(
@@ -404,6 +432,7 @@ async def process_response_logic(bot: Any, event: Any, state: Dict[str, Any], de
                     sticker_candidates_ref=sticker_candidates,
                     logger=runtime.logger,
                     stop_reply_ref=stop_reply_due_to_gif,
+                    sticker_image_urls=sticker_image_urls,
                 )
             elif seg.type == "gif":
                 # OneBot 独立 gif 消息段，直接忽略，不下载，不传给视觉模型
@@ -423,6 +452,7 @@ async def process_response_logic(bot: Any, event: Any, state: Dict[str, Any], de
                             sticker_candidates_ref=sticker_candidates,
                             logger=runtime.logger,
                             stop_reply_ref=stop_reply_due_to_gif,
+                            sticker_image_urls=sticker_image_urls,
                         )
             except Exception as e:
                 runtime.logger.warning(f"回退解析原始消息图片失败: {e}")
@@ -478,12 +508,33 @@ async def process_response_logic(bot: Any, event: Any, state: Dict[str, Any], de
             message_text_parts.append(clipped_forward)
 
         message_text = "".join(message_text_parts)
+        # 多人/连续刷表情时，把一连串表情占位符折叠成单个中性标记，
+        # 避免模型看到"一张接一张"的信号后吐槽刷屏（配合 base prompt 的告诫）。
+        message_text = _fold_consecutive_sticker_placeholders(message_text)
         raw_message_text = message_text
         message_content = message_text.strip()
         is_private_context = str(group_id).startswith(session.private_session_prefix)
         if isinstance(event, types.private_message_event_cls) and session.looks_like_private_command(message_content):
             runtime.logger.debug(f"拟人插件：私聊命令消息已跳过，用户 {user_id}")
             return
+        # P7：识别其他机器人 / Q 群管家，避免 bot 互相对话
+        try:
+            from ...core.peer_awareness import detect_other_bot
+
+            extra_bot_ids = list(getattr(runtime.plugin_config, "personification_peer_bot_ids", []) or [])
+            peer_decision = detect_other_bot(
+                user_id=user_id,
+                text=message_content,
+                extra_bot_ids=extra_bot_ids,
+            )
+            if peer_decision.is_other_bot and peer_decision.suggest_silence:
+                runtime.logger.info(
+                    f"拟人插件：检测到来自其他机器人/管家的消息，跳过本轮 "
+                    f"user={user_id} reason={peer_decision.reason}"
+                )
+                return
+        except Exception:
+            pass
         sticker_feedback_scene = build_sticker_feedback_scene_key(
             group_id=str(group_id),
             user_id=user_id,
@@ -667,22 +718,23 @@ async def process_response_logic(bot: Any, event: Any, state: Dict[str, Any], de
             incoming_relation_metadata["sender_role"] = sender_role
 
     tool_image_urls = list(image_urls)
+    # 真实照片（不含表情包），仅这部分允许走文本摘要降级；表情包不打标。
+    photo_image_urls = list(image_urls)
     image_input_mode = normalize_image_input_mode(
         getattr(runtime.plugin_config, "personification_image_input_mode", "auto")
     )
     image_detail = normalize_image_detail(
         getattr(runtime.plugin_config, "personification_image_detail", "auto")
     )
-    is_sticker_like = _looks_like_sticker_message(raw_message_text or message_content)
     has_photo_input = _looks_like_photo_message(raw_message_text or message_content)
-    direct_image_input = bool(image_urls) and image_input_mode in {"auto", "direct"} and (
-        image_input_mode == "direct"
-        or _primary_route_supports_vision(runtime, VISUAL_ROUTE_REPLY_PLAIN)
+    plain_route_vision = image_input_mode == "direct" or _primary_route_supports_vision(
+        runtime, VISUAL_ROUTE_REPLY_PLAIN
     )
-    agent_direct_image_input = bool(image_urls) and image_input_mode in {"auto", "direct"} and (
-        image_input_mode == "direct"
-        or _primary_route_supports_vision(runtime, VISUAL_ROUTE_AGENT)
+    agent_route_vision = image_input_mode == "direct" or _primary_route_supports_vision(
+        runtime, VISUAL_ROUTE_AGENT
     )
+    direct_image_input = bool(image_urls) and image_input_mode in {"auto", "direct"} and plain_route_vision
+    agent_direct_image_input = bool(image_urls) and image_input_mode in {"auto", "direct"} and agent_route_vision
     image_summary_suffix = ""
     image_urls_for_text_model = list(image_urls)
     _needs_image_summary = False
@@ -694,6 +746,32 @@ async def process_response_logic(bot: Any, event: Any, state: Dict[str, Any], de
                 _needs_image_summary = True
             if not direct_image_input:
                 image_urls_for_text_model = []
+
+    # 非 gif 表情包：去重 + 限量后，仅在视觉可用时直传模型理解（多模态直传 / 非多模态降级为文本占位符，不打标）。
+    # summary / disabled 模式不直传：前者明确要走文本，后者关图；两种情况下表情都只留文本占位符。
+    if sticker_image_urls and image_input_mode in {"auto", "direct"}:
+        sticker_vision_max = int(
+            getattr(runtime.plugin_config, "personification_sticker_vision_max", 3) or 0
+        )
+        _seen_sticker: set[str] = set()
+        capped_stickers: List[str] = []
+        for _su in sticker_image_urls:
+            if _su and _su not in _seen_sticker:
+                _seen_sticker.add(_su)
+                capped_stickers.append(_su)
+            if sticker_vision_max > 0 and len(capped_stickers) >= sticker_vision_max:
+                break
+        if capped_stickers and (plain_route_vision or agent_route_vision):
+            for _su in capped_stickers:
+                if _su not in tool_image_urls:
+                    tool_image_urls.append(_su)
+            if plain_route_vision:
+                for _su in capped_stickers:
+                    if _su not in image_urls_for_text_model:
+                        image_urls_for_text_model.append(_su)
+                direct_image_input = True
+            if agent_route_vision:
+                agent_direct_image_input = True
 
     hook_ctx = HookContext(
         user_id=user_id,
@@ -740,16 +818,15 @@ async def process_response_logic(bot: Any, event: Any, state: Dict[str, Any], de
             limit=8,
             include_message_ids=[incoming_relation_metadata.get("reply_to_msg_id")],
         )
-        recent_context_hint = render_group_context_structured(
-            recent_window,
-            trigger_msg_id=str(incoming_relation_metadata.get("message_id", "") or ""),
-        )
-        relationship_hint = summarize_group_relationships(
-            recent_window,
+        conversation_context = build_group_conversation_context(
+            recent_messages=recent_window,
             trigger_msg_id=str(incoming_relation_metadata.get("message_id", "") or ""),
             trigger_user_id=user_id,
             bot_self_id=bot_self_id,
+            repeat_clusters=repeat_clusters,
         )
+        recent_context_hint = render_group_conversation_context(conversation_context)
+        relationship_hint = conversation_context.relationship_hint
     if not is_private_session and sticker_candidates:
         _spawn_auto_collect_stickers(
             runtime=runtime,
@@ -759,12 +836,13 @@ async def process_response_logic(bot: Any, event: Any, state: Dict[str, Any], de
             task_exc_logger=_task_exc_logger,
         )
     async def _image_summary_task() -> str:
-        if not _needs_image_summary:
+        # 仅对真实照片做文本摘要降级；表情包不在回复路径打标（打标只服务于收集入库）。
+        if not _needs_image_summary or not photo_image_urls:
             return ""
         return await _build_image_summary_suffix(
             runtime=runtime,
-            image_urls=tool_image_urls,
-            sticker_like=is_sticker_like,
+            image_urls=photo_image_urls,
+            sticker_like=False,
         )
 
     image_summary_suffix, prepared_semantics = await asyncio.gather(
@@ -784,6 +862,7 @@ async def process_response_logic(bot: Any, event: Any, state: Dict[str, Any], de
             repeat_clusters=repeat_clusters,
             message_target=str(state.get("message_target", "") or ""),
             solo_speaker_follow=is_solo_speaker_follow,
+            has_images=bool(tool_image_urls),
         ),
     )
     if image_summary_suffix and tool_image_urls:
@@ -813,21 +892,10 @@ async def process_response_logic(bot: Any, event: Any, state: Dict[str, Any], de
         )
         return
     if is_random_chat:
-        should_speak = await should_speak_in_random_chat(
-            runtime=runtime,
+        should_speak = should_speak_in_random_chat(
             state=state,
-            raw_message_text=raw_message_text or message_text or message_content,
-            message_text=message_text,
-            message_content=message_content,
-            recent_context_hint=recent_context_hint,
-            relationship_hint=relationship_hint,
-            repeat_clusters=repeat_clusters,
-            recent_bot_replies=recent_bot_replies,
-            message_intent=message_intent,
-            ambiguity_level=intent_decision.ambiguity_level,
             message_target=str(state.get("message_target", "") or ""),
             solo_speaker_follow=is_solo_speaker_follow,
-            knowledge_store=runtime.knowledge_store,
         )
         if not should_speak:
             runtime.logger.info(f"拟人插件：随机插话场景被 LLM 否决，group={group_id} user={user_id}")
@@ -919,8 +987,11 @@ async def process_response_logic(bot: Any, event: Any, state: Dict[str, Any], de
     hook_ctx.semantic_frame = semantic_frame
     prelude_chunks = await get_hook_registry().run_all(hook_ctx, phase="system_prelude")
     context_chunks = await get_hook_registry().run_all(hook_ctx, phase="system_context")
+    primary_api_type, primary_model = _get_primary_provider_signature(runtime)
     context_chunks = await compress_context_if_needed(
         context_chunks,
+        max_tokens=context_token_budget_for_route(primary_api_type, primary_model),
+        keep_recent=context_keep_recent_for_route(primary_api_type, primary_model),
         call_ai_api=runtime.lite_call_ai_api or runtime.call_ai_api,
     )
     postlude_chunks = await get_hook_registry().run_all(hook_ctx, phase="system_postlude")
@@ -943,6 +1014,12 @@ async def process_response_logic(bot: Any, event: Any, state: Dict[str, Any], de
         plugin_summary=plugin_summary,
         has_visual_context=bool(tool_image_urls),
         photo_like=has_photo_input,
+        primary_api_type=primary_api_type,
+        primary_model=primary_model,
+        native_search_enabled=should_enable_default_builtin_search(
+            runtime.plugin_config,
+            get_configured_api_providers=runtime.get_configured_api_providers,
+        ),
     )
     if state.get("message_target") == TARGET_OTHERS:
         system_prompt += (
@@ -964,6 +1041,13 @@ async def process_response_logic(bot: Any, event: Any, state: Dict[str, Any], de
             "\n[系统提示] 当前最新名词/对象存在较高歧义。"
             "如果上下文和现有证据不足，请优先承认不确定；群聊里若没人明确在 cue 你，且这轮明显会打断别人时，也可以输出 [NO_REPLY]。"
         )
+    system_prompt += _build_confidence_style_instruction(
+        float(getattr(semantic_frame, "confidence", 0.0) or 0.0),
+        is_group=not is_private_session,
+    )
+    system_prompt += _build_scenario_instruction(
+        str(getattr(semantic_frame, "conversation_scenario", "") or ""),
+    )
     if arbitration == "clarify":
         system_prompt += (
             "\n[系统提示] 这轮高歧义但对方像是在直接问你。"
@@ -1020,8 +1104,8 @@ async def process_response_logic(bot: Any, event: Any, state: Dict[str, Any], de
             runtime.logger.warning("拟人插件：模型不支持图片输入，改用视觉摘要重试...")
             retry_suffix = image_summary_suffix or await _build_image_summary_suffix(
                 runtime=runtime,
-                image_urls=tool_image_urls,
-                sticker_like=is_sticker_like,
+                image_urls=photo_image_urls,
+                sticker_like=False,
             )
             retry_messages = clone_messages_with_text_suffix(messages_to_use, retry_suffix)
             result = await runtime.call_ai_api(retry_messages)
@@ -1029,28 +1113,33 @@ async def process_response_logic(bot: Any, event: Any, state: Dict[str, Any], de
             runtime.logger.warning("拟人插件：图片输入可能不被支持，改用视觉摘要重试...")
             retry_suffix = image_summary_suffix or await _build_image_summary_suffix(
                 runtime=runtime,
-                image_urls=tool_image_urls,
-                sticker_like=is_sticker_like,
+                image_urls=photo_image_urls,
+                sticker_like=False,
             )
             retry_messages = clone_messages_with_text_suffix(messages_to_use, retry_suffix)
             result = await runtime.call_ai_api(retry_messages)
         return result
 
-    recovered_direct_mention_reply: str | None = None
-
-    async def _recover_direct_mention_reply_now() -> str:
-        nonlocal recovered_direct_mention_reply
-        if recovered_direct_mention_reply is None:
-            recovered_direct_mention_reply = await recover_direct_mention_reply(
-                runtime.call_ai_api,
-                raw_message_text=raw_message_text or message_text or message_content,
-                recent_context=recent_context_hint,
-                relationship_hint=relationship_hint,
-                recent_bot_replies=recent_bot_replies,
-                semantic_frame=semantic_frame,
-                is_direct_mention=is_direct_mention,
-            )
-        return recovered_direct_mention_reply
+    async def _call_persona_responder_model(messages_to_use: List[Dict[str, Any]]) -> str:
+        if not bool(getattr(runtime.plugin_config, "personification_persona_responder_json_enabled", False)):
+            return await _call_text_model_with_retry(messages_to_use)
+        json_messages = with_persona_responder_instruction(
+            messages_to_use,
+            semantic_frame=semantic_frame,
+            is_direct_mention=is_direct_mention,
+            relationship_hint=relationship_hint,
+            recent_bot_replies=recent_bot_replies,
+            message_text=raw_message_text or message_text or message_content,
+            lorebook_enabled=bool(getattr(runtime.plugin_config, "personification_lorebook_enabled", False)),
+            memory_store=getattr(runtime, "memory_store", None),
+        )
+        raw = await _call_text_model_with_retry(json_messages)
+        parsed = parse_persona_response(raw)
+        if parsed is None:
+            runtime.logger.warning("拟人插件：PersonaResponder JSON 解析失败，按普通文本处理。")
+            return raw
+        apply_persona_response_to_semantic_frame(parsed, semantic_frame)
+        return parsed.reply_text
 
     fallback_model_messages = (
         agent_messages
@@ -1094,6 +1183,7 @@ async def process_response_logic(bot: Any, event: Any, state: Dict[str, Any], de
                         relationship_hint=relationship_hint,
                         recent_bot_replies=recent_bot_replies,
                         precomputed_intent=intent_decision,
+                        turn_plan=getattr(semantic_frame, "turn_plan", None),
                         started_at=started_at,
                         is_direct_mention=is_direct_mention,
                         response_timeout_seconds=float(
@@ -1116,13 +1206,7 @@ async def process_response_logic(bot: Any, event: Any, state: Dict[str, Any], de
             finally:
                 reset_current_image_context(image_ctx_token)
         if used_agent and reply_content in ("[NO_REPLY]", "<NO_REPLY>"):
-            recovered_reply = await _recover_direct_mention_reply_now()
-            if recovered_reply:
-                runtime.logger.info("拟人插件：Agent 对直呼消息返回 NO_REPLY，改用 LLM 补答。")
-                reply_content = recovered_reply
-                used_agent = False
-                bypass_length_limits = False
-            elif is_random_chat:
+            if is_random_chat:
                 runtime.logger.info("拟人插件：Agent 在随机插话场景选择 NO_REPLY，保持沉默。")
                 return
             else:
@@ -1131,14 +1215,11 @@ async def process_response_logic(bot: Any, event: Any, state: Dict[str, Any], de
                 reply_content = ""
                 bypass_length_limits = False
         if not used_agent:
-            reply_content = await _call_text_model_with_retry(fallback_model_messages)
+            reply_content = await _call_persona_responder_model(fallback_model_messages)
             bypass_length_limits = False
             if not reply_content:
-                recovered_reply = await _recover_direct_mention_reply_now()
                 runtime.logger.warning("拟人插件：未能获取到 AI 回复内容")
-                if recovered_reply:
-                    reply_content = recovered_reply
-                elif is_direct_mention:
+                if is_direct_mention:
                     reply_content = random.choice(_FALLBACK_REPLIES)
                 else:
                     return
@@ -1147,6 +1228,7 @@ async def process_response_logic(bot: Any, event: Any, state: Dict[str, Any], de
                 tool_caller=runtime.lite_tool_caller or runtime.agent_tool_caller,
                 original_text=reply_content,
                 persona_system=system_prompt,
+                output_mode=str(getattr(semantic_frame, "output_mode", "chat_short") or "chat_short"),
             )
             if rewritten_ooc:
                 reply_content = rewritten_ooc
@@ -1208,32 +1290,19 @@ async def process_response_logic(bot: Any, event: Any, state: Dict[str, Any], de
 
         has_silence_marker = "[SILENCE]" in reply_content or "<SILENCE>" in reply_content
         if has_silence_marker:
-            recovered_reply = await _recover_direct_mention_reply_now()
             runtime.logger.info(f"AI 决定结束与群 {group_id} 中 {user_name}({user_id}) 的对话 (SILENCE)")
-            if recovered_reply:
-                reply_content = recovered_reply
-            else:
-                return
+            return
 
         if used_agent and ("[NO_REPLY]" in reply_content or "<NO_REPLY>" in reply_content):
-            recovered_reply = await _recover_direct_mention_reply_now()
-            if recovered_reply:
-                runtime.logger.info("拟人插件：Agent 文本对直呼消息返回 NO_REPLY，改用 LLM 补答。")
-                reply_content = recovered_reply
-                used_agent = False
-                bypass_length_limits = False
-            elif is_random_chat:
+            if is_random_chat:
                 return
             else:
                 runtime.logger.info("拟人插件：Agent 文本含 NO_REPLY 标记，回退基础模型重试。")
                 reply_content = await _call_text_model_with_retry(fallback_model_messages)
                 bypass_length_limits = False
                 if not reply_content:
-                    recovered_reply = await _recover_direct_mention_reply_now()
                     runtime.logger.warning("拟人插件：Agent 回退基础模型后仍无回复内容")
-                    if recovered_reply:
-                        reply_content = recovered_reply
-                    elif is_direct_mention:
+                    if is_direct_mention:
                         reply_content = random.choice(_FALLBACK_REPLIES)
                     else:
                         return
@@ -1400,20 +1469,37 @@ async def process_response_logic(bot: Any, event: Any, state: Dict[str, Any], de
                 message_intent=message_intent,
                 is_private=is_private_session,
                 is_random_chat=is_random_chat,
+                is_direct_mention=is_direct_mention,
                 semantic_frame=semantic_frame,
             )
         if review_decision.action == "no_reply":
-            recovered_reply = await _recover_direct_mention_reply_now()
-            if recovered_reply:
-                runtime.logger.info(
-                    f"拟人插件：回复审阅对直呼消息选择沉默，改用 LLM 补答，group={group_id} user={user_id}"
-                )
-                reply_content = recovered_reply
-            else:
-                runtime.logger.info(f"拟人插件：回复审阅后选择沉默，group={group_id} user={user_id}")
-                return
+            runtime.logger.info(f"拟人插件：回复审阅后选择沉默，group={group_id} user={user_id}")
+            return
         if review_decision.action == "rewrite" and review_decision.text:
             reply_content = review_decision.text.strip()
+
+        if has_silence_control_marker(reply_content):
+            runtime.logger.info(
+                f"拟人插件：最终回复含沉默控制标记，group={group_id} user={user_id}"
+            )
+            return
+        # 兼容 yaml_pipeline prompt 的 <output><message>...</message></output> 思维链结构：
+        # 若 LLM 把回复包在 <message> 里（多条），用 \n\n 串接保留分段，下游 _split_segments 会再拆。
+        try:
+            parsed_yaml = parse_yaml_response(reply_content)
+        except Exception:
+            parsed_yaml = {"messages": []}
+        if parsed_yaml.get("messages"):
+            joined = "\n\n".join(
+                str(item.get("text", "")).strip()
+                for item in parsed_yaml["messages"]
+                if str(item.get("text", "")).strip()
+            )
+            if joined:
+                reply_content = joined
+        reply_content = strip_response_control_markers(reply_content)
+        if not reply_content and not _IMAGE_B64_RE.search(str(reply_content or "")):
+            return
 
         stale_reason = _stale_reply_abort_reason(state)
         if stale_reason:
@@ -1577,6 +1663,31 @@ async def process_response_logic(bot: Any, event: Any, state: Dict[str, Any], de
             assistant_text=final_visible_reply_text,
             is_private=is_private_session,
         )
+
+        if not is_private_session and bool(getattr(runtime.plugin_config, "personification_relation_evolution_enabled", False)):
+            async def _spawn_relation_evolution() -> None:
+                try:
+                    from ...core.evolve_group_relations import evolve_group_relations, list_group_relations
+                    current_relations = list_group_relations(runtime.memory_store, str(group_id))
+                    current_tags = list(set(
+                        str(r.get("tag", "")).strip()
+                        for r in current_relations
+                        if str(r.get("tag", "")).strip()
+                    ))
+                    turn_summary = f"回复: {str(final_visible_reply_text)[:200]} | 意图: {message_intent} | 原话: {str(raw_message_text or message_text or message_content)[:200]}"
+                    await evolve_group_relations(
+                        tool_caller=runtime.lite_tool_caller or runtime.agent_tool_caller,
+                        memory_store=runtime.memory_store,
+                        group_id=str(group_id),
+                        user_id=user_id,
+                        turn_summary=turn_summary,
+                        current_tags=current_tags,
+                        plugin_config=runtime.plugin_config,
+                    )
+                except Exception:
+                    pass
+            asyncio.create_task(_spawn_relation_evolution())
+
         if isinstance(event, types.group_message_event_cls):
             assistant_metadata.update(
                 {
@@ -1596,12 +1707,24 @@ async def process_response_logic(bot: Any, event: Any, state: Dict[str, Any], de
             **assistant_metadata,
         )
         if getattr(runtime, "memory_curator", None) is not None:
-            runtime.memory_curator.schedule_capture(
-                summary=final_visible_reply_text,
-                user_id=user_id,
-                group_id="" if is_private_session else str(group_id),
-                topic_tags=[str(group_id)] if not is_private_session else [],
-            )
+            memory_group_id = "" if is_private_session else str(group_id)
+            if hasattr(runtime.memory_curator, "schedule_turn_capture"):
+                runtime.memory_curator.schedule_turn_capture(
+                    user_utterance=raw_message_text or message_text or message_content,
+                    bot_response=final_visible_reply_text,
+                    user_id=user_id,
+                    group_id=memory_group_id,
+                    vision_summary=image_summary_suffix,
+                    semantic_frame=semantic_frame,
+                    scope=f"group:{memory_group_id}" if memory_group_id else f"user:{user_id}",
+                )
+            else:
+                runtime.memory_curator.schedule_capture(
+                    summary=final_visible_reply_text,
+                    user_id=user_id,
+                    group_id=memory_group_id,
+                    topic_tags=[str(group_id)] if not is_private_session else [],
+                )
 
         if isinstance(event, types.group_message_event_cls):
             runtime.record_group_msg(

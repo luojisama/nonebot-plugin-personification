@@ -18,6 +18,9 @@ def load_proactive_state() -> Dict[str, Dict[str, Any]]:
         user_state.setdefault("count", 0)
         user_state.setdefault("last_interaction", 0)
         user_state.setdefault("last_proactive_at", 0)
+        history = user_state.get("proactive_history")
+        user_state["proactive_history"] = history if isinstance(history, list) else []
+        user_state.setdefault("last_proactive_message", "")
     return data
 
 

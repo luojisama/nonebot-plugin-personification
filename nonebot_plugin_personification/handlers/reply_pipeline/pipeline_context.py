@@ -20,6 +20,7 @@ from ...core.message_parts import build_user_message_content
 from ...core.message_relations import build_event_relation_metadata
 from ...core.persona_profile import load_persona_profile, render_persona_snapshot
 from ...core.prompt_loader import pick_ack_phrase
+from ...core.gemini_profile import build_gemini_route_policy_prompt
 from ...core.reply_style_policy import build_reply_style_policy_prompt
 from ...core.visual_capabilities import VISUAL_ROUTE_REPLY_PLAIN
 from ...skill_runtime.runtime_api import SkillRuntime
@@ -104,6 +105,65 @@ def _int_or_zero(value: Any) -> int:
 
 def clear_image_classify_cache() -> None:
     _IMAGE_CLASSIFY_CACHE.clear()
+
+
+def _latest_user_text_for_agent_memory(messages: List[Dict[str, Any]]) -> str:
+    for message in reversed(list(messages or [])):
+        if str(message.get("role", "") or "") != "user":
+            continue
+        content = message.get("content", "")
+        if isinstance(content, str):
+            text = content.strip()
+            if text:
+                return text[:800]
+        if isinstance(content, list):
+            parts: list[str] = []
+            for item in content:
+                if isinstance(item, dict):
+                    text = str(item.get("text", "") or "").strip()
+                    if text:
+                        parts.append(text)
+            merged = " ".join(parts).strip()
+            if merged:
+                return merged[:800]
+    return ""
+
+
+async def _recall_agent_candidate_memories(
+    *,
+    runtime: Any,
+    event: Any,
+    messages: List[Dict[str, Any]],
+    turn_plan: Any = None,
+) -> list[dict[str, Any]]:
+    if not bool(getattr(runtime.plugin_config, "personification_evidence_synthesizer_enabled", False)):
+        return []
+    memory_store = getattr(runtime, "memory_store", None)
+    if memory_store is None or not bool(getattr(runtime.plugin_config, "personification_memory_palace_enabled", False)):
+        return []
+    memory_need = str(getattr(turn_plan, "memory_need", "") or "").strip()
+    if memory_need == "none":
+        return []
+    query = _latest_user_text_for_agent_memory(messages)
+    if not query:
+        return []
+    group_id = str(getattr(event, "group_id", "") or "").strip()
+    user_id = str(getattr(event, "user_id", "") or "").strip()
+    mode = "deep" if memory_need == "deep" else "auto"
+    try:
+        return await asyncio.to_thread(
+            memory_store.recall_memories,
+            query=query,
+            scope="auto",
+            user_id=user_id,
+            group_id=group_id,
+            limit=12,
+            mode=mode,
+            context_type="group" if group_id else "private",
+        )
+    except Exception as exc:
+        runtime.logger.debug(f"[agent] evidence memory recall failed: {exc}")
+        return []
 
 
 def _remember_image_classification(
@@ -326,11 +386,44 @@ def build_tts_user_hint(*, is_private: bool, group_style: str = "") -> str:
 
 def looks_like_sticker_message(text: str) -> bool:
     plain = str(text or "")
-    return "[图片·表情包]" in plain or "[表情id:" in plain or "[表情包]" in plain
+    return (
+        "[图片·表情包]" in plain
+        or "[表情id:" in plain
+        or "[表情:" in plain
+        or "[表情包]" in plain
+        or "[多张表情]" in plain
+    )
 
 
 def looks_like_photo_message(text: str) -> bool:
     return "[图片·照片]" in str(text or "")
+
+
+# 单个表情占位符的形态（incoming sticker placeholder）。
+_STICKER_PLACEHOLDER_ALT = (
+    r"\[图片·表情包\]"
+    r"|\[对方发送了一个表情包(?:：[^\]]*)?\]"
+    r"|\[表情包\]"
+    r"|\[表情:[^\]]*\]"
+    r"|\[表情id:[^\]]*\]"
+)
+# 连续 2+ 个表情占位符（中间可夹空白/分隔符）——批量刷表情时出现。
+_STICKER_RUN_RE = re.compile(
+    rf"(?:{_STICKER_PLACEHOLDER_ALT})(?:\s*(?:{_STICKER_PLACEHOLDER_ALT}))+"
+)
+
+
+def fold_consecutive_sticker_placeholders(text: str) -> str:
+    """把"一连串表情占位符"折叠成单个中性标记。
+
+    多人/连续刷表情时，喂给模型的消息文本会出现 N 个相邻的 `[图片·表情包]` 等占位符，
+    模型看到"一张接一张"的信号容易被勾出"怎么发个没完"之类的吐槽。这里在源头把连续
+    占位符折叠成一个中性的 `[多张表情]`，消除数量/连续性线索（单个表情保持原样）。
+    """
+    plain = str(text or "")
+    if not plain:
+        return plain
+    return _STICKER_RUN_RE.sub("[多张表情]", plain)
 
 
 def get_primary_provider_signature(runtime: Any) -> tuple[str, str]:
@@ -579,6 +672,7 @@ async def run_agent_if_enabled(
     relationship_hint: str = "",
     recent_bot_replies: list[str] | None = None,
     precomputed_intent: Any = None,
+    turn_plan: Any = None,
     started_at: float | None = None,
     is_direct_mention: bool = False,
     response_timeout_seconds: float = _DEFAULT_RESPONSE_TIMEOUT_SECONDS,
@@ -632,6 +726,37 @@ async def run_agent_if_enabled(
         async def _ack_sender(text: str, *, _phrase: str = ack_phrase) -> None:
             await bot.send(event, str(text or "").strip() or _phrase)
         ack_sender = _ack_sender
+    candidate_memories = await _recall_agent_candidate_memories(
+        runtime=runtime,
+        event=event,
+        messages=messages,
+        turn_plan=turn_plan,
+    )
+    try:
+        profile_service = getattr(runtime, "profile_service", None)
+        if profile_service is not None:
+            _gid = str(getattr(event, "group_id", "") or "")
+            _uid = str(getattr(event, "user_id", "") or "")
+            if _uid:
+                _block = profile_service.build_prompt_block(user_id=_uid, group_id=_gid)
+                if _block:
+                    messages.append({"role": "system", "content": _block})
+    except Exception:
+        pass
+    # 注入群风格摘要（最近一次 group_style_autobuild 产出）
+    try:
+        _gid = str(getattr(event, "group_id", "") or "")
+        if _gid:
+            from ...core.group_style_autobuild import get_latest_style_text
+
+            _style_text = get_latest_style_text(_gid)
+            if _style_text:
+                messages.append({
+                    "role": "system",
+                    "content": f"## 本群风格画像\n{_style_text}\n\n回复时请贴合该群的语气、节奏和用语习惯。",
+                })
+    except Exception:
+        pass
     result = await run_agent(
         messages=messages,
         registry=runtime_registry,
@@ -650,6 +775,8 @@ async def run_agent_if_enabled(
         relationship_hint=relationship_hint,
         recent_bot_replies=list(recent_bot_replies or []),
         precomputed_intent=precomputed_intent,
+        turn_plan=turn_plan,
+        candidate_memories=candidate_memories,
         time_budget_seconds=compute_agent_time_budget(
             started_at=started_at,
             total_timeout_seconds=response_timeout_seconds,
@@ -728,7 +855,11 @@ def build_base_system_prompt(
     postlude_chunks: List[str],
     plugin_summary: str = "",
     has_visual_context: bool = False,
+    has_video_context: bool = False,
     photo_like: bool = False,
+    primary_api_type: str = "",
+    primary_model: str = "",
+    native_search_enabled: bool = False,
 ) -> str:
     profile = load_persona_profile(base_prompt)
     parts: List[str] = [base_prompt if isinstance(base_prompt, str) else ""]
@@ -774,6 +905,15 @@ def build_base_system_prompt(
             photo_like=photo_like,
         )
     )
+    gemini_policy = build_gemini_route_policy_prompt(
+        api_type=primary_api_type,
+        model=primary_model,
+        has_visual_context=has_visual_context,
+        has_video_context=has_video_context,
+        native_search_enabled=native_search_enabled,
+    )
+    if gemini_policy:
+        parts.append(gemini_policy)
     parts.append(build_prompt_injection_guard())
     parts.extend(chunk for chunk in context_chunks if chunk)
     parts.append(
@@ -788,14 +928,79 @@ def build_base_system_prompt(
         "8. 收到贴图/表情包时绝对不要对图片内容发表任何评论（包括“这图也太X了”“哈哈这个”等），"
         "当作没看见，按对话语境继续；收到真实照片时可以像群友看朋友圈一样自然回应。"
         "表情包/梗图/截图可以当作语气线索理解，但没人问图里是什么时，不要主动做图片讲解。"
+        "当多位群友连续刷表情包时，理解为大家在用表情表达情绪/玩梗/附和，把它当成群里的情绪氛围；"
+        "绝不要抱怨刷屏、说“看不过来”“怎么这么多表情”，也不要复述或统计表情数量。\n"
+        "9. 有人让你“写一段/来一段/AI 一段/帮我写”对白、剧本、小作文、段子、歌词或角色扮演内容时，"
+        "不要切换成写作工具去交付任务：不写前言铺垫（如“来一段…的氛围：”）、不写“角色：台词”式的多角色剧本、"
+        "不写结尾点评或总结、不堆营业腔和网络黑话。可以用自己的人设口吻即兴接两三句、玩梗式轻轻带过，"
+        "但绝不展开成长篇命题作文，也不要为此出戏、扮演成别的角色或换成别的说话风格。"
     )
     parts.extend(chunk for chunk in postlude_chunks if chunk)
     return "\n\n".join(part for part in parts if part)
 
 
+def build_confidence_style_instruction(confidence: float, *, is_group: bool = False) -> str:
+    try:
+        value = float(confidence)
+    except (TypeError, ValueError):
+        value = 0.0
+    if value >= 0.8:
+        return ""
+    if value >= 0.6:
+        return (
+            "\n[系统提示] 当前语义置信度中等。回复时用“我理解是…”“应该是…”这类留余地的口吻，"
+            "不要把不确定的推断说死。"
+        )
+    if value >= 0.4:
+        return (
+            "\n[系统提示] 当前语义置信度偏低。优先先确认理解是否正确，例如用一句短问句确认对象或上下文；"
+            "群聊里如果没人明确 cue 你，也可以 [NO_REPLY]。"
+        )
+    if is_group:
+        return (
+            "\n[系统提示] 当前语义置信度很低。群聊里默认不要硬插话，除非被直接 @ 或明确追问，否则输出 [NO_REPLY]。"
+        )
+    return "\n[系统提示] 当前语义置信度很低。先用一句话确认对方意思，不要硬猜。"
+
+
+_SCENARIO_INSTRUCTIONS: dict[str, str] = {
+    "casual_banter": (
+        "\n[场景提示] 当前群友在互相调侃闲聊。"
+        "不要认真科普或长篇大论；适合沉默、轻接一句、或短句吐槽。"
+    ),
+    "sarcasm_irony": (
+        "\n[场景提示] 当前对话含有反讽/阴阳怪气语气。"
+        "先识别语气再回应，不要把反讽当真回复；可以顺着接或沉默。"
+    ),
+    "argument": (
+        "\n[场景提示] 当前群友在争吵或对立。"
+        "不要站队任何一方；可以尝试降温，或者直接 [NO_REPLY] 不掺和。"
+    ),
+    "inside_joke": (
+        "\n[场景提示] 当前对话涉及群内部梗或暗号。"
+        "如果你不确定含义，不要硬解释；可以问一句或者沉默。"
+    ),
+    "multi_thread": (
+        "\n[场景提示] 群内多个话题同时进行。"
+        "只回应与你被 @ 或直接相关的线程，不要把不同线程的内容混在一起总结。"
+    ),
+    "private_topic": (
+        "\n[场景提示] 当前对话涉及个人隐私或敏感话题。"
+        "不要主动记忆具体内容到长期存储；回复要克制，不追问细节。"
+    ),
+}
+
+
+def build_scenario_instruction(scenario: str) -> str:
+    normalized = str(scenario or "").strip().lower()
+    return _SCENARIO_INSTRUCTIONS.get(normalized, "")
+
+
 __all__ = [
     "batch_has_newer_messages",
     "build_base_system_prompt",
+    "build_confidence_style_instruction",
+    "build_scenario_instruction",
     "build_final_visible_reply_text",
     "build_group_session_relation_metadata",
     "build_tts_user_hint",
@@ -805,6 +1010,7 @@ __all__ = [
     "compute_agent_time_budget",
     "count_user_interactions",
     "extract_reply_sender_meta",
+    "fold_consecutive_sticker_placeholders",
     "get_cached_friend_ids",
     "get_primary_provider_signature",
     "IncomingImageClassification",

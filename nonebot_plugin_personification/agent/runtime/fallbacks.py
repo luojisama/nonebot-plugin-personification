@@ -7,7 +7,6 @@ from typing import Any
 
 from ..query_rewriter import ContextualQueryRewrite
 from ..tool_registry import ToolRegistry
-from ...skills.skillpacks.tool_caller.scripts.impl import ToolCaller
 from .tool_selection import _select_tool_schemas
 
 

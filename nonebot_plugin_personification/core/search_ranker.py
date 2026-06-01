@@ -88,6 +88,7 @@ def rank_memory_payload(
     created_at = safe_float(payload.get("time_created", 0.0), 0.0)
     last_accessed_at = safe_float(payload.get("last_accessed_at", 0.0), 0.0)
     time_sensitivity = str(payload.get("time_sensitivity", "normal") or "normal")
+    memory_type = str(payload.get("memory_type", "") or "")
     source_kind = str(payload.get("source_kind", "") or "")
     crystal_status = str(payload.get("status", "") or payload.get("crystal_status", "") or "")
     cross_group_allowed = bool(payload.get("cross_group_allowed", False))
@@ -106,6 +107,12 @@ def rank_memory_payload(
     score += group_scope_delta(payload_group_id, requested_group_id, cross_group_allowed)
     if requested_user_id and payload_user_id and payload_user_id == requested_user_id:
         score += 0.10
+    if memory_type == "persona_knowledge":
+        score += 0.16
+    elif memory_type == "group_knowledge" and payload_group_id == requested_group_id:
+        score += 0.14
+    elif memory_type == "episodic_turn":
+        score += 0.04
     if source_kind == "crystal":
         score -= 0.12
         if crystal_status in {"unreviewed", "candidate"}:

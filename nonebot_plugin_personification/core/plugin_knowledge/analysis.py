@@ -4,8 +4,6 @@ import json
 import re
 from typing import Any
 
-from ...skills.skillpacks.tool_caller.scripts.impl import ToolCaller
-
 
 _BATCH_MAX_SOURCE_CHARS = 12_000
 _BATCH_MAX_CHUNKS = 4

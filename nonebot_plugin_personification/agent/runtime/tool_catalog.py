@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from ..tool_registry import AgentTool
 from ..tool_registry import ToolRegistry
 from .constants import DEFAULT_AGENT_MAX_STEPS, MAX_AGENT_MAX_STEPS, MIN_AGENT_MAX_STEPS
 
@@ -42,6 +43,28 @@ _PLUGIN_WEB_TOOL_NAMES = frozenset(
         "search_github_repos",
     }
 )
+_NETWORK_TOOL_NAMES = frozenset(
+    {
+        "parallel_research",
+        "web_search",
+        "search_web",
+        "multi_search_engine",
+        "collect_resources",
+        "search_images",
+        "search_official_site",
+        "search_github_repos",
+        "wiki_lookup",
+        "get_baike_entry",
+        "get_daily_news",
+        "get_ai_news",
+        "get_trending",
+        "get_history_today",
+        "get_epic_games",
+        "get_gold_price",
+        "get_exchange_rate",
+        "weather",
+    }
+)
 _ADMIN_TOOL_NAMES = frozenset(
     {
         "sticker_labeler",
@@ -54,6 +77,126 @@ _ADMIN_TOOL_NAMES = frozenset(
         "confirm_resource_request",
     }
 )
+_MEMORY_TOOL_NAMES = frozenset({"memory_recall", "get_user_persona"})
+
+
+def _coerce_tags(value: Any) -> set[str]:
+    if isinstance(value, str):
+        return {item.strip() for item in value.split(",") if item.strip()}
+    if isinstance(value, (list, tuple, set, frozenset)):
+        return {str(item or "").strip() for item in value if str(item or "").strip()}
+    return set()
+
+
+def _default_tool_metadata(tool_name: str) -> dict[str, Any]:
+    name = str(tool_name or "").strip()
+    metadata: dict[str, Any] = {
+        "intent_tags": [],
+        "evidence_kind": "generic",
+        "requires_network": False,
+        "requires_image": False,
+        "latency_class": "normal",
+        "risk_level": "low",
+    }
+    if name in _ADMIN_TOOL_NAMES:
+        metadata.update({"risk_level": "admin", "intent_tags": ["admin"]})
+    if name in _IMAGE_REQUIRED_TOOL_NAMES:
+        metadata.update(
+            {
+                "intent_tags": ["vision"],
+                "evidence_kind": "visual_summary",
+                "requires_image": True,
+                "latency_class": "medium",
+            }
+        )
+    if name in _IMAGE_GENERATION_TOOL_NAMES:
+        metadata.update(
+            {
+                "intent_tags": ["image_generation"],
+                "evidence_kind": "direct_media",
+                "latency_class": "slow",
+            }
+        )
+    if name in _IMAGE_GENERATION_CONTEXT_TOOL_NAMES:
+        tags = _coerce_tags(metadata.get("intent_tags"))
+        tags.update({"lookup", "image_generation"})
+        metadata.update(
+            {
+                "intent_tags": sorted(tags),
+                "evidence_kind": "web" if name in _NETWORK_TOOL_NAMES else "resource",
+                "requires_network": name in _NETWORK_TOOL_NAMES,
+                "latency_class": "slow" if name == "parallel_research" else "normal",
+            }
+        )
+    if name in _PLUGIN_LOCAL_TOOL_NAMES:
+        metadata.update(
+            {
+                "intent_tags": ["plugin_question", "plugin_local"],
+                "evidence_kind": "plugin_knowledge",
+                "latency_class": "fast",
+            }
+        )
+    if name in _PLUGIN_WEB_TOOL_NAMES:
+        tags = _coerce_tags(metadata.get("intent_tags"))
+        tags.update({"lookup", "plugin_latest"})
+        metadata.update(
+            {
+                "intent_tags": sorted(tags),
+                "evidence_kind": "web",
+                "requires_network": True,
+            }
+        )
+    if name in _NETWORK_TOOL_NAMES:
+        tags = _coerce_tags(metadata.get("intent_tags"))
+        tags.add("lookup")
+        metadata.update(
+            {
+                "intent_tags": sorted(tags),
+                "evidence_kind": "web",
+                "requires_network": True,
+                "latency_class": "slow" if name == "parallel_research" else metadata.get("latency_class", "normal"),
+            }
+        )
+    if name in _MEMORY_TOOL_NAMES:
+        tags = _coerce_tags(metadata.get("intent_tags"))
+        tags.add("memory")
+        metadata.update(
+            {
+                "intent_tags": sorted(tags),
+                "evidence_kind": "memory",
+                "latency_class": "fast",
+            }
+        )
+    return metadata
+
+
+def apply_tool_metadata_defaults(registry: ToolRegistry) -> None:
+    for tool in registry.all():
+        defaults = _default_tool_metadata(tool.name)
+        metadata = dict(defaults)
+        metadata.update(tool.metadata or {})
+        tool.metadata = metadata
+
+
+def tool_planner_metadata(tool: AgentTool) -> dict[str, Any]:
+    metadata = dict(_default_tool_metadata(tool.name))
+    metadata.update(tool.metadata or {})
+    return {
+        "name": tool.name,
+        "description": tool.description,
+        "intent_tags": sorted(_coerce_tags(metadata.get("intent_tags"))),
+        "evidence_kind": str(metadata.get("evidence_kind", "generic") or "generic"),
+        "requires_network": bool(metadata.get("requires_network", False)),
+        "requires_image": bool(metadata.get("requires_image", False)),
+        "latency_class": str(metadata.get("latency_class", "normal") or "normal"),
+        "risk_level": str(metadata.get("risk_level", "low") or "low"),
+        "local": bool(tool.local),
+    }
+
+
+def registry_planner_metadata(registry: ToolRegistry, *, active_only: bool = True) -> list[dict[str, Any]]:
+    tools = registry.active() if active_only else registry.all()
+    return [tool_planner_metadata(tool) for tool in tools]
 
 
 def normalize_agent_max_steps(value: Any, default: int = DEFAULT_AGENT_MAX_STEPS) -> int:
@@ -71,6 +214,27 @@ def schema_tool_name(schema: dict) -> str:
     if not isinstance(function, dict):
         function = {}
     return str(function.get("name", "") or "").strip()
+
+
+def _tool_metadata_for_name(registry: ToolRegistry, name: str) -> dict[str, Any]:
+    tool = registry.get(name)
+    if tool is None:
+        return _default_tool_metadata(name)
+    return tool_planner_metadata(tool)
+
+
+def _tool_tags(registry: ToolRegistry, name: str) -> set[str]:
+    return _coerce_tags(_tool_metadata_for_name(registry, name).get("intent_tags"))
+
+
+def _tool_is_admin(registry: ToolRegistry, name: str) -> bool:
+    metadata = _tool_metadata_for_name(registry, name)
+    return str(metadata.get("risk_level", "") or "").strip() == "admin" or name in _ADMIN_TOOL_NAMES
+
+
+def _tool_requires_image(registry: ToolRegistry, name: str) -> bool:
+    metadata = _tool_metadata_for_name(registry, name)
+    return bool(metadata.get("requires_image", False)) or name in _IMAGE_REQUIRED_TOOL_NAMES
 
 
 def select_tool_schemas(
@@ -91,28 +255,38 @@ def select_tool_schemas(
         result_schemas = [
             schema
             for schema in schemas
-            if schema_tool_name(schema) in _IMAGE_REQUIRED_TOOL_NAMES
+            if _tool_requires_image(registry, schema_tool_name(schema))
         ]
     elif effective_chat_intent == "image_generation":
-        allowed = set(_IMAGE_GENERATION_TOOL_NAMES)
-        allowed.update(_IMAGE_GENERATION_CONTEXT_TOOL_NAMES)
-        if has_images:
-            allowed.update(_IMAGE_REQUIRED_TOOL_NAMES)
         result_schemas = [
             schema
             for schema in schemas
-            if schema_tool_name(schema) in allowed
+            if (
+                "image_generation" in _tool_tags(registry, schema_tool_name(schema))
+                or schema_tool_name(schema) in _IMAGE_GENERATION_TOOL_NAMES
+                or schema_tool_name(schema) in _IMAGE_GENERATION_CONTEXT_TOOL_NAMES
+                or (has_images and _tool_requires_image(registry, schema_tool_name(schema)))
+            )
         ]
     elif effective_chat_intent == "plugin_question":
-        allowed = set(_PLUGIN_LOCAL_TOOL_NAMES)
-        if str(plugin_question_intent or "").strip() == "latest":
-            allowed.update(_PLUGIN_WEB_TOOL_NAMES)
+        include_latest = str(plugin_question_intent or "").strip() == "latest"
         if has_images:
-            allowed.update(_IMAGE_REQUIRED_TOOL_NAMES)
+            include_latest = True
         result_schemas = [
             schema
             for schema in schemas
-            if schema_tool_name(schema) in allowed
+            if (
+                "plugin_local" in _tool_tags(registry, schema_tool_name(schema))
+                or schema_tool_name(schema) in _PLUGIN_LOCAL_TOOL_NAMES
+                or (
+                    include_latest
+                    and (
+                        "plugin_latest" in _tool_tags(registry, schema_tool_name(schema))
+                        or schema_tool_name(schema) in _PLUGIN_WEB_TOOL_NAMES
+                    )
+                )
+                or (has_images and _tool_requires_image(registry, schema_tool_name(schema)))
+            )
         ]
     elif has_images:
         result_schemas = list(schemas)
@@ -120,12 +294,12 @@ def select_tool_schemas(
         result_schemas = [
             schema
             for schema in schemas
-            if schema_tool_name(schema) not in _IMAGE_REQUIRED_TOOL_NAMES
+            if not _tool_requires_image(registry, schema_tool_name(schema))
         ]
     return [
         schema
         for schema in result_schemas
-        if schema_tool_name(schema) not in _ADMIN_TOOL_NAMES
+        if not _tool_is_admin(registry, schema_tool_name(schema))
     ]
 
 
@@ -142,8 +316,11 @@ __all__ = [
     "DEFAULT_AGENT_MAX_STEPS",
     "MAX_AGENT_MAX_STEPS",
     "MIN_AGENT_MAX_STEPS",
+    "apply_tool_metadata_defaults",
     "normalize_agent_max_steps",
+    "registry_planner_metadata",
     "schema_tool_name",
     "select_tool_schemas",
     "semantic_tool_guidance",
+    "tool_planner_metadata",
 ]

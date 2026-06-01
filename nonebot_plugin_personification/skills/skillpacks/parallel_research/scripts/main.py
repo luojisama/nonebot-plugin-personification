@@ -24,6 +24,7 @@ def build_tools(runtime: Any) -> list[AgentTool]:
         images: list[str] | None = None,
         image_urls: list[str] | None = None,
         max_workers: int | None = None,
+        research_level: str = "medium",
     ) -> str:
         if str(purpose or "").strip().lower() == "lookup" and not bool(
             getattr(plugin_config, "personification_parallel_research_lookup_enabled", True)
@@ -44,6 +45,7 @@ def build_tools(runtime: Any) -> list[AgentTool]:
             images=images,
             image_urls=image_urls,
             max_workers=max_workers,
+            research_level=research_level,
         )
 
     return [
@@ -85,6 +87,11 @@ def build_tools(runtime: Any) -> list[AgentTool]:
                         "type": "integer",
                         "description": "允许 planner 启动的最大子Agent数，上限由配置和代码限制保护",
                         "default": 6,
+                    },
+                    "research_level": {
+                        "type": "string",
+                        "description": "深度研究 v2 档位：low/medium/high；仅在 personification_deep_research_v2_enabled=true 时生效",
+                        "default": "medium",
                     },
                 },
                 "required": ["query"],

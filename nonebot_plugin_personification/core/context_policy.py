@@ -7,6 +7,29 @@ _HISTORY_MARKER_PATTERNS = (
     r"\[发送了一张表情包:[^\]]*\]",
     r"\[发送了表情包[^\]]*\]",
 )
+_SILENCE_MARKERS = ("[SILENCE]", "<SILENCE>", "[NO_REPLY]", "<NO_REPLY>")
+_SILENCE_BARE_WORDS = frozenset(
+    {
+        "silence",
+        "silent",
+        "no_reply",
+        "no-reply",
+        "noreply",
+        "沉默",
+        "不回复",
+        "无回复",
+        "静默",
+        "保持沉默",
+    }
+)
+_SILENCE_PREFIX_PATTERN = re.compile(
+    r"^\s*(?:silence|silent|no[_\s\-]?reply|noreply|沉默|不回复|无回复|静默|保持沉默)\s*[:：]\s*",
+    re.IGNORECASE,
+)
+_SILENCE_LEADING_LINE_PATTERN = re.compile(
+    r"^\s*(?:silence|silent|no[_\s\-]?reply|noreply|沉默|不回复|无回复|静默|保持沉默)\s*(?:\r?\n)+",
+    re.IGNORECASE,
+)
 _PRIVATE_COMMAND_PREFIXES = ("/", "!", "！", "#", "＃", ".", "。")
 _PRIVATE_COMMAND_KEYWORDS: Set[str] = set()
 
@@ -32,11 +55,64 @@ def get_private_command_keywords() -> Set[str]:
 
 
 def sanitize_history_text(text: Any) -> str:
-    cleaned = str(text or "")
+    cleaned = strip_response_control_markers(str(text or ""))
     for pattern in _HISTORY_MARKER_PATTERNS:
         cleaned = re.sub(pattern, "", cleaned)
     cleaned = re.sub(r"\s+", " ", cleaned).strip()
     return cleaned
+
+
+def has_silence_control_marker(text: Any) -> bool:
+    raw = str(text or "")
+    if any(marker in raw for marker in _SILENCE_MARKERS):
+        return True
+    stripped = raw.strip()
+    if not stripped:
+        return False
+    if stripped.lower() in _SILENCE_BARE_WORDS:
+        return True
+    if _SILENCE_PREFIX_PATTERN.match(stripped):
+        leftover = _SILENCE_PREFIX_PATTERN.sub("", stripped, count=1).strip()
+        if not leftover:
+            return True
+    if _SILENCE_LEADING_LINE_PATTERN.match(stripped):
+        leftover = _SILENCE_LEADING_LINE_PATTERN.sub("", stripped, count=1).strip()
+        if not leftover:
+            return True
+    return False
+
+
+def strip_response_control_markers(text: Any) -> str:
+    cleaned = str(text or "")
+    # 1) 完整闭合的思维链块，连同内容一并删除
+    cleaned = re.sub(
+        r"<\s*(?:think|status|action)\b[^>]*>.*?</\s*(?:think|status|action)\s*>",
+        "",
+        cleaned,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    # 2) 未闭合的 think/status/action：从开标签吃到下一个标签或文本结尾，避免内部内容漏出
+    cleaned = re.sub(
+        r"<\s*(?:think|status|action)\b[^>]*>[\s\S]*?(?=<\s*[A-Za-z/]|\Z)",
+        "",
+        cleaned,
+        flags=re.IGNORECASE,
+    )
+    # 3) 单独的 output/message/think/status/action 残留标签
+    cleaned = re.sub(
+        r"</?\s*(?:output|message|think|status|action)\b[^>]*>",
+        "",
+        cleaned,
+        flags=re.IGNORECASE,
+    )
+    for marker in _SILENCE_MARKERS:
+        cleaned = cleaned.replace(marker, "")
+    cleaned = _SILENCE_LEADING_LINE_PATTERN.sub("", cleaned, count=1)
+    cleaned = _SILENCE_PREFIX_PATTERN.sub("", cleaned, count=1)
+    bare = cleaned.strip()
+    if bare.lower() in _SILENCE_BARE_WORDS:
+        return ""
+    return bare
 
 
 def build_prompt_injection_guard() -> str:

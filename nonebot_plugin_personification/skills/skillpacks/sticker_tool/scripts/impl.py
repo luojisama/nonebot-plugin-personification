@@ -20,7 +20,7 @@ from plugin.personification.core.sticker_semantics import (
     parse_sticker_semantic_hint,
 )
 from plugin.personification.core.media_understanding import analyze_images_with_route_or_fallback
-from plugin.personification.core.sticker_feedback import get_sticker_score
+from plugin.personification.core.sticker_feedback import get_sticker_decay_multiplier, get_sticker_score
 from plugin.personification.core.image_result_cache import (
     build_image_cache_key,
     get_cached_image_result,
@@ -321,7 +321,10 @@ def rank_sticker_candidates(
             continue
         score = _score_sticker(meta, hint, proactive, context)
         feedback_score = max(0.3, get_sticker_score(sticker.stem, feedback_state))
-        weighted_score = score * weight * feedback_score
+        # 衰减乘子：刚发过的表情包 1h 内压制到 0.3，1-24h 线性恢复，24h+ 完全放开。
+        # 防止高 weight 表情包反复中签。
+        decay_multiplier = get_sticker_decay_multiplier(sticker.stem, feedback_state)
+        weighted_score = score * weight * feedback_score * decay_multiplier
         if weighted_score < threshold:
             continue
         candidates.append(

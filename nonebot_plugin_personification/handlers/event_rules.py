@@ -297,8 +297,9 @@ def _extract_recordable_group_message(event: Any) -> tuple[str, int, str]:
                 if text:
                     text_parts.append(text)
             elif seg_type == "face":
-                face_id = str(data.get("id", "") or "").strip()
-                token = f"[表情id:{face_id}]" if face_id else "[表情]"
+                from ..core.qq_face_names import render_face_token
+
+                token = render_face_token(data.get("id", ""))
                 text_parts.append(token)
                 visual_parts.append(token)
             elif seg_type == "mface":
@@ -354,7 +355,7 @@ def resolve_record_message(
     relation_metadata = build_event_relation_metadata(
         event,
         bot_self_id=self_id,
-        source_kind="bot" if is_bot_message else "user",
+        source_kind="plugin" if is_bot_message else "user",
     )
     count = record_group_msg(
         group_id,
@@ -445,26 +446,11 @@ async def poke_notice_rule(
 
 
 def split_text_into_segments(text: str) -> list[str]:
-    pattern = r"([。！？!?\n]+|[…]{1,2}|[.]{3,6})"
-    parts = re.split(pattern, text)
-    segments = []
-    buffer = ""
-
-    for part in parts:
-        if not part:
-            continue
-        if re.match(pattern, part):
-            buffer += part
-            segments.append(buffer)
-            buffer = ""
-        else:
-            if buffer:
-                segments.append(buffer)
-                buffer = ""
-            buffer = part
-
-    if buffer:
-        segments.append(buffer)
+    # 只按 LLM 显式输出的段落分隔（连续 2+ 换行/空行）切分。
+    # 单个句号、问号、感叹号不再触发切分，避免一句完整回复被发成多条消息。
+    # 单换行（软分行）也不切，由下游 split_segment_if_long 按字数处理。
+    parts = re.split(r"\n\s*\n+", text)
+    segments = [p.strip() for p in parts if p.strip()]
     return segments
 
 

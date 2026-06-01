@@ -13,8 +13,12 @@ _EDGE_WEIGHTS = {
     "mention": 1.0,
     "turn": 0.7,
     "repeat": 1.2,
+    # 同 thread（话题线程）内的弱共现，区别于 turn（仅顺序相邻）
+    "co_topic": 0.5,
 }
 _DECAY_HALF_LIFE_HOURS = 18.0
+# upsert 累加权重时按"上一次到现在的时间"做半衰，避免边随机增长，不衰减
+_INSERT_DECAY_HALF_LIFE_HOURS = 24.0 * 30  # 30 天
 
 
 def _normalize_user_id(value: Any) -> str:
@@ -43,6 +47,29 @@ def upsert_group_relation_edge(
     if not group_id or not src or not dst or src == dst:
         return
     edge = str(edge_kind or "").strip().lower() or "other"
+    # 写入前对存量 weight 做一次时间衰减，避免边权重单向膨胀
+    existing = conn.execute(
+        """
+        SELECT weight, last_seen_at
+        FROM group_relation_edges
+        WHERE group_id=? AND src_user_id=? AND dst_user_id=? AND edge_kind=?
+        """,
+        (str(group_id), src, dst, edge),
+    ).fetchone()
+    decayed_existing = 0.0
+    if existing is not None:
+        try:
+            prev_w = float(existing["weight"] or 0)
+            prev_ts = float(existing["last_seen_at"] or 0)
+        except Exception:
+            prev_w, prev_ts = 0.0, 0.0
+        age_seconds = max(0.0, float(last_seen_at) - prev_ts)
+        if age_seconds > 0 and prev_w > 0:
+            decay_factor = 0.5 ** (age_seconds / (_INSERT_DECAY_HALF_LIFE_HOURS * 3600.0))
+            decayed_existing = prev_w * decay_factor
+        else:
+            decayed_existing = prev_w
+    new_weight = float(weight) + decayed_existing
     conn.execute(
         """
         INSERT INTO group_relation_edges(
@@ -50,7 +77,7 @@ def upsert_group_relation_edge(
         ) VALUES (?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(group_id, src_user_id, dst_user_id, edge_kind)
         DO UPDATE SET
-            weight = group_relation_edges.weight + excluded.weight,
+            weight = excluded.weight,
             last_seen_at = MAX(group_relation_edges.last_seen_at, excluded.last_seen_at),
             sample_msg_id = CASE
                 WHEN excluded.sample_msg_id != '' THEN excluded.sample_msg_id
@@ -62,7 +89,7 @@ def upsert_group_relation_edge(
             src,
             dst,
             edge,
-            float(weight),
+            float(new_weight),
             float(last_seen_at),
             str(sample_msg_id or ""),
         ),
@@ -82,6 +109,7 @@ def update_relation_edges_from_message(
     message_id: str = "",
     content: str = "",
     timestamp: float | None = None,
+    thread_id: str = "",
 ) -> None:
     src = _normalize_user_id(user_id)
     if not src or not _is_human_source(source_kind, is_bot=is_bot):
@@ -194,6 +222,43 @@ def update_relation_edges_from_message(
                         last_seen_at=ts,
                         sample_msg_id=message_id,
                     )
+
+    # P8：同 thread 内的弱共现，作为 co_topic 边
+    thread_norm = str(thread_id or "").strip()
+    if thread_norm:
+        thread_rows = conn.execute(
+            """
+            SELECT user_id, timestamp
+            FROM group_messages
+            WHERE group_id=? AND thread_id=? AND user_id<>? AND is_bot=0
+              AND source_kind NOT IN ('bot', 'plugin', 'system')
+            ORDER BY timestamp DESC
+            LIMIT 12
+            """,
+            (str(group_id), thread_norm, src),
+        ).fetchall()
+        seen_partners: set[str] = set()
+        for row in thread_rows:
+            partner = _normalize_user_id(row["user_id"] if hasattr(row, "__getitem__") else "")
+            if not partner or partner in seen_partners:
+                continue
+            seen_partners.add(partner)
+            other_ts = float(row["timestamp"] if hasattr(row, "__getitem__") else 0 or 0)
+            # 仅累计近 6 小时内同 thread 的共现
+            if ts - other_ts > 6 * 3600:
+                continue
+            upsert_group_relation_edge(
+                conn,
+                group_id=group_id,
+                src_user_id=src,
+                dst_user_id=partner,
+                edge_kind="co_topic",
+                weight=_EDGE_WEIGHTS["co_topic"],
+                last_seen_at=ts,
+                sample_msg_id=message_id,
+            )
+            if len(seen_partners) >= 5:
+                break
 
 
 def _decayed_weight(weight: float, last_seen_at: float, *, now_ts: float) -> float:

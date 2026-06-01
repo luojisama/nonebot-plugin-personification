@@ -10,6 +10,24 @@ from urllib.parse import quote
 import httpx
 
 
+def _web_proxy() -> Optional[str]:
+    """读取 personification_web_proxy 配置，供联网检索的 httpx 客户端使用。"""
+    try:
+        from nonebot import get_driver
+        proxy = str(getattr(get_driver().config, "personification_web_proxy", "") or "").strip()
+    except Exception:
+        proxy = ""
+    return proxy or None
+
+
+def _client_kwargs(**base: Any) -> Dict[str, Any]:
+    """在 base kwargs 上按需注入 proxy。"""
+    proxy = _web_proxy()
+    if proxy:
+        base["proxy"] = proxy
+    return base
+
+
 async def extract_forward_message_content(
     bot: Any,
     event: Any,
@@ -308,9 +326,37 @@ async def fetch_tavily_context(
     get_now: Callable[[], Any],
     logger: Any,
 ) -> str:
+    """旧版兼容 API：返回拼接字符串。新代码请用 fetch_tavily_results。"""
+    results = await fetch_tavily_results(
+        keyword,
+        intent=intent,
+        force_fact_check=force_fact_check,
+        get_now=get_now,
+        logger=logger,
+    )
+    if not results:
+        return ""
+    answer = (results[0].extras.get("answer") or "").strip() if results else ""
+    if answer:
+        return answer
+    return " | ".join(r.snippet for r in results[:3] if r.snippet)
+
+
+async def fetch_tavily_results(
+    keyword: str,
+    *,
+    intent: str = "generic",
+    force_fact_check: bool = False,
+    get_now: Callable[[], Any],
+    logger: Any,
+    max_results: int = 6,
+) -> "List[Any]":
+    """Tavily advanced 模式 → 结构化 SearchResult 列表。无 key 返回 []。"""
+    from .free_search import SearchResult, _clip_snippet, _domain_of  # 避免循环 import
+
     api_key = _get_tavily_api_key()
     if not api_key:
-        return ""
+        return []
 
     if intent == "news":
         now_date = get_now().strftime("%Y-%m-%d")
@@ -328,31 +374,47 @@ async def fetch_tavily_context(
     payload = {
         "api_key": api_key,
         "query": query,
-        "search_depth": "basic",
+        "search_depth": "advanced",
         "include_answer": True,
-        "max_results": 3,
+        "max_results": max(3, min(int(max_results or 6), 10)),
     }
     try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
+        async with httpx.AsyncClient(**_client_kwargs(timeout=15.0)) as client:
             resp = await client.post("https://api.tavily.com/search", json=payload)
             if resp.status_code != 200:
-                return ""
+                return []
             data = resp.json()
-            answer = str(data.get("answer", "")).strip()
-            if answer:
-                return answer
-            results = data.get("results", [])
-            snippets: List[str] = []
-            for item in results[:3]:
-                if not isinstance(item, dict):
-                    continue
-                content = str(item.get("content", "")).strip()
-                if content:
-                    snippets.append(re.sub(r"\s+", " ", content)[:180])
-            return " | ".join(snippets)
     except Exception as e:
         logger.warning(f"拟人插件：Tavily 搜索失败: {e}")
-        return ""
+        return []
+
+    answer = str(data.get("answer", "") or "").strip()
+    items = data.get("results", []) or []
+    out: List[Any] = []
+    for idx, item in enumerate(items):
+        if not isinstance(item, dict):
+            continue
+        url = str(item.get("url") or "").strip()
+        title = str(item.get("title") or "").strip()
+        content = str(item.get("content") or "").strip()
+        if not url or not title:
+            continue
+        try:
+            score = float(item.get("score") or (1.0 - idx * 0.05))
+        except (TypeError, ValueError):
+            score = max(0.0, 1.0 - idx * 0.05)
+        sr = SearchResult(
+            title=title,
+            url=url,
+            domain=_domain_of(url),
+            snippet=_clip_snippet(content),
+            source="tavily",
+            score=score,
+        )
+        if answer and idx == 0:
+            sr.extras["answer"] = answer
+        out.append(sr)
+    return out
 
 
 async def fetch_baike_summary(keyword: str, *, logger: Any) -> str:
@@ -365,7 +427,7 @@ async def fetch_baike_summary(keyword: str, *, logger: Any) -> str:
         )
     }
     try:
-        async with httpx.AsyncClient(timeout=10.0, follow_redirects=True, headers=headers) as client:
+        async with httpx.AsyncClient(**_client_kwargs(timeout=10.0, follow_redirects=True, headers=headers)) as client:
             url = f"https://baike.baidu.com/search/word?word={quote(keyword)}"
             resp = await client.get(url)
             if resp.status_code != 200:
@@ -555,6 +617,86 @@ def should_avoid_interrupting(
     return random.random() > pass_rate
 
 
+def _get_web_search_config() -> dict:
+    """读取 web_search 相关运行时配置，缺省值兜底。"""
+    try:
+        from nonebot import get_driver
+        cfg = get_driver().config
+    except Exception:
+        cfg = None
+    def g(name, default):
+        return getattr(cfg, name, default) if cfg is not None else default
+    return {
+        "engines": list(g("personification_free_search_engines", ["wikipedia", "searxng", "duckduckgo"]) or []),
+        "instances": list(g("personification_searxng_instances", []) or []),
+        "max_results": int(g("personification_web_search_max_results", 6) or 6),
+        "snippet_chars": int(g("personification_web_search_snippet_chars", 400) or 400),
+        "proxy": (str(g("personification_web_proxy", "") or "").strip() or None),
+    }
+
+
+def _dedup_and_rank(results: list, *, max_results: int) -> list:
+    """同 URL 折合；同 domain 取 score 最高那条；按 score 倒序。"""
+    seen_url: set[str] = set()
+    by_domain: dict[str, Any] = {}
+    for r in results:
+        if not getattr(r, "url", None) or not getattr(r, "title", None):
+            continue
+        if r.url in seen_url:
+            continue
+        seen_url.add(r.url)
+        dom = r.domain or _domain_of_safe(r.url)
+        cur = by_domain.get(dom)
+        if cur is None or (getattr(r, "score", 0) or 0) > (getattr(cur, "score", 0) or 0):
+            by_domain[dom] = r
+    ranked = sorted(by_domain.values(), key=lambda x: -(getattr(x, "score", 0) or 0))
+    return ranked[:max_results]
+
+
+def _domain_of_safe(url: str) -> str:
+    try:
+        from urllib.parse import urlparse as _up
+        return (_up(url).hostname or "").lower().lstrip("www.")
+    except Exception:
+        return ""
+
+
+def _render_results_for_llm(
+    results: list,
+    *,
+    query: str,
+    snippet_chars: int,
+) -> str:
+    if not results:
+        return (
+            f"[联网搜索 query=\"{query}\" 命中=0]\n"
+            "本次未检索到与该问题相关的可靠资料。请告知用户：\"我没查到这方面的信息\"，"
+            "不要凭空作答。"
+        )
+    sources = sorted({getattr(r, "source", "") for r in results if getattr(r, "source", "")})
+    lines = [
+        f"[联网搜索 query=\"{query}\"  来源={'/'.join(sources) or '混合'}  命中={len(results)}]"
+    ]
+    for idx, r in enumerate(results, start=1):
+        title = (getattr(r, "title", "") or "").strip()
+        url = (getattr(r, "url", "") or "").strip()
+        domain = (getattr(r, "domain", "") or "").strip() or _domain_of_safe(url)
+        snippet = (getattr(r, "snippet", "") or "").strip()
+        if len(snippet) > snippet_chars:
+            snippet = snippet[:snippet_chars].rstrip() + "…"
+        # extras.answer 是 Tavily 的总结，附在第一条
+        extras = getattr(r, "extras", {}) or {}
+        ans = (extras.get("answer") if isinstance(extras, dict) else "") or ""
+        lines.append(f"{idx}. **{title}** — {domain}")
+        if url:
+            lines.append(f"   {url}")
+        if ans:
+            lines.append(f"   摘要(综合): {ans}")
+        if snippet:
+            lines.append(f"   {snippet}")
+    return "\n".join(lines)
+
+
 async def do_web_search(
     query: str,
     *,
@@ -562,117 +704,84 @@ async def do_web_search(
     get_now: Callable[[], Any],
     logger: Any,
 ) -> str:
-    """执行联网检索，优先 Tavily/百科，失败再回退 DuckDuckGo。"""
+    """聚合 Tavily（可选）+ 百度百科 + 免 key 引擎链（Wikipedia/SearXNG/DDG）。
+
+    返回对 LLM 友好的结构化字符串，含来源 URL；失败时返回明确的"未检索到"提示
+    供不确定性护栏接住。
+    """
+    from .free_search import SearchResult, free_search
+
     try:
         topic = merge_grounding_topic(query, context_hint)
         intent = infer_grounding_intent(topic)
         force_fact_check = should_force_fact_check(query) or should_force_fact_check(topic)
+        cfg = _get_web_search_config()
+        max_results = max(3, min(cfg["max_results"], 10))
 
-        if intent in {"knowledge", "recommend"}:
-            baike_task = asyncio.create_task(fetch_baike_summary(topic, logger=logger))
-            tavily_task = asyncio.create_task(
-                fetch_tavily_context(
+        # ──── 1) 主路径并行：Tavily（有 key 时）+ 免 key 引擎链 ────
+        tasks: list[asyncio.Task] = []
+        tasks.append(
+            asyncio.create_task(
+                fetch_tavily_results(
                     topic,
                     intent=intent,
                     force_fact_check=force_fact_check,
                     get_now=get_now,
                     logger=logger,
+                    max_results=max_results,
                 )
             )
-            baike_text, tavily_text = await asyncio.gather(baike_task, tavily_task)
-            blocks: List[str] = []
-            if baike_text:
-                blocks.append(f"百科: {baike_text}")
-            if tavily_text:
-                blocks.append(f"Tavily: {tavily_text}")
-            if blocks:
-                return "\n".join(blocks)
-
-        if intent == "news":
-            tavily_text = await fetch_tavily_context(
-                topic,
-                intent="news",
-                force_fact_check=force_fact_check,
-                get_now=get_now,
-                logger=logger,
-            )
-            if tavily_text:
-                if force_fact_check:
-                    return f"Tavily 新闻查证结果: {tavily_text}"
-                return f"Tavily 新闻结果: {tavily_text}"
-
-        async with httpx.AsyncClient(timeout=12.0, follow_redirects=True) as client:
-            search_query = topic or query
-            resp = await client.get(
-                "https://api.duckduckgo.com/",
-                params={"q": search_query, "format": "json", "no_html": "1", "skip_disambig": "1"},
-                headers={"User-Agent": "Mozilla/5.0 (compatible; PersonificationBot/1.0)"},
-            )
-            if resp.status_code == 414 and len(search_query) > 48:
-                compact_query = search_query[:48]
-                resp = await client.get(
-                    "https://api.duckduckgo.com/",
-                    params={"q": compact_query, "format": "json", "no_html": "1", "skip_disambig": "1"},
-                    headers={"User-Agent": "Mozilla/5.0 (compatible; PersonificationBot/1.0)"},
+        )
+        tasks.append(
+            asyncio.create_task(
+                free_search(
+                    topic or query,
+                    engines=cfg["engines"],
+                    max_results=max_results,
+                    proxy=cfg["proxy"],
+                    searxng_instances=cfg["instances"] or None,
+                    logger=logger,
                 )
-            data: Dict[str, Any] = {}
+            )
+        )
+
+        # 知识 / 推荐意图：额外塞一份百度百科作为高密度中文事实层
+        baike_task: Optional[asyncio.Task] = None
+        if intent in {"knowledge", "recommend"}:
+            baike_task = asyncio.create_task(fetch_baike_summary(topic, logger=logger))
+
+        results_lists = await asyncio.gather(*tasks, return_exceptions=True)
+        merged: list = []
+        for res in results_lists:
+            if isinstance(res, list):
+                merged.extend(res)
+
+        if baike_task is not None:
             try:
-                data = resp.json()
+                baike_text = await baike_task
             except Exception:
-                logger.warning(
-                    "拟人插件：DuckDuckGo Instant API 返回非 JSON，"
-                    f"status={resp.status_code} content-type={resp.headers.get('content-type', '')}"
+                baike_text = ""
+            if baike_text:
+                merged.append(
+                    SearchResult(
+                        title=f"{topic} - 百度百科",
+                        url=f"https://baike.baidu.com/item/{quote(topic)}",
+                        domain="baike.baidu.com",
+                        snippet=str(baike_text)[: cfg["snippet_chars"]],
+                        source="baidu_baike",
+                        score=0.85,
+                    )
                 )
-            results: List[str] = []
-            if data.get("AbstractText"):
-                results.append(f"摘要: {data['AbstractText']}")
-            for topic_item in data.get("RelatedTopics", [])[:5]:
-                if isinstance(topic_item, dict) and topic_item.get("Text"):
-                    results.append(f"- {topic_item['Text']}")
-            if results:
-                return "\n".join(results)
 
-            html_resp = await client.get(
-                "https://duckduckgo.com/html/",
-                params={"q": query},
-                headers={
-                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
-                    "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
-                },
-            )
-            html_text = html_resp.text
-            raw_blocks = re.findall(
-                r'<div[^>]*class="[^"]*result__body[^"]*"[^>]*>(.*?)</div>\s*</div>',
-                html_text,
-                flags=re.IGNORECASE | re.DOTALL,
-            )
-            parsed: List[str] = []
-            for block in raw_blocks[:8]:
-                title_match = re.search(
-                    r'<a[^>]*class="[^"]*result__a[^"]*"[^>]*>(.*?)</a>',
-                    block,
-                    flags=re.IGNORECASE | re.DOTALL,
-                )
-                snippet_match = re.search(
-                    r'<a[^>]*class="[^"]*result__snippet[^"]*"[^>]*>(.*?)</a>|<div[^>]*class="[^"]*result__snippet[^"]*"[^>]*>(.*?)</div>',
-                    block,
-                    flags=re.IGNORECASE | re.DOTALL,
-                )
-                title = ""
-                snippet = ""
-                if title_match:
-                    title = re.sub(r"<[^>]+>", "", title_match.group(1) or "")
-                if snippet_match:
-                    snippet = re.sub(r"<[^>]+>", "", (snippet_match.group(1) or snippet_match.group(2) or ""))
-                title = re.sub(r"\s+", " ", title).strip()
-                snippet = re.sub(r"\s+", " ", snippet).strip()
-                if title and snippet:
-                    parsed.append(f"- {title}: {snippet}")
-                elif title:
-                    parsed.append(f"- {title}")
-            if parsed:
-                return "\n".join(parsed[:5])
-        return ""
+        # ──── 2) 去重 + 排名 + 渲染 ────
+        ranked = _dedup_and_rank(merged, max_results=max_results)
+        return _render_results_for_llm(
+            ranked, query=topic or query, snippet_chars=cfg["snippet_chars"]
+        )
     except Exception as e:
         logger.warning(f"拟人插件：联网搜索失败: {e}")
+        return (
+            f"[联网搜索 query=\"{query}\" 命中=0]\n"
+            f"搜索过程出错：{e}。请告知用户：\"搜索暂时不可用\"，不要凭空作答。"
+        )
         return ""

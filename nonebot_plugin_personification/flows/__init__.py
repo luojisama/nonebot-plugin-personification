@@ -19,6 +19,7 @@ from .proactive_flow import (
     run_group_idle_topic,
     run_proactive_messaging,
 )
+from .qzone_social_flow import scan_qzone_inbound_messages, scan_qzone_social_feeds
 from .runtime_switch_flow import apply_global_switch, apply_proactive_switch, apply_tts_global_switch, apply_web_search_switch
 from .style_flow import analyze_group_style
 from .yaml_parser import extract_xml_content, parse_yaml_response
@@ -121,6 +122,8 @@ __all__ = [
     "parse_yaml_response",
     "run_group_idle_topic",
     "run_proactive_messaging",
+    "scan_qzone_inbound_messages",
+    "scan_qzone_social_feeds",
     "FlowSetupDeps",
     "setup_flows",
 ]

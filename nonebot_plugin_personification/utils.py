@@ -6,6 +6,7 @@ from .core.data_store import get_data_store
 from .core.db import connect_sync
 from .core.group_roles import normalize_group_role
 from .core.group_relation_edges import update_relation_edges_from_message
+from .core.thread_tracker import assign_thread_for_message
 
 
 _WHITELIST_STORE = "whitelist"
@@ -137,12 +138,23 @@ def record_group_msg(
     sender_role = normalize_group_role(safe_metadata.get("sender_role", ""))
 
     with connect_sync() as conn:
+        thread_assignment = assign_thread_for_message(
+            conn,
+            group_id=str(group_id),
+            user_id=str(safe_metadata.get("user_id", "") or ""),
+            content=str(content or ""),
+            message_id=str(safe_metadata.get("message_id", "") or ""),
+            reply_to_msg_id=str(safe_metadata.get("reply_to_msg_id", "") or ""),
+            reply_to_user_id=str(safe_metadata.get("reply_to_user_id", "") or ""),
+            mentioned_ids=[str(item or "").strip() for item in mentioned_ids if str(item or "").strip()],
+            timestamp=now_ts,
+        )
         conn.execute(
             """
             INSERT INTO group_messages(
                 group_id, user_id, nickname, content, image_count, visual_summary, is_bot,
-                reply_to_msg_id, reply_to_user_id, mentioned_ids, is_at_bot, message_id, source_kind, sender_role, timestamp
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                reply_to_msg_id, reply_to_user_id, mentioned_ids, is_at_bot, message_id, thread_id, source_kind, sender_role, timestamp
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 str(group_id),
@@ -157,6 +169,7 @@ def record_group_msg(
                 json.dumps(mentioned_ids, ensure_ascii=False),
                 1 if bool(safe_metadata.get("is_at_bot")) else 0,
                 str(safe_metadata.get("message_id", "") or "") or None,
+                thread_assignment.thread_id,
                 str(safe_metadata.get("source_kind", "bot" if is_bot else "user") or "user"),
                 sender_role,
                 now_ts,
@@ -174,6 +187,7 @@ def record_group_msg(
             message_id=str(safe_metadata.get("message_id", "") or ""),
             content=str(content or ""),
             timestamp=now_ts,
+            thread_id=str(thread_assignment.thread_id or ""),
         )
         row = conn.execute(
             "SELECT COUNT(1) AS cnt FROM group_messages WHERE group_id=?",
@@ -220,6 +234,7 @@ def should_trigger_group_style_analysis(group_id: str, total_message_count: int)
 def clear_group_msgs(group_id: str):
     with connect_sync() as conn:
         conn.execute("DELETE FROM group_messages WHERE group_id=?", (str(group_id),))
+        conn.execute("DELETE FROM conversation_threads WHERE group_id=?", (str(group_id),))
         conn.commit()
 
 
@@ -233,7 +248,7 @@ def get_group_msg_by_message_id(group_id: str, message_id: str) -> Optional[Dict
         row = conn.execute(
             """
             SELECT group_id, user_id, nickname, content, image_count, visual_summary, is_bot,
-                   reply_to_msg_id, reply_to_user_id, mentioned_ids, is_at_bot, message_id, source_kind, sender_role, timestamp
+                   reply_to_msg_id, reply_to_user_id, mentioned_ids, is_at_bot, message_id, thread_id, source_kind, sender_role, timestamp
             FROM group_messages
             WHERE group_id=? AND message_id=?
             ORDER BY timestamp DESC
@@ -263,6 +278,7 @@ def get_group_msg_by_message_id(group_id: str, message_id: str) -> Optional[Dict
         "mentioned_ids": mentioned_ids if isinstance(mentioned_ids, list) else [],
         "is_at_bot": bool(row["is_at_bot"]),
         "message_id": row["message_id"],
+        "thread_id": row["thread_id"],
         "source_kind": row["source_kind"],
         "sender_role": row["sender_role"],
     }
@@ -283,7 +299,7 @@ def get_recent_group_msgs(group_id: str, limit: int = 200, expire_hours: Optiona
         rows = conn.execute(
             f"""
             SELECT group_id, user_id, nickname, content, image_count, visual_summary, is_bot,
-                   reply_to_msg_id, reply_to_user_id, mentioned_ids, is_at_bot, message_id, source_kind, sender_role, timestamp
+                   reply_to_msg_id, reply_to_user_id, mentioned_ids, is_at_bot, message_id, thread_id, source_kind, sender_role, timestamp
             FROM group_messages
             WHERE {" AND ".join(clauses)}
             ORDER BY timestamp DESC
@@ -314,6 +330,7 @@ def get_recent_group_msgs(group_id: str, limit: int = 200, expire_hours: Optiona
                 "mentioned_ids": mentioned_ids if isinstance(mentioned_ids, list) else [],
                 "is_at_bot": bool(row["is_at_bot"]),
                 "message_id": row["message_id"],
+                "thread_id": row["thread_id"],
                 "source_kind": row["source_kind"],
                 "sender_role": row["sender_role"],
             }
