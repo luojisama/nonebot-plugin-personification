@@ -484,6 +484,10 @@ def setup_all_matchers(*, deps: MatcherSetupDeps) -> Dict[str, Any]:
         track_command_keywords=deps.register_private_command_keywords,
     )
 
+    from ..login_approval_matchers import register_login_approval_matchers
+
+    login_approval_matchers = register_login_approval_matchers(logger=deps.logger)
+
     return {
         "personification_help_cmd": runtime_switch_matchers["personification_help_cmd"],
         "reload_config_cmd": runtime_switch_matchers["reload_config_cmd"],
@@ -499,6 +503,8 @@ def setup_all_matchers(*, deps: MatcherSetupDeps) -> Dict[str, Any]:
         "reject_whitelist": whitelist_matchers["reject_whitelist"],
         "add_whitelist": whitelist_matchers["add_whitelist"],
         "remove_whitelist": whitelist_matchers["remove_whitelist"],
+        "approve_login": login_approval_matchers["approve_login"],
+        "deny_login": login_approval_matchers["deny_login"],
         "group_fav_query": admin_matchers["group_fav_query"],
         "set_group_fav": admin_matchers["set_group_fav"],
         "set_persona": admin_matchers["set_persona"],

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Body, Depends, HTTPException
 
 from ...core.onebot_cache import get_user_nickname
 from ..deps import AdminIdentity, require_admin
@@ -13,6 +13,13 @@ def _profile_service(runtime) -> Any | None:
     if bundle is None:
         return None
     return getattr(bundle, "profile_service", None)
+
+
+def _persona_store(runtime) -> Any | None:
+    bundle = getattr(runtime, "runtime_bundle", None)
+    if bundle is None:
+        return None
+    return getattr(bundle, "persona_store", None)
 
 
 def _get_first_bot(runtime) -> Any | None:
@@ -73,15 +80,47 @@ def build_persona_router(*, runtime) -> APIRouter:
                     "updated_at": entry.updated_at,
                 }
             )
+        core_json = (core.profile_json if core and isinstance(core.profile_json, dict) else {}) or {}
+        structured = core_json.get("structured") or {}
+        if not structured and core:
+            # 旧画像没有结构化字段时，即时解析一次（不写库）
+            try:
+                from ...core.persona_service import parse_persona_structured
+
+                structured = parse_persona_structured(core.profile_text or "")
+            except Exception:
+                structured = {}
         return {
             "user_id": user_id,
             "core_profile": {
                 "profile_text": core.profile_text if core else "",
-                "profile_json": core.profile_json if core else {},
+                "profile_json": core_json,
+                "structured": structured,
+                "user_corrections": core_json.get("user_corrections", {}),
                 "updated_at": core.updated_at if core else 0,
             } if core else None,
             "local_profiles": local_profiles,
             "prompt_block": svc.build_prompt_block(user_id=user_id, group_id=""),
         }
+
+    @router.post("/{user_id}/correction")
+    async def correction(
+        user_id: str,
+        body: dict = Body(default_factory=dict),
+        admin: AdminIdentity = Depends(require_admin),
+    ) -> dict:
+        """用户/管理员更正画像：以最高优先级写入并保留到后续再生成。"""
+        store = _persona_store(runtime)
+        if store is None or not hasattr(store, "apply_user_correction"):
+            raise HTTPException(status_code=503, detail="persona_store 未就绪")
+        corrections = body.get("corrections") or {}
+        if not isinstance(corrections, dict) or not corrections:
+            raise HTTPException(status_code=400, detail="corrections 不能为空")
+        entry = await store.apply_user_correction(user_id, corrections)
+        from ...core import webui_audit_log
+
+        webui_audit_log.record(action="persona_correction", qq=admin.qq, device_id=admin.device_id,
+                               target=str(user_id), detail={"fields": list(corrections.keys())}, outcome="ok")
+        return {"success": True, "profile_text": entry.data if entry else ""}
 
     return router

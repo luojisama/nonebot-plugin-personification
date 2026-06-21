@@ -10,6 +10,10 @@ from urllib.parse import quote
 import httpx
 
 
+# personification-semantic-boundary: grounding-context-only
+# Keyword buckets here only choose web-search context shape. They must not be
+# used as normal-chat intent routing, emotion inference, TTS/sticker mood, or
+# review-stage semantic vetoes.
 def _web_proxy() -> Optional[str]:
     """读取 personification_web_proxy 配置，供联网检索的 httpx 客户端使用。"""
     try:

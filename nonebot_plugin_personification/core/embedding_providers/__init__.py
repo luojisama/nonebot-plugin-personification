@@ -15,9 +15,9 @@ def build_embedding_provider(plugin_config: Any | None = None) -> EmbeddingProvi
     if not real_enabled:
         return HashBowEmbeddingProvider()
     if provider_name == "gemini":
-        return GeminiEmbeddingProvider()
+        return GeminiEmbeddingProvider(plugin_config)
     if provider_name == "openai":
-        return OpenAIEmbeddingProvider()
+        return OpenAIEmbeddingProvider(plugin_config)
     return HashBowEmbeddingProvider()
 
 

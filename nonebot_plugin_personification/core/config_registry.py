@@ -165,6 +165,20 @@ def _embedding_provider_parser(raw: str) -> str:
     return mapping.get(text, text)
 
 
+def _memory_vector_backend_parser(raw: str) -> str:
+    text = str(raw or "").strip().lower().replace("-", "_")
+    mapping = {
+        "sqlite": "sqlite_exact",
+        "local": "sqlite_exact",
+        "sqlite_exact": "sqlite_exact",
+        "hash": "sqlite_exact",
+        "off": "disabled",
+        "none": "disabled",
+        "disabled": "disabled",
+    }
+    return mapping.get(text, text)
+
+
 @dataclass(frozen=True)
 class ConfigEntry:
     key: str
@@ -193,6 +207,13 @@ class ConfigEntry:
     def normalize_value(self, raw: Any) -> Any:
         if isinstance(raw, bool) and self.value_type == "bool":
             value = raw
+        elif isinstance(raw, (list, dict)):
+            # 前端可能直接传来已解析的 JSON 数组/对象（如 API Provider 池编辑器
+            # 提交的 provider 列表）。此时 str(raw) 会得到 Python repr（单引号、
+            # True/False），交给 json.loads 必然失败，导致保存被拒、配置"回退"。
+            # 用 json.dumps 转回合法 JSON 再交给 parser 校验归一。
+            parser = self.parser or _str_parser
+            value = parser(json.dumps(raw, ensure_ascii=False))
         else:
             parser = self.parser or _str_parser
             value = parser(str(raw or ""))
@@ -225,7 +246,16 @@ _GROUP_RULES: tuple[tuple[Callable[[str], bool], str], ...] = (
     (lambda k: k.startswith("turn_planner_") or k == "evidence_synthesizer_enabled", "意图规划"),
     (
         lambda k: k.startswith("parallel_research_")
-        or k in {"deep_research_v2_enabled", "tool_web_search_enabled", "tool_web_search_mode", "model_builtin_search_enabled"},
+        or k.startswith("web_search_")
+        or k in {
+            "deep_research_v2_enabled",
+            "tool_web_search_enabled",
+            "tool_web_search_mode",
+            "model_builtin_search_enabled",
+            "free_search_engines",
+            "searxng_instances",
+            "web_proxy",
+        },
         "联网搜索",
     ),
     (lambda k: k.startswith("fallback_"), "模型回退"),
@@ -233,7 +263,12 @@ _GROUP_RULES: tuple[tuple[Callable[[str], bool], str], ...] = (
     (lambda k: k.startswith("image_gen_"), "图像生成"),
     (lambda k: k.startswith("tts_"), "TTS 语音"),
     (lambda k: k.startswith("qzone_"), "QQ 空间"),
-    (lambda k: k.startswith("memory_") or k in {"real_embedding_enabled", "embedding_provider"}, "记忆"),
+    (
+        lambda k: k.startswith("memory_")
+        or k.startswith("embedding_")
+        or k in {"real_embedding_enabled", "embedding_provider", "agent_memory_write_enabled"},
+        "记忆",
+    ),
     (
         lambda k: k in {"persona_history_max", "private_history_turns", "persona_enabled"},
         "画像",
@@ -278,6 +313,11 @@ _REQUIRED_KEYS: frozenset[str] = frozenset({"global_enabled", "api_pools"})
 
 _SECRET_FIELD_HINTS: tuple[str, ...] = ("_api_key", "_token", "_secret", "auth_path", "cookie")
 
+# value_type=="list" 但元素是对象 / 结构化项的字段，保留 JSON 编辑器
+_OBJECT_LIST_KEYS: frozenset[str] = frozenset({
+    "api_pools", "skill_sources",
+})
+
 
 def _infer_group(key: str) -> str:
     for predicate, name in _GROUP_RULES:
@@ -301,7 +341,13 @@ def _infer_kind(entry: ConfigEntry, *, secret: bool) -> str:
         return "path"
     if entry.choices:
         return "select"
-    if entry.value_type in {"dict", "list"}:
+    if entry.value_type == "list":
+        # 对象数组（provider 池 / 远程 skill 源 / 社交场景配置）保留 JSON 编辑；
+        # 简单字符串数组用更友好的「逐项增删」编辑器。
+        if entry.key in _OBJECT_LIST_KEYS:
+            return "json"
+        return "strlist"
+    if entry.value_type == "dict":
         return "json"
     if entry.value_type == "int":
         return "int"
@@ -954,6 +1000,95 @@ def _build_entries() -> list[ConfigEntry]:
             parser=_embedding_provider_parser,
         ),
         ConfigEntry(
+            key="embedding_model",
+            field_name="personification_embedding_model",
+            display_name="Embedding 模型",
+            value_type="str",
+            default="",
+            scope=GLOBAL_SCOPE,
+            description="真实向量记忆使用的 embedding 模型；留空时按 provider 使用默认模型。",
+            category="config",
+            help_aliases=("embedding_model", "向量模型名", "嵌入模型"),
+            parser=_str_parser,
+        ),
+        ConfigEntry(
+            key="embedding_api_url",
+            field_name="personification_embedding_api_url",
+            display_name="Embedding API URL",
+            value_type="str",
+            default="",
+            scope=GLOBAL_SCOPE,
+            description="OpenAI 兼容 embedding 接口 Base URL；留空时使用 SDK 默认地址。",
+            category="config",
+            help_aliases=("embedding_api_url", "向量接口", "embedding_base_url"),
+            parser=_str_parser,
+        ),
+        ConfigEntry(
+            key="embedding_api_key",
+            field_name="personification_embedding_api_key",
+            display_name="Embedding API Key",
+            value_type="str",
+            default="",
+            scope=GLOBAL_SCOPE,
+            description="真实 embedding provider 的 API Key。留空时尝试复用对应 SDK 的环境变量。",
+            category="config",
+            help_aliases=("embedding_api_key", "向量key", "embedding_key"),
+            parser=_str_parser,
+        ),
+        ConfigEntry(
+            key="embedding_batch_size",
+            field_name="personification_embedding_batch_size",
+            display_name="Embedding 批量大小",
+            value_type="int",
+            default=16,
+            scope=GLOBAL_SCOPE,
+            description="后台重建向量索引时单批提交的文本数量；过大可能触发 provider 限流。",
+            category="config",
+            min_value=1,
+            max_value=128,
+            help_aliases=("embedding_batch", "向量批量", "embedding批量"),
+            parser=_int_parser,
+        ),
+        ConfigEntry(
+            key="memory_vector_backend",
+            field_name="personification_memory_vector_backend",
+            display_name="记忆向量后端",
+            value_type="str",
+            default="sqlite_exact",
+            scope=GLOBAL_SCOPE,
+            description="长期记忆 RAG 的本地向量后端；sqlite_exact 不需要额外服务，disabled 关闭向量索引。",
+            category="config",
+            choices=("sqlite_exact", "disabled"),
+            help_aliases=("向量后端", "vector_backend", "rag_backend"),
+            parser=_memory_vector_backend_parser,
+        ),
+        ConfigEntry(
+            key="memory_rag_enabled",
+            field_name="personification_memory_rag_enabled",
+            display_name="记忆 RAG 召回",
+            value_type="bool",
+            default=True,
+            scope=GLOBAL_SCOPE,
+            description="启用长期记忆的 chunk 向量索引与 RAG 召回；关闭后仍保留 FTS/实体/时间召回。",
+            category="config",
+            help_aliases=("rag", "记忆rag", "向量召回"),
+            parser=_bool_parser,
+        ),
+        ConfigEntry(
+            key="memory_rag_candidate_limit",
+            field_name="personification_memory_rag_candidate_limit",
+            display_name="RAG 候选上限",
+            value_type="int",
+            default=80,
+            scope=GLOBAL_SCOPE,
+            description="单次 RAG 向量召回最多扫描的 chunk 候选数；数值越大越容易找回旧记忆但会增加 CPU 开销。",
+            category="config",
+            min_value=20,
+            max_value=1000,
+            help_aliases=("rag候选", "向量候选", "memory_rag_candidate_limit"),
+            parser=_int_parser,
+        ),
+        ConfigEntry(
             key="response_timeout",
             field_name="personification_response_timeout",
             display_name="单轮回复超时",
@@ -1560,7 +1695,7 @@ def _build_entries() -> list[ConfigEntry]:
             value_type="bool",
             default=False,
             scope=GLOBAL_SCOPE,
-            description="开启后 bot 会按 inner_state / 主动发表节奏自主发空间说说，受 daily_limit 与 min_interval_hours 约束。",
+            description="开启后 bot 会按 inner_state / 主动发表节奏自主发空间说说，受 monthly_limit 与 min_interval_hours 约束。",
             category="config",
             help_aliases=("qzone主动发表", "空间主动"),
             parser=_bool_parser,
@@ -2148,7 +2283,7 @@ def _build_entries() -> list[ConfigEntry]:
             field_name="personification_memory_palace_enabled",
             display_name="记忆宫殿",
             value_type="bool",
-            default=False,
+            default=True,
             scope=GLOBAL_SCOPE,
             description="启用长期记忆宫殿存储与 recall。",
             category="config",
@@ -2192,6 +2327,45 @@ def _build_entries() -> list[ConfigEntry]:
             max_value=MAX_MEMORY_RECALL_TOP_K,
             help_aliases=("召回条数", "recall条数"),
             parser=_int_parser,
+        ),
+        ConfigEntry(
+            key="memory_search_scan_limit",
+            field_name="personification_memory_search_scan_limit",
+            display_name="记忆召回扫描池",
+            value_type="int",
+            default=800,
+            scope=GLOBAL_SCOPE,
+            description="单次长期记忆召回最多扫描多少条候选记忆；越大越容易找回旧记忆，但会增加 CPU/SQLite 开销。",
+            category="config",
+            min_value=80,
+            max_value=5000,
+            help_aliases=("记忆扫描池", "旧记忆召回", "memory_scan_limit"),
+            parser=_int_parser,
+        ),
+        ConfigEntry(
+            key="memory_capture_policy",
+            field_name="personification_memory_capture_policy",
+            display_name="长期记忆写入策略",
+            value_type="str",
+            default="balanced",
+            scope=GLOBAL_SCOPE,
+            description="控制聊天回合进入长期记忆的积极程度：balanced 只保留较有信息量内容，conservative 更克制，all 保持尽量全量写入。",
+            category="config",
+            choices=("balanced", "conservative", "all"),
+            help_aliases=("记忆写入策略", "记忆采集策略", "memory_capture_policy"),
+            parser=_str_parser,
+        ),
+        ConfigEntry(
+            key="agent_memory_write_enabled",
+            field_name="personification_agent_memory_write_enabled",
+            display_name="Agent 写长期记忆",
+            value_type="bool",
+            default=True,
+            scope=GLOBAL_SCOPE,
+            description="允许 Agent 通过工具主动沉淀用户或群长期记忆；关闭后仍可读取已有记忆。",
+            category="config",
+            help_aliases=("agent记忆写入", "主动记忆", "remember工具"),
+            parser=_bool_parser,
         ),
         ConfigEntry(
             key="persona_history_max",
@@ -2456,7 +2630,51 @@ def _build_entries() -> list[ConfigEntry]:
             parser=_bool_parser,
         ),
     ]
+    entries.extend(_build_extra_entries())
     return [_enrich_entry(entry) for entry in entries]
+
+
+_EXTRA_SPEC_PARSERS: dict[str, Callable[[str], Any]] = {
+    "bool": _bool_parser,
+    "int": _int_parser,
+    "float": _float_parser,
+    "str": _str_parser,
+    "list": _json_array_parser,
+    "dict": _json_object_parser,
+}
+
+
+def _build_extra_entries() -> list[ConfigEntry]:
+    from .config_registry_extra import EXTRA_CONFIG_SPECS
+
+    entries: list[ConfigEntry] = []
+    for spec in EXTRA_CONFIG_SPECS:
+        field_name = str(spec["field"])
+        value_type = str(spec["t"])
+        entries.append(
+            ConfigEntry(
+                key=field_name.removeprefix("personification_"),
+                field_name=field_name,
+                display_name=str(spec["name"]),
+                value_type=value_type,
+                default=spec["default"],
+                scope=GLOBAL_SCOPE,
+                description=str(spec["desc"]),
+                category="config",
+                choices=tuple(spec.get("choices", ())),
+                min_value=spec.get("min"),
+                max_value=spec.get("max"),
+                help_aliases=tuple(spec.get("aliases", ())),
+                risk_note=str(spec.get("risk", "")),
+                parser=_EXTRA_SPEC_PARSERS[value_type],
+                kind=str(spec.get("kind", "")),
+                group=str(spec.get("group", "其他")),
+                advanced=bool(spec.get("advanced", False)),
+                hot_reloadable=bool(spec.get("hot", True)),
+                example=str(spec.get("example", "")),
+            )
+        )
+    return entries
 
 
 _ENTRIES = _build_entries()

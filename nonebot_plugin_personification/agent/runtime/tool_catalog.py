@@ -15,6 +15,21 @@ _IMAGE_REQUIRED_TOOL_NAMES = frozenset(
     }
 )
 _IMAGE_GENERATION_TOOL_NAMES = frozenset({"generate_image"})
+# 闲聊/接梗场景也放行的一组"轻量查证"工具：遇到看不懂的梗/专有名词/外号/分享内容时，
+# 模型应先查清楚再用自己的口吻接话；runner 会用模型侧草稿审查兜底。
+_LIGHTWEIGHT_LOOKUP_TOOL_NAMES = frozenset(
+    {
+        "web_search",
+        "search_web",
+        "wiki_lookup",
+        "resolve_acg_entity",
+        "weather",
+        "memory_recall",
+        "recall_user_memory",
+        "recall_group_memory",
+        "get_user_persona",
+    }
+)
 _IMAGE_GENERATION_CONTEXT_TOOL_NAMES = frozenset(
     {
         "parallel_research",
@@ -33,6 +48,7 @@ _PLUGIN_LOCAL_TOOL_NAMES = frozenset(
         "list_plugins",
         "list_plugin_features",
         "get_feature_detail",
+        "invoke_plugin",
     }
 )
 _PLUGIN_WEB_TOOL_NAMES = frozenset(
@@ -77,7 +93,7 @@ _ADMIN_TOOL_NAMES = frozenset(
         "confirm_resource_request",
     }
 )
-_MEMORY_TOOL_NAMES = frozenset({"memory_recall", "get_user_persona"})
+_MEMORY_TOOL_NAMES = frozenset({"memory_recall", "recall_user_memory", "recall_group_memory", "get_user_persona"})
 
 
 def _coerce_tags(value: Any) -> set[str]:
@@ -250,12 +266,15 @@ def select_tool_schemas(
     result_schemas: list[dict]
     effective_chat_intent = str(chat_intent or "").strip()
     if effective_chat_intent == "banter":
-        if not has_images:
-            return []
+        # 闲聊也可能遇到看不懂的梗/专有名词/外号/分享内容，放行轻量查证工具，
+        # 让模型"想查就能查"（不再无图就 return []）；有图时再叠加视觉类工具。
         result_schemas = [
             schema
             for schema in schemas
-            if _tool_requires_image(registry, schema_tool_name(schema))
+            if (
+                schema_tool_name(schema) in _LIGHTWEIGHT_LOOKUP_TOOL_NAMES
+                or (has_images and _tool_requires_image(registry, schema_tool_name(schema)))
+            )
         ]
     elif effective_chat_intent == "image_generation":
         result_schemas = [
@@ -306,8 +325,14 @@ def select_tool_schemas(
 def semantic_tool_guidance() -> str:
     return (
         "工具使用总原则：能直接回答就别起工具；不确定、高风险、时效性强、明显需要查证时再调用工具。"
+        "当当前消息包含你不认识、无法确定指代或可能有圈内含义的专有名词、角色名、作品名、游戏/动漫/卡牌术语、"
+        "怪物/装备/地图名、外号、别称、缩写、谐音、空耳、梗或活动名时，如果可用工具里有 web_search、search_web、"
+        "wiki_lookup、resolve_acg_entity 或 parallel_research，必须先调用合适工具查证；不要凭记忆猜，也不要直接在群里问"
+        "“这是什么梗/哪个游戏/什么意思”。"
         "插件技术问题优先本地插件知识和源码工具。"
         "用户明确要求生成图片时，必须调用 generate_image，不要只给提示词。"
+        "涉及本地天气、出行、城市或附近状态时，如果用户没明说地点，先看已注入的用户档案；仍不确定可调用记忆工具确认，不能猜城市。"
+        "最终回复只输出纯文本，不要 markdown、项目符号列表、编号列表，也不要说正在查询、根据搜索结果或我需要确认一下。"
         "群聊接梗场景优先像群友接话，不要为了显得聪明而滥用工具。"
     )
 

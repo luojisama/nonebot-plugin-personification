@@ -14,11 +14,20 @@ from typing import Any, Awaitable, Callable
 
 
 class SafetyRefusalError(Exception):
-    """LLM 返回的内容命中拒绝模板，调用方应丢弃本次结果。"""
+    """LLM 返回的内容命中拒绝模板或被 API 层安全策略拦截，调用方应丢弃本次结果。
 
-    def __init__(self, sample: str = "") -> None:
-        super().__init__("LLM 响应命中拒绝模板")
+    source: "text"=自生成拒绝文本；"api_block"=供应商 API 层强制拦截。
+    reason: API 层拦截时的具体原因（如 gemini:SAFETY / openai:content_filter）。
+    """
+
+    def __init__(self, sample: str = "", *, source: str = "text", reason: str = "") -> None:
+        super().__init__(
+            f"LLM 响应被{'API 安全策略拦截' if source == 'api_block' else '命中拒绝模板'}"
+            + (f"：{reason}" if reason else "")
+        )
         self.sample = sample
+        self.source = source
+        self.reason = reason
 
 
 _REFUSAL_PATTERNS: tuple[re.Pattern[str], ...] = (
@@ -33,6 +42,13 @@ _REFUSAL_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"(?:内容|响应|回答)(?:已|被)(?:屏蔽|拦截|过滤)"),
     re.compile(r"无法(?:回答|回应|提供|生成|继续).{0,12}(?:这个|该|此|问题|话题|请求|内容)"),
     re.compile(r"我不(?:能|会|应该)(?:讨论|回答|评论|涉及)"),
+    # 客服式婉拒（画像/分析类任务常见）
+    re.compile(r"不在我(?:能|可以)?(?:协助|帮助|提供帮助|处理|完成)的范围"),
+    re.compile(r"(?:这类|此类|这种|该)?(?:请求|任务|分析|内容).{0,6}(?:不在|超出).{0,8}范围"),
+    re.compile(r"我(?:没办法|没有办法|无法|不便)(?:完成|协助|处理|继续)(?:这个|该|此)?(?:请求|任务)?"),
+    re.compile(r"如果你有.{0,20}(?:问题|需求|需要).{0,6}(?:随时|请)(?:告诉|联系|问)我"),
+    re.compile(r"很乐意.{0,10}(?:其他|别的).{0,6}(?:问题|方面|帮助)"),
+    re.compile(r"建议(?:你)?(?:咨询|寻求|联系).{0,10}(?:专业|相关)(?:人士|人员|机构)"),
     # 英文常见
     re.compile(r"\bas an?\s+(?:ai|language model|assistant)\b", re.IGNORECASE),
     re.compile(r"\bi\s*(?:cannot|can'?t|won'?t|am\s+(?:not\s+)?able\s+to)\b", re.IGNORECASE),
@@ -41,6 +57,77 @@ _REFUSAL_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"\b(?:violates?|against)\s+.{0,20}(?:policy|guidelines?|terms)\b", re.IGNORECASE),
     re.compile(r"\bsafety\s+(?:reasons|guidelines|policy)\b", re.IGNORECASE),
 )
+
+
+# 触发"被拦截"判定的 finishReason / blockReason 取值（大小写无关）
+_BLOCK_FINISH_REASONS: frozenset[str] = frozenset({
+    "content_filter", "safety", "recitation", "blocklist",
+    "prohibited_content", "spii", "image_safety", "refusal", "blocked",
+})
+_BLOCK_REASON_IGNORE: frozenset[str] = frozenset({"", "0", "block_reason_unspecified", "stop", "end_turn"})
+
+
+def _get(obj: Any, key: str) -> Any:
+    """从 dict 或对象上取属性，取不到返回 None。"""
+    if obj is None:
+        return None
+    if isinstance(obj, dict):
+        return obj.get(key)
+    return getattr(obj, key, None)
+
+
+def _norm(value: Any) -> str:
+    return str(value or "").strip().lower()
+
+
+def detect_api_block(response: Any) -> str:
+    """检查 LLM 响应是否被供应商 API 层安全策略拦截。
+
+    覆盖 OpenAI(finish_reason=content_filter)、Gemini(promptFeedback.blockReason /
+    candidates[].finishReason=SAFETY 等)、Anthropic(stop_reason=refusal)。
+    返回形如 "gemini:SAFETY" 的原因串；未被拦截返回 ""。绝不抛异常。
+    """
+    if response is None:
+        return ""
+    try:
+        # 1) ToolCallerResponse.finish_reason 已被标记
+        fr = _norm(_get(response, "finish_reason"))
+        if fr in _BLOCK_FINISH_REASONS:
+            return f"finish_reason:{fr}"
+
+        raw = _get(response, "raw")
+        if raw is None:
+            raw = response
+
+        # 2) Gemini：promptFeedback.blockReason
+        feedback = _get(raw, "prompt_feedback") or _get(raw, "promptFeedback")
+        block_reason = _get(feedback, "block_reason") or _get(feedback, "blockReason")
+        if block_reason is not None and _norm(block_reason) not in _BLOCK_REASON_IGNORE:
+            return f"gemini:{block_reason}"
+
+        # 3) Gemini：candidates[].finishReason
+        candidates = _get(raw, "candidates")
+        if isinstance(candidates, (list, tuple)):
+            for cand in candidates:
+                raw_cfr = _get(cand, "finish_reason") or _get(cand, "finishReason")
+                if _norm(raw_cfr) in _BLOCK_FINISH_REASONS:
+                    return f"gemini:{raw_cfr}"
+
+        # 4) OpenAI：choices[].finish_reason == content_filter
+        choices = _get(raw, "choices")
+        if isinstance(choices, (list, tuple)):
+            for ch in choices:
+                raw_cfr = _get(ch, "finish_reason") or _get(ch, "finishReason")
+                if _norm(raw_cfr) in _BLOCK_FINISH_REASONS:
+                    return f"openai:{raw_cfr}"
+
+        # 5) Anthropic：stop_reason == refusal
+        stop_reason = _norm(_get(raw, "stop_reason"))
+        if stop_reason in _BLOCK_FINISH_REASONS:
+            return f"anthropic:{stop_reason}"
+    except Exception:
+        return ""
+    return ""
 
 
 def detect_refusal(text: str) -> bool:
@@ -90,35 +177,47 @@ async def sanitize_or_retry(
     response = await call()
     _notify(response)
     text = extract(response)
-    if not detect_refusal(text):
+    block = detect_api_block(response)
+    if not block and not detect_refusal(text):
         return response
+    source = "api_block" if block else "text"
     if logger is not None:
         try:
-            logger.warning(
-                f"[safety_filter] {purpose or 'llm_response'} 命中拒绝模板，"
-                f"sample={_sanitize_sample(text)!r}"
-            )
+            if block:
+                logger.warning(
+                    f"[safety_filter] {purpose or 'llm_response'} 被 API 安全策略拦截"
+                    f"（{block}），将重试软化 prompt"
+                )
+            else:
+                logger.warning(
+                    f"[safety_filter] {purpose or 'llm_response'} 命中拒绝模板，"
+                    f"sample={_sanitize_sample(text)!r}"
+                )
         except Exception:
             pass
     if retry_call is None:
-        raise SafetyRefusalError(sample=_sanitize_sample(text))
+        raise SafetyRefusalError(sample=_sanitize_sample(text), source=source, reason=block)
     response2 = await retry_call()
     _notify(response2)
     text2 = extract(response2)
-    if detect_refusal(text2):
+    block2 = detect_api_block(response2)
+    if block2 or detect_refusal(text2):
+        source2 = "api_block" if block2 else "text"
         if logger is not None:
             try:
                 logger.warning(
-                    f"[safety_filter] {purpose or 'llm_response'} 重试仍命中拒绝模板，丢弃"
+                    f"[safety_filter] {purpose or 'llm_response'} 重试后仍"
+                    f"{'被 API 拦截（' + block2 + '）' if block2 else '命中拒绝模板'}，丢弃"
                 )
             except Exception:
                 pass
-        raise SafetyRefusalError(sample=_sanitize_sample(text2))
+        raise SafetyRefusalError(sample=_sanitize_sample(text2), source=source2, reason=block2)
     return response2
 
 
 __all__ = [
     "SafetyRefusalError",
     "detect_refusal",
+    "detect_api_block",
     "sanitize_or_retry",
 ]

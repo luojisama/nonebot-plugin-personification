@@ -24,6 +24,9 @@ def setup_persona_matchers(
 
     @msg_recorder.handle()
     async def _record(event: MessageEvent) -> None:
+        # 跳过 plugin_invoker 代为执行时分发的合成事件，避免污染用户画像数据。
+        if getattr(event, "_personification_synthetic", False):
+            return
         text = event.get_plaintext().strip()
         if not text:
             return

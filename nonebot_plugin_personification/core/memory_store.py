@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import sqlite3
 import struct
 import time
@@ -27,6 +28,8 @@ MAX_RECALL_LIMIT = MAX_MEMORY_RECALL_TOP_K
 MAX_SEARCH_STATS_ROWS = 20000
 SEARCH_STATS_RETENTION_DAYS = 30
 SEARCH_STATS_PRUNE_INTERVAL_SECONDS = 3600
+VECTOR_CHUNK_MODEL_VERSION = EMBED_MODEL_VERSION
+VECTOR_CHUNK_TEXT_LIMIT = 900
 
 
 def _plugin_data_dir(plugin_config: Any | None = None) -> Path:
@@ -54,6 +57,9 @@ def _connect(path: Path) -> sqlite3.Connection:
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA synchronous=NORMAL")
     conn.execute("PRAGMA foreign_keys=ON")
+    # 共享连接可能被事件循环与线程池并发使用，写锁竞争时等待而不是立刻抛
+    # "database is locked"。
+    conn.execute("PRAGMA busy_timeout=5000")
     return conn
 
 
@@ -515,6 +521,7 @@ class MemoryStore:
                 "UPDATE memory_items SET embedding=?, embedding_model=? WHERE memory_id=?",
                 (_pack_float16_vector(payload.get("_embedding", [])), EMBED_MODEL_VERSION, memory_id),
             )
+            self._write_vector_chunks(conn, payload=payload, updated_at=updated_at)
             conn.execute("DELETE FROM memory_entities WHERE memory_id=?", (memory_id,))
             for entity in payload.get("_entities", []):
                 conn.execute(
@@ -578,6 +585,7 @@ class MemoryStore:
             getattr(self.plugin_config, "personification_memory_recall_top_k", MAX_RECALL_LIMIT) or MAX_RECALL_LIMIT
         )
         limit = max(1, min(int(limit or configured_limit), MAX_RECALL_LIMIT))
+        scan_limit = self._memory_search_scan_limit(limit=limit)
         normalized_query = normalize_text(query)
         if self.palace_enabled() and group_id and self.needs_bootstrap(group_id):
             self.bootstrap_group_memories(group_id)
@@ -590,6 +598,7 @@ class MemoryStore:
             user_id=user_id,
             group_id=group_id,
             limit=max(limit * 3, 12),
+            scan_limit=scan_limit,
         ):
             existing = candidate_map.get(candidate.memory_id)
             if existing is None or candidate.base_score > existing.base_score:
@@ -625,6 +634,7 @@ class MemoryStore:
                 scope=scope,
                 query=normalized_query,
                 limit=limit,
+                scan_limit=scan_limit,
             )
             if len(fallback) < limit:
                 fallback.extend(
@@ -680,6 +690,14 @@ class MemoryStore:
         )
         return results
 
+    def _memory_search_scan_limit(self, *, limit: int) -> int:
+        configured = safe_float(
+            getattr(self.plugin_config, "personification_memory_search_scan_limit", 800),
+            800,
+        )
+        floor = max(int(limit or 1) * 8, 80)
+        return max(floor, min(int(configured or 800), 5000))
+
     def _recall_item_fallback(
         self,
         *,
@@ -688,6 +706,7 @@ class MemoryStore:
         scope: str,
         query: str,
         limit: int,
+        scan_limit: int,
     ) -> list[dict[str, Any]]:
         query_tokens = [token for token in tokenize(query) if token]
         if not query_tokens:
@@ -702,7 +721,7 @@ class MemoryStore:
                 ORDER BY updated_at DESC
                 LIMIT ?
                 """,
-                (max(limit * 8, 48),),
+                (max(limit * 8, min(int(scan_limit or 0), 5000), 48),),
             ).fetchall()
 
         scored: list[tuple[float, dict[str, Any]]] = []
@@ -862,6 +881,94 @@ class MemoryStore:
 
     def get_memory_item(self, memory_id: str) -> dict[str, Any] | None:
         return self._get_memory_payload(str(memory_id or ""))
+
+    def get_vector_index_status(self) -> dict[str, Any]:
+        db_path = self.memory_palace_dir / "memory_palace.db"
+        status: dict[str, Any] = {
+            "enabled": self._vector_index_enabled(),
+            "backend": str(getattr(self.plugin_config, "personification_memory_vector_backend", "sqlite_exact") or "sqlite_exact"),
+            "model_version": VECTOR_CHUNK_MODEL_VERSION,
+            "memory_count": 0,
+            "chunk_count": 0,
+            "stale_count": 0,
+            "available": db_path.exists(),
+        }
+        if not db_path.exists():
+            return status
+        with _connect(db_path) as conn:
+            memory_row = conn.execute("SELECT COUNT(1) AS cnt FROM memory_items WHERE supports_recall=1").fetchone()
+            chunk_row = conn.execute("SELECT COUNT(1) AS cnt FROM memory_vector_chunks").fetchone()
+            stale_row = conn.execute(
+                """
+                SELECT COUNT(1) AS cnt
+                FROM memory_items i
+                WHERE i.supports_recall=1
+                  AND NOT EXISTS (
+                    SELECT 1 FROM memory_vector_chunks c
+                    WHERE c.memory_id=i.memory_id AND c.model_version=?
+                  )
+                """,
+                (VECTOR_CHUNK_MODEL_VERSION,),
+            ).fetchone()
+        status["memory_count"] = int(memory_row["cnt"] if memory_row else 0)
+        status["chunk_count"] = int(chunk_row["cnt"] if chunk_row else 0)
+        status["stale_count"] = int(stale_row["cnt"] if stale_row else 0)
+        return status
+
+    def rebuild_vector_index(self, *, limit: int = 0) -> dict[str, Any]:
+        if not self.palace_enabled():
+            return {"rebuilt": 0, "status": "disabled"}
+        max_rows = int(limit or 0)
+        sql = """
+            SELECT payload
+            FROM memory_items
+            WHERE supports_recall=1
+            ORDER BY updated_at DESC
+        """
+        params: tuple[Any, ...] = ()
+        if max_rows > 0:
+            sql += " LIMIT ?"
+            params = (max_rows,)
+        rebuilt = 0
+        with _connect(self.memory_palace_dir / "memory_palace.db") as conn:
+            rows = conn.execute(sql, params).fetchall()
+            for row in rows:
+                payload = _json_loads(row["payload"], {})
+                if not isinstance(payload, dict):
+                    continue
+                self._write_vector_chunks(conn, payload=payload, updated_at=now_ts())
+                rebuilt += 1
+            conn.commit()
+        return {"rebuilt": rebuilt, "status": "ok", "index": self.get_vector_index_status()}
+
+    def mark_memories_summarized(self, memory_ids: list[str], *, summarized_by: str = "") -> int:
+        updated = 0
+        for memory_id in list(memory_ids or [])[:80]:
+            payload = self.get_memory_item(str(memory_id or ""))
+            if not isinstance(payload, dict):
+                continue
+            if str(payload.get("source_kind", "") or "") == "crystal":
+                continue
+            payload["summary_status"] = "summarized"
+            payload["summarized_at"] = now_ts()
+            if summarized_by:
+                refs = list(payload.get("summary_refs") or [])
+                if summarized_by not in refs:
+                    refs.append(str(summarized_by))
+                payload["summary_refs"] = refs[-8:]
+                payload["summarized_by"] = str(summarized_by)
+            if str(payload.get("tier", "") or "").strip().lower() not in {"semantic", "background"}:
+                payload["tier"] = "background"
+            if str(payload.get("memory_type", "") or "") in {"episodic", "episodic_turn"}:
+                payload["palace_zone"] = "background"
+            payload["salience"] = max(0.12, min(safe_float(payload.get("salience", 0.4), 0.4), 0.42) * 0.72)
+            payload["supports_recall"] = bool(payload.get("supports_recall", True))
+            try:
+                self.write_memory_item(payload)
+                updated += 1
+            except Exception:
+                continue
+        return updated
 
     def list_recent_memories(
         self,
@@ -1327,6 +1434,24 @@ class MemoryStore:
                 (memory_id, superseded_by, "evolves", 0.9, now_ts()),
             )
 
+    def _candidate_visible_for_request(
+        self,
+        payload: dict[str, Any],
+        *,
+        group_id: str,
+        user_id: str,
+    ) -> bool:
+        requested_group_id = str(group_id or "")
+        requested_user_id = str(user_id or "")
+        payload_group_id = str(payload.get("group_id") or "")
+        payload_user_id = str(payload.get("user_id") or "")
+        cross_group_allowed = bool(payload.get("cross_group_allowed", False))
+        if requested_group_id and payload_group_id and payload_group_id != requested_group_id and not cross_group_allowed:
+            return False
+        if requested_user_id and payload_user_id and payload_user_id != requested_user_id:
+            return False
+        return True
+
     def _candidate_from_payload(
         self,
         payload: dict[str, Any],
@@ -1440,12 +1565,49 @@ class MemoryStore:
         user_id: str,
         group_id: str,
         limit: int,
+        scan_limit: int,
     ) -> list[MemorySearchCandidate]:
         groups = [
-            self._search_by_fts(query=query, group_id=group_id, user_id=user_id, scope=scope, limit=max(limit, 20)),
-            self._search_by_embedding(query=query, group_id=group_id, user_id=user_id, scope=scope, limit=max(limit, 20)),
-            self._search_by_entity(query=query, group_id=group_id, user_id=user_id, scope=scope, limit=max(limit, 10)),
-            self._search_by_time(query=query, group_id=group_id, user_id=user_id, scope=scope, limit=limit),
+            self._search_by_vector_chunks(
+                query=query,
+                group_id=group_id,
+                user_id=user_id,
+                scope=scope,
+                limit=max(limit, 20),
+                scan_limit=scan_limit,
+            ),
+            self._search_by_fts(
+                query=query,
+                group_id=group_id,
+                user_id=user_id,
+                scope=scope,
+                limit=max(limit, 20),
+                scan_limit=scan_limit,
+            ),
+            self._search_by_embedding(
+                query=query,
+                group_id=group_id,
+                user_id=user_id,
+                scope=scope,
+                limit=max(limit, 20),
+                scan_limit=scan_limit,
+            ),
+            self._search_by_entity(
+                query=query,
+                group_id=group_id,
+                user_id=user_id,
+                scope=scope,
+                limit=max(limit, 10),
+                scan_limit=scan_limit,
+            ),
+            self._search_by_time(
+                query=query,
+                group_id=group_id,
+                user_id=user_id,
+                scope=scope,
+                limit=limit,
+                scan_limit=scan_limit,
+            ),
         ]
         return _fuse_recall_candidates(groups, limit=limit)
 
@@ -1483,6 +1645,150 @@ class MemoryStore:
                     candidate.match_reasons.append("deep_rerank")
         return sorted(ranked, key=lambda item: item.base_score, reverse=True)
 
+    def _vector_index_enabled(self) -> bool:
+        if not bool(getattr(self.plugin_config, "personification_memory_rag_enabled", True)):
+            return False
+        backend = str(getattr(self.plugin_config, "personification_memory_vector_backend", "sqlite_exact") or "")
+        return backend.strip().lower() in {"", "sqlite", "sqlite_exact", "local"}
+
+    def _vector_content_hash(self, text: str) -> str:
+        return hashlib.blake2b(
+            normalize_text(text).encode("utf-8"),
+            digest_size=16,
+            person=b"pers-rag-v1",
+        ).hexdigest()
+
+    def _build_vector_chunks(self, payload: dict[str, Any]) -> list[tuple[str, str]]:
+        memory_id = str(payload.get("memory_id") or "").strip()
+        if not memory_id:
+            return []
+        raw_chunks = [
+            self._build_searchable_text(payload),
+            *[str(value or "") for value in list(payload.get("snippets") or [])],
+        ]
+        seen: set[str] = set()
+        chunks: list[tuple[str, str]] = []
+        for index, raw_text in enumerate(raw_chunks):
+            text = normalize_text(raw_text)[:VECTOR_CHUNK_TEXT_LIMIT]
+            if not text:
+                continue
+            digest = self._vector_content_hash(text)
+            if digest in seen:
+                continue
+            seen.add(digest)
+            chunks.append((f"{memory_id}:{index}:{digest[:8]}", text))
+            if len(chunks) >= 4:
+                break
+        return chunks
+
+    def _write_vector_chunks(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        payload: dict[str, Any],
+        updated_at: float,
+    ) -> None:
+        memory_id = str(payload.get("memory_id") or "").strip()
+        if not memory_id:
+            return
+        conn.execute("DELETE FROM memory_vector_chunks WHERE memory_id=?", (memory_id,))
+        if not self._vector_index_enabled() or not bool(payload.get("supports_recall", True)):
+            return
+        for chunk_id, text in self._build_vector_chunks(payload):
+            embedding = embed_text(text)
+            conn.execute(
+                """
+                INSERT INTO memory_vector_chunks(
+                    chunk_id, memory_id, chunk_text, content_hash, model_version,
+                    embedding, embedding_dim, group_id, user_id, permission_type,
+                    group_scope, cross_group_allowed, salience, confidence, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    chunk_id,
+                    memory_id,
+                    text,
+                    self._vector_content_hash(text),
+                    VECTOR_CHUNK_MODEL_VERSION,
+                    json.dumps(embedding, ensure_ascii=False),
+                    len(embedding),
+                    str(payload.get("group_id") or ""),
+                    str(payload.get("user_id") or ""),
+                    str(payload.get("permission_type", "public_preference") or "public_preference"),
+                    str(payload.get("group_scope", "shared") or "shared"),
+                    1 if bool(payload.get("cross_group_allowed", False)) else 0,
+                    float(payload.get("salience", 0) or 0),
+                    float(payload.get("confidence", 0) or 0),
+                    float(updated_at or now_ts()),
+                ),
+            )
+
+    def _search_by_vector_chunks(
+        self,
+        *,
+        query: str,
+        group_id: str,
+        user_id: str,
+        scope: str,
+        limit: int,
+        scan_limit: int,
+    ) -> list[MemorySearchCandidate]:
+        if not query or not self._vector_index_enabled():
+            return []
+        query_embedding = embed_text(query)
+        if not query_embedding:
+            return []
+        configured_candidates = safe_float(
+            getattr(self.plugin_config, "personification_memory_rag_candidate_limit", 80),
+            80,
+        )
+        scan = max(limit * 4, min(int(configured_candidates or 80), max(int(scan_limit or 800), 80)))
+        with _connect(self.memory_palace_dir / "memory_palace.db") as conn:
+            rows = conn.execute(
+                """
+                SELECT c.memory_id, c.chunk_text, c.embedding, c.model_version, i.payload
+                FROM memory_vector_chunks c
+                JOIN memory_items i ON i.memory_id = c.memory_id
+                WHERE i.supports_recall=1
+                  AND c.model_version=?
+                ORDER BY c.salience DESC, c.updated_at DESC
+                LIMIT ?
+                """,
+                (VECTOR_CHUNK_MODEL_VERSION, min(scan, 5000)),
+            ).fetchall()
+        best_by_memory: dict[str, MemorySearchCandidate] = {}
+        for row in rows:
+            payload = _json_loads(row["payload"], {})
+            if not isinstance(payload, dict):
+                continue
+            if not self._scope_matches(payload, scope):
+                continue
+            if not self._candidate_visible_for_request(payload, group_id=group_id, user_id=user_id):
+                continue
+            embedding = _json_loads(row["embedding"], [])
+            if not isinstance(embedding, list):
+                continue
+            similarity = cosine_similarity(query_embedding, embedding)
+            if similarity <= 0.08:
+                continue
+            payload["_query"] = query
+            candidate = self._candidate_from_payload(
+                payload,
+                base_score=0.2 + similarity * 0.76,
+                reason="RAG向量块",
+                source="vector",
+                requested_group_id=group_id,
+                requested_user_id=user_id,
+            )
+            chunk_text = str(row["chunk_text"] or "").strip()
+            if chunk_text:
+                candidate.match_reasons.append("chunk:" + chunk_text[:80])
+            existing = best_by_memory.get(candidate.memory_id)
+            if existing is None or candidate.base_score > existing.base_score:
+                best_by_memory[candidate.memory_id] = candidate
+        return sorted(best_by_memory.values(), key=lambda item: item.base_score, reverse=True)[: max(1, int(limit or 1))]
+
     def _search_by_fts(
         self,
         *,
@@ -1491,6 +1797,7 @@ class MemoryStore:
         user_id: str,
         scope: str,
         limit: int,
+        scan_limit: int,
     ) -> list[MemorySearchCandidate]:
         if not query:
             return []
@@ -1510,7 +1817,7 @@ class MemoryStore:
                         ORDER BY i.updated_at DESC
                         LIMIT ?
                         """,
-                        (match_query, max(limit, 6)),
+                        (match_query, min(max(limit * 4, 40), max(int(scan_limit or 80), 80))),
                     ).fetchall()
                 except Exception:
                     rows = []
@@ -1524,7 +1831,7 @@ class MemoryStore:
                     ORDER BY updated_at DESC
                     LIMIT ?
                     """,
-                    (f"%{query[:32]}%", max(limit, 6)),
+                    (f"%{query[:32]}%", min(max(limit * 4, 40), max(int(scan_limit or 80), 80))),
                 ).fetchall()
         results: list[MemorySearchCandidate] = []
         query_token_set = set(tokenize(query))
@@ -1533,6 +1840,8 @@ class MemoryStore:
             if not isinstance(payload, dict):
                 continue
             if not self._scope_matches(payload, scope):
+                continue
+            if not self._candidate_visible_for_request(payload, group_id=group_id, user_id=user_id):
                 continue
             searchable = " ".join(
                 [
@@ -1566,6 +1875,7 @@ class MemoryStore:
         user_id: str,
         scope: str,
         limit: int,
+        scan_limit: int,
     ) -> list[MemorySearchCandidate]:
         entities = extract_entities(query, [], [])
         if not entities:
@@ -1582,7 +1892,7 @@ class MemoryStore:
                 ORDER BY i.updated_at DESC
                 LIMIT ?
                 """,
-                (*entities, max(limit, 6)),
+                (*entities, min(max(limit * 4, 40), max(int(scan_limit or 80), 80))),
             ).fetchall()
         results: list[MemorySearchCandidate] = []
         entity_set = {normalize_text(entity).lower() for entity in entities}
@@ -1591,6 +1901,8 @@ class MemoryStore:
             if not isinstance(payload, dict):
                 continue
             if not self._scope_matches(payload, scope):
+                continue
+            if not self._candidate_visible_for_request(payload, group_id=group_id, user_id=user_id):
                 continue
             payload_entities = {normalize_text(value).lower() for value in payload.get("entity_tags", [])}
             payload_entities |= {normalize_text(value).lower() for value in payload.get("aliases", [])}
@@ -1616,20 +1928,57 @@ class MemoryStore:
         user_id: str,
         scope: str,
         limit: int,
+        scan_limit: int,
     ) -> list[MemorySearchCandidate]:
         query_embedding = embed_text(query)
         with _connect(self.memory_palace_dir / "memory_palace.db") as conn:
-            rows = conn.execute(
-                """
-                SELECT i.payload, e.embedding, e.model_version
-                FROM memory_embeddings e
-                JOIN memory_items i ON i.memory_id = e.memory_id
-                WHERE i.supports_recall=1
-                ORDER BY i.updated_at DESC
-                LIMIT ?
-                """,
-                (max(limit * 5, 24),),
-            ).fetchall()
+            row_map: dict[str, sqlite3.Row] = {}
+            scan = max(int(scan_limit or 800), max(limit * 8, 80))
+            queries = [
+                (
+                    """
+                    SELECT i.memory_id, i.payload, e.embedding, e.model_version
+                    FROM memory_embeddings e
+                    JOIN memory_items i ON i.memory_id = e.memory_id
+                    WHERE i.supports_recall=1
+                    ORDER BY i.updated_at DESC
+                    LIMIT ?
+                    """,
+                    (scan,),
+                ),
+                (
+                    """
+                    SELECT i.memory_id, i.payload, e.embedding, e.model_version
+                    FROM memory_embeddings e
+                    JOIN memory_items i ON i.memory_id = e.memory_id
+                    WHERE i.supports_recall=1
+                      AND (
+                        i.memory_type IN ('semantic', 'persona_knowledge', 'group_knowledge', 'core_profile', 'fact')
+                        OR i.palace_zone IN ('topic', 'profile', 'person', 'group', 'self')
+                      )
+                    ORDER BY i.salience DESC, i.updated_at DESC
+                    LIMIT ?
+                    """,
+                    (max(limit * 10, scan // 2),),
+                ),
+                (
+                    """
+                    SELECT i.memory_id, i.payload, e.embedding, e.model_version
+                    FROM memory_embeddings e
+                    JOIN memory_items i ON i.memory_id = e.memory_id
+                    WHERE i.supports_recall=1
+                    ORDER BY i.salience DESC, i.updated_at DESC
+                    LIMIT ?
+                    """,
+                    (max(limit * 10, scan // 3),),
+                ),
+            ]
+            for sql, params in queries:
+                for row in conn.execute(sql, params).fetchall():
+                    memory_id = str(row["memory_id"] or "")
+                    if memory_id and memory_id not in row_map:
+                        row_map[memory_id] = row
+            rows = list(row_map.values())
             results: list[MemorySearchCandidate] = []
             refreshed_any = False
             for row in rows:
@@ -1637,6 +1986,8 @@ class MemoryStore:
                 if not isinstance(payload, dict):
                     continue
                 if not self._scope_matches(payload, scope):
+                    continue
+                if not self._candidate_visible_for_request(payload, group_id=group_id, user_id=user_id):
                     continue
                 embedding = self._embedding_for_payload(conn=conn, payload=payload, row=row)
                 if str(row["model_version"] or "") != EMBED_MODEL_VERSION:
@@ -1667,6 +2018,7 @@ class MemoryStore:
         user_id: str,
         scope: str,
         limit: int,
+        scan_limit: int,
     ) -> list[MemorySearchCandidate]:
         if not query:
             return []
@@ -1679,7 +2031,7 @@ class MemoryStore:
                 ORDER BY created_at DESC
                 LIMIT ?
                 """,
-                (max(limit * 4, 18),),
+                (min(max(limit * 8, 48), max(int(scan_limit or 80), 80)),),
             ).fetchall()
         results: list[MemorySearchCandidate] = []
         for row in rows:
@@ -1687,6 +2039,8 @@ class MemoryStore:
             if not isinstance(payload, dict):
                 continue
             if not self._scope_matches(payload, scope):
+                continue
+            if not self._candidate_visible_for_request(payload, group_id=group_id, user_id=user_id):
                 continue
             delta = time_hint_score(
                 query,
@@ -1999,6 +2353,27 @@ class MemoryStore:
             )
             conn.execute(
                 """
+                CREATE TABLE IF NOT EXISTS memory_vector_chunks(
+                    chunk_id TEXT PRIMARY KEY,
+                    memory_id TEXT NOT NULL,
+                    chunk_text TEXT NOT NULL,
+                    content_hash TEXT NOT NULL,
+                    model_version TEXT NOT NULL,
+                    embedding TEXT NOT NULL,
+                    embedding_dim INTEGER NOT NULL DEFAULT 0,
+                    group_id TEXT NOT NULL DEFAULT '',
+                    user_id TEXT NOT NULL DEFAULT '',
+                    permission_type TEXT NOT NULL DEFAULT 'public_preference',
+                    group_scope TEXT NOT NULL DEFAULT 'shared',
+                    cross_group_allowed INTEGER NOT NULL DEFAULT 0,
+                    salience REAL NOT NULL DEFAULT 0,
+                    confidence REAL NOT NULL DEFAULT 0,
+                    updated_at REAL NOT NULL
+                )
+                """
+            )
+            conn.execute(
+                """
                 CREATE TABLE IF NOT EXISTS memory_entities(
                     entity TEXT NOT NULL,
                     memory_id TEXT NOT NULL,
@@ -2053,6 +2428,12 @@ class MemoryStore:
             )
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_memory_items_recall ON memory_items(supports_recall, group_id, updated_at)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_memory_vector_lookup ON memory_vector_chunks(model_version, group_id, user_id, updated_at)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_memory_vector_memory ON memory_vector_chunks(memory_id)"
             )
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_memory_palace_zone ON memory_items(palace_zone)"

@@ -8,6 +8,8 @@ def build_generate_ai_diary_task(
     call_ai_api: Callable[..., Awaitable[str]],
     logger: Any,
     agent_tool_caller: Any = None,
+    agent_tool_registry: Any = None,
+    agent_max_steps: int = 4,
     agent_data_dir: Any = None,
 ) -> Callable[[Any], Awaitable[str]]:
     async def _generate_ai_diary(bot: Any) -> str:
@@ -17,6 +19,8 @@ def build_generate_ai_diary_task(
             call_ai_api=call_ai_api,
             logger=logger,
             tool_caller=agent_tool_caller,
+            registry=agent_tool_registry,
+            agent_max_steps=agent_max_steps,
             data_dir=agent_data_dir,
         )
 
@@ -52,7 +56,7 @@ def build_proactive_qzone_post_task(
     qzone_publish_available: bool,
     qzone_proactive_enabled: bool,
     qzone_probability: float,
-    qzone_daily_limit: int,
+    qzone_monthly_limit: int,
     qzone_min_interval_hours: float,
     get_bots: Callable[[], dict[str, Any]],
     get_now: Callable[[], Any],
@@ -68,7 +72,7 @@ def build_proactive_qzone_post_task(
             qzone_publish_available=qzone_publish_available,
             qzone_proactive_enabled=qzone_proactive_enabled,
             qzone_probability=qzone_probability,
-            qzone_daily_limit=qzone_daily_limit,
+            qzone_monthly_limit=qzone_monthly_limit,
             qzone_min_interval_hours=qzone_min_interval_hours,
             get_bots=get_bots,
             get_now=get_now,
@@ -139,9 +143,11 @@ def build_maybe_generate_qzone_post_task(
     call_ai_api: Callable[..., Awaitable[str]],
     logger: Any,
     agent_tool_caller: Any = None,
+    agent_tool_registry: Any = None,
+    agent_max_steps: int = 4,
     agent_data_dir: Any = None,
-) -> Callable[[Any], Awaitable[str]]:
-    async def _maybe_generate_qzone_post(bot: Any) -> str:
+) -> Callable[..., Awaitable[str]]:
+    async def _maybe_generate_qzone_post(bot: Any, quota: Any = None) -> str:
         return await maybe_generate_proactive_qzone_post_flow(
             bot,
             load_prompt=load_prompt,
@@ -149,6 +155,9 @@ def build_maybe_generate_qzone_post_task(
             logger=logger,
             data_dir=agent_data_dir,
             tool_caller=agent_tool_caller,
+            registry=agent_tool_registry,
+            agent_max_steps=agent_max_steps,
+            quota=quota,
         )
 
     return _maybe_generate_qzone_post

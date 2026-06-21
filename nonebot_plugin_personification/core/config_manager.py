@@ -26,15 +26,10 @@ def _managed_field_names() -> list[str]:
 
 
 def _collect_explicit_env_fields(plugin_config: Any) -> set[str]:
-    """收集所有 .env / OS 环境变量 / pydantic 中显式声明的 personification_ 字段。
+    """收集 .env / OS 环境变量 / pydantic 显式声明的插件字段。
 
-    被 _save_unlocked / _load_unlocked 用作"哪些字段属于 env 来源、不应被 env.json 覆盖
-    或持久化"的判定。
-
-    历史 bug：ConfigManager 早期只看 __pydantic_fields_set__ + os.environ，没读 .env 文件。
-    服务器场景下 NoneBot 包装层可能不传递 fields_set，导致 env.json 中过去由 admin
-    命令 / 模型路由 持久化的旧 api_pools 在重启后无条件覆盖 .env.prod 的新值。
-    现统一与 runtime_config._collect_explicit_env_fields 行为一致。
+    这些字段只用于首次导入 env.json。导入后 env.json 是 WebUI 管理的权威层，
+    不再被 .env.prod 里的旧值永久压制。
     """
     explicit: set[str] = set()
     raw_fields = getattr(plugin_config, "__pydantic_fields_set__", None)
@@ -99,10 +94,19 @@ def _new_load_info(path: Path) -> dict[str, Any]:
     return {
         "path": str(path),
         "applied_fields": [],
+        "imported_fields": [],
         "skipped_fields": [],
         "errors": [],
         "loaded": False,
     }
+
+
+def _restrict_sensitive_file_permissions(path: Path) -> None:
+    """Best-effort: keep config files containing tokens/cookies owner-readable only."""
+    try:
+        os.chmod(path, 0o600)
+    except Exception:
+        pass
 
 
 def _write_payload_atomic(path: Path, payload: dict[str, Any]) -> None:
@@ -117,7 +121,9 @@ def _write_payload_atomic(path: Path, payload: dict[str, Any]) -> None:
             json.dump(payload, fh, ensure_ascii=False, indent=2)
             fh.flush()
             os.fsync(fh.fileno())
+        _restrict_sensitive_file_permissions(Path(tmp_path))
         os.replace(tmp_path, path)
+        _restrict_sensitive_file_permissions(path)
     except Exception:
         try:
             os.unlink(tmp_path)
@@ -171,53 +177,61 @@ class ConfigManager:
         }
 
     def _save_unlocked(self) -> None:
-        # 关键约束：env.json 只持久化"不在 .env / 环境变量里"的运行时字段。
-        # 任何被 .env 显式声明的字段，env.json 中不应保留旧值（否则将来 .env 删除时
-        # 旧值会反咬复活），保存时直接剔除。
-        explicit_fields = _collect_explicit_env_fields(self.plugin_config)
-        payload: dict[str, Any] = {}
-        skipped_fields: list[str] = []
-        for field_name in _managed_field_names():
-            if field_name in explicit_fields:
-                skipped_fields.append(field_name)
-                continue
-            payload[field_name] = getattr(self.plugin_config, field_name, None)
+        payload = self._managed_payload()
         try:
             _write_payload_atomic(self.path, payload)
         except Exception as exc:
             if self.logger is not None:
                 self.logger.warning(f"personification: save env config failed path={self.path}: {exc}")
             return
-        if skipped_fields and self.logger is not None:
-            self.logger.info(
-                "personification: env config save skipped fields managed by .env: "
-                + ", ".join(sorted(skipped_fields))
-            )
 
     def _load_unlocked(self) -> None:
         info = _new_load_info(self.path)
-        if not self.path.exists():
-            _set_env_config_info(self.plugin_config, info)
-            return
-
-        try:
-            with open(self.path, "r", encoding="utf-8") as f:
-                payload = json.load(f)
-        except Exception as exc:
-            info["errors"].append(str(exc))
-            _set_env_config_info(self.plugin_config, info)
-            if self.logger is not None:
-                self.logger.warning(f"personification: load env config failed path={self.path}: {exc}")
-            return
-
-        if not isinstance(payload, dict):
+        had_file = self.path.exists()
+        payload: dict[str, Any] = {}
+        if not had_file:
             payload = {}
-        explicit_fields = _collect_explicit_env_fields(self.plugin_config)
+        else:
+            try:
+                with open(self.path, "r", encoding="utf-8") as f:
+                    loaded = json.load(f)
+            except Exception as exc:
+                info["errors"].append(str(exc))
+                _set_env_config_info(self.plugin_config, info)
+                if self.logger is not None:
+                    self.logger.warning(f"personification: load env config failed path={self.path}: {exc}")
+                return
+            if isinstance(loaded, dict):
+                payload = loaded
+            else:
+                payload = {}
+
+        managed_fields = set(_managed_field_names())
+        imported_fields: list[str] = []
+        for field_name in sorted(_collect_explicit_env_fields(self.plugin_config)):
+            if field_name not in managed_fields or field_name in payload:
+                continue
+            if not hasattr(self.plugin_config, field_name):
+                continue
+            payload[field_name] = getattr(self.plugin_config, field_name, None)
+            imported_fields.append(field_name)
+
+        if imported_fields:
+            try:
+                _write_payload_atomic(self.path, payload)
+            except Exception as exc:
+                info["errors"].append(f"bootstrap import save failed: {exc}")
+                if self.logger is not None:
+                    self.logger.warning(
+                        f"personification: import env fields to env.json failed path={self.path}: {exc}"
+                    )
+
+        if not had_file and not imported_fields:
+            _set_env_config_info(self.plugin_config, info)
+            return
+
         for field_name in _managed_field_names():
             if field_name not in payload:
-                continue
-            if field_name in explicit_fields:
-                info["skipped_fields"].append(field_name)
                 continue
             try:
                 setattr(self.plugin_config, field_name, payload[field_name])
@@ -225,29 +239,21 @@ class ConfigManager:
                 info["errors"].append(f"{field_name}: {exc}")
                 continue
             info["applied_fields"].append(field_name)
+        info["imported_fields"] = imported_fields
         info["loaded"] = True
         _set_env_config_info(self.plugin_config, info)
-        if info["skipped_fields"]:
-            if self.logger is not None:
+        if imported_fields and self.logger is not None:
+            self.logger.info(
+                "personification: imported initial .env fields into env.json; fields="
+                + ", ".join(imported_fields)
+            )
+        if had_file and self.logger is not None:
+            env_shadowed = sorted(set(info["applied_fields"]) & _collect_explicit_env_fields(self.plugin_config))
+            if env_shadowed:
                 self.logger.info(
-                    "personification: env.json respected .env explicit fields; skipped="
-                    + ", ".join(sorted(info["skipped_fields"]))
+                    "personification: env.json overrides legacy .env bootstrap fields; fields="
+                    + ", ".join(env_shadowed)
                 )
-            # 自动迁移：env.json 中还残留着已经迁到 .env 的字段
-            # 这是历史 admin 命令热切留下的脏数据，会让以后 .env 删除后旧值反咬。
-            # 立即重写 env.json 把这些字段剔除（_save_unlocked 已会跳过 explicit 字段）。
-            stale_in_file = [f for f in info["skipped_fields"] if f in payload]
-            if stale_in_file:
-                if self.logger is not None:
-                    self.logger.warning(
-                        "personification: env.json contains stale fields shadowed by .env; "
-                        f"cleaning up: {', '.join(sorted(stale_in_file))}"
-                    )
-                try:
-                    self._save_unlocked()
-                except Exception as exc:
-                    if self.logger is not None:
-                        self.logger.warning(f"personification: env.json cleanup failed: {exc}")
 
 
 def save_managed_env_config(plugin_config: Any, logger: Any) -> None:

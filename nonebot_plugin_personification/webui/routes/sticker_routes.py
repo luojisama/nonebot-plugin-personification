@@ -48,11 +48,11 @@ def _multipart_available() -> bool:
     否则 startup 会失败。这里探测一次，缺包则降级跳过上传功能（其他端点照常）。
     """
     try:
-        import multipart  # noqa: F401  python-multipart 包名是 multipart
+        import python_multipart  # noqa: F401
         return True
     except Exception:
         try:
-            import python_multipart  # 新版命名
+            import multipart  # noqa: F401  兼容旧版 python-multipart 包名
             return True
         except Exception:
             return False

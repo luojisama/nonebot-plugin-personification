@@ -21,11 +21,13 @@ from ...core.message_relations import build_event_relation_metadata
 from ...core.persona_profile import load_persona_profile, render_persona_snapshot
 from ...core.prompt_loader import pick_ack_phrase
 from ...core.gemini_profile import build_gemini_route_policy_prompt
+from ...core.reply_text_policy import normalize_visible_reply_text
 from ...core.reply_style_policy import build_reply_style_policy_prompt
 from ...core.visual_capabilities import VISUAL_ROUTE_REPLY_PLAIN
 from ...skill_runtime.runtime_api import SkillRuntime
 from ...skills.skillpacks.friend_request_tool.scripts.main import build_friend_request_tool_for_runtime
 from ...skills.skillpacks.group_info_tool.scripts.main import build_group_info_tool_for_runtime
+from ...skills.skillpacks.plugin_invoker.scripts.main import build_invoke_plugin_tool_for_runtime
 
 
 _FRIEND_IDS_CACHE: Dict[str, tuple[float, set[str]]] = {}
@@ -712,6 +714,17 @@ async def run_agent_if_enabled(
             is_group_scene=hasattr(event, "group_id") and not str(getattr(event, "group_id", "")).startswith("private_"),
         )
     )
+    if (
+        bool(getattr(runtime.plugin_config, "personification_plugin_invoker_enabled", False))
+        and runtime.knowledge_store is not None
+    ):
+        runtime_registry.register(
+            build_invoke_plugin_tool_for_runtime(
+                bot=bot,
+                event=event,
+                runtime=skill_runtime,
+            )
+        )
     ack_phrase = ""
     if is_direct_mention:
         group_id = str(getattr(event, "group_id", "") or "").strip() or None
@@ -783,10 +796,6 @@ async def run_agent_if_enabled(
         ),
         ack_sender=ack_sender,
     )
-    if runtime.inner_state_updater and task_exc_logger is not None:
-        user_id = str(getattr(event, "user_id", "") or "")
-        task = asyncio.create_task(runtime.inner_state_updater(result.text, user_id))
-        task.add_done_callback(task_exc_logger("inner_state_updater", runtime.logger))
     for action in result.pending_actions:
         await executor.execute(action["type"], action["params"])
     return result.text, True, bool(getattr(result, "bypass_length_limits", False))
@@ -836,7 +845,7 @@ def build_final_visible_reply_text(
     这里显式复用发送前的裁剪结果，确保「用户实际看到/听到的文本」
     与下一轮模型读到的 assistant 历史保持一致。
     """
-    final_reply = str(reply_content or "").strip()
+    final_reply = normalize_visible_reply_text(reply_content)
     if max_chars and max_chars > 0 and len(final_reply) > max_chars:
         final_reply = truncate_at_punctuation(final_reply, max_chars)
     return sanitize_history_text(final_reply)

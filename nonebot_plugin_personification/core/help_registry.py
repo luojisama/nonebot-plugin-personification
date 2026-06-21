@@ -245,7 +245,7 @@ _COMMANDS: list[CommandHelpEntry] = [
             "personification_qzone_enabled=true",
             "personification_qzone_cookie=<手动填写或用'发个说说'命令自动刷新>",
             "personification_qzone_proactive_enabled=true  # 可选，允许主动发说说",
-            "personification_qzone_daily_limit=2           # 每日主动发说说上限",
+            "personification_qzone_monthly_limit=30        # 每月主动发说说上限",
         ),
         permission="管理员配置",
         scope="global",

@@ -58,6 +58,12 @@ async def _evaluate_personification_rule(
     event: Event,
     state: T_State,
 ) -> dict[str, Any]:
+    # plugin_invoker 用 handle_event 重新分发的合成事件与原事件共享 message_id，
+    # 会命中下方的规则结果缓存而绕过 personification_rule 顶部的合成事件短路，
+    # 因此这里必须在查缓存之前先短路，避免合成事件再次进入回复流程造成递归。
+    if getattr(event, "_personification_synthetic", False):
+        state["is_random_chat"] = False
+        return {"matched": False, "is_random_chat": False}
     cache_key = _build_rule_cache_key(event)
     now_ts = time.time()
     cached = _RULE_EVAL_CACHE.get(cache_key)

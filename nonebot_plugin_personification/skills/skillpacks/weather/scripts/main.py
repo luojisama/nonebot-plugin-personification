@@ -10,14 +10,14 @@ SKILL_ROOT = Path(__file__).resolve().parents[2]
 SKILLS_ROOT = SKILL_ROOT.parent
 
 
-async def run(city: str) -> str:
+async def run(city: str, days: int = 1) -> str:
     city_name = str(city or "").strip()
     if not city_name:
         return "请提供城市名，例如：北京、上海、广州。"
     try:
         config = impl.load_weather_config(SKILLS_ROOT)
         resolved = impl.resolve_city_alias(city_name, config)
-        result = await impl.fetch_weather(resolved)
+        result = await impl.fetch_weather(resolved, impl.coerce_forecast_days(days))
         return result or f"{resolved} 天气查询失败"
     except Exception as e:
         return f"{city_name} 天气查询失败: {e}"

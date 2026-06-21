@@ -228,6 +228,33 @@ def build_group_router(*, runtime) -> APIRouter:
         if svc is None:
             raise HTTPException(status_code=503, detail="profile_service 未就绪")
         profiles = svc.list_local_profiles(group_id)
+        seen = {str(p.get("user_id", "")) for p in profiles}
+        # 本地群画像通常为空（没有专门的本地画像构建流程）。回退：把本群近期活跃成员
+        # 的【全局画像】并进来，避免「群内成员画像」一直显示为 0。
+        try:
+            from ...utils import get_recent_group_msgs
+
+            recent = get_recent_group_msgs(str(group_id), limit=200, expire_hours=0) or []
+            active_uids: list[str] = []
+            for m in recent:
+                uid = str((m or {}).get("user_id", "") or "").strip()
+                if uid and uid not in seen and uid not in active_uids:
+                    active_uids.append(uid)
+            for uid in active_uids:
+                snap = svc.get_core_profile(uid)
+                text = getattr(snap, "profile_text", "") if snap is not None else ""
+                if not str(text or "").strip():
+                    continue
+                profiles.append({
+                    "user_id": uid,
+                    "profile_text": str(text),
+                    "profile_json": {"scope": "global"},
+                    "updated_at": float(getattr(snap, "updated_at", 0) or 0),
+                })
+                seen.add(uid)
+        except Exception as exc:
+            getattr(runtime, "logger", None) and runtime.logger.debug(f"[group personas] 全局画像回退失败: {exc}")
+        profiles.sort(key=lambda p: float(p.get("updated_at", 0) or 0), reverse=True)
         bot = _get_first_bot(runtime)
 
         # 拉一次 emotion_state 给每条 persona 附上"近期情绪"

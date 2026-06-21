@@ -1,3 +1,4 @@
+import calendar
 import re
 import time
 from typing import Any, Callable, Dict, Iterable
@@ -6,6 +7,45 @@ from ..core.data_store import get_data_store
 
 
 _IMAGE_B64_RE = re.compile(r"\[IMAGE_B64\][A-Za-z0-9+/=\r\n]+\[/IMAGE_B64\]")
+
+
+def build_qzone_quota(
+    *,
+    state: Any,
+    now: Any,
+    monthly_limit: int,
+    min_interval_hours: float,
+) -> Dict[str, Any]:
+    """计算发空间的月度额度快照，供 agent 自我节奏控制与 WebUI 展示共用。
+
+    state 为 data_store 的 qzone_post_state；若其 period 不是当前月（或缺失），
+    本月已发计 0（与 run_proactive 的按月重置一致）。
+    """
+    period = now.strftime("%Y-%m")
+    same_period = isinstance(state, dict) and state.get("period") == period
+    used = int((state or {}).get("count", 0) or 0) if same_period else 0
+    limit = max(0, int(monthly_limit or 0))
+    remaining = max(0, limit - used)
+    days_in_month = calendar.monthrange(now.year, now.month)[1]
+    day_of_month = int(getattr(now, "day", 1) or 1)
+    days_left = max(1, days_in_month - day_of_month + 1)
+    last_post_at = float((state or {}).get("last_post_at", 0) or 0)
+    min_interval_seconds = max(0.0, float(min_interval_hours or 0)) * 3600
+    next_eligible_at = (
+        last_post_at + min_interval_seconds if (last_post_at and min_interval_seconds) else 0.0
+    )
+    return {
+        "month": period,
+        "used": used,
+        "limit": limit,
+        "remaining": remaining,
+        "days_in_month": days_in_month,
+        "day_of_month": day_of_month,
+        "days_left": days_left,
+        "min_interval_hours": float(min_interval_hours or 0),
+        "last_post_at": last_post_at,
+        "next_eligible_at": next_eligible_at,
+    }
 
 
 def _compact_qzone_state_content(content: str) -> str:
@@ -28,6 +68,34 @@ def _remember_qzone_post(state: dict[str, Any], content: str, *, max_items: int 
         normalized.append(text)
     state["recent_contents"] = normalized[-max(1, int(max_items)) :]
     state["last_content"] = compact
+
+
+def record_qzone_post(content: str, *, now: Any) -> Dict[str, Any]:
+    """发布一条空间说说后更新 qzone_post_state（按月计数 +1、记录去重）。
+
+    供 WebUI 手动「立即发一条」复用，保证手动发布也计入月度额度。
+    """
+    store = get_data_store()
+    state = store.load_sync("qzone_post_state")
+    if not isinstance(state, dict):
+        state = {}
+    period = now.strftime("%Y-%m")
+    if state.get("period") != period:
+        state = {
+            "period": period,
+            "count": 0,
+            "last_post_at": float(state.get("last_post_at", 0) or 0),
+            "last_content": str(state.get("last_content", "") or ""),
+            "recent_contents": list(state.get("recent_contents", []))
+            if isinstance(state.get("recent_contents"), list)
+            else [],
+        }
+    state["period"] = period
+    state["count"] = int(state.get("count", 0) or 0) + 1
+    state["last_post_at"] = time.time()
+    _remember_qzone_post(state, content)
+    store.save_sync("qzone_post_state", state)
+    return state
 
 
 async def run_daily_group_fav_report(
@@ -180,7 +248,7 @@ async def run_proactive_qzone_post(
     qzone_publish_available: bool,
     qzone_proactive_enabled: bool,
     qzone_probability: float,
-    qzone_daily_limit: int,
+    qzone_monthly_limit: int,
     qzone_min_interval_hours: float,
     get_bots: Callable[[], Dict[str, Any]],
     get_now: Callable[[], Any],
@@ -208,16 +276,18 @@ async def run_proactive_qzone_post(
             f"[qzone] skip proactive post in quiet hour {quiet_hour_start}-{quiet_hour_end}"
         )
         return False
-    today = now.strftime("%Y-%m-%d")
+    period = now.strftime("%Y-%m")
     now_ts = time.time()
 
     store = get_data_store()
     state = store.load_sync("qzone_post_state")
     if not isinstance(state, dict):
         state = {}
-    if state.get("date") != today:
+    # 按月计数：跨月（或旧的按天 state，缺少 period 字段）时 count 归零，
+    # last_post_at / recent_contents 照旧 carry over 喂去重。
+    if state.get("period") != period:
         state = {
-            "date": today,
+            "period": period,
             "count": 0,
             "last_post_at": float(state.get("last_post_at", 0) or 0),
             "last_content": str(state.get("last_content", "") or ""),
@@ -226,12 +296,20 @@ async def run_proactive_qzone_post(
             else [],
         }
 
-    if int(state.get("count", 0) or 0) >= max(1, int(qzone_daily_limit)):
+    if int(state.get("count", 0) or 0) >= max(1, int(qzone_monthly_limit)):
         return False
     min_interval_seconds = max(0.0, float(qzone_min_interval_hours)) * 3600
     last_post_at = float(state.get("last_post_at", 0) or 0)
     if min_interval_seconds and last_post_at and now_ts - last_post_at < min_interval_seconds:
         return False
+
+    # 把月度额度快照交给 agent，让它自己把控发不发、发的节奏（硬上限仍由上面的 gate 兜底）。
+    quota = build_qzone_quota(
+        state=state,
+        now=now,
+        monthly_limit=qzone_monthly_limit,
+        min_interval_hours=qzone_min_interval_hours,
+    )
 
     try:
         cookie_ok, cookie_msg = await update_qzone_cookie(bot)
@@ -241,7 +319,7 @@ async def run_proactive_qzone_post(
         if not cookie_ok:
             logger.warning(f"拟人插件：主动说说刷新 Cookie 失败（{cookie_msg}），尝试使用旧 Cookie。")
 
-    content = await maybe_generate_qzone_post(bot)
+    content = await maybe_generate_qzone_post(bot, quota=quota)
     if not content:
         return False
 
@@ -250,7 +328,7 @@ async def run_proactive_qzone_post(
         logger.error(f"拟人插件：主动说说发布失败：{msg}")
         return False
 
-    state["date"] = today
+    state["period"] = period
     state["count"] = int(state.get("count", 0) or 0) + 1
     state["last_post_at"] = now_ts
     _remember_qzone_post(state, content)

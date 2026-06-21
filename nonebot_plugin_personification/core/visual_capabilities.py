@@ -119,6 +119,20 @@ def error_indicates_vision_unavailable(error: Any) -> bool:
     return any(hint in text for hint in _VISION_ERROR_HINTS)
 
 
+def _mimo_heuristic_supports_vision(model_text: str) -> bool | None:
+    normalized_model = str(model_text or "").strip().lower().replace("_", "-")
+    compact_model = re.sub(r"[^a-z0-9]+", "", normalized_model)
+    if not compact_model.startswith("mimo"):
+        return None
+    if any(token in normalized_model for token in ("tts", "asr", "embedding", "embed")):
+        return False
+    if compact_model.startswith(("mimo25", "mimov25", "mimov2omni")):
+        return True
+    if "vision" in normalized_model or "-vl" in normalized_model:
+        return True
+    return False
+
+
 def heuristic_supports_vision(api_type: str, model: str | None = None) -> bool:
     """判断 provider 是否支持视觉输入（接收 image_url 类型 content）。
 
@@ -132,6 +146,12 @@ def heuristic_supports_vision(api_type: str, model: str | None = None) -> bool:
     """
     api = str(api_type or "").strip().lower().replace("-", "_")
     model_text = str(model or "").strip().lower()
+    if any(token in model_text for token in ("tts", "asr", "embedding", "embed")):
+        return False
+    normalized_model = model_text.replace("_", "-")
+    mimo_support = _mimo_heuristic_supports_vision(normalized_model)
+    if mimo_support is not None:
+        return mimo_support
     if api == "openai_codex":
         return "codex" in model_text
     # 官方 Anthropic / Gemini API：所有当前模型都支持视觉

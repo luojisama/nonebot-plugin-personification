@@ -210,7 +210,10 @@ async def _try_primary_image_routes(
         model = str(provider.get("model", "") or "")
         provider_name = str(provider.get("name", "") or model or api_type or "primary")
         if not provider_supports_vision(api_type, model, route_name=route_name):
-            continue
+            _log_warning(
+                runtime,
+                f"[vision] provider={provider_name} is not known to support image input; trying anyway",
+            )
         try:
             caller = _build_tool_caller(_ProviderConfigProxy(plugin_config, provider))
             response = await caller.chat_with_tools(

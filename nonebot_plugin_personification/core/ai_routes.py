@@ -176,6 +176,29 @@ def _get_primary_provider_list(plugin_config: Any, logger: Any) -> list[dict[str
     return [dict(provider) for provider in providers if isinstance(provider, dict)]
 
 
+def list_primary_providers(plugin_config: Any, logger: Any) -> list[dict[str, Any]]:
+    """返回当前配置的全部主回复 provider（api_pools 解析后），供 WebUI 逐个测试。"""
+    return _get_primary_provider_list(plugin_config, logger)
+
+
+def build_single_provider_caller(
+    plugin_config: Any,
+    provider: dict[str, Any],
+    *,
+    thinking_mode_override: str = "",
+    model_override: str = "",
+) -> ToolCaller:
+    """为单个 provider 构建独立 caller（不走路由/回退），用于逐个连通性测试。"""
+    return _build_tool_caller(
+        _ProviderConfigProxy(
+            plugin_config,
+            provider,
+            thinking_mode_override=thinking_mode_override,
+            model_override=model_override,
+        )
+    )
+
+
 def get_primary_provider_config(plugin_config: Any, logger: Any) -> dict[str, str]:
     providers = _get_primary_provider_list(plugin_config, logger)
     if providers:

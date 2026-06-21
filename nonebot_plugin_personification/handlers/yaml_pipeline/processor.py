@@ -59,6 +59,7 @@ from ...core.response_review import (
     rewrite_agent_reply_ooc,
     review_response_text,
 )
+from ...core.reply_text_policy import normalize_visible_reply_text
 from ...core.prompt_loader import pick_ack_phrase
 from ...core.sticker_feedback import (
     build_sticker_feedback_scene_key,
@@ -73,7 +74,10 @@ from ...core.visual_capabilities import VISUAL_ROUTE_AGENT, VISUAL_ROUTE_REPLY_Y
 from ...agent.action_executor import ActionExecutor
 from ...agent.loop import run_agent
 from ...agent.query_rewriter import QueryRewriteContext
-from ..reply_pipeline.pipeline_emotion import compose_reply_emotion_block
+from ..reply_pipeline.pipeline_emotion import (
+    compose_reply_emotion_block,
+    schedule_inner_state_update_after_reply,
+)
 from ..reply_pipeline.pipeline_context import (
     batch_has_newer_messages as _shared_batch_has_newer_messages,
     compute_agent_time_budget as _compute_agent_time_budget,
@@ -294,6 +298,19 @@ def _strip_control_markers(text: str) -> str:
     return cleaned.strip()
 
 
+def _normalize_parsed_message_texts(parsed: Dict[str, Any]) -> Dict[str, Any]:
+    copied = dict(parsed or {})
+    messages: list[dict[str, Any]] = []
+    for item in list(copied.get("messages") or []):
+        if not isinstance(item, dict):
+            continue
+        normalized = dict(item)
+        normalized["text"] = normalize_visible_reply_text(strip_response_control_markers(normalized.get("text", "")))
+        messages.append(normalized)
+    copied["messages"] = messages
+    return copied
+
+
 def _build_tts_user_hint(*, is_private: bool) -> str:
     scene = "私聊" if is_private else "群聊"
     return f"这是{scene}场景下的回复，请自然朗读，整体语速略快一点。"
@@ -424,6 +441,7 @@ async def process_yaml_response_logic(
     extract_forward_content: Callable[..., Any] = None,
     memory_curator: Any = None,
     knowledge_store: Any = None,
+    inner_state_updater: Any = None,
     disable_network_hooks: bool = False,
     batched_events: List[Dict[str, Any]] | None = None,
     repeat_clusters: List[Dict[str, Any]] | None = None,
@@ -450,6 +468,51 @@ async def process_yaml_response_logic(
     def _has_newer_batch_now() -> bool:
         return bool(has_newer_batch or _batch_ref_has_newer_messages(batch_runtime_ref))
 
+    def _trace_stage(
+        key: str,
+        label: str,
+        status: str,
+        detail: str = "",
+        hint: str = "",
+    ) -> None:
+        try:
+            from ...core import reply_turn_trace
+
+            reply_turn_trace.record_stage(
+                key=key,
+                label=label,
+                status=status,
+                detail=detail,
+                hint=hint,
+            )
+        except Exception:
+            pass
+
+    def _trace_finish(outcome: str, diagnosis_code: str, detail: Dict[str, Any] | None = None) -> None:
+        try:
+            from ...core import reply_turn_trace
+
+            reply_turn_trace.finish_trace(
+                outcome=outcome,
+                diagnosis_code=diagnosis_code,
+                detail=detail or {},
+            )
+        except Exception:
+            pass
+
+    def _trace_no_reply(reason: str, *, diagnosis_code: str = "no_reply", detail: str = "") -> None:
+        _trace_stage(
+            key="yaml_no_reply",
+            label="YAML 未发送",
+            status="warn",
+            detail=detail or reason,
+        )
+        _trace_finish(
+            outcome="no_reply",
+            diagnosis_code=diagnosis_code,
+            detail={"reason": reason},
+        )
+
     now = get_current_time()
     week_days = ["星期一", "星期二", "星期三", "星期四", "星期五", "星期六", "星期日"]
     weekday_str = week_days[now.weekday()]
@@ -464,6 +527,12 @@ async def process_yaml_response_logic(
         "yaml_reply.requests_total",
         scene="private" if is_private_session else "group",
         random_chat=bool(is_random_chat),
+    )
+    _trace_stage(
+        key="yaml_start",
+        label="YAML 回复开始",
+        status="info",
+        detail=f"scene={'private' if is_private_session else 'group'} user={user_id} group={group_id or '-'}",
     )
     is_direct_mention = _event_mentions_bot(event, bot)
 
@@ -658,6 +727,16 @@ async def process_yaml_response_logic(
         intent_ambiguity_level = intent_decision.ambiguity_level
     if intent_recommend_silence is None:
         intent_recommend_silence = intent_decision.recommend_silence
+    _trace_stage(
+        key="yaml_semantic_frame",
+        label="YAML 语义帧",
+        status="info",
+        detail=(
+            f"intent={message_intent or '-'} "
+            f"ambiguity={intent_ambiguity_level or '-'} "
+            f"recommend_silence={bool(intent_recommend_silence)}"
+        ),
+    )
 
     arbitration = arbitrate_reply_mode(
         intent_decision=ReplyArbitrationIntent(
@@ -674,9 +753,14 @@ async def process_yaml_response_logic(
         logger.info(
             f"拟人插件 (YAML)：LLM 意图判别认为本轮高歧义且不宜插话，group={group_id} user={user_id}"
         )
+        _trace_no_reply(
+            "arbitration_no_reply",
+            detail="LLM 语义判别认为高歧义且不宜插话",
+        )
         return
     if is_random_chat and _has_newer_batch_now():
         logger.info(f"拟人插件 (YAML)：随机插话场景较新批次到达，跳过，group={group_id} user={user_id}")
+        _trace_no_reply("stale_random_chat", diagnosis_code="stale_reply", detail="随机插话期间出现更新批次")
         return
 
     system_prompt = prompt_config.get("system", "")
@@ -894,6 +978,15 @@ async def process_yaml_response_logic(
     image_summary_suffix = ""
     text_model_images = list(last_images)
     if last_images:
+        _trace_stage(
+            key="yaml_vision_mode",
+            label="YAML 视觉输入",
+            status="info",
+            detail=(
+                f"images={len(last_images)} mode={image_input_mode} "
+                f"text_direct={bool(direct_image_input)} agent_direct={bool(agent_direct_image_input)}"
+            ),
+        )
         if image_input_mode == "disabled":
             text_model_images = []
         else:
@@ -1017,6 +1110,12 @@ async def process_yaml_response_logic(
             async def _ack_sender(text: str, *, _phrase: str = ack_phrase) -> None:
                 await bot.send(event, str(text or "").strip() or _phrase)
             ack_sender = _ack_sender
+        _trace_stage(
+            key="yaml_agent_start",
+            label="YAML Agent 开始",
+            status="info",
+            detail=f"images={len(tool_image_urls)} direct_image={bool(agent_direct_image_input)}",
+        )
         try:
             try:
                 agent_result = await run_agent(
@@ -1063,6 +1162,16 @@ async def process_yaml_response_logic(
         if agent_result is not None:
             reply_content = agent_result.text
             used_agent = True
+            _trace_stage(
+                key="yaml_agent_result",
+                label="YAML Agent 结果",
+                status="ok" if reply_content else "warn",
+                detail=(
+                    f"chars={len(str(reply_content or ''))} "
+                    f"direct_output={bool(getattr(agent_result, 'direct_output', False))} "
+                    f"actions={len(getattr(agent_result, 'pending_actions', []) or [])}"
+                ),
+            )
             if not agent_result.direct_output and is_agent_reply_ooc(reply_content):
                 rewritten_ooc = await rewrite_agent_reply_ooc(
                     tool_caller=lite_tool_caller or agent_tool_caller,
@@ -1076,6 +1185,7 @@ async def process_yaml_response_logic(
                     reply_content = "[SILENCE]"
             if _has_newer_batch_now():
                 logger.info(f"拟人插件 (YAML)：会话 {group_id} 已出现更新批次，本轮旧回复丢弃。")
+                _trace_no_reply("stale_reply", diagnosis_code="stale_reply", detail="Agent 结果生成后出现更新批次")
                 return
             for action in agent_result.pending_actions:
                 await executor.execute(action["type"], action["params"])
@@ -1084,28 +1194,63 @@ async def process_yaml_response_logic(
                 if _looks_like_translation_result(raw_direct_output):
                     try:
                         if await _send_translation_forward(bot, event, raw_direct_output):
+                            _trace_stage(
+                                key="yaml_direct_output_success",
+                                label="YAML 直出完成",
+                                status="ok",
+                                detail="translation_forward",
+                            )
+                            _trace_finish(
+                                outcome="ok",
+                                diagnosis_code="ok",
+                                detail={"direct_output": True, "kind": "translation_forward"},
+                            )
                             return
                     except Exception as e:
                         logger.warning(f"拟人插件: 翻译结果转发发送失败，回退到普通消息: {e}")
+                raw_direct_output = normalize_visible_reply_text(raw_direct_output)
+                direct_segments_sent = 0
                 for seg in re.split(r"(?:\r?\n){2,}", raw_direct_output):
                     text = seg.strip()
                     if text:
                         if _has_newer_batch_now():
                             logger.info(f"拟人插件 (YAML)：会话 {group_id} 已出现更新批次，本轮旧回复丢弃。")
+                            _trace_no_reply("stale_reply", diagnosis_code="stale_reply", detail="直出消息发送前出现更新批次")
                             return
                         await bot.send(event, text)
+                        direct_segments_sent += 1
                         await asyncio.sleep(random.uniform(0.5, 1.2))
+                _trace_stage(
+                    key="yaml_direct_output_success",
+                    label="YAML 直出完成",
+                    status="ok",
+                    detail=f"segments={direct_segments_sent}",
+                )
+                _trace_finish(
+                    outcome="ok",
+                    diagnosis_code="ok",
+                    detail={"direct_output": True, "segments": direct_segments_sent},
+                )
                 return
     if not used_agent:
         reply_content = await _call_text_model_with_retry(messages)
+        _trace_stage(
+            key="yaml_model_result",
+            label="YAML 模型结果",
+            status="ok" if reply_content else "warn",
+            detail=f"chars={len(str(reply_content or ''))} images={len(text_model_images)}",
+        )
     if not reply_content:
         logger.warning("拟人插件 (YAML): 未能获取到 AI 回复内容")
+        _trace_no_reply("empty_model_reply", diagnosis_code="model_empty", detail="模型返回空内容")
         return
     if _has_newer_batch_now():
         logger.info(f"拟人插件 (YAML)：会话 {group_id} 已出现更新批次，本轮旧回复丢弃。")
+        _trace_no_reply("stale_reply", diagnosis_code="stale_reply", detail="模型回复生成后出现更新批次")
         return
     if used_agent and reply_content in ("[NO_REPLY]", "<NO_REPLY>"):
         logger.info("拟人插件 (YAML)：Agent 返回 NO_REPLY，保持沉默。")
+        _trace_no_reply("agent_no_reply", detail="Agent 返回 NO_REPLY")
         return
 
     parsed = parse_yaml_response(reply_content)
@@ -1142,9 +1287,11 @@ async def process_yaml_response_logic(
                         logger.warning(f"[BLOCK] 通知管理员 {_su} 失败: {_e}")
 
             asyncio.create_task(_notify_superusers())
+        _trace_no_reply("block_marker", diagnosis_code="blocked", detail="模型返回 BLOCK 控制标记")
         return
     if "[SILENCE]" in reply_content or "<SILENCE>" in reply_content:
         logger.info("AI (YAML) 决定保持沉默 (SILENCE)")
+        _trace_no_reply("silence_marker", detail="模型返回 SILENCE 控制标记")
         return
 
     status_text = str(parsed.get("status") or "").strip()
@@ -1287,6 +1434,7 @@ async def process_yaml_response_logic(
         )
     if review_decision.action == "no_reply":
         logger.info(f"拟人插件 (YAML)：回复审阅后选择沉默，group={group_id} user={user_id}")
+        _trace_no_reply("review_no_reply", detail="回复审阅选择沉默")
         return
     if review_decision.action == "rewrite" and review_decision.text:
         assistant_text = sanitize_history_text(review_decision.text.strip())
@@ -1294,12 +1442,19 @@ async def process_yaml_response_logic(
 
     if has_silence_control_marker(assistant_text):
         logger.info(f"拟人插件 (YAML)：最终回复含沉默控制标记，group={group_id} user={user_id}")
+        _trace_no_reply("final_silence_marker", detail="最终回复含沉默控制标记")
         return
 
     cleaned_assistant_text = strip_response_control_markers(assistant_text)
+    cleaned_assistant_text = normalize_visible_reply_text(cleaned_assistant_text)
     if not cleaned_assistant_text:
+        _trace_no_reply("empty_visible_reply", diagnosis_code="model_empty", detail="清理控制标记后没有可见文本")
         return
-    if cleaned_assistant_text != assistant_text:
+    if parsed.get("messages"):
+        parsed = _normalize_parsed_message_texts(parsed)
+        if not any(str(item.get("text", "") or "").strip() for item in parsed.get("messages", [])):
+            parsed = {"messages": [{"text": cleaned_assistant_text, "sticker": ""}], "think": "", "status": "", "action": ""}
+    elif cleaned_assistant_text != assistant_text:
         parsed = {"messages": [{"text": cleaned_assistant_text, "sticker": ""}], "think": "", "status": "", "action": ""}
     assistant_text = cleaned_assistant_text
 
@@ -1346,6 +1501,7 @@ async def process_yaml_response_logic(
 
     if _has_newer_batch_now():
         logger.info(f"拟人插件 (YAML)：会话 {group_id} 已出现更新批次，本轮旧回复丢弃。")
+        _trace_no_reply("stale_reply", diagnosis_code="stale_reply", detail="发送前出现更新批次")
         return
 
     sent_as_tts = False
@@ -1417,6 +1573,7 @@ async def process_yaml_response_logic(
                         if seg.strip():
                             if _has_newer_batch_now():
                                 logger.info(f"拟人插件 (YAML)：会话 {group_id} 已出现更新批次，本轮旧回复丢弃。")
+                                _trace_no_reply("stale_reply", diagnosis_code="stale_reply", detail="分段文本发送前出现更新批次")
                                 return
                             send_result = await bot.send(event, seg)
                             if not sent_message_id:
@@ -1426,6 +1583,7 @@ async def process_yaml_response_logic(
                 for image_b64 in image_b64_payloads:
                     if _has_newer_batch_now():
                         logger.info(f"拟人插件 (YAML)：会话 {group_id} 已出现更新批次，本轮旧回复丢弃。")
+                        _trace_no_reply("stale_reply", diagnosis_code="stale_reply", detail="图片发送前出现更新批次")
                         return
                     send_result = await bot.send(event, message_segment_cls.image(f"base64://{image_b64}"))
                     if not sent_message_id:
@@ -1437,6 +1595,7 @@ async def process_yaml_response_logic(
                     try:
                         if _has_newer_batch_now():
                             logger.info(f"拟人插件 (YAML)：会话 {group_id} 已出现更新批次，本轮旧回复丢弃。")
+                            _trace_no_reply("stale_reply", diagnosis_code="stale_reply", detail="表情发送前出现更新批次")
                             return
                         send_result = await bot.send(event, message_segment_cls.image(f"file:///{chosen_sticker_path.absolute()}"))
                         if not sent_message_id:
@@ -1462,6 +1621,7 @@ async def process_yaml_response_logic(
             if clean_reply:
                 if _has_newer_batch_now():
                     logger.info(f"拟人插件 (YAML)：会话 {group_id} 已出现更新批次，本轮旧回复丢弃。")
+                    _trace_no_reply("stale_reply", diagnosis_code="stale_reply", detail="普通文本发送前出现更新批次")
                     return
                 send_result = await bot.send(event, clean_reply)
                 if not sent_message_id:
@@ -1469,6 +1629,7 @@ async def process_yaml_response_logic(
             for image_b64 in image_b64_payloads:
                 if _has_newer_batch_now():
                     logger.info(f"拟人插件 (YAML)：会话 {group_id} 已出现更新批次，本轮旧回复丢弃。")
+                    _trace_no_reply("stale_reply", diagnosis_code="stale_reply", detail="生成图片发送前出现更新批次")
                     return
                 send_result = await bot.send(event, message_segment_cls.image(f"base64://{image_b64}"))
                 if not sent_message_id:
@@ -1505,6 +1666,16 @@ async def process_yaml_response_logic(
         )
     except Exception as e:
         logger.debug(f"[emotion] YAML update after reply failed: {e}")
+    schedule_inner_state_update_after_reply(
+        inner_state_updater=inner_state_updater,
+        logger=logger,
+        user_text=raw_message_text or history_last_text or trigger_reason,
+        assistant_text=assistant_text,
+        user_id=user_id,
+        group_id=group_id,
+        is_private=is_private_session,
+        semantic_frame=semantic_frame,
+    )
     if memory_curator is not None:
         memory_group_id = "" if is_private_session else group_id
         if hasattr(memory_curator, "schedule_turn_capture"):
@@ -1547,6 +1718,21 @@ async def process_yaml_response_logic(
         (time.monotonic() - started_at) * 1000.0,
         scene="private" if is_private_session else "group",
     )
+    _trace_stage(
+        key="yaml_reply_success",
+        label="YAML 回复完成",
+        status="ok",
+        detail=f"chars={len(assistant_text)} tts={bool(sent_as_tts)} sticker={bool(stickers_sent)}",
+    )
+    _trace_finish(
+        outcome="ok",
+        diagnosis_code="ok",
+        detail={
+            "reply_chars": len(assistant_text),
+            "tts": bool(sent_as_tts),
+            "sticker": bool(stickers_sent),
+        },
+    )
 
 
 def build_yaml_response_processor(
@@ -1582,6 +1768,7 @@ def build_yaml_response_processor(
     extract_forward_content: Callable[..., Any] = None,
     memory_curator: Any = None,
     knowledge_store: Any = None,
+    inner_state_updater: Any = None,
 ) -> Callable[..., Awaitable[None]]:
     async def _processor(
         bot: Any,
@@ -1651,6 +1838,7 @@ def build_yaml_response_processor(
             ),
             memory_curator=runtime_overrides.get("memory_curator", memory_curator),
             knowledge_store=runtime_overrides.get("knowledge_store", knowledge_store),
+            inner_state_updater=runtime_overrides.get("inner_state_updater", inner_state_updater),
             disable_network_hooks=bool(runtime_overrides.get("disable_network_hooks", False)),
             batched_events=list(runtime_overrides.get("batched_events") or []),
             repeat_clusters=list(runtime_overrides.get("repeat_clusters") or []),

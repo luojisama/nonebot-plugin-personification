@@ -322,7 +322,20 @@ async def run_buffer_timer(
     delay: float = 0.0,
     response_timeout_seconds: float = _PROCESS_RESPONSE_TIMEOUT_SECONDS,
 ) -> None:
+    started_at = time.monotonic()
     await asyncio.sleep(max(0.0, float(delay or 0.0)))
+    try:
+        from ..core import reply_turn_trace
+
+        if float(delay or 0.0) > 0.01:
+            reply_turn_trace.record_stage(
+                key="buffer_wait",
+                label="缓冲等待",
+                status="info",
+                detail=f"delay_ms={int(float(delay or 0.0) * 1000)}",
+            )
+    except Exception:
+        pass
 
     entry = msg_buffer.get(key)
     if not isinstance(entry, dict):
@@ -419,6 +432,21 @@ async def run_buffer_timer(
     entry["current_trigger_type"] = trigger_type
     entry["current_is_random_chat"] = bool(state.get("is_random_chat", False))
     timeout_seconds = max(30.0, float(response_timeout_seconds or _PROCESS_RESPONSE_TIMEOUT_SECONDS))
+    try:
+        from ..core import reply_turn_trace
+
+        reply_turn_trace.record_stage(
+            key="buffer_dequeue",
+            label="缓冲出队",
+            status="info",
+            detail=(
+                f"session={key} trigger={trigger_type} events={len(events)} "
+                f"elapsed_ms={int((time.monotonic() - started_at) * 1000)} "
+                f"timeout={timeout_seconds:.0f}s"
+            ),
+        )
+    except Exception:
+        pass
 
     try:
         await asyncio.wait_for(
@@ -429,6 +457,23 @@ async def run_buffer_timer(
         logger.warning(
             f"拟人插件：会话 {key} 单轮回复超时（>{timeout_seconds:.0f}s），已放弃旧批次。"
         )
+        try:
+            from ..core import reply_turn_trace
+
+            reply_turn_trace.record_stage(
+                key="reply_timeout",
+                label="回复超时",
+                status="error",
+                detail=f"process_response_logic 超过 {timeout_seconds:.0f}s",
+                hint="检查 provider 超时、工具耗时、模型路由与重试次数",
+            )
+            reply_turn_trace.finish_trace(
+                outcome="failed",
+                diagnosis_code="reply_timeout",
+                detail={"timeout_seconds": timeout_seconds, "session": key},
+            )
+        except Exception:
+            pass
     except asyncio.CancelledError:
         if int(entry.get("superseded_generation", 0) or 0) >= current_generation:
             logger.info(f"拟人插件：会话 {key} 当前批次已被新的直呼消息抢占。")

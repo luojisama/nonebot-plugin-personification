@@ -712,9 +712,9 @@ def render_qzone_status(bundle: Any) -> str:
         f"总开关：{'开' if bool(getattr(bundle.plugin_config, 'personification_qzone_enabled', False)) else '关'}",
         f"主动发说说：{'开' if bool(getattr(bundle.plugin_config, 'personification_qzone_proactive_enabled', False)) else '关'}",
         f"主动发说说频率：每 {getattr(bundle.plugin_config, 'personification_qzone_check_interval', 90)} 分钟检查，"
-        f"每日最多 {getattr(bundle.plugin_config, 'personification_qzone_daily_limit', 3)} 条，"
+        f"每月最多 {getattr(bundle.plugin_config, 'personification_qzone_monthly_limit', 30)} 条，"
         f"最小间隔 {getattr(bundle.plugin_config, 'personification_qzone_min_interval_hours', 6.0)} 小时",
-        f"今日已发：{int(post_state.get('count', 0) or 0)} 条",
+        f"本月已发：{int(post_state.get('count', 0) or 0)} 条",
         f"上次发说说：{format_timestamp(float(post_state.get('last_post_at', 0) or 0))}",
         f"上次内容：{post_state.get('last_content') or '无'}",
         "",

@@ -325,6 +325,7 @@ async def _init_personification_runtime() -> None:
     )
     runtime_bundle.qzone_social_scan = job_handles.get("qzone_social_scan")
     runtime_bundle.qzone_inbound_poll = job_handles.get("qzone_inbound_poll")
+    runtime_bundle.qzone_generate_post = job_handles.get("generate_ai_diary")
     _start_qzone_cookie_refresh_background()
 
     if bool(getattr(plugin_config, "personification_git_auto_update", False)):
@@ -495,6 +496,22 @@ async def _install_personification_webui() -> None:
         webui_audit_log.prune_old_entries()
     except Exception as exc:
         logger.warning(f"[webui] 启动期清理失败：{exc}")
+
+    # 启动后台预热一次功能体检，使 WebUI 打开即有结果（不阻塞启动）
+    try:
+        from .core.diagnostics import warm_diagnostics
+
+        async def _warm_health() -> None:
+            await asyncio.sleep(20)  # 等 bot 连接与运行时就绪
+            await warm_diagnostics(
+                plugin_config=plugin_config, bundle=runtime_bundle,
+                superusers=set(superusers or set()), get_bots=get_bots, logger=logger,
+            )
+
+        _t = asyncio.create_task(_warm_health())
+        _t.add_done_callback(lambda _t: None)
+    except Exception as exc:
+        logger.debug(f"[webui] 体检预热调度失败：{exc}")
 
     driver_config = get_driver().config
     host = str(getattr(driver_config, "host", "") or "127.0.0.1")

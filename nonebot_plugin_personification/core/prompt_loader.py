@@ -12,7 +12,9 @@ AGENT_GUIDANCE_TEMPLATE = """=== 轻量工具约束（对用户不可见）===
 - 你首先是群聊成员，不是助手；能直接聊天时不要表现出查资料或执行任务的感觉。
 - 只有明显无关、会打断别人、刚说过类似内容，或高歧义且没人 cue 你时才输出 [NO_REPLY]。
 - 当对方明确在找实时信息、新闻、版本、天气、图片内容，或要找资料、链接、资源、壁纸、原画、设定图、官网、下载页、教程、图片合集时，可以考虑使用工具。
-- 绝对不要暴露“我查了一下 / 工具返回 / 我调用了”这类表达，把结果消化后自然说出来。
+- 涉及本地天气、出行、城市或附近状态时，如果对方没明说地点，先看已注入的用户档案；仍不确定可调用记忆工具确认，不能猜城市。
+- 绝对不要暴露“我查了一下 / 工具返回 / 我调用了 / 我需要确认一下 / 根据搜索结果”这类表达，把结果消化后自然说出来。
+- 最终回复只输出纯文本，不要 markdown、标题、项目符号列表、编号列表或代码块。
 - 回复优先短、口语、像群员随手接一句；不要因为有工具就变成长篇说明。
 - 对方已经连着说了一阵、顺着前文续聊、或者这轮适合发表情包接梗时，可以更愿意开口。
 - 遇到群聊梗、复读、空耳、调侃时，默认先顺着梗接一句，不要把笑点翻译成说明文。
@@ -20,6 +22,7 @@ AGENT_GUIDANCE_TEMPLATE = """=== 轻量工具约束（对用户不可见）===
 """
 
 AGENT_GUIDANCE_MARKER = "=== 轻量工具约束（对用户不可见）==="
+CORE_VALUES_MARKER = "=== 基础三观与判断底线（对用户不可见）==="
 
 SKILLS_DIRECTORY_GUIDE = """
 """
@@ -99,6 +102,56 @@ def _append_agent_guidance(
     return content
 
 
+def _core_values_prompt(plugin_config: Any) -> str:
+    if not getattr(plugin_config, "personification_core_values_enabled", True):
+        return ""
+    raw_prompt = getattr(plugin_config, "personification_core_values_prompt", "")
+    prompt = str(raw_prompt or "").strip()
+    if not prompt:
+        return ""
+    if CORE_VALUES_MARKER in prompt:
+        return prompt
+    return f"{CORE_VALUES_MARKER}\n\n{prompt}"
+
+
+def _append_core_values(
+    content: Union[str, Dict[str, Any], None],
+    plugin_config: Any,
+) -> Union[str, Dict[str, Any], None]:
+    core_values = _core_values_prompt(plugin_config)
+    if not core_values:
+        return content
+
+    if isinstance(content, str):
+        if CORE_VALUES_MARKER in content:
+            return content
+        if content.strip():
+            return f"{content.rstrip()}\n\n{core_values}"
+        return core_values
+
+    if isinstance(content, dict):
+        copied = dict(content)
+        system_prompt = copied.get("system")
+        if isinstance(system_prompt, str):
+            if CORE_VALUES_MARKER not in system_prompt:
+                copied["system"] = (
+                    f"{system_prompt.rstrip()}\n\n{core_values}"
+                    if system_prompt.strip()
+                    else core_values
+                )
+        elif "system" not in copied or system_prompt is None:
+            copied["system"] = core_values
+        return copied
+
+    return content
+
+
+def _append_prompt_guidance(
+    content: Union[str, Dict[str, Any], None], plugin_config: Any
+) -> Union[str, Dict[str, Any], None]:
+    return _append_agent_guidance(_append_core_values(content, plugin_config), plugin_config)
+
+
 def load_prompt(
     plugin_config: Any,
     get_group_config: Callable[[str], Dict[str, Any]],
@@ -125,12 +178,12 @@ def load_prompt(
                     if path.suffix.lower() in [".yml", ".yaml"]:
                         yaml_data = _load_yaml_file(path, logger)
                         if yaml_data is not None:
-                            return _append_agent_guidance(yaml_data, plugin_config)
+                            return _append_prompt_guidance(yaml_data, plugin_config)
                     content = path.read_text(encoding="utf-8").strip()
                     logger.info(
                         f"拟人插件：成功从文件加载人格设定: {path.absolute()} (内容长度: {len(content)})"
                     )
-                    return _append_agent_guidance(content, plugin_config)
+                    return _append_prompt_guidance(content, plugin_config)
                 except Exception as e:
                     logger.error(f"加载路径提示词失败 ({path}): {e}")
             else:
@@ -149,10 +202,10 @@ def load_prompt(
                 if path.suffix.lower() in [".yml", ".yaml"]:
                     yaml_data = _load_yaml_file(path, logger)
                     if yaml_data is not None:
-                        return _append_agent_guidance(yaml_data, plugin_config)
+                        return _append_prompt_guidance(yaml_data, plugin_config)
                 file_content = path.read_text(encoding="utf-8").strip()
                 logger.info(f"拟人插件：成功从 system_prompt 路径加载人格设定: {path.absolute()}")
-                return _append_agent_guidance(file_content, plugin_config)
+                return _append_prompt_guidance(file_content, plugin_config)
         except Exception:
             pass
 
@@ -160,11 +213,11 @@ def load_prompt(
         try:
             parsed = yaml.safe_load(content)
             if isinstance(parsed, dict) and ("input" in parsed or "system" in parsed):
-                return _append_agent_guidance(parsed, plugin_config)
+                return _append_prompt_guidance(parsed, plugin_config)
         except Exception:
             pass
 
-    return _append_agent_guidance(content, plugin_config)
+    return _append_prompt_guidance(content, plugin_config)
 
 
 def load_ack_phrases(

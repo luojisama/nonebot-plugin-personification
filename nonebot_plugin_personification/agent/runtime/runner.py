@@ -235,6 +235,67 @@ def _tool_timeout_result(tool_name: str) -> str:
     return "工具调用失败：超时"
 
 
+async def _classify_deferred_lookup_reply(
+    *,
+    tool_caller: Any,
+    user_query_text: str,
+    assistant_reply_text: str,
+    previous_tool_name: str = "",
+    previous_tool_result_text: str = "",
+    timeout: float = 8.0,
+) -> bool:
+    """Ask the model whether a draft should trigger one more lookup.
+
+    This is a compatibility helper for older tests and callers. It keeps the
+    decision model-led: code only parses the model's explicit enum answer.
+    """
+
+    if tool_caller is None:
+        return False
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "判断候选回复是否应该立刻补一次查证。"
+                "如果候选回复只是在承诺稍后去查、承认自己没懂但没有查、"
+                "反问用户/群友某个专有名词/梗/外号/游戏动漫卡牌术语是什么，"
+                "或明显在没有证据时凭印象猜，应严格输出 RETRY_SEARCH。"
+                "如果上一轮工具已经查过且结果为空，或候选回复已经能自然作为最终回复，严格输出 FINAL_ANSWER。"
+                "只输出这两个枚举之一。"
+                "按语义判断，不要按固定关键词机械判断。"
+            ),
+        },
+        {
+            "role": "user",
+            "content": (
+                f"用户问题：{str(user_query_text or '').strip()[:300]}\n"
+                f"候选回复：{str(assistant_reply_text or '').strip()[:300]}\n"
+                f"上一个工具：{str(previous_tool_name or '').strip()[:80] or '[无]'}\n"
+                f"上一个工具结果：{str(previous_tool_result_text or '').strip()[:500] or '[无]'}"
+            ),
+        },
+    ]
+    try:
+        response = await asyncio.wait_for(
+            tool_caller.chat_with_tools(messages, [], False),
+            timeout=timeout,
+        )
+    except Exception:
+        return False
+    verdict = str(getattr(response, "content", "") or "").strip().upper()
+    return verdict == "RETRY_SEARCH"
+
+
+def _has_lookup_schema(schemas: list[dict]) -> bool:
+    return any(_schema_tool_name(schema) in _RETRYABLE_LOOKUP_TOOLS for schema in list(schemas or []))
+
+
+def _should_review_banter_lookup_draft(*, ambiguity_level: str, draft_answer_text: str) -> bool:
+    # 只用结构性信号控制是否追加一次模型审查，避免把具体话题词写进代码语义。
+    if str(ambiguity_level or "").strip() == "high":
+        return True
+    draft = str(draft_answer_text or "").strip()
+    return "?" in draft or "？" in draft
 
 
 def _direct_tool_result_agent_result(
@@ -282,6 +343,28 @@ async def _safe_ack(
         await ack_sender(text)
     except Exception as exc:
         logger.debug(f"[agent] ack send failed: {exc}")
+
+
+def _record_reply_trace_stage(
+    *,
+    key: str,
+    label: str,
+    status: str = "info",
+    detail: Any = "",
+    hint: str = "",
+) -> None:
+    try:
+        from ...core import reply_turn_trace
+
+        reply_turn_trace.record_stage(
+            key=key,
+            label=label,
+            status=status,
+            detail=detail,
+            hint=hint,
+        )
+    except Exception:
+        pass
 
 
 async def run_agent(
@@ -343,6 +426,7 @@ async def run_agent(
         intent_decision = precomputed_intent
         logger.debug("[agent] using precomputed intent_decision, skipping LLM inference")
     else:
+        intent_started_at = time.monotonic()
         intent_decision = await _infer_intent_decision_with_context(
             preliminary_query_text or user_text,
             messages,
@@ -350,6 +434,18 @@ async def run_agent(
             repeat_clusters=repeat_clusters,
             relationship_hint=relationship_hint,
             recent_bot_replies=recent_bot_replies,
+        )
+        intent_elapsed_ms = int((time.monotonic() - intent_started_at) * 1000)
+        record_timing("agent.intent_ms", intent_elapsed_ms)
+        _record_reply_trace_stage(
+            key="agent_intent",
+            label="Agent 意图判别",
+            status="ok",
+            detail=(
+                f"intent={getattr(intent_decision, 'chat_intent', '')} "
+                f"ambiguity={getattr(intent_decision, 'ambiguity_level', '')} "
+                f"elapsed_ms={intent_elapsed_ms}"
+            ),
         )
     chat_intent = intent_decision.chat_intent
     plugin_query_intent = intent_decision.plugin_question_intent if chat_intent == "plugin_question" else ""
@@ -373,6 +469,7 @@ async def run_agent(
             search_plan=[],
         )
     else:
+        rewrite_started_at = time.monotonic()
         rewritten_query = await contextual_query_rewriter(
             tool_caller=tool_caller,
             history_new=rewrite_context.history_new,
@@ -381,6 +478,14 @@ async def run_agent(
             images=rewrite_context.images,
             quoted_message=rewrite_context.quoted_message,
             topic_hint=context_hint,
+        )
+        rewrite_elapsed_ms = int((time.monotonic() - rewrite_started_at) * 1000)
+        record_timing("agent.query_rewrite_ms", rewrite_elapsed_ms, intent=runtime_chat_intent or "unknown")
+        _record_reply_trace_stage(
+            key="agent_query_rewrite",
+            label="Agent 查询改写",
+            status="ok",
+            detail=f"intent={runtime_chat_intent or '-'} elapsed_ms={rewrite_elapsed_ms}",
         )
     effective_query_text = (
         rewritten_query.primary_query
@@ -446,7 +551,10 @@ async def run_agent(
             "content": (
                 "最终对用户的回复必须自然、像群聊里的活人接话。"
                 "不要暴露工具、检索、看图、回忆这些中间步骤。"
-                "遇到不确定或有歧义时，优先查证或承认不确定，不要硬猜。"
+                "遇到不确定或有歧义时，如果有可用查证工具必须先查；工具不可用、查不到或时间预算不足时再承认不确定，不要硬猜。"
+                "遇到不认识的专有名词、外号、梗、游戏/动漫/卡牌术语或圈内说法，不要直接问群友那是什么，先用可用工具查证。"
+                "涉及本地天气、出行、城市或附近状态时，如果用户没明说地点，先看已注入的用户档案；仍不确定可调用记忆工具确认，不能猜城市。"
+                "最终只输出纯文本，不要 markdown、标题、项目符号列表、编号列表、URL 列表，也不要说“我需要确认一下”“根据搜索结果”。"
             ),
         }
     )
@@ -471,8 +579,11 @@ async def run_agent(
             {
                 "role": "system",
                 "content": (
-                    "当前更像接梗、吐槽、复读或顺嘴接话场景。"
-                    "优先短句自然接话，不要进入解释、定义、考据或检索腔。"
+                    "当前更像接梗、吐槽、复读或顺嘴接话场景，优先短句自然接话。"
+                    "但如果群友分享了你看不懂的内容、梗、专有名词、节目名或外号（比如配图配文、视频/链接分享），"
+                    "且可用工具里有 web_search、search_web、wiki_lookup 或 resolve_acg_entity，必须先快速查清楚那是什么，再用自己的口吻接住——"
+                    "不要直接在群里问『这是什么梗/哪个游戏/什么意思』，也不要凭记忆猜。"
+                    "查证只为听懂梗，别变成解释、定义、考据或百科腔，查完一句话接住即可。"
                 ),
             }
         )
@@ -496,6 +607,12 @@ async def run_agent(
             plugin_hint += (
                 "如果对方明确问官网、仓库、最新文档或版本，再考虑 web_search、search_official_site、search_github_repos。"
             )
+        plugin_hint += (
+            "如果对方不是在问插件原理，而是想直接用某个插件功能（查天气、签到、点歌、查询等），"
+            "先用 search_plugin_knowledge / list_plugin_features 定位插件和它的命令触发方式，"
+            "确认后用 invoke_plugin 传入完整命令文本（如 /天气 北京）代为执行，再用你自己的语气转述结果，"
+            "不要让用户自己去发命令。"
+        )
         messages.append(
             {
                 "role": "system",
@@ -508,7 +625,8 @@ async def run_agent(
                 "role": "system",
                 "content": (
                     "当前这句里有高歧义名词/对象，容易误解。"
-                    "如果上下文和工具证据仍不足，请优先承认不确定；群聊里若没人明确在 cue 你，也可以输出 [NO_REPLY]。"
+                    "如果有可用查证工具，先查证再说；上下文和工具证据仍不足时再承认不确定。"
+                    "群聊里若没人明确在 cue 你，也可以输出 [NO_REPLY]。"
                 ),
             }
         )
@@ -709,6 +827,23 @@ async def run_agent(
             f"tool_calls={len(response.tool_calls)} content_len={content_len} "
             f"model_elapsed_ms={model_elapsed_ms}"
         )
+        record_timing(
+            "agent.model_step_ms",
+            model_elapsed_ms,
+            intent=runtime_chat_intent or "unknown",
+            finish_reason=str(response.finish_reason or ""),
+        )
+        _record_reply_trace_stage(
+            key="agent_model_step",
+            label=f"Agent 模型步 {_step + 1}",
+            status="ok" if content_len > 0 or response.tool_calls else "warn",
+            detail=(
+                f"intent={runtime_chat_intent or '-'} step={_step + 1} "
+                f"tools={','.join(selected_names[:8]) if selected_names else '-'} "
+                f"finish={response.finish_reason} tool_calls={len(response.tool_calls)} "
+                f"content_len={content_len} elapsed_ms={model_elapsed_ms}"
+            ),
+        )
         if response.finish_reason == "stop" and not response.tool_calls and content_len == 0:
             logger.warning(
                 "[agent] provider returned empty stop response "
@@ -718,12 +853,50 @@ async def run_agent(
             if _evidence_synthesizer_enabled(plugin_config) and has_tool_call:
                 await _append_evidence_guidance_if_needed(draft_answer_text=str(response.content or ""))
         if response.finish_reason == "stop":
+            banter_requires_lookup_retry = False
             if runtime_chat_intent == "banter" and not response.tool_calls and content_len > 0:
-                return AgentResult(
-                    text=str(response.content or "").strip(),
-                    pending_actions=pending_actions,
-                    bypass_length_limits=False,
-                )
+                if (
+                    not has_tool_call
+                    and not semantic_fallback_attempted
+                    and bool(user_query_text)
+                    and _has_lookup_schema(active_schemas)
+                    and _should_review_banter_lookup_draft(
+                        ambiguity_level=str(getattr(intent_decision, "ambiguity_level", "") or ""),
+                        draft_answer_text=str(response.content or ""),
+                    )
+                ):
+                    lookup_review_started_at = time.monotonic()
+                    banter_requires_lookup_retry = await _classify_deferred_lookup_reply(
+                        tool_caller=tool_caller,
+                        user_query_text=user_query_text,
+                        assistant_reply_text=str(response.content or ""),
+                        previous_tool_name=last_tool_name,
+                        previous_tool_result_text=last_tool_result_text,
+                    )
+                    lookup_review_elapsed_ms = int((time.monotonic() - lookup_review_started_at) * 1000)
+                    record_timing(
+                        "agent.banter_lookup_review_ms",
+                        lookup_review_elapsed_ms,
+                        retry=bool(banter_requires_lookup_retry),
+                    )
+                    _record_reply_trace_stage(
+                        key="agent_banter_lookup_review",
+                        label="Banter 查证裁判",
+                        status="warn" if banter_requires_lookup_retry else "ok",
+                        detail=(
+                            f"retry={bool(banter_requires_lookup_retry)} "
+                            f"elapsed_ms={lookup_review_elapsed_ms}"
+                        ),
+                        hint="若此阶段经常较慢，配置 lite_model 并关闭严格主模型模式",
+                    )
+                    if banter_requires_lookup_retry:
+                        logger.info("[agent] banter draft requested lookup retry")
+                if not banter_requires_lookup_retry:
+                    return AgentResult(
+                        text=str(response.content or "").strip(),
+                        pending_actions=pending_actions,
+                        bypass_length_limits=False,
+                    )
             if (
                 response.vision_unavailable
                 and bool(
@@ -761,10 +934,8 @@ async def run_agent(
                     continue
             fallback_lookup = None
             previous_tool_empty = _tool_result_indicates_empty(last_tool_result_text)
-            should_run_fallback_lookup = (
+            non_banter_fallback_needed = (
                 runtime_chat_intent != "banter"
-                and not semantic_fallback_attempted
-                and bool(user_query_text)
                 and (
                     not has_tool_call
                     or bool(pending_evidence_followup_query)
@@ -772,9 +943,15 @@ async def run_agent(
                     or response.vision_unavailable
                 )
             )
+            should_run_fallback_lookup = (
+                not semantic_fallback_attempted
+                and bool(user_query_text)
+                and (non_banter_fallback_needed or banter_requires_lookup_retry)
+            )
             if should_run_fallback_lookup:
                 semantic_fallback_attempted = True
                 fallback_query_text = pending_evidence_followup_query or user_query_text
+                fallback_planner_started_at = time.monotonic()
                 fallback_lookup = await _select_semantic_fallback_tool(
                     tool_caller=tool_caller,
                     registry=registry,
@@ -788,6 +965,22 @@ async def run_agent(
                     user_images=user_images,
                     previous_tool_name=last_tool_name,
                     previous_tool_result_text=last_tool_result_text,
+                )
+                fallback_planner_elapsed_ms = int((time.monotonic() - fallback_planner_started_at) * 1000)
+                record_timing(
+                    "agent.semantic_fallback_planner_ms",
+                    fallback_planner_elapsed_ms,
+                    selected=bool(fallback_lookup),
+                    intent=runtime_chat_intent or "unknown",
+                )
+                _record_reply_trace_stage(
+                    key="agent_semantic_fallback",
+                    label="语义 fallback 选工具",
+                    status="ok" if fallback_lookup else "warn",
+                    detail=(
+                        f"selected={fallback_lookup[0] if fallback_lookup else '-'} "
+                        f"intent={runtime_chat_intent or '-'} elapsed_ms={fallback_planner_elapsed_ms}"
+                    ),
                 )
                 if fallback_lookup is None and pending_evidence_followup_query:
                     pending_evidence_followup_query = ""
@@ -809,6 +1002,7 @@ async def run_agent(
                     last_fallback_signature = fallback_signature
                     fallback_tool = registry.get(fallback_name)
                     if fallback_tool is not None:
+                        fallback_tool_started_at = time.monotonic()
                         fallback_args, fallback_result = await _execute_tool_with_retries(
                             registry=registry,
                             tool_name=fallback_name,
@@ -819,6 +1013,15 @@ async def run_agent(
                             previous_tool_result_text=last_tool_result_text,
                             logger=logger,
                             budget_deadline=budget_deadline,
+                        )
+                        _record_reply_trace_stage(
+                            key="agent_fallback_tool",
+                            label="fallback 工具执行",
+                            status="ok" if str(fallback_result or "").strip() else "warn",
+                            detail=(
+                                f"tool={fallback_name} "
+                                f"elapsed_ms={int((time.monotonic() - fallback_tool_started_at) * 1000)}"
+                            ),
                         )
                         fallback_id = f"fallback-{fallback_name}-{_step + 1}"
                         messages.append(
@@ -861,6 +1064,12 @@ async def run_agent(
                         await _append_evidence_guidance_if_needed()
                         continue
                     logger.info(f"[agent] semantic fallback selected unavailable tool: {fallback_name}")
+            if banter_requires_lookup_retry:
+                return AgentResult(
+                    text="[NO_REPLY]",
+                    pending_actions=pending_actions,
+                    bypass_length_limits=False,
+                )
             if (
                 content_len == 0
                 and bool(

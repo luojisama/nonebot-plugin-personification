@@ -5,6 +5,7 @@ import json
 import re
 from typing import Any, List
 
+from ...core.reply_text_policy import normalize_visible_reply_text
 from .fallbacks import _parse_json_tool_result
 from .intent import _clean_user_query_text, _render_message_text
 
@@ -19,6 +20,20 @@ _IMAGE_FAILURE_DIAGNOSTIC_HINTS = (
     "content_types=",
     "result_keys=",
 )
+
+
+def _looks_like_raw_tool_dump(text: str) -> bool:
+    raw = str(text or "").strip()
+    if not raw:
+        return False
+    if _parse_json_tool_result(raw) is not None:
+        return True
+    if re.search(r"https?://\S+", raw):
+        return True
+    lines = [line.strip() for line in raw.splitlines() if line.strip()]
+    if sum(1 for line in lines if re.match(r"^\d+[.)]\s+", line) or re.match(r"^[-*+]\s+", line)) >= 2:
+        return True
+    return False
 
 
 def _render_tool_result_for_user(tool_name: str, result_text: str, query: str) -> str:
@@ -121,6 +136,7 @@ async def _wrap_tool_result_in_persona(
                 "把下面的搜索/工具结果用你自己的口吻自然说给对方。"
                 "像群友顺手接话，不要暴露搜索、查询、工具、来源、链接这些中间过程。"
                 "不要列 URL，不要说“根据搜索结果”“我查了一下”。"
+                "最终只输出纯文本，不要 markdown、标题、项目符号列表或编号列表。"
                 f"{length_hint}。"
             ),
         }
@@ -141,9 +157,17 @@ async def _wrap_tool_result_in_persona(
             timeout=10.0,
         )
     except Exception:
-        return fallback_text
+        cleaned = normalize_visible_reply_text(fallback_text)
+        if _looks_like_raw_tool_dump(fallback_text):
+            return "这块我没拿到稳的结果，先别按我说死。"
+        return cleaned
     wrapped_text = str(getattr(response, "content", "") or "").strip()
-    return wrapped_text or fallback_text
+    if wrapped_text:
+        return normalize_visible_reply_text(wrapped_text)
+    cleaned = normalize_visible_reply_text(fallback_text)
+    if _looks_like_raw_tool_dump(fallback_text):
+        return "这块我没拿到稳的结果，先别按我说死。"
+    return cleaned
 
 
 __all__ = [

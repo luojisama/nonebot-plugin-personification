@@ -196,6 +196,50 @@ DDL_STATEMENTS = (
     CREATE INDEX IF NOT EXISTS idx_webui_audit_action ON webui_audit_log(action, ts DESC)
     """,
     """
+    CREATE TABLE IF NOT EXISTS plugin_runtime_logs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        ts REAL NOT NULL,
+        level TEXT NOT NULL,
+        source TEXT NOT NULL DEFAULT '',
+        message TEXT NOT NULL DEFAULT '',
+        context TEXT NOT NULL DEFAULT '{}',
+        trace_id TEXT NOT NULL DEFAULT ''
+    )
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS idx_plugin_runtime_logs_ts
+        ON plugin_runtime_logs(ts DESC, id DESC)
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS idx_plugin_runtime_logs_level
+        ON plugin_runtime_logs(level, ts DESC)
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS idx_plugin_runtime_logs_trace
+        ON plugin_runtime_logs(trace_id, ts DESC)
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS reply_turn_traces (
+        trace_id TEXT PRIMARY KEY,
+        ts REAL NOT NULL,
+        session_type TEXT NOT NULL DEFAULT '',
+        group_id TEXT NOT NULL DEFAULT '',
+        user_id TEXT NOT NULL DEFAULT '',
+        stages TEXT NOT NULL DEFAULT '[]',
+        outcome TEXT NOT NULL DEFAULT '',
+        diagnosis_code TEXT NOT NULL DEFAULT '',
+        detail TEXT NOT NULL DEFAULT '{}'
+    )
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS idx_reply_turn_traces_ts
+        ON reply_turn_traces(ts DESC)
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS idx_reply_turn_traces_target
+        ON reply_turn_traces(session_type, group_id, user_id, ts DESC)
+    """,
+    """
     CREATE TABLE IF NOT EXISTS proactive_diagnostics (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         ts REAL NOT NULL,
@@ -269,6 +313,9 @@ def _configure_connection(conn: sqlite3.Connection) -> sqlite3.Connection:
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA synchronous=NORMAL")
     conn.execute("PRAGMA foreign_keys=ON")
+    # 共享连接可能被事件循环与线程池并发使用，写锁竞争时等待而不是立刻抛
+    # "database is locked"。
+    conn.execute("PRAGMA busy_timeout=5000")
     return conn
 
 

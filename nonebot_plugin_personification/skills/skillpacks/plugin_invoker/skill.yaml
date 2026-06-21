@@ -1,0 +1,7 @@
+name: plugin_invoker
+enabled: true
+category: action
+entrypoint: scripts/main.py
+description: 代为执行同一 bot 实例上其它已安装插件的命令，并捕获其输出供转述
+tools:
+  - invoke_plugin

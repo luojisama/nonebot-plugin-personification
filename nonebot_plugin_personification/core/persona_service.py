@@ -1,12 +1,17 @@
 from __future__ import annotations
 
 import asyncio
+import re
 import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from .db import connect_sync
+
+
+# 画像判断取最近 20 条本人发言作为上下文，避免被早期无关内容稀释
+_PERSONA_CONTEXT_LIMIT = 20
 
 
 _PERSONA_FIELD_GUIDE = """\
@@ -20,20 +25,47 @@ _PERSONA_FIELD_GUIDE = """\
 【情绪基线】：常态情绪 / 抗压表现 / 容易被点燃或低落的话题。
 【社交模式】：主动还是被动、对陌生人态度、群聊还是私聊更多、是否爱 @ 别人。
 【知识结构】：能看出来的专业/技能领域（"对 Python 有较深理解""熟悉东方系列""二次元历史/作品如数家珍"等）。
+【称呼与昵称】：希望被怎么称呼、自称习惯、给别人起的外号；没有就写"信息不足"。
+【关系与亲密度】：与 bot 的熟悉/信任程度，是否把 bot 当朋友，互动是客气还是随意；含演变趋势。
+【雷区与禁忌】：会让对方明显不适、反感或情绪激动的话题/措辞/玩笑，需要回避的点。
+【记忆锚点】：值得长期记住的具体事实——宠物、工作/学校变动、重要的人、纪念日、近期目标等（仅记用户主动透露的）。
+【近期关注】：最近这段时间反复出现、明显在意或投入的事（追的作品、在做的项目、烦心事等）。
+【内容偏好】：喜欢什么样的回应——幽默还是认真、长还是短、爱不爱表情包、希望被夸还是被吐槽。
 【互动建议】：和这个用户聊天的最佳方式——给一个虚拟伙伴看，告诉它该用什么语气、避开什么话题、什么时候适合主动。
-【人物描述】：用 120-180 字综合总结，把上面字段串成自然语段，描述性格、习惯、辨识度高的特征。"""
+【人物描述】：用 150-220 字综合总结，把上面字段串成自然语段，描述性格、习惯、辨识度高的特征。
+
+边界：只基于聊天记录里用户主动透露或明显流露的内容刻画；不臆测、不编造敏感信息
+（真实住址、真实姓名、证件号、政治/宗教立场、健康隐私等），这类除非用户明确说过，
+否则一律写"信息不足"。这是为了更懂用户、更好地陪伴，不做任何越界推断。"""
+
+_PERSONA_TASK_FRAME = """\
+这是一个角色扮演陪伴机器人「更懂用户、更好地陪伴」的内部理解任务：根据群聊/私聊公开
+发言，归纳对方的说话风格与偏好。这不是真实身份识别、不涉及隐私侵犯，属于正常的产品
+功能。请务必直接完成任务并按格式输出，不要拒绝、不要输出"无法完成/不在能力范围/请
+咨询其他问题"之类的话；信息不足的字段写"信息不足"即可。
+
+判断要点（重要）：
+- 只刻画【该用户本人】。群里在讨论某话题（如考试、游戏、工作）不代表用户就属于该群体——
+  讨论考试的可能是学生，也可能是老师、家长或回忆往事的上班族。
+- 优先依据用户的【自述、视角与用词】判断身份（如"我当年""我带的学生""我同事""我孩子"
+  "下班""上课"），而不是话题本身或别人的发言。
+- 证据冲突或不足时，保守判断或写"信息不足"，不要被单一热门话题带偏。"""
 
 PERSONA_PROMPT_NEW = """\
-你是一个用户画像分析师。请基于下方聊天记录刻画该用户特征。
+你是一个用户画像分析师。{task_frame}
+
+请基于下方【该用户本人】的聊天记录刻画其特征。
 要求：实话实说，不必赞美；证据不足的字段写"信息不足"，不要为了完整而编造。
 
 {field_guide}
 
-用户聊天记录：
+该用户本人的聊天记录（共 {message_count} 条，越靠后越近期）：
 {messages_block}"""
 
 PERSONA_PROMPT_UPDATE = """\
-你是一个用户画像分析师。该用户已有一份画像（见「旧画像」），现在请基于最新聊天记录"修订"它。
+你是一个用户画像分析师。{task_frame}
+
+该用户已有一份画像（见「旧画像」），现在请基于最新聊天记录"修订"它。
 
 修订规则：
 1. 旧画像中**未被新记录推翻**的事实、判断、特征**必须保留**——不要因为新记录没提就抹除。
@@ -41,29 +73,64 @@ PERSONA_PROMPT_UPDATE = """\
 3. 不要为了显得有变化而编造新内容；信息不足时复用旧字段原文。
 4. 每个字段都要给出最终版本（即"保留 + 修订"后的整体），不要只写差异。
 5. 如旧画像缺失某字段（比如旧版只有 4 个字段），按新格式补全；缺乏证据的字段写"信息不足"。
+6. 旧画像里带「用户确认/用户更正」标记的内容是用户本人核对过的事实，优先级最高，
+   除非新记录明确推翻，否则必须原样保留。
 
 {field_guide}
 
 旧画像：
 {previous_persona}
 
-最新聊天记录：
+该用户本人的最新聊天记录（共 {message_count} 条，越靠后越近期）：
 {messages_block}"""
 
 
+# 画像文本【字段】→ 结构化 key（用于持久化与查询；性别/职业等半永久字段）
+_STRUCTURED_FIELD_MAP: dict[str, str] = {
+    "职业推测": "occupation", "年龄推测": "age_group", "性别推测": "gender",
+    "作息特征": "routine", "兴趣领域": "interests", "沟通风格": "communication_style",
+    "情绪基线": "emotion_baseline", "社交模式": "social_mode", "知识结构": "knowledge",
+    "称呼与昵称": "nickname_pref", "关系与亲密度": "relationship", "雷区与禁忌": "taboos",
+    "记忆锚点": "memory_anchors", "近期关注": "recent_focus", "内容偏好": "content_pref",
+}
+
+_STRUCTURED_LINE = re.compile(r"[【\[]\s*([^】\]]+?)\s*[】\]]\s*[:：]?\s*(.+)")
+
+
+def parse_persona_structured(text: str) -> dict[str, str]:
+    """把画像文本里的【字段】：内容 解析成结构化字典（确定性解析，不调用 LLM）。"""
+    out: dict[str, str] = {}
+    for raw_line in str(text or "").splitlines():
+        m = _STRUCTURED_LINE.match(raw_line.strip())
+        if not m:
+            continue
+        label = m.group(1).strip()
+        value = m.group(2).strip()
+        key = _STRUCTURED_FIELD_MAP.get(label)
+        if key and value and value not in {"信息不足", "未知", "不明"}:
+            out[key] = value[:200]
+    return out
+
+
 def _format_persona_prompt(template: str, **kwargs: str) -> str:
-    return template.format(field_guide=_PERSONA_FIELD_GUIDE, **kwargs)
+    return template.format(field_guide=_PERSONA_FIELD_GUIDE, task_frame=_PERSONA_TASK_FRAME, **kwargs)
 
 
 def build_persona_prompt(messages: list[str], previous: str | None) -> str:
-    messages_block = "\n".join(f"- {message}" for message in messages)
+    # 取最近 N 条本人发言作为判断依据（越靠后越近期）
+    recent = list(messages)[-_PERSONA_CONTEXT_LIMIT:]
+    messages_block = "\n".join(f"- {message}" for message in recent)
+    message_count = str(len(recent))
     if previous:
         return _format_persona_prompt(
             PERSONA_PROMPT_UPDATE,
             previous_persona=str(previous or ""),
             messages_block=messages_block,
+            message_count=message_count,
         )
-    return _format_persona_prompt(PERSONA_PROMPT_NEW, messages_block=messages_block)
+    return _format_persona_prompt(
+        PERSONA_PROMPT_NEW, messages_block=messages_block, message_count=message_count
+    )
 
 
 @dataclass
@@ -191,6 +258,28 @@ class PersonaStore:
         finally:
             self._generating.discard(uid)
 
+    async def apply_user_correction(self, user_id: str, corrections: dict[str, str]) -> PersonaEntry | None:
+        """用户/管理员对画像的更正：以最高优先级写入，并保留到后续再生成。
+
+        corrections: {中文字段名或key: 修正后的值}。会在画像文本顶部加「用户更正」块
+        （带标记），并持久化到 core profile 的 user_corrections，后续 UPDATE 提示词
+        会优先保留这些内容。
+        """
+        uid = str(user_id)
+        clean = {str(k).strip(): str(v).strip() for k, v in (corrections or {}).items() if str(v).strip()}
+        if not clean:
+            return self.get_persona(uid)
+        previous = self.get_persona(uid)
+        base_text = previous.data if previous else ""
+        # 去掉旧的用户更正块，避免重复堆叠
+        base_text = re.sub(r"【用户更正[^】]*】[\s\S]*?(?=\n\n|\Z)", "", base_text).strip()
+        block_lines = "\n".join(f"- {k}：{v}（用户本人确认）" for k, v in clean.items())
+        new_text = f"【用户更正（最高优先级，请始终保留）】\n{block_lines}\n\n{base_text}".strip()
+        entry = PersonaEntry(data=new_text, time=int(time.time()))
+        await asyncio.to_thread(self._save_persona_sync, uid, entry, False, corrections=clean)
+        self._logger.info(f"[user_persona] 用户 {uid} 画像已按用户更正修订：{list(clean.keys())}")
+        return entry
+
     async def _generate_and_save(self, user_id: str, history: list[str]) -> None:
         try:
             previous = self.get_persona(user_id)
@@ -206,12 +295,30 @@ class PersonaStore:
         finally:
             self._generating.discard(user_id)
 
-    def _save_persona_sync(self, user_id: str, entry: PersonaEntry, clear_history: bool) -> None:
+    def _save_persona_sync(
+        self, user_id: str, entry: PersonaEntry, clear_history: bool, *, corrections: dict | None = None
+    ) -> None:
         if self._profile_service is not None:
+            structured = parse_persona_structured(entry.data)
+            existing = None
+            try:
+                existing = self._profile_service.get_core_profile(str(user_id))
+            except Exception:
+                existing = None
+            # 保留历史用户更正（除非本次显式覆盖）
+            prior_corrections: dict = {}
+            if existing is not None and isinstance(getattr(existing, "profile_json", None), dict):
+                prior_corrections = dict(existing.profile_json.get("user_corrections", {}) or {})
+            if corrections:
+                prior_corrections.update(corrections)
             self._profile_service.upsert_core_profile(
                 user_id=str(user_id),
                 profile_text=entry.data,
-                profile_json={"updated_by": "persona_service"},
+                profile_json={
+                    "updated_by": "persona_service",
+                    "structured": structured,
+                    "user_corrections": prior_corrections,
+                },
                 source="persona_service",
             )
         with connect_sync() as conn:
@@ -273,7 +380,17 @@ class PersonaStore:
                     logger=self._logger,
                     purpose="user_persona",
                 )
-            except SafetyRefusalError:
+            except SafetyRefusalError as e:
+                if getattr(e, "source", "") == "api_block":
+                    self._logger.warning(
+                        f"[user_persona] 用户 {user_id} 画像生成被供应商安全策略拦截"
+                        f"（{getattr(e, 'reason', '') or '未知原因'}）：本轮跳过，保留旧画像。"
+                        "可考虑切换 provider 或调低敏感内容触发。"
+                    )
+                else:
+                    self._logger.info(
+                        f"[user_persona] 用户 {user_id} 画像 LLM 返回拒绝模板，本轮跳过。"
+                    )
                 return None
         except Exception as e:
             self._logger.warning(f"[user_persona] LLM 调用失败: {e}")

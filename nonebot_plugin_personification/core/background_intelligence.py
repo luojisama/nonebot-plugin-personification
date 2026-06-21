@@ -310,6 +310,11 @@ class BackgroundIntelligence:
                 "time_sensitivity": "normal",
             }
             await asyncio.to_thread(self.memory_store.write_memory_item, payload)
+            await asyncio.to_thread(
+                self.memory_store.mark_memories_summarized,
+                [str(item.get("memory_id", "") or "") for item in items[:12]],
+                summarized_by=str(payload.get("memory_id", "") or ""),
+            )
             updated += 1
         self._update_state(last_crystal_at=time.time())
         return {"updated": updated, "groups": len(grouped)}

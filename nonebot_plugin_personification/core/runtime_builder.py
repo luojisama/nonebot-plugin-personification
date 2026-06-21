@@ -125,6 +125,8 @@ from .memory_store import init_memory_store
 from .time_ctx import init_time_context
 from .builtin_hooks import register_all_builtin_hooks
 from .plugin_meta import build_plugin_metadata, build_plugin_usage_text
+from .plugin_runtime_logs import maybe_prune as maybe_prune_plugin_logs
+from .plugin_runtime_logs import wrap_logger as wrap_plugin_logger
 from .proactive_store import load_proactive_state, save_proactive_state, update_private_interaction_time
 from .profile_service import ProfileService
 from .qzone_service import build_qzone_services, build_qzone_social_service
@@ -193,6 +195,8 @@ def build_plugin_runtime(
     md_to_pic: Any,
 ) -> PluginRuntimeBundle:
     init_data_store(plugin_config, logger=logger)
+    logger = wrap_plugin_logger(logger, config=plugin_config)
+    maybe_prune_plugin_logs(config=plugin_config, force=True)
     init_schedule_config(plugin_config)
     init_time_context(str(getattr(plugin_config, "personification_timezone", "Asia/Shanghai") or "Asia/Shanghai"))
     register_all_builtin_hooks()
@@ -478,6 +482,7 @@ def build_plugin_runtime(
         extract_forward_content=extract_forward_message_content,
         memory_curator=memory_curator,
         knowledge_store=knowledge_store,
+        inner_state_updater=inner_state_updater,
     )
 
     get_custom_title = build_custom_title_getter(logger=logger)
@@ -642,6 +647,7 @@ def build_plugin_runtime(
             extract_forward_content=extract_forward_message_content,
             memory_curator=memory_curator,
             knowledge_store=knowledge_store,
+            inner_state_updater=inner_state_updater,
         )
         reply_processor_deps.runtime.process_yaml_response_logic = yaml_response_processor
         reply_processor_deps.runtime.agent_tool_caller = new_agent_tool_caller

@@ -40,6 +40,9 @@ def require_admin(request: Request) -> AdminIdentity:
     record = webui_auth_store.lookup_device(token, ua=ua)
     if not record:
         raise HTTPException(status_code=401, detail="设备令牌无效、已被撤销或已过期")
+    # 待审批设备：除"查询自身状态"外一律拒绝，返回可识别的 detail 供前端切到等待页
+    if str(record.get("status", "approved") or "approved") == "pending":
+        raise HTTPException(status_code=403, detail="DEVICE_PENDING")
     # CSRF: 改变服务器状态的请求必须带匹配的 CSRF token header
     if request.method.upper() not in _CSRF_SAFE_METHODS:
         expected = str(record.get("csrf_token", "") or "")

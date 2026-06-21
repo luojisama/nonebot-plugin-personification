@@ -244,27 +244,75 @@ def parse_api_pool_config(raw_config: Any, logger: Any = None) -> List[Dict[str,
     return providers
 
 
-def _load_env_api_pool_config(logger: Any) -> List[Dict[str, Any]]:
+def _read_env_api_pool_raw() -> str:
     try:
         from .runtime_config import read_env_file_value
     except Exception:
-        return []
-    raw_env = read_env_file_value("personification_api_pools")
+        return ""
+    return read_env_file_value("personification_api_pools") or ""
+
+
+def _load_env_api_pool_config(logger: Any) -> List[Dict[str, Any]]:
+    raw_env = _read_env_api_pool_raw()
     if not raw_env:
         return []
     return parse_api_pool_config(raw_env, logger)
 
 
+def _has_usable_legacy_primary_config(plugin_config: Any) -> bool:
+    legacy_type = normalize_api_type(getattr(plugin_config, "personification_api_type", "openai"))
+    model = _default_model_for_api_type(
+        legacy_type,
+        str(getattr(plugin_config, "personification_model", "") or "").strip(),
+    )
+    if legacy_type in {"openai_codex", "gemini_cli", "antigravity_cli", "claude_code"}:
+        return bool(model)
+    api_url = str(getattr(plugin_config, "personification_api_url", "") or "").strip()
+    api_key = str(getattr(plugin_config, "personification_api_key", "") or "").strip()
+    return bool(api_url and api_key and model)
+
+
 def load_api_pool_config(plugin_config: Any, logger: Any) -> List[Dict[str, Any]]:
     raw_config = getattr(plugin_config, "personification_api_pools", None)
     providers = parse_api_pool_config(raw_config, logger)
+
+    env_raw = _read_env_api_pool_raw()
     env_providers = _load_env_api_pool_config(logger)
+
+    # 运行时为空（未配置或被异常清空）：直接用 .env 兜底救援。
+    if not providers:
+        if env_providers:
+            if _has_usable_legacy_primary_config(plugin_config):
+                logger.info(
+                    "personification: runtime api_pools is empty but legacy primary provider "
+                    "is explicitly configured; ignoring .env api_pools fallback."
+                )
+                return providers
+            logger.warning(
+                "personification: 运行时 api_pools 为空，回退到 .env 文件中的配置 "
+                f"({len(env_providers)} 个 provider)。"
+            )
+            return env_providers
+        return providers
+
+    # 运行时与 .env 都非空但数量不一致时，需要区分两种情况：
+    # 1) .env 是手写的多行 pretty JSON —— NoneBot/pydantic 的 dotenv 解析器只读
+    #    首行，会把内存值截断成更少的 provider；此时应以 .env 文件的完整值为准。
+    # 2) .env 是工具（WebUI/命令）写入的单行紧凑 JSON —— pydantic 能完整解析，
+    #    内存值才是用户的真实意图。用户主动删减 provider 属于此类，必须信任内存，
+    #    否则会出现"保存后被 .env 旧配置顶回"的回退问题。
     if env_providers and len(env_providers) > len(providers):
-        logger.warning(
-            "personification: using personification_api_pools directly from .env file "
-            f"because parsed runtime value has fewer providers ({len(providers)} < {len(env_providers)})"
+        if "\n" in env_raw.strip():
+            logger.warning(
+                "personification: 运行时 api_pools 疑似被 dotenv 多行解析截断 "
+                f"(runtime={len(providers)} < env={len(env_providers)})，改用 .env 文件的完整配置。"
+            )
+            return env_providers
+        logger.info(
+            "personification: api_pools 运行时值少于 .env 文件 "
+            f"(runtime={len(providers)}, env={len(env_providers)})；.env 为单行可解析，"
+            "以运行时值为准（视为用户主动删减）。"
         )
-        return env_providers
     return providers
 
 
@@ -863,6 +911,19 @@ async def _try_provider_chain(
                     f"personification: provider {provider['name']} failed "
                     f"({attempt + 1}/{retries}): {error_text}"
                 )
+                try:
+                    from . import provider_health
+
+                    error_kind = provider_health.classify_error(e)
+                except Exception:
+                    error_kind = ""
+                if error_kind in {"timeout", "connect"}:
+                    cooldown = _mark_provider_failure(provider["name"], e)
+                    logger.warning(
+                        f"personification: provider {provider['name']} {error_kind}，"
+                        f"跳过剩余重试并 cooldown {int(cooldown)}s"
+                    )
+                    break
                 if attempt + 1 >= retries:
                     _mark_provider_failure(provider["name"], e)
                 else:

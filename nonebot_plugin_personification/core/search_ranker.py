@@ -90,6 +90,9 @@ def rank_memory_payload(
     time_sensitivity = str(payload.get("time_sensitivity", "normal") or "normal")
     memory_type = str(payload.get("memory_type", "") or "")
     source_kind = str(payload.get("source_kind", "") or "")
+    palace_zone = str(payload.get("palace_zone", "") or "")
+    tier = str(payload.get("tier", "") or "").strip().lower()
+    summary_status = str(payload.get("summary_status", "") or "").strip().lower()
     crystal_status = str(payload.get("status", "") or payload.get("crystal_status", "") or "")
     cross_group_allowed = bool(payload.get("cross_group_allowed", False))
     payload_group_id = str(payload.get("group_id", "") or "")
@@ -107,16 +110,24 @@ def rank_memory_payload(
     score += group_scope_delta(payload_group_id, requested_group_id, cross_group_allowed)
     if requested_user_id and payload_user_id and payload_user_id == requested_user_id:
         score += 0.10
+    if tier == "semantic":
+        score += 0.16
+    elif tier == "background":
+        score -= 0.18
     if memory_type == "persona_knowledge":
         score += 0.16
     elif memory_type == "group_knowledge" and payload_group_id == requested_group_id:
         score += 0.14
+    elif memory_type in {"semantic", "fact", "core_profile"}:
+        score += 0.10
     elif memory_type == "episodic_turn":
         score += 0.04
+    if palace_zone == "background" or summary_status == "summarized":
+        score -= 0.16
     if source_kind == "crystal":
-        score -= 0.12
+        score -= 0.04
         if crystal_status in {"unreviewed", "candidate"}:
-            score -= 0.08
+            score -= 0.04
         if crystal_status in {"stale", "staled"}:
             score -= 0.18
     if superseded_by:

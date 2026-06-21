@@ -39,13 +39,76 @@ def _looks_like_bot_self_entry(item: dict[str, Any]) -> bool:
         return True
     return False
 
-
 def build_memory_router(*, runtime) -> APIRouter:
     router = APIRouter(prefix="/api/memory", tags=["memory"])
 
+    @router.get("/vector-index")
+    async def vector_index_status(_: AdminIdentity = Depends(require_admin)) -> dict:
+        store = _memory_store(runtime)
+        if store is None:
+            return {"available": False, "reason": "memory_store_missing"}
+        try:
+            return {"available": True, **dict(store.get_vector_index_status())}
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=str(exc))
+
+    @router.post("/vector-index/rebuild")
+    async def rebuild_vector_index(
+        limit: int = Query(default=0, ge=0, le=10000),
+        _: AdminIdentity = Depends(require_admin),
+    ) -> dict:
+        store = _memory_store(runtime)
+        if store is None:
+            raise HTTPException(status_code=503, detail="memory_store 未就绪")
+        try:
+            return dict(store.rebuild_vector_index(limit=int(limit or 0)))
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=str(exc))
+
+    @router.get("/search-test")
+    async def search_test(
+        query: str = Query(default="", min_length=1, max_length=300),
+        group_id: str = Query(default=""),
+        user_id: str = Query(default=""),
+        context_type: str = Query(default="auto"),
+        limit: int = Query(default=8, ge=1, le=32),
+        _: AdminIdentity = Depends(require_admin),
+    ) -> dict:
+        store = _memory_store(runtime)
+        if store is None:
+            raise HTTPException(status_code=503, detail="memory_store 未就绪")
+        try:
+            items = list(
+                store.recall_memories(
+                    query=str(query or "").strip(),
+                    group_id=str(group_id or "").strip(),
+                    user_id=str(user_id or "").strip(),
+                    context_type=str(context_type or "auto").strip() or "auto",
+                    limit=int(limit or 8),
+                )
+            )
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=str(exc))
+        rendered = []
+        for item in items:
+            rendered.append(
+                {
+                    "memory_id": str(item.get("memory_id", "") or ""),
+                    "summary": str(item.get("summary", "") or "")[:300],
+                    "memory_type": str(item.get("memory_type", "") or ""),
+                    "palace_zone": str(item.get("palace_zone", "") or ""),
+                    "score": float(item.get("score", 0) or 0),
+                    "search_source": str(item.get("search_source", "") or ""),
+                    "why_relevant": str(item.get("why_relevant", "") or ""),
+                    "group_id": str(item.get("group_id", "") or ""),
+                    "user_id": str(item.get("user_id", "") or ""),
+                }
+            )
+        return {"items": rendered, "query": query, "count": len(rendered)}
+
     @router.get("/recent")
     async def recent(
-        limit: int = Query(default=40, ge=1, le=200),
+        limit: int = Query(default=100, ge=1, le=500),
         memory_type: str = Query(default=""),
         group_id: str = Query(default=""),
         user_id: str = Query(default=""),
@@ -64,7 +127,7 @@ def build_memory_router(*, runtime) -> APIRouter:
         if not palace_on:
             return {"items": [], "palace_enabled": False}
         # 默认拉略多一些，过滤 bot 自言后剩下的可能少于 limit
-        raw_limit = int(limit) if include_self else min(int(limit) * 3, 200)
+        raw_limit = int(limit) if include_self else min(int(limit) * 3, 1000)
         try:
             items = list(store.list_recent_memories(
                 group_id=str(group_id or "").strip(),
@@ -89,6 +152,8 @@ def build_memory_router(*, runtime) -> APIRouter:
                 "user_id": str(item.get("user_id", "") or ""),
                 "summary": str(item.get("summary", "") or "")[:300],
                 "source_kind": str(item.get("source_kind", "") or ""),
+                "tier": str(item.get("tier", "") or ""),
+                "palace_zone": str(item.get("palace_zone", "") or ""),
                 "confidence": float(item.get("confidence", 0) or 0),
                 "salience": float(item.get("salience", 0) or 0),
                 "updated_at": float(item.get("updated_at", 0) or 0),

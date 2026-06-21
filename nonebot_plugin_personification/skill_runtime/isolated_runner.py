@@ -6,6 +6,10 @@ import json
 import sys
 from pathlib import Path
 
+RUNNER_DIR = Path(__file__).resolve().parent
+if str(RUNNER_DIR) not in sys.path:
+    sys.path.insert(0, str(RUNNER_DIR))
+
 from module_loader import load_skill_module
 
 

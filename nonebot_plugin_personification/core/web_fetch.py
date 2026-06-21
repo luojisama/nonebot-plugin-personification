@@ -17,7 +17,7 @@ import ipaddress
 import re
 import socket
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import urljoin, urlparse
 
 import httpx
 from bs4 import BeautifulSoup
@@ -99,6 +99,36 @@ def _validate_url(url: str) -> tuple[str, str]:
     return scheme, host
 
 
+async def _validate_fetch_target(
+    url: str,
+    *,
+    blocked_domains: list[str] | None,
+    proxy_url: str | None,
+) -> tuple[str, str]:
+    """校验一次实际将要访问的 URL。
+
+    重定向后的 URL 也必须走同一套 SSRF 防护，否则公网首跳可以 302 到
+    169.254.169.254 / 127.0.0.1 等内网地址。
+    """
+    scheme, host = _validate_url(url)
+    if _is_blocked_domain(host, blocked_domains):
+        raise WebFetchError(f"目标域名被黑名单拦截：{host}")
+    if _is_literal_private_ip(host):
+        raise WebFetchError(f"目标主机是内网/本地 IP，拒绝访问：{host}")
+    if proxy_url:
+        # 走代理：DNS 由代理侧解析，本地解析结果不可信（可能被污染）。
+        # 字面内网 IP 已在上面拦截。
+        return scheme, host
+    is_unsafe = await asyncio.to_thread(_is_unsafe_host, host)
+    if is_unsafe:
+        raise WebFetchError(
+            f"目标主机解析到内网/本地地址，拒绝访问：{host}"
+            "（若该域名确为公网站点，可能是本地 DNS 被污染/劫持；"
+            "可在配置 personification_web_proxy 设置代理后重试）"
+        )
+    return scheme, host
+
+
 def _is_blocked_domain(host: str, blocked_domains: list[str] | None) -> bool:
     if not blocked_domains:
         return False
@@ -149,23 +179,8 @@ async def fetch_web_page(
     - content_type: 服务器返回的 Content-Type
     - char_count: text 实际字符数
     """
-    scheme, host = _validate_url(url)
-    if _is_blocked_domain(host, blocked_domains):
-        raise WebFetchError(f"目标域名被黑名单拦截：{host}")
     proxy_url = str(proxy or "").strip() or None
-    if proxy_url:
-        # 走代理：DNS 由代理侧解析，本地解析结果不可信（可能被污染），
-        # 只拦截字面内网 IP，避免误把公网站点（被本地 DNS 污染）当成内网拒绝。
-        if _is_literal_private_ip(host):
-            raise WebFetchError(f"目标主机是内网/本地 IP，拒绝访问：{host}")
-    else:
-        is_unsafe = await asyncio.to_thread(_is_unsafe_host, host)
-        if is_unsafe:
-            raise WebFetchError(
-                f"目标主机解析到内网/本地地址，拒绝访问：{host}"
-                "（若该域名确为公网站点，可能是本地 DNS 被污染/劫持；"
-                "可在配置 personification_web_proxy 设置代理后重试）"
-            )
+    await _validate_fetch_target(url, blocked_domains=blocked_domains, proxy_url=proxy_url)
 
     headers = {
         "User-Agent": _USER_AGENT,
@@ -176,14 +191,30 @@ async def fetch_web_page(
     try:
         client_kwargs: dict[str, Any] = {
             "timeout": float(timeout or _DEFAULT_TIMEOUT),
-            "follow_redirects": True,
-            "max_redirects": 5,
+            "follow_redirects": False,
             "headers": headers,
         }
         if proxy_url:
             client_kwargs["proxy"] = proxy_url
         async with httpx.AsyncClient(**client_kwargs) as client:
-            resp = await client.get(url)
+            current_url = str(url)
+            resp = None
+            for redirect_count in range(6):
+                await _validate_fetch_target(
+                    current_url,
+                    blocked_domains=blocked_domains,
+                    proxy_url=proxy_url,
+                )
+                resp = await client.get(current_url)
+                status_code = int(getattr(resp, "status_code", 0) or 0)
+                location = str(resp.headers.get("location", "") or "").strip()
+                if status_code not in {301, 302, 303, 307, 308} or not location:
+                    break
+                if redirect_count >= 5:
+                    raise WebFetchError("重定向次数超过上限（5）")
+                current_url = urljoin(str(getattr(resp, "url", current_url) or current_url), location)
+            if resp is None:
+                raise WebFetchError("请求未返回响应")
             content_type = (resp.headers.get("content-type", "") or "").lower()
             raw = resp.content
             if len(raw) > _MAX_BYTES:

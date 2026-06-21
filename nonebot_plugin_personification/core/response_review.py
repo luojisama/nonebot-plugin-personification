@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Iterable
 
 from ..agent.runtime.planner import OUTPUT_MODE_LENGTHS
+from .reply_text_policy import looks_like_markdown_reply, normalize_visible_reply_text
 
 
 @dataclass(frozen=True)
@@ -109,6 +110,7 @@ _SILENCE_CONFIDENCE_THRESHOLD = 0.72
 _AGENT_REPLY_OOC_PATTERNS = re.compile(
     r"根据(搜索|查询|检索|找到的)结果|"
     r"(查|搜|搜索|检索|查询)了一下|"
+    r"我需要确认一下|"
     r"以下是(相关|查到的|找到的)|"
     r"(参考链接|相关链接|来源)[：:]|"
     r"(http|https)://\S{15,}|"
@@ -151,7 +153,7 @@ def arbitrate_reply_mode(
 
 
 def is_agent_reply_ooc(text: str) -> bool:
-    return bool(_AGENT_REPLY_OOC_PATTERNS.search(str(text or "")))
+    return bool(_AGENT_REPLY_OOC_PATTERNS.search(str(text or "")) or looks_like_markdown_reply(text))
 
 
 def _parse_review_payload(raw: str) -> ResponseReviewDecision | None:
@@ -176,6 +178,145 @@ def _parse_review_payload(raw: str) -> ResponseReviewDecision | None:
     revised = str(payload.get("text", "") or "").strip()
     reason = str(payload.get("reason", "") or "").strip()
     return ResponseReviewDecision(action=action, text=revised, reason=reason)
+
+
+def _parse_bool_payload(raw: str) -> bool | None:
+    text = str(raw or "").strip()
+    if not text:
+        return None
+    lowered = text.lower()
+    if lowered in {"true", "yes", "speak", "reply"}:
+        return True
+    if lowered in {"false", "no", "silent", "no_reply"}:
+        return False
+    try:
+        payload = json.loads(text)
+    except Exception:
+        match = re.search(r"\{.*\}", text, flags=re.DOTALL)
+        if not match:
+            return None
+        try:
+            payload = json.loads(match.group(0))
+        except Exception:
+            return None
+    if isinstance(payload, bool):
+        return payload
+    if not isinstance(payload, dict):
+        return None
+    for key in ("speak", "reply", "should_reply"):
+        if key in payload:
+            return bool(payload.get(key))
+    action = str(payload.get("action", "") or "").strip().lower()
+    if action in {"speak", "reply", "accept"}:
+        return True
+    if action in {"silent", "no_reply", "skip"}:
+        return False
+    return None
+
+
+async def decide_random_chat_speak(
+    call_ai_api: Callable[[list[dict[str, Any]]], Awaitable[Any]],
+    *,
+    raw_message_text: str,
+    recent_context: str = "",
+    relationship_hint: str = "",
+    message_target: str = "",
+    solo_speaker_follow: bool = False,
+    semantic_frame: Any = None,
+) -> bool:
+    if solo_speaker_follow:
+        return True
+    if str(message_target or "").strip() == "bot":
+        return True
+    semantic_hint = _render_semantic_frame_hint(semantic_frame)
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "你是群聊随机插话判定器。判断这轮 bot 是否应该开口。"
+                "只输出 JSON：{\"speak\":true/false,\"reason\":\"...\"}。"
+                "如果不是明确需要 bot 参与，优先保持沉默。"
+            ),
+        },
+        {
+            "role": "user",
+            "content": (
+                f"当前原话：{str(raw_message_text or '').strip()[:240] or '[EMPTY]'}\n"
+                f"最近上下文：{str(recent_context or '').strip()[:500] or '[EMPTY]'}\n"
+                f"互动关系：{str(relationship_hint or '').strip()[:320] or '[EMPTY]'}\n"
+                f"语义情绪帧：{semantic_hint or '[EMPTY]'}"
+            ),
+        },
+    ]
+    try:
+        raw = await call_ai_api(messages)
+    except Exception:
+        return False
+    parsed = _parse_bool_payload(str(raw or ""))
+    return bool(parsed) if parsed is not None else False
+
+
+def _extract_recovered_message(raw: str) -> str:
+    text = str(raw or "").strip()
+    if not text:
+        return ""
+    match = re.search(r"<message>(.*?)</message>", text, flags=re.DOTALL | re.IGNORECASE)
+    if match:
+        return normalize_visible_reply_text(match.group(1))
+    parsed = _parse_review_payload(text)
+    if parsed is not None and parsed.text:
+        return normalize_visible_reply_text(parsed.text)
+    try:
+        payload = json.loads(text)
+    except Exception:
+        payload = None
+    if isinstance(payload, dict):
+        for key in ("message", "text", "reply"):
+            value = str(payload.get(key, "") or "").strip()
+            if value:
+                return normalize_visible_reply_text(value)
+    return normalize_visible_reply_text(text)
+
+
+async def recover_direct_mention_reply(
+    call_ai_api: Callable[[list[dict[str, Any]]], Awaitable[Any]],
+    *,
+    raw_message_text: str,
+    recent_context: str = "",
+    relationship_hint: str = "",
+    recent_bot_replies: list[str] | None = None,
+    is_direct_mention: bool = False,
+    semantic_frame: Any = None,
+) -> str:
+    if not is_direct_mention:
+        return ""
+    semantic_hint = _render_semantic_frame_hint(semantic_frame)
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "当前用户是在直呼或提及 bot，候选链路可能没有给出可用回复。"
+                "请补一条自然、短、符合人设的最终回复。"
+                "只输出 <output><message>最终回复</message></output>。"
+                "最终回复必须是纯文本，不要 markdown、标题、列表、链接，也不要解释过程。"
+            ),
+        },
+        {
+            "role": "user",
+            "content": (
+                f"当前原话：{str(raw_message_text or '').strip()[:240] or '[EMPTY]'}\n"
+                f"最近上下文：{str(recent_context or '').strip()[:500] or '[EMPTY]'}\n"
+                f"互动关系：{str(relationship_hint or '').strip()[:320] or '[EMPTY]'}\n"
+                f"语义情绪帧：{semantic_hint or '[EMPTY]'}\n"
+                f"最近 bot 发言：{json.dumps(_to_text_list(recent_bot_replies or []), ensure_ascii=False)}"
+            ),
+        },
+    ]
+    try:
+        raw = await call_ai_api(messages)
+    except Exception:
+        return ""
+    return _extract_recovered_message(str(raw or ""))
 
 
 async def review_response_text(
@@ -212,7 +353,8 @@ async def review_response_text(
                 f"{'当前是直呼/提及 bot 的消息，禁止输出 no_reply。' if is_direct_mention else ''}"
                 "普通短句 banter、顺着上一句接话、轻量吐槽，优先 accept 或 rewrite，不要轻易 no_reply。"
                 "只输出 JSON，不要解释。"
-                "\n## 必须 rewrite 的 AI 味回复模式（重点检查）\n1. 「回声评论」：把用户说的话原样重复后加“太真实了/太直球了/太 X 了吧/真的假的”等感叹——必须改写为不重复原话的短句接话。\n2. 候选回复中超过 3 个连续字与用户原话重叠，且没有新增信息或立场——必须 rewrite。\n3. 候选只是在用感叹词复述用户语义，没有新事实、延续话题、转向或明确态度——必须 rewrite。\n4. 「安抚式客服腔」：以“别这么说/已经很够用了/不要这样想/你很棒的”开头——改写为自然接话。\n5. 「旁白式观察」：类似“真去做了啊/真的行动了/居然真的 XX 了”的旁白——改写为参与式短句。\n6. 「梗分析腔」：用“像是把 X 玩成 Y 了/意思就是/可以理解成”解释梗结构——改写为直接接梗。\n改写原则：去掉对用户发言的复述和分析，按 output_mode 的长度要求输出；改写后不得引入新的回声模式。"
+                "\n## 必须 rewrite 的 AI 味回复模式（重点检查）\n1. 「回声评论」：把用户说的话原样重复后加“太真实了/太直球了/太 X 了吧/真的假的”等感叹——必须改写为不重复原话的短句接话。\n2. 候选回复中超过 3 个连续字与用户原话重叠，且没有新增信息或立场——必须 rewrite。\n3. 候选只是在用感叹词复述用户语义，没有新事实、延续话题、转向或明确态度——必须 rewrite。\n4. 「安抚式客服腔」：以“别这么说/已经很够用了/不要这样想/你很棒的”开头——改写为自然接话。\n5. 「旁白式观察」：类似“真去做了啊/真的行动了/居然真的 XX 了”的旁白——改写为参与式短句。\n6. 「梗分析腔」：用“像是把 X 玩成 Y 了/意思就是/可以理解成”解释梗结构——改写为直接接梗。\n7. 「营业感叹腔」：用“(也)太……了吧/……爆了/绝了/谁懂啊/笑死/绷不住了/yyds”这类口号式感叹收尾或起势——改写成平铺直叙的接话，去掉感叹营业腔和网络流行语，不喊口号。\n改写原则：去掉对用户发言的复述和分析，按 output_mode 的长度要求输出；改写后不得引入新的回声模式或营业感叹腔。"
+                "\n8. 出现 markdown 格式、标题、项目符号列表、编号列表、代码块、链接列表时，必须改成纯文本短句。"
                 "\n如果语义情绪帧里 persona_info_added=tone_only 且 persona_echoed_user_phrase=true，也必须 rewrite。"
             ),
         },
@@ -271,6 +413,7 @@ async def rewrite_agent_reply_ooc(
                 "下面这句话听起来像 AI 助手而不像普通群友。"
                 f"把它用你自己的口吻重说一次，{min_chars}-{max_chars} 字以内。"
                 "去掉【搜索/查询/结果/链接/来源】类表述和 URL，不要解释改写过程。"
+                "只输出纯文本，不要 markdown、标题、项目符号列表或编号列表。"
             ),
         }
     )
@@ -282,7 +425,7 @@ async def rewrite_agent_reply_ooc(
         )
     except Exception:
         return ""
-    rewritten = str(getattr(response, "content", "") or "").strip()
+    rewritten = normalize_visible_reply_text(getattr(response, "content", "") or "")
     if not rewritten or is_agent_reply_ooc(rewritten):
         return ""
     return rewritten
@@ -291,9 +434,11 @@ async def rewrite_agent_reply_ooc(
 __all__ = [
     "ResponseReviewDecision",
     "arbitrate_reply_mode",
+    "decide_random_chat_speak",
     "extract_recent_bot_reply_texts",
     "is_agent_reply_ooc",
     "make_passthrough_review_decision",
+    "recover_direct_mention_reply",
     "rewrite_agent_reply_ooc",
     "review_response_text",
 ]

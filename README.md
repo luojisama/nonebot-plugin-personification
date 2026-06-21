@@ -322,6 +322,13 @@ system: |
 
 ## 更新日志
 
+### 0.6.1
+
+- **同步本地 `personification` 最新开发版**：迁移 0.6.0 后的 WebUI 体检、GIF 理解、基础三观提示词、Agent 查证约束、轻量路由与耗时追踪等更新。
+- **修复插件元数据 homepage**：`PluginMetadata.homepage` 改为当前发布仓库 `https://github.com/luojisama/nonebot-plugin-personification`，避免插件校验报告项目主页无法访问。
+- **补齐发布仓库测试套件**：迁移本地测试与回放样本到发布仓库根目录，并增加测试命名空间适配，便于在包仓库布局下验证 `plugin.personification` 兼容入口。
+- **保留发布版专属适配**：继续保留 `web_console_api` 桥接、`nonebot_plugin_personification` 到 `plugin.personification` 的兼容命名空间，以及 localstore/htmlrender 的加载顺序保护。
+
 ### 0.6.0
 
 - **全量同步本地 `personification` 开发版**：以当前开发分支为准重建发布包代码，补齐自 0.5.3 以来的全部新功能，并保留发布版特有的 `web_console_api` 桥接与命名空间适配。

@@ -34,7 +34,7 @@ ENV/
 # NoneBot
 .env.dev
 .env.prod
-data/
+/data/
 *.log
 
 # IDEs

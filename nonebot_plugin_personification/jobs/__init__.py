@@ -58,7 +58,7 @@ class JobSetupDeps:
     group_idle_check_interval_minutes: int = 15
     qzone_proactive_enabled: bool = False
     qzone_check_interval_minutes: int = 90
-    qzone_daily_limit: int = 3
+    qzone_monthly_limit: int = 30
     qzone_probability: float = 0.35
     qzone_min_interval_hours: float = 6.0
     qzone_quiet_hour_start: int = 0
@@ -73,6 +73,8 @@ class JobSetupDeps:
     persona_store: Any = None
     vision_caller: Any = None
     agent_tool_caller: Any = None
+    agent_tool_registry: Any = None
+    agent_max_steps: int = 4
     agent_data_dir: Any = None
     background_intelligence: Any = None
 
@@ -93,12 +95,17 @@ def setup_jobs(*, scheduler: Any, deps: JobSetupDeps) -> Dict[str, Any]:
         logger=deps.logger,
     )
 
+    # generate_ai_diary 任务仍保留：供"发个说说"手动命令使用（见 matcher 接线）。
+    # 但"定时发送"（每周五 19:00 到点必发的 run_auto_post_diary + register_weekly_diary_job）
+    # 已弃用——自动发空间改由下方 proactive 路径，让 agent 按 inner_state 自主判断 skip|post。
     generate_ai_diary = build_generate_ai_diary_task(
         generate_ai_diary_flow=deps.generate_ai_diary_flow,
         load_prompt=deps.load_prompt,
         call_ai_api=deps.call_ai_api,
         logger=deps.logger,
         agent_tool_caller=deps.agent_tool_caller,
+        agent_tool_registry=deps.agent_tool_registry,
+        agent_max_steps=deps.agent_max_steps,
         agent_data_dir=deps.agent_data_dir,
     )
     auto_post_diary = None
@@ -110,21 +117,6 @@ def setup_jobs(*, scheduler: Any, deps: JobSetupDeps) -> Dict[str, Any]:
             "拟人插件：Qzone 说说功能未启用（personification_qzone_enabled=False），跳过定时注册"
         )
     if deps.qzone_publish_available:
-        auto_post_diary = build_auto_post_diary_task(
-            run_auto_post_diary=run_auto_post_diary,
-            qzone_publish_available=deps.qzone_publish_available,
-            get_bots=deps.get_bots,
-            update_qzone_cookie=deps.update_qzone_cookie,
-            generate_ai_diary=generate_ai_diary,
-            publish_qzone_shuo=deps.publish_qzone_shuo,
-            logger=deps.logger,
-        )
-
-        register_weekly_diary_job(
-            scheduler=scheduler,
-            auto_post_diary=auto_post_diary,
-            logger=deps.logger,
-        )
         if deps.qzone_proactive_enabled and deps.maybe_generate_proactive_qzone_post_flow is not None:
             maybe_generate_qzone_post = build_maybe_generate_qzone_post_task(
                 maybe_generate_proactive_qzone_post_flow=deps.maybe_generate_proactive_qzone_post_flow,
@@ -132,6 +124,8 @@ def setup_jobs(*, scheduler: Any, deps: JobSetupDeps) -> Dict[str, Any]:
                 call_ai_api=deps.call_ai_api,
                 logger=deps.logger,
                 agent_tool_caller=deps.agent_tool_caller,
+                agent_tool_registry=deps.agent_tool_registry,
+                agent_max_steps=deps.agent_max_steps,
                 agent_data_dir=deps.agent_data_dir,
             )
             proactive_qzone_post = build_proactive_qzone_post_task(
@@ -139,7 +133,7 @@ def setup_jobs(*, scheduler: Any, deps: JobSetupDeps) -> Dict[str, Any]:
                 qzone_publish_available=deps.qzone_publish_available,
                 qzone_proactive_enabled=deps.qzone_proactive_enabled,
                 qzone_probability=deps.qzone_probability,
-                qzone_daily_limit=deps.qzone_daily_limit,
+                qzone_monthly_limit=deps.qzone_monthly_limit,
                 qzone_min_interval_hours=deps.qzone_min_interval_hours,
                 get_bots=deps.get_bots,
                 get_now=deps.get_now,
@@ -303,6 +297,7 @@ def setup_jobs(*, scheduler: Any, deps: JobSetupDeps) -> Dict[str, Any]:
 
     return {
         "daily_group_fav_report": daily_group_fav_report,
+        # generate_ai_diary 仍供"发个说说"手动命令使用；auto_post_diary（定时发送）已弃用。
         "generate_ai_diary": generate_ai_diary,
         "auto_post_diary": auto_post_diary,
         "proactive_qzone_post": proactive_qzone_post,

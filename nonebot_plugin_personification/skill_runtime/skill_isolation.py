@@ -9,6 +9,28 @@ from typing import Any
 
 
 RUNNER_PATH = Path(__file__).resolve().parent / "isolated_runner.py"
+_SAFE_ENV_KEYS = frozenset(
+    {
+        "COMSPEC",
+        "LANG",
+        "LC_ALL",
+        "PATH",
+        "PATHEXT",
+        "SystemRoot",
+        "TEMP",
+        "TMP",
+        "TMPDIR",
+        "WINDIR",
+    }
+)
+_SAFE_ENV_KEYS_LOWER = frozenset(key.lower() for key in _SAFE_ENV_KEYS)
+_PYTHON_ENV_GUARDS = {
+    "PYTHONDONTWRITEBYTECODE": "1",
+    "PYTHONIOENCODING": "utf-8",
+    "PYTHONNOUSERSITE": "1",
+    "PYTHONSAFEPATH": "1",
+    "PYTHONUTF8": "1",
+}
 
 
 def normalize_isolation_config(
@@ -52,6 +74,33 @@ def script_supports_function(script_path: Path, function_name: str = "run") -> b
     return any(marker in text for marker in markers)
 
 
+def _build_subprocess_env(*, inherit_env: bool, extra_env: dict[str, Any] | None = None) -> dict[str, str]:
+    if inherit_env:
+        env = os.environ.copy()
+    else:
+        env = {
+            key: value
+            for key, value in os.environ.items()
+            if key.lower() in _SAFE_ENV_KEYS_LOWER
+        }
+        for canonical, aliases in {
+            "SystemRoot": ("SystemRoot", "SYSTEMROOT"),
+            "WINDIR": ("WINDIR", "windir"),
+            "ComSpec": ("ComSpec", "COMSPEC"),
+        }.items():
+            if canonical in env:
+                continue
+            for alias in aliases:
+                value = os.environ.get(alias)
+                if value:
+                    env[canonical] = value
+                    break
+    env.update({str(k): str(v) for k, v in dict(extra_env or {}).items()})
+    for key, value in _PYTHON_ENV_GUARDS.items():
+        env[key] = value
+    return env
+
+
 async def run_skill_in_subprocess(
     *,
     script_path: Path,
@@ -66,8 +115,10 @@ async def run_skill_in_subprocess(
     python_executable = str(isolation_cfg.get("python_executable") or "").strip() or sys.executable
     timeout = max(1, int(isolation_cfg.get("timeout", 15) or 15))
     inherit_env = bool(isolation_cfg.get("inherit_env", True))
-    env = os.environ.copy() if inherit_env else {}
-    env.update({str(k): str(v) for k, v in dict(isolation_cfg.get("env") or {}).items()})
+    env = _build_subprocess_env(
+        inherit_env=inherit_env,
+        extra_env=dict(isolation_cfg.get("env") or {}),
+    )
     cwd_raw = str(isolation_cfg.get("cwd") or "").strip()
     cwd = str((skill_dir / cwd_raw).resolve()) if cwd_raw else str(skill_dir.resolve())
 

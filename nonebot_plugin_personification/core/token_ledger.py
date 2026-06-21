@@ -212,7 +212,7 @@ def query_summary(window: str = "month") -> dict[str, Any]:
             FROM token_usage_ledger
             WHERE bucket_day >= ?
             GROUP BY bucket_day
-            ORDER BY bucket_day ASC
+            ORDER BY bucket_day DESC
             """,
             (start_str,),
         ).fetchall()

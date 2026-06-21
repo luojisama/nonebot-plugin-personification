@@ -2,12 +2,18 @@ name: weather
 enabled: true
 category: query
 entrypoint: scripts/main.py
-description: 查询城市天气信息
+description: 查询城市当前天气或未来1到16天天气预报；地点不明确时应先根据用户档案/记忆确认，不能猜城市
 parameters:
   type: object
   properties:
     city:
       type: string
       description: 城市名称
+    days:
+      type: integer
+      description: 预报天数，当前天气用1；未来几天/这周/半个月用对应天数，最大16
+      default: 1
+      minimum: 1
+      maximum: 16
   required:
     - city

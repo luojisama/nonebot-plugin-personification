@@ -65,6 +65,13 @@ class MemoryCurator:
         bot_text = normalize_text(bot_response)[:500]
         if not user_text and not bot_text:
             return
+        if self._should_skip_turn_capture(
+            user_text=user_text,
+            bot_text=bot_text,
+            evidence_refs=evidence_refs or [],
+            vision_summary=vision_summary,
+        ):
+            return
         task = asyncio.create_task(
             self.capture_turn(
                 user_utterance=user_text,
@@ -79,6 +86,35 @@ class MemoryCurator:
         )
         self._tasks.add(task)
         task.add_done_callback(self._tasks.discard)
+
+    def _capture_policy(self) -> str:
+        raw = str(
+            getattr(self.memory_store.plugin_config, "personification_memory_capture_policy", "balanced")
+            or "balanced"
+        ).strip().lower()
+        return raw if raw in {"balanced", "conservative", "all"} else "balanced"
+
+    def _should_skip_turn_capture(
+        self,
+        *,
+        user_text: str,
+        bot_text: str,
+        evidence_refs: list[str],
+        vision_summary: str,
+    ) -> bool:
+        policy = self._capture_policy()
+        if policy == "all":
+            return False
+        if evidence_refs or normalize_text(vision_summary):
+            return False
+        combined = normalize_text(f"{user_text} {bot_text}")
+        if not combined:
+            return True
+        non_space_len = len("".join(combined.split()))
+        token_count = len(tokenize(combined))
+        threshold = 18 if policy == "balanced" else 32
+        token_threshold = 3 if policy == "balanced" else 5
+        return non_space_len < threshold and token_count < token_threshold
 
     async def capture(
         self,

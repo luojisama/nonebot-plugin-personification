@@ -12,6 +12,13 @@ from urllib.parse import urljoin, urlparse
 
 import httpx
 
+from ...core.gif_understanding import (
+    get_gif_max_bytes,
+    get_gif_max_per_turn,
+    get_gif_understanding_timeout,
+    is_gif_understanding_enabled,
+    summarize_gif_bytes,
+)
 from ...core.media_understanding import analyze_images_with_route_or_fallback
 from ...core.metrics import record_counter
 from ...core.sticker_library import (
@@ -140,6 +147,130 @@ class IncomingStickerCandidate:
     mime_type: str
     source_kind: str
     summary_hint: str = ""
+
+
+def _gif_placeholder(summary_hint: str = "") -> str:
+    hint = str(summary_hint or "").strip().strip("[]")
+    if hint:
+        return f"[对方发送了一个动态表情：{hint}]"
+    return "[对方发送了一个动态表情]"
+
+
+def _reserve_gif_understanding(runtime: Any, counter_ref: List[int] | None) -> bool:
+    if counter_ref is None:
+        return True
+    config = getattr(runtime, "plugin_config", None)
+    max_per_turn = get_gif_max_per_turn(config)
+    current = int(counter_ref[0] if counter_ref else 0)
+    if current >= max_per_turn:
+        return False
+    counter_ref[0] = current + 1
+    return True
+
+
+async def _append_gif_understanding_from_payload(
+    *,
+    runtime: Any,
+    payload: bytes | None,
+    message_text_ref: List[str],
+    logger: Any,
+    summary_hint: str = "",
+    source_hint: str = "",
+    counter_ref: List[int] | None = None,
+    already_reserved: bool = False,
+) -> bool:
+    if not is_gif_understanding_enabled(runtime):
+        return False
+    if not already_reserved and not _reserve_gif_understanding(runtime, counter_ref):
+        message_text_ref.append(_gif_placeholder(summary_hint))
+        return True
+    if not payload:
+        message_text_ref.append(_gif_placeholder(summary_hint))
+        return True
+
+    result = await summarize_gif_bytes(
+        runtime=runtime,
+        payload=payload,
+        source_hint=source_hint,
+        summary_hint=summary_hint,
+    )
+    if result.summary:
+        message_text_ref.append(f"[动态表情摘要：{result.summary}]")
+        try:
+            logger.info(
+                "拟人插件：GIF 理解完成 "
+                f"route={result.route} frames={result.frame_count} "
+                f"sampled={result.sampled_frames} cost={result.duration_ms}ms"
+            )
+        except Exception:
+            pass
+        return True
+
+    message_text_ref.append(_gif_placeholder(summary_hint))
+    try:
+        logger.info(f"拟人插件：GIF 理解未生成摘要，使用占位符 route={result.route} cost={result.duration_ms}ms")
+    except Exception:
+        pass
+    return True
+
+
+async def _append_gif_understanding_from_url(
+    *,
+    runtime: Any,
+    url: str,
+    file_name: str,
+    http_client: httpx.AsyncClient,
+    message_text_ref: List[str],
+    logger: Any,
+    summary_hint: str = "",
+    source_hint: str = "",
+    counter_ref: List[int] | None = None,
+) -> bool:
+    if not is_gif_understanding_enabled(runtime):
+        return False
+    if not _reserve_gif_understanding(runtime, counter_ref):
+        message_text_ref.append(_gif_placeholder(summary_hint))
+        return True
+
+    config = getattr(runtime, "plugin_config", None)
+    timeout = get_gif_understanding_timeout(config)
+
+    async def _download_and_summarize() -> bool:
+        mime_type, payload, is_gif = await download_safe_image_bytes(
+            url=url,
+            file_name=file_name,
+            http_client=http_client,
+            logger=logger,
+            allow_gif=True,
+            max_bytes=get_gif_max_bytes(config),
+        )
+        if payload is None:
+            message_text_ref.append(_gif_placeholder(summary_hint))
+            return True
+        if not is_gif:
+            logger.info("拟人插件：gif 消息段下载后不是 GIF，仍按动态表情占位处理")
+            message_text_ref.append(_gif_placeholder(summary_hint))
+            return True
+        return await _append_gif_understanding_from_payload(
+            runtime=runtime,
+            payload=payload,
+            message_text_ref=message_text_ref,
+            logger=logger,
+            summary_hint=summary_hint,
+            source_hint=source_hint,
+            counter_ref=counter_ref,
+            already_reserved=True,
+        )
+
+    try:
+        return await asyncio.wait_for(_download_and_summarize(), timeout=timeout)
+    except asyncio.TimeoutError:
+        message_text_ref.append(_gif_placeholder(summary_hint))
+        try:
+            logger.warning(f"拟人插件：GIF 下载/理解超过 {timeout:.1f}s，已降级为占位符。")
+        except Exception:
+            pass
+        return True
 
 
 async def build_image_summary_suffix(
@@ -418,14 +549,18 @@ async def download_safe_image_bytes(
     file_name: str,
     http_client: httpx.AsyncClient,
     logger: Any,
+    allow_gif: bool = False,
+    max_bytes: int | None = None,
 ) -> tuple[str | None, bytes | None, bool]:
-    if file_name.endswith(".gif"):
+    extension_is_gif = str(file_name or "").lower().endswith(".gif")
+    if extension_is_gif and not allow_gif:
         return None, None, True
     current_url = str(url or "").strip()
     if not current_url:
         return None, None, False
     if not await _is_safe_remote_image_url(current_url, logger):
         return None, None, False
+    byte_limit = int(max_bytes or _MAX_IMAGE_DOWNLOAD_BYTES)
 
     try:
         for _ in range(_MAX_IMAGE_REDIRECTS):
@@ -442,13 +577,14 @@ async def download_safe_image_bytes(
                 if resp.status_code != 200:
                     raise ValueError(f"HTTP {resp.status_code}")
                 mime_type = resp.headers.get("Content-Type", "image/jpeg")
-                if "image/gif" in mime_type.lower():
+                content_is_gif = "image/gif" in mime_type.lower()
+                if content_is_gif and not allow_gif:
                     return None, None, True
 
                 content_length = resp.headers.get("Content-Length")
                 if content_length:
                     try:
-                        if int(content_length) > _MAX_IMAGE_DOWNLOAD_BYTES:
+                        if int(content_length) > byte_limit:
                             raise ValueError("image too large")
                     except ValueError:
                         raise ValueError("invalid image size")
@@ -456,9 +592,9 @@ async def download_safe_image_bytes(
                 payload = bytearray()
                 async for chunk in resp.aiter_bytes():
                     payload.extend(chunk)
-                    if len(payload) > _MAX_IMAGE_DOWNLOAD_BYTES:
+                    if len(payload) > byte_limit:
                         raise ValueError("image too large")
-                return mime_type, bytes(payload), False
+                return mime_type, bytes(payload), bool(content_is_gif or extension_is_gif)
         raise ValueError("too many redirects")
     except Exception as e:
         logger.warning(f"下载图片失败或被拦截，已忽略原图 URL: {e}")
@@ -468,6 +604,7 @@ async def download_safe_image_bytes(
 async def extract_mface_from_segment(
     seg: Any,
     *,
+    runtime: Any | None = None,
     http_client: httpx.AsyncClient,
     message_text_ref: List[str],
     image_urls: List[str],
@@ -475,6 +612,7 @@ async def extract_mface_from_segment(
     logger: Any,
     stop_reply_ref: List[bool],
     sticker_image_urls: List[str] | None = None,
+    gif_understanding_counter_ref: List[int] | None = None,
 ) -> None:
     if getattr(seg, "type", None) != "mface":
         return
@@ -485,13 +623,42 @@ async def extract_mface_from_segment(
     if not url:
         message_text_ref.append(f"[{summary}]")
         return
-    mime_type, payload, is_gif = await download_safe_image_bytes(
-        url=url,
-        file_name=file_name,
-        http_client=http_client,
-        logger=logger,
-    )
+    gif_enabled = bool(runtime is not None and is_gif_understanding_enabled(runtime))
+    if gif_enabled and file_name.endswith(".gif"):
+        await _append_gif_understanding_from_url(
+            runtime=runtime,
+            url=url,
+            file_name=file_name,
+            http_client=http_client,
+            message_text_ref=message_text_ref,
+            logger=logger,
+            summary_hint=summary,
+            source_hint="mface",
+            counter_ref=gif_understanding_counter_ref,
+        )
+        return
+    download_kwargs: dict[str, Any] = {
+        "url": url,
+        "file_name": file_name,
+        "http_client": http_client,
+        "logger": logger,
+    }
+    if gif_enabled:
+        download_kwargs["allow_gif"] = True
+        download_kwargs["max_bytes"] = get_gif_max_bytes(getattr(runtime, "plugin_config", None))
+    mime_type, payload, is_gif = await download_safe_image_bytes(**download_kwargs)
     if is_gif:
+        if gif_enabled:
+            await _append_gif_understanding_from_payload(
+                runtime=runtime,
+                payload=payload,
+                message_text_ref=message_text_ref,
+                logger=logger,
+                summary_hint=summary,
+                source_hint="mface",
+                counter_ref=gif_understanding_counter_ref,
+            )
+            return
         logger.info("拟人插件：检测到 GIF 表情包，忽略并不予回复")
         stop_reply_ref[0] = True
         return
@@ -525,6 +692,7 @@ async def extract_images_from_segment(
     logger: Any,
     stop_reply_ref: List[bool],
     sticker_image_urls: List[str] | None = None,
+    gif_understanding_counter_ref: List[int] | None = None,
 ) -> None:
     if getattr(seg, "type", None) != "image":
         return
@@ -544,6 +712,7 @@ async def extract_images_from_segment(
     except (TypeError, ValueError):
         sub_type_int = 0
     is_protocol_sticker = sub_type_int == 1
+    gif_enabled = is_gif_understanding_enabled(runtime)
 
     if is_protocol_sticker:
         summary = str(data.get("summary") or data.get("emoji_id") or "").strip()
@@ -556,18 +725,47 @@ async def extract_images_from_segment(
         )
         # 下载用于 sticker_candidates_ref（让插件能学习用户常用的表情包）；
         # 非 gif 的同时放进 sticker_image_urls，由上层决定是否直传视觉模型理解（不打标）。
-        try:
-            mime_type, payload, _is_gif = await download_safe_image_bytes(
+        if gif_enabled and file_name.endswith(".gif"):
+            await _append_gif_understanding_from_url(
+                runtime=runtime,
                 url=url,
                 file_name=file_name,
                 http_client=http_client,
+                message_text_ref=message_text_ref,
                 logger=logger,
+                summary_hint=summary,
+                source_hint="onebot_sticker",
+                counter_ref=gif_understanding_counter_ref,
             )
+            return
+        try:
+            download_kwargs = {
+                "url": url,
+                "file_name": file_name,
+                "http_client": http_client,
+                "logger": logger,
+            }
+            if gif_enabled:
+                download_kwargs["allow_gif"] = True
+                download_kwargs["max_bytes"] = get_gif_max_bytes(getattr(runtime, "plugin_config", None))
+            mime_type, payload, _is_gif = await download_safe_image_bytes(**download_kwargs)
         except Exception:
             mime_type, payload, _is_gif = None, None, False
+        if _is_gif:
+            if gif_enabled:
+                await _append_gif_understanding_from_payload(
+                    runtime=runtime,
+                    payload=payload,
+                    message_text_ref=message_text_ref,
+                    logger=logger,
+                    summary_hint=summary,
+                    source_hint="onebot_sticker",
+                    counter_ref=gif_understanding_counter_ref,
+                )
+            return
         if payload is not None and mime_type is not None:
             data_url = image_bytes_to_data_url(payload, mime_type)
-            if not _is_gif and sticker_image_urls is not None:
+            if sticker_image_urls is not None:
                 sticker_image_urls.append(data_url)
             sticker_candidates_ref.append(
                 IncomingStickerCandidate(
@@ -580,13 +778,41 @@ async def extract_images_from_segment(
             )
         return
 
-    mime_type, payload, is_gif = await download_safe_image_bytes(
-        url=url,
-        file_name=file_name,
-        http_client=http_client,
-        logger=logger,
-    )
+    if gif_enabled and file_name.endswith(".gif"):
+        await _append_gif_understanding_from_url(
+            runtime=runtime,
+            url=url,
+            file_name=file_name,
+            http_client=http_client,
+            message_text_ref=message_text_ref,
+            logger=logger,
+            summary_hint=str(data.get("summary") or "").strip(),
+            source_hint="image",
+            counter_ref=gif_understanding_counter_ref,
+        )
+        return
+    download_kwargs = {
+        "url": url,
+        "file_name": file_name,
+        "http_client": http_client,
+        "logger": logger,
+    }
+    if gif_enabled:
+        download_kwargs["allow_gif"] = True
+        download_kwargs["max_bytes"] = get_gif_max_bytes(getattr(runtime, "plugin_config", None))
+    mime_type, payload, is_gif = await download_safe_image_bytes(**download_kwargs)
     if is_gif:
+        if gif_enabled:
+            await _append_gif_understanding_from_payload(
+                runtime=runtime,
+                payload=payload,
+                message_text_ref=message_text_ref,
+                logger=logger,
+                summary_hint=str(data.get("summary") or "").strip(),
+                source_hint="image",
+                counter_ref=gif_understanding_counter_ref,
+            )
+            return
         logger.info("拟人插件：检测到 GIF 图片，忽略并不予回复")
         stop_reply_ref[0] = True
         return
@@ -637,6 +863,8 @@ async def extract_reply_images(
     image_urls: List[str],
     logger: Any,
     stop_reply_ref: List[bool],
+    runtime: Any | None = None,
+    gif_understanding_counter_ref: List[int] | None = None,
 ) -> None:
     if seg_type != "image":
         return
@@ -644,13 +872,42 @@ async def extract_reply_images(
     file_name = str(data.get("file", "")).lower()
     if not url:
         return
-    mime_type, payload, is_gif = await download_safe_image_bytes(
-        url=url,
-        file_name=file_name,
-        http_client=http_client,
-        logger=logger,
-    )
+    gif_enabled = bool(runtime is not None and is_gif_understanding_enabled(runtime))
+    if gif_enabled and file_name.endswith(".gif"):
+        await _append_gif_understanding_from_url(
+            runtime=runtime,
+            url=url,
+            file_name=file_name,
+            http_client=http_client,
+            message_text_ref=message_text_ref,
+            logger=logger,
+            summary_hint=str(data.get("summary") or "").strip(),
+            source_hint="quoted_image",
+            counter_ref=gif_understanding_counter_ref,
+        )
+        return
+    download_kwargs = {
+        "url": url,
+        "file_name": file_name,
+        "http_client": http_client,
+        "logger": logger,
+    }
+    if gif_enabled:
+        download_kwargs["allow_gif"] = True
+        download_kwargs["max_bytes"] = get_gif_max_bytes(getattr(runtime, "plugin_config", None))
+    mime_type, payload, is_gif = await download_safe_image_bytes(**download_kwargs)
     if is_gif:
+        if gif_enabled:
+            await _append_gif_understanding_from_payload(
+                runtime=runtime,
+                payload=payload,
+                message_text_ref=message_text_ref,
+                logger=logger,
+                summary_hint=str(data.get("summary") or "").strip(),
+                source_hint="quoted_image",
+                counter_ref=gif_understanding_counter_ref,
+            )
+            return
         stop_reply_ref[0] = True
         return
     message_text_ref.append("[图片]")
@@ -658,6 +915,42 @@ async def extract_reply_images(
         return
     base64_data = base64.b64encode(payload).decode("utf-8")
     image_urls.append(f"data:{mime_type};base64,{base64_data}")
+
+
+async def extract_gif_from_segment(
+    seg: Any,
+    *,
+    runtime: Any,
+    http_client: httpx.AsyncClient,
+    message_text_ref: List[str],
+    logger: Any,
+    stop_reply_ref: List[bool],
+    gif_understanding_counter_ref: List[int] | None = None,
+) -> None:
+    if getattr(seg, "type", None) != "gif":
+        return
+    data = getattr(seg, "data", {}) or {}
+    summary = str(data.get("summary") or "").strip()
+    url = str(data.get("url", "") or "").strip()
+    file_name = str(data.get("file", "") or "").lower()
+    if not is_gif_understanding_enabled(runtime):
+        logger.info("拟人插件：检测到 gif 消息段，忽略并不予回复")
+        stop_reply_ref[0] = True
+        return
+    if not url:
+        message_text_ref.append(_gif_placeholder(summary))
+        return
+    await _append_gif_understanding_from_url(
+        runtime=runtime,
+        url=url,
+        file_name=file_name,
+        http_client=http_client,
+        message_text_ref=message_text_ref,
+        logger=logger,
+        summary_hint=summary,
+        source_hint="gif_segment",
+        counter_ref=gif_understanding_counter_ref,
+    )
 
 
 async def maybe_choose_reply_sticker(
@@ -759,6 +1052,7 @@ __all__ = [
     "auto_collect_stickers",
     "build_image_summary_suffix",
     "download_safe_image_bytes",
+    "extract_gif_from_segment",
     "extract_images_from_segment",
     "extract_mface_from_segment",
     "extract_reply_images",

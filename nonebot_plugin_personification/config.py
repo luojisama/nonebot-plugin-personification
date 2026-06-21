@@ -47,6 +47,14 @@ class Config(BaseModel):
     personification_image_input_mode: str = "auto"
     personification_image_detail: str = "auto"
     personification_sticker_vision_max: int = 3
+    personification_gif_understanding_enabled: bool = False
+    personification_gif_understanding_timeout: float = 12.0
+    personification_gif_max_bytes: int = 8 * 1024 * 1024
+    personification_gif_max_decode_frames: int = 180
+    personification_gif_sample_frames: int = 8
+    personification_gif_contact_sheet_long_edge: int = 1600
+    personification_gif_max_per_turn: int = 1
+    personification_gif_summary_cache_enabled: bool = True
     personification_builtin_search: bool = True
     # 默认启用：Gemini/Anthropic/OpenAICodex 等支持的 caller 会直接用 provider 原生
     # 联网搜索（google_search / web_search_20250305 / web_search_options），无需任何 key。
@@ -164,12 +172,22 @@ class Config(BaseModel):
     personification_persona_snippet_max_chars: int = 150
     personification_persona_prompt_max_chars: int = 120
     personification_memory_enabled: bool = True
-    personification_memory_palace_enabled: bool = False
+    personification_memory_palace_enabled: bool = True
     personification_real_embedding_enabled: bool = False
     personification_embedding_provider: str = "hash_bow"
+    personification_embedding_model: str = ""
+    personification_embedding_api_url: str = ""
+    personification_embedding_api_key: str = ""
+    personification_embedding_batch_size: int = 16
+    personification_memory_vector_backend: str = "sqlite_exact"
+    personification_memory_rag_enabled: bool = True
+    personification_memory_rag_candidate_limit: int = 80
     personification_memory_decay_enabled: bool = True
     personification_memory_consolidation_enabled: bool = True
     personification_memory_recall_top_k: int = DEFAULT_MEMORY_RECALL_TOP_K
+    personification_memory_search_scan_limit: int = 800
+    personification_memory_capture_policy: str = "balanced"
+    personification_agent_memory_write_enabled: bool = True
     personification_background_intelligence_enabled: bool = True
     personification_background_evolves_enabled: bool = True
     personification_background_crystals_enabled: bool = True
@@ -196,7 +214,7 @@ class Config(BaseModel):
     personification_labeler_api_type: str = "openai"
     personification_labeler_api_url: str = ""
     personification_labeler_api_key: str = ""
-    personification_labeler_model: str = "gemini-2.0-flash"
+    personification_labeler_model: str = ""
     personification_labeler_concurrency: int = 3
     personification_fallback_enabled: bool = True
     personification_fallback_api_type: str = ""
@@ -215,6 +233,14 @@ class Config(BaseModel):
     personification_video_fallback_model: str = ""
     personification_video_fallback_auth_path: str = ""
     personification_plugin_knowledge_build_enabled: bool = False
+    # plugin_invoker：让 bot 代为执行其它已安装插件的命令并转述结果（默认关闭，安全起见）
+    personification_plugin_invoker_enabled: bool = False
+    personification_plugin_invoker_allowlist: list[str] = []  # 非空则仅允许这些插件
+    personification_plugin_invoker_blocklist: list[str] = []  # 插件名 或 插件名:命令
+    personification_plugin_invoker_max_calls_per_turn: int = 2
+    personification_plugin_invoker_capture_timeout: float = 15.0
+    personification_plugin_invoker_max_output_chars: int = 1500
+    personification_plugin_invoker_extra_danger_keywords: list[str] = []
     personification_image_gen_enabled: bool = True
     personification_image_gen_model: str = "gpt-image-2"
     personification_image_gen_nanobanan_model: str = "gemini-3-pro-image-preview"
@@ -234,7 +260,8 @@ class Config(BaseModel):
     qzone_cookie: str = ""
     personification_qzone_proactive_enabled: bool = True
     personification_qzone_check_interval: int = 30
-    personification_qzone_daily_limit: int = 3
+    personification_qzone_monthly_limit: int = 30
+    personification_qzone_agent_max_steps: int = 4
     personification_qzone_probability: float = 0.35
     personification_qzone_min_interval_hours: float = 6.0
     personification_qzone_social_enabled: bool = True
@@ -277,8 +304,8 @@ class Config(BaseModel):
     personification_lite_model: str = ""
     # 严格主模型模式：开启后忽略 lite_model 配置，所有 intent / review / 闸门 /
     # 表情决策都走主模型，避免 cooldown / 网关失败时降级到弱模型导致 bot 突然变傻。
-    # 代价是 token 消耗更高。要回到旧行为把这个关掉。
-    personification_strict_main_model: bool = True
+    # 默认关闭，让已配置的 lite_model 真正承担轻量任务，降低普通闲聊回复延迟。
+    personification_strict_main_model: bool = False
     personification_persona_api_type: str = ""
     personification_persona_api_url: str = ""
     personification_persona_api_key: str = ""
@@ -317,6 +344,14 @@ class Config(BaseModel):
     personification_system_prompt: str = (
         "你是一个群聊成员，性格活泼，说话幽默。"
         "你可以根据当前语境决定是否回复，如果不回复请只输出 [NO_REPLY]。"
+    )
+    personification_core_values_enabled: bool = True
+    personification_core_values_prompt: str = (
+        "你有稳定的基础三观和判断底线：尊重生命、公共安全、法律责任与人的尊严；"
+        "不要把违法、危险、伤害他人、逃避责任或损害公共秩序的行为说成值得同情、羡慕或鼓励的事。"
+        "群聊玩笑可以接，但底线不能歪：如果话题涉及安全、违法、伤害或责任，"
+        "先自然承认行为本身不对或风险很大，再用简短口语把话接住；不要长篇说教，也不要装成官方普法。"
+        "对受害者、弱者、被伤害的人保持基本共情；不嘲笑苦难，不美化欺凌、歧视、暴力或剥削。"
     )
     personification_prompt_path: Optional[str] = None
     personification_system_path: Optional[str] = None
@@ -401,6 +436,45 @@ class Config(BaseModel):
 
     # KY 保护：热聊时 bot 随机发言的最低通过概率（0.0 完全拦截，0.3 保留30%机会）
     personification_hot_chat_min_pass_rate: float = 0.40
+
+    # ──────────── 拟人化发送层（humanize）────────────
+    # 协议扩展档位：auto=按 get_version_info 自动识别；none=禁用全部扩展 API；
+    # 也可强制指定 napcat / lagrange / llonebot / gocq
+    personification_protocol_extensions: str = "auto"
+    # 打字延迟：首条回复按 阅读时间+len/cps-LLM已耗时 模拟，消除"秒回长文"
+    personification_humanize_typing_enabled: bool = True
+    personification_humanize_typing_cps: float = 7.0
+    personification_humanize_typing_max_delay: float = 5.0
+    # 碎片化输出：off=不干预；prompt=提示词引导拆成 1-3 条群聊短消息
+    personification_humanize_fragment_style: str = "prompt"
+    # 跨楼回复时带引用（OneBot v11 标准 reply 段，全端可用）
+    personification_humanize_quote_reply_enabled: bool = True
+    personification_humanize_quote_reply_min_gap: int = 4
+    # NO_REPLY 时按概率贴表情代替沉默（NapCat/LLOneBot/Lagrange 扩展 API）
+    personification_humanize_reaction_enabled: bool = True
+    personification_humanize_reaction_probability: float = 0.25
+    personification_humanize_reaction_daily_limit: int = 20
+    # 闲聊短句低概率错别字+跟发修正；0=关闭，建议 0.03
+    personification_humanize_typo_probability: float = 0.0
+    # 被拍后拍回去的概率；主动拍一拍默认关闭
+    personification_humanize_poke_back_probability: float = 0.3
+    personification_humanize_proactive_poke_enabled: bool = False
+    # 多人混战时 @ 回复对象（与引用互斥）
+    personification_humanize_at_enabled: bool = True
+    # 私聊回复前显示"正在输入"（仅 NapCat 系支持）
+    personification_humanize_input_status_enabled: bool = True
+
+    # WebUI 新设备登录需已批准设备确认（首个设备自动批准，防锁死）
+    personification_webui_require_device_approval: bool = True
+    # 登录页是否公开展示可登录管理员 QQ；公网暴露 WebUI 时建议保持关闭，改为手动输入 QQ
+    personification_webui_expose_admin_list: bool = False
+    personification_webui_log_retention_days: int = 7
+    personification_webui_log_max_entries: int = 10000
+    personification_webui_log_capture_level: str = "INFO"
+    personification_turn_trace_enabled: bool = True
+    # 功能体检"实际交互测试"的目标：测试群号 / 测试私聊用户 QQ（任填其一即可）
+    personification_webui_test_group_id: str = ""
+    personification_webui_test_user_id: str = ""
 
     personification_blacklist_duration: int = 300
 

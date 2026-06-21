@@ -8,6 +8,10 @@ from typing import Any
 from ..core.message_parts import build_user_message_content
 
 
+# personification-semantic-boundary: search-query-rewrite-only
+# Lexical hints in this module are only structural fallbacks for search query
+# construction after LLM intent planning. They must not decide reply intent,
+# user attitude, bot emotion, TTS style, sticker mood, or review vetoes.
 _JSON_BLOCK_RE = re.compile(r"\{.*\}", re.S)
 _DEFAULT_RECOMMENDED_TOOLS = ["web_search"]
 _QUERY_WRAPPER_LEADING_RE = re.compile(

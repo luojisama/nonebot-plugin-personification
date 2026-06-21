@@ -192,6 +192,16 @@ def build_agent_tool_registry(
         registry.register(
             _build_recall_user_memory_tool(memory_store, plugin_config, logger)
         )
+        registry.register(
+            _build_recall_group_memory_tool(memory_store, plugin_config, logger)
+        )
+        if bool(getattr(plugin_config, "personification_agent_memory_write_enabled", True)):
+            registry.register(
+                _build_remember_user_memory_tool(memory_store, plugin_config, logger)
+            )
+            registry.register(
+                _build_remember_group_memory_tool(memory_store, plugin_config, logger)
+            )
 
     if bool(getattr(plugin_config, "personification_tool_web_fetch_enabled", True)):
         registry.register(_build_web_fetch_tool(plugin_config, logger))
@@ -318,12 +328,101 @@ def _build_get_persona_tool(persona_store: Any, max_chars: int = 120) -> AgentTo
     )
 
 
+def _memory_tool_limit(value: Any, *, default: int = 12) -> int:
+    try:
+        raw = int(value or default)
+    except (TypeError, ValueError):
+        raw = default
+    return max(1, min(raw, 32))
+
+
+def _memory_days(value: Any, *, default: int = 30) -> int:
+    try:
+        raw = int(value or default)
+    except (TypeError, ValueError):
+        raw = default
+    return max(0, min(raw, 3650))
+
+
+def _memory_float(value: Any, *, default: float, minimum: float = 0.0, maximum: float = 1.0) -> float:
+    try:
+        raw = float(value)
+    except (TypeError, ValueError):
+        raw = default
+    return max(float(minimum), min(raw, float(maximum)))
+
+
+def _memory_is_durable(item: dict[str, Any]) -> bool:
+    memory_type = str(item.get("memory_type", "") or "").strip().lower()
+    tier = str(item.get("tier", "") or "").strip().lower()
+    return tier in {"semantic", "background"} or memory_type in {
+        "semantic",
+        "fact",
+        "core_profile",
+        "persona_knowledge",
+        "group_knowledge",
+        "group_meme",
+        "concept_anchor",
+        "user_persona",
+    }
+
+
+def _filter_memories_by_days(items: list[dict[str, Any]], *, days: int) -> list[dict[str, Any]]:
+    if days <= 0:
+        return list(items or [])
+    import time as _time
+
+    cutoff = _time.time() - float(days) * 86400.0
+    filtered: list[dict[str, Any]] = []
+    for item in list(items or []):
+        if not isinstance(item, dict):
+            continue
+        created_at = _memory_float(item.get("time_created", 0), default=0.0, minimum=0.0, maximum=10**12)
+        if _memory_is_durable(item) or not created_at or created_at >= cutoff:
+            filtered.append(item)
+    return filtered
+
+
+def _format_memory_tool_items(items: list[dict[str, Any]], *, limit: int) -> list[dict[str, Any]]:
+    from ..search_ranker import build_time_hint
+
+    formatted: list[dict[str, Any]] = []
+    for item in list(items or [])[:limit]:
+        summary = str(item.get("summary", "") or "").strip()
+        if not summary:
+            continue
+        created_at = _memory_float(item.get("time_created", 0), default=0.0, minimum=0.0, maximum=10**12)
+        formatted.append(
+            {
+                "memory_id": str(item.get("memory_id", "") or ""),
+                "summary": summary,
+                "time_hint": str(item.get("time_hint", "") or build_time_hint(created_at)).strip(),
+                "type": str(item.get("memory_type", "") or ""),
+                "tier": str(item.get("tier", "") or ""),
+                "score": _memory_float(item.get("score", 0), default=0.0, minimum=-100.0, maximum=100.0),
+                "why_relevant": str(item.get("why_relevant", "") or ""),
+            }
+        )
+    return formatted
+
+
+def _memory_tools_enabled(memory_store: Any, plugin_config: Any) -> bool:
+    if not bool(getattr(plugin_config, "personification_memory_enabled", True)):
+        return False
+    try:
+        return bool(memory_store.palace_enabled())
+    except Exception:
+        return False
+
+
 def _build_recall_user_memory_tool(memory_store: Any, plugin_config: Any, logger: Any) -> AgentTool:
     import json as _json
 
-    async def _handler(query: str, days: int = 30, limit: int = 8) -> str:
+    async def _handler(query: str, days: int = 30, limit: int = 12) -> str:
         ctx = current_llm_context()
         user_id = str(ctx.get("user_id", "") or "").strip()
+        resolved_limit = _memory_tool_limit(limit, default=12)
+        resolved_days = _memory_days(days, default=30)
         if not user_id:
             return _json.dumps({"query": query, "memories": [], "note": "无法确定当前用户，跳过记忆召回"}, ensure_ascii=False)
         try:
@@ -331,46 +430,221 @@ def _build_recall_user_memory_tool(memory_store: Any, plugin_config: Any, logger
                 query=query,
                 scope="auto",
                 user_id=user_id,
-                limit=max(1, min(int(limit or 8), 20)),
+                limit=resolved_limit,
                 mode="auto",
                 context_type="private",
             )
         except Exception as exc:
             logger.debug(f"[recall_user_memory] recall failed: {exc}")
             memories = []
-        from ..search_ranker import build_time_hint
-        items = []
-        for m in memories[:max(1, int(limit or 8))]:
-            summary = str(m.get("summary", "") or "").strip()
-            if not summary:
-                continue
-            time_hint = str(m.get("time_hint", "") or build_time_hint(float(m.get("time_created", 0) or 0))).strip()
-            memory_type = str(m.get("memory_type", "") or "").strip()
-            items.append(f"[{time_hint}] {summary}（{memory_type}）")
-        if not items:
-            return _json.dumps({"query": query, "memories": []}, ensure_ascii=False)
-        return _json.dumps({"query": query, "memories": items}, ensure_ascii=False)
+        memories = _filter_memories_by_days(memories, days=resolved_days)
+        items = _format_memory_tool_items(memories, limit=resolved_limit)
+        return _json.dumps({"query": query, "days": resolved_days, "memories": items}, ensure_ascii=False)
 
     return AgentTool(
         name="recall_user_memory",
         description=(
-            "当用户询问 '你记得我...吗/上次/之前/前几天/复述' 等涉及"
-            "跨对话历史时调用。按 user_id 召回该用户在过去 N 天内的 episodic"
-            "记忆与所有 semantic 记忆，用于回答记忆类问题。"
-            "不要用 search_plugin_knowledge 处理用户记忆问题。"
+            "召回当前用户的长期记忆、画像事实、跨会话偏好和过往经历。"
+            "适合需要把当前对话和这个用户以前说过/确认过的内容接起来时调用；"
+            "返回结构化条目，供你判断是否采用。"
         ),
         parameters={
             "type": "object",
             "properties": {
                 "query": {"type": "string", "description": "自然语言查询，例如用户原话"},
                 "days": {"type": "integer", "description": "回溯天数，默认30", "default": 30},
-                "limit": {"type": "integer", "description": "返回记忆条数上限，默认8", "default": 8},
+                "limit": {"type": "integer", "description": "返回记忆条数上限，默认12，最大32", "default": 12},
             },
             "required": ["query"],
         },
         handler=_handler,
         local=True,
-        enabled=lambda: bool(getattr(plugin_config, "personification_memory_enabled", True)),
+        enabled=lambda: _memory_tools_enabled(memory_store, plugin_config),
+    )
+
+
+def _build_recall_group_memory_tool(memory_store: Any, plugin_config: Any, logger: Any) -> AgentTool:
+    import json as _json
+
+    async def _handler(query: str, days: int = 30, limit: int = 12) -> str:
+        ctx = current_llm_context()
+        group_id = str(ctx.get("group_id", "") or "").strip()
+        resolved_limit = _memory_tool_limit(limit, default=12)
+        resolved_days = _memory_days(days, default=30)
+        if not group_id:
+            return _json.dumps({"query": query, "memories": [], "note": "当前不是群聊，无法召回群记忆"}, ensure_ascii=False)
+        try:
+            memories = memory_store.recall_memories(
+                query=query,
+                scope="auto",
+                group_id=group_id,
+                limit=resolved_limit,
+                mode="auto",
+                context_type="group",
+            )
+        except Exception as exc:
+            logger.debug(f"[recall_group_memory] recall failed: {exc}")
+            memories = []
+        memories = _filter_memories_by_days(memories, days=resolved_days)
+        items = _format_memory_tool_items(memories, limit=resolved_limit)
+        return _json.dumps({"query": query, "group_id": group_id, "days": resolved_days, "memories": items}, ensure_ascii=False)
+
+    return AgentTool(
+        name="recall_group_memory",
+        description=(
+            "召回当前群的长期上下文、群知识、常见梗、成员互动背景和已沉淀主题。"
+            "适合需要判断这个群以前怎么聊、某个话题在本群的背景、或接续群内长期上下文时调用。"
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "自然语言查询，例如当前群聊话题"},
+                "days": {"type": "integer", "description": "回溯天数，默认30；长期群知识不受此限制", "default": 30},
+                "limit": {"type": "integer", "description": "返回记忆条数上限，默认12，最大32", "default": 12},
+            },
+            "required": ["query"],
+        },
+        handler=_handler,
+        local=True,
+        enabled=lambda: _memory_tools_enabled(memory_store, plugin_config),
+    )
+
+
+def _build_remember_user_memory_tool(memory_store: Any, plugin_config: Any, logger: Any) -> AgentTool:
+    import json as _json
+
+    async def _handler(summary: str, memory_type: str = "semantic", confidence: float = 0.72, salience: float = 0.58) -> str:
+        import asyncio as _asyncio
+        import time as _time
+
+        ctx = current_llm_context()
+        user_id = str(ctx.get("user_id", "") or "").strip()
+        text = str(summary or "").strip()
+        if not user_id:
+            return _json.dumps({"saved": False, "reason": "无法确定当前用户"}, ensure_ascii=False)
+        if len(text) < 6:
+            return _json.dumps({"saved": False, "reason": "summary 太短"}, ensure_ascii=False)
+        normalized_type = str(memory_type or "semantic").strip().lower()
+        if normalized_type not in {"semantic", "fact", "core_profile", "persona_knowledge"}:
+            normalized_type = "semantic"
+        payload = {
+            "memory_type": normalized_type,
+            "palace_zone": "person",
+            "summary": text[:800],
+            "source_kind": "agent_tool",
+            "source_refs": [],
+            "user_id": user_id,
+            "group_id": "",
+            "topic_tags": [],
+            "entity_tags": [],
+            "snippets": [text[:120]],
+            "time_created": _time.time(),
+            "confidence": _memory_float(confidence, default=0.72),
+            "salience": _memory_float(salience, default=0.58),
+            "stability": 0.64,
+            "permission_type": "private_fact",
+            "supports_recall": True,
+            "supports_autofill": normalized_type in {"core_profile", "persona_knowledge"},
+            "group_scope": "shared",
+            "cross_group_allowed": False,
+            "time_sensitivity": "normal",
+            "reinforcement_count": 1,
+        }
+        try:
+            memory_id = await _asyncio.to_thread(memory_store.write_memory_item, payload)
+        except Exception as exc:
+            logger.debug(f"[remember_user_memory] write failed: {exc}")
+            return _json.dumps({"saved": False, "reason": str(exc)[:160]}, ensure_ascii=False)
+        return _json.dumps({"saved": True, "memory_id": str(memory_id or ""), "summary": text[:160]}, ensure_ascii=False)
+
+    return AgentTool(
+        name="remember_user_memory",
+        description=(
+            "把当前用户明确表达、稳定、有后续价值的偏好、个人事实或长期约定写入长期记忆。"
+            "只在内容足够确定且未来对这个用户有用时调用；不要记录一次性的寒暄或临时闲聊。"
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "summary": {"type": "string", "description": "要沉淀的简短事实或偏好，用自然语言概括"},
+                "memory_type": {"type": "string", "description": "semantic/fact/core_profile/persona_knowledge", "default": "semantic"},
+                "confidence": {"type": "number", "description": "置信度 0-1", "default": 0.72},
+                "salience": {"type": "number", "description": "重要度 0-1", "default": 0.58},
+            },
+            "required": ["summary"],
+        },
+        handler=_handler,
+        local=True,
+        enabled=lambda: _memory_tools_enabled(memory_store, plugin_config)
+        and bool(getattr(plugin_config, "personification_agent_memory_write_enabled", True)),
+        per_session_quota=2,
+    )
+
+
+def _build_remember_group_memory_tool(memory_store: Any, plugin_config: Any, logger: Any) -> AgentTool:
+    import json as _json
+
+    async def _handler(summary: str, confidence: float = 0.68, salience: float = 0.56) -> str:
+        import asyncio as _asyncio
+        import time as _time
+
+        ctx = current_llm_context()
+        group_id = str(ctx.get("group_id", "") or "").strip()
+        text = str(summary or "").strip()
+        if not group_id:
+            return _json.dumps({"saved": False, "reason": "当前不是群聊，无法写入群记忆"}, ensure_ascii=False)
+        if len(text) < 6:
+            return _json.dumps({"saved": False, "reason": "summary 太短"}, ensure_ascii=False)
+        payload = {
+            "memory_type": "group_knowledge",
+            "palace_zone": "group",
+            "summary": text[:800],
+            "source_kind": "agent_tool",
+            "source_refs": [],
+            "user_id": "",
+            "group_id": group_id,
+            "topic_tags": [],
+            "entity_tags": [],
+            "snippets": [text[:120]],
+            "time_created": _time.time(),
+            "confidence": _memory_float(confidence, default=0.68),
+            "salience": _memory_float(salience, default=0.56),
+            "stability": 0.6,
+            "permission_type": "group_meme",
+            "supports_recall": True,
+            "supports_autofill": True,
+            "group_scope": "isolated",
+            "cross_group_allowed": False,
+            "time_sensitivity": "normal",
+            "reinforcement_count": 1,
+        }
+        try:
+            memory_id = await _asyncio.to_thread(memory_store.write_memory_item, payload)
+        except Exception as exc:
+            logger.debug(f"[remember_group_memory] write failed: {exc}")
+            return _json.dumps({"saved": False, "reason": str(exc)[:160]}, ensure_ascii=False)
+        return _json.dumps({"saved": True, "memory_id": str(memory_id or ""), "summary": text[:160]}, ensure_ascii=False)
+
+    return AgentTool(
+        name="remember_group_memory",
+        description=(
+            "把当前群稳定、公开、后续有用的群知识、群规约、常见梗或长期话题写入群长期记忆。"
+            "只在它确实属于这个群的共享背景时调用。"
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "summary": {"type": "string", "description": "要沉淀的群知识或长期背景"},
+                "confidence": {"type": "number", "description": "置信度 0-1", "default": 0.68},
+                "salience": {"type": "number", "description": "重要度 0-1", "default": 0.56},
+            },
+            "required": ["summary"],
+        },
+        handler=_handler,
+        local=True,
+        enabled=lambda: _memory_tools_enabled(memory_store, plugin_config)
+        and bool(getattr(plugin_config, "personification_agent_memory_write_enabled", True)),
+        per_session_quota=2,
     )
 
 
@@ -448,7 +722,7 @@ def _build_agent_tool_caller(plugin_config: Any, logger: Any) -> Any:
 
 def _build_lite_tool_caller(plugin_config: Any, logger: Any, default_caller: Any = None) -> Any:
     # P10：严格主模型模式下，所有 lite 路径都共用主模型，避免偶尔降级到弱模型
-    # 导致 bot "突然变傻"。默认开启；要恢复旧行为把此开关关掉即可。
+    # 导致 bot "突然变傻"。默认关闭以优先降低普通回复延迟；要强制质量一致可手动开启。
     if bool(getattr(plugin_config, "personification_strict_main_model", True)):
         if logger is not None:
             try:

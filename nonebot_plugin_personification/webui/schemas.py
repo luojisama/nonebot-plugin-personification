@@ -13,6 +13,9 @@ class LoginResponse(BaseModel):
     sent: bool
     cooldown_seconds: int = 0
     message: str = ""
+    request_id: str = ""
+    passwordless: bool = False
+    pending: bool = False
 
 
 class VerifyRequest(BaseModel):
@@ -24,6 +27,7 @@ class VerifyRequest(BaseModel):
 class VerifyResponse(BaseModel):
     success: bool
     message: str = ""
+    pending: bool = False
 
 
 class DeviceInfo(BaseModel):
@@ -33,11 +37,16 @@ class DeviceInfo(BaseModel):
     ua: str
     created_at: float
     last_seen: float
+    status: str = "approved"
 
 
 class DeviceListResponse(BaseModel):
     devices: list[DeviceInfo]
     current_device_id: str = ""
+
+
+class PendingDeviceListResponse(BaseModel):
+    devices: list[DeviceInfo]
 
 
 class ConfigEntryView(BaseModel):
@@ -52,6 +61,7 @@ class ConfigEntryView(BaseModel):
     secret: bool
     advanced: bool = False
     example: str = ""
+    aliases: list[str] = []
     default: Any = None
     current: Any = None
     active_source: str = "default"

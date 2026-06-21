@@ -6,6 +6,27 @@ from fastapi import APIRouter, Depends, HTTPException
 
 from ...core import config_registry, env_writer, webui_audit_log
 from ..deps import AdminIdentity, require_admin
+
+
+def _schedule_diagnostics_warm(runtime: Any) -> None:
+    """配置变更后后台刷新功能体检缓存；never-raise。"""
+    import asyncio
+
+    from ...core.diagnostics import warm_diagnostics
+
+    async def _run() -> None:
+        await warm_diagnostics(
+            plugin_config=getattr(runtime, "plugin_config", None),
+            bundle=getattr(runtime, "runtime_bundle", None),
+            superusers=getattr(runtime, "superusers", set()),
+            get_bots=getattr(runtime, "get_bots", None),
+            logger=getattr(runtime, "logger", None),
+        )
+
+    try:
+        asyncio.create_task(_run())
+    except Exception:
+        pass
 from ..schemas import (
     ConfigEntriesResponse,
     ConfigEntryView,
@@ -25,7 +46,7 @@ _RECOMMENDED_DEFAULTS: dict[str, Any] = {
     "personification_qzone_enabled": True,
     "personification_qzone_proactive_enabled": True,
     "personification_qzone_check_interval": 90,
-    "personification_qzone_daily_limit": 3,
+    "personification_qzone_monthly_limit": 30,
     "personification_qzone_min_interval_hours": 6,
     "personification_labeler_enabled": True,
     "personification_labeler_concurrency": 3,
@@ -44,6 +65,11 @@ _RECOMMENDED_DEFAULTS: dict[str, Any] = {
     "personification_poke_probability": 0.5,
     "personification_agent_enabled": True,
     "personification_agent_max_steps": 5,
+    "personification_memory_palace_enabled": True,
+    "personification_memory_recall_top_k": 12,
+    "personification_memory_search_scan_limit": 800,
+    "personification_memory_capture_policy": "balanced",
+    "personification_agent_memory_write_enabled": True,
     "personification_builtin_search": True,
     "personification_thinking_mode": "none",
     "personification_state_thinking_mode": "adaptive",
@@ -70,6 +96,7 @@ def _entry_to_view(entry: Any, *, plugin_config: Any) -> ConfigEntryView:
         secret=bool(entry.secret),
         advanced=bool(getattr(entry, "advanced", False)),
         example=str(getattr(entry, "example", "") or ""),
+        aliases=list(getattr(entry, "help_aliases", ()) or ()),
         default=getattr(type(plugin_config), entry.field_name, entry.default),
         current=sources.get("current"),
         active_source=sources.get("active_source", "default"),
@@ -185,6 +212,9 @@ def build_config_router(*, runtime) -> APIRouter:
             detail={"errors": result.get("errors", []), "secret": bool(entry.secret)},
             outcome="ok" if not result["errors"] else "partial",
         )
+        # 配置变更后后台重跑一次功能体检，刷新缓存（不阻塞本次响应）
+        if not result["errors"]:
+            _schedule_diagnostics_warm(runtime)
         return ConfigUpdateResponse(
             success=not result["errors"],
             errors=list(result["errors"]),

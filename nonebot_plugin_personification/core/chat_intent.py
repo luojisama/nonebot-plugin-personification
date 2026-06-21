@@ -58,6 +58,9 @@ class TurnSemanticFrame:
     tts_style_hint: str = "自然"
     sticker_mood_hint: str = DEFAULT_STICKER_SEMANTIC_HINT
     conversation_scenario: ConversationScenario = "normal"
+    # 由 LLM 决定回复时要不要 @ 对方 / 引用对方消息：auto=交给默认启发式；
+    # none=直接接话；at=@对方；quote=引用回复；at_quote=两者都用。
+    address_mode: str = "auto"
     confidence: float = 0.0
     reason: str = ""
 
@@ -197,6 +200,7 @@ def _parse_turn_semantic_frame_payload(payload: Any) -> TurnSemanticFrame | None
         tts_style_hint=str(payload.get("tts_style_hint", "") or "").strip() or "自然",
         sticker_mood_hint=normalize_sticker_semantic_hint(payload.get("sticker_mood_hint")),
         conversation_scenario=_parse_scenario(payload.get("conversation_scenario")),
+        address_mode=_parse_address_mode(payload.get("address_mode")),
         confidence=max(0.0, min(1.0, confidence)),
         reason=str(payload.get("reason", "") or "").strip(),
     )
@@ -205,6 +209,14 @@ def _parse_turn_semantic_frame_payload(payload: Any) -> TurnSemanticFrame | None
 def _parse_scenario(value: Any) -> ConversationScenario:
     normalized = str(value or "normal").strip().lower()
     return normalized if normalized in _VALID_SCENARIOS else "normal"  # type: ignore[return-value]
+
+
+_VALID_ADDRESS_MODES = {"auto", "none", "at", "quote", "at_quote"}
+
+
+def _parse_address_mode(value: Any) -> str:
+    normalized = str(value or "auto").strip().lower()
+    return normalized if normalized in _VALID_ADDRESS_MODES else "auto"
 
 
 def _extract_json_payload(raw: str) -> dict[str, Any] | None:
@@ -279,10 +291,15 @@ async def infer_turn_semantic_frame_with_llm(
         '"tts_style_hint":"给 TTS 的简短风格词",'
         '"sticker_mood_hint":"给表情包选择的结构化标签，格式固定为 情绪标签|场景标签",'
         '"conversation_scenario":"normal|casual_banter|sarcasm_irony|argument|inside_joke|multi_thread|private_topic",'
+        '"address_mode":"auto|none|at|quote|at_quote",'
         '"confidence":0.0,'
         '"reason":"一句极短中文原因"}\n'
         "判别要求：\n"
         "1. chat_intent 关注用户这一轮真正想让 bot 做什么，而不是句子里表面词汇。\n"
+        "1b. 如果最新消息引用了一个你不确定含义的专有名词/梗/节目名/人名/外号，"
+        "或群友分享了图片/视频/链接而你无法确定其内容或出处（例如配图只配了一个短词、视频/分享卡片标题里有陌生词），"
+        "倾向 chat_intent=lookup（先查证再接话），不要只因为是短句、像闲聊就判成 banter——"
+        "先搞懂群友在聊什么再接话才更像真人。\n"
         "2. plugin_question 只在对方确实在问 bot/插件/本地实现/配置/能力时使用。"
         "用户让 bot 直接生成、绘制、制作图片/海报/头像/梗图时，chat_intent=image_generation，不要标成 plugin_question。\n"
         "3. meta_question=true 表示这句更像在问上一条消息是谁发的、为什么触发、接的是谁的话，而不是问正文知识点。\n"
@@ -308,6 +325,12 @@ async def infer_turn_semantic_frame_with_llm(
         "- multi_thread：多个话题同时进行\n"
         "- private_topic：涉及个人隐私/敏感话题\n"
         "- normal：以上都不是\n"
+        "14. address_mode 决定这条回复要不要 @ 对方或引用对方消息，让多人群聊更像真人、指向更清楚：\n"
+        "- none：直接接话、不@不引用（一对一顺畅聊、或刚好接着对方最后一句时优先，别每句都@显得机械）\n"
+        "- at：多人混战、你要回的人已经被后面的新消息刷上去了、或需要明确『我在回你』时，@ 对方\n"
+        "- quote：需要精确指向对方那条具体消息（尤其是隔了好几条、容易认错）时，引用回复\n"
+        "- at_quote：两者都用（少用，仅在既要指人又要指那条消息时）\n"
+        "- auto：拿不准就给 auto，交给默认规则。私聊一律 none/auto。\n"
     )
     user_content = (
         f"场景：{'群聊' if is_group else '私聊'}\n"

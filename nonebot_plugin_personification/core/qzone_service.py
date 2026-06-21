@@ -9,6 +9,8 @@ from typing import Any, Awaitable, Callable
 
 import httpx
 
+from .config_manager import _restrict_sensitive_file_permissions
+
 
 def _get_g_tk(p_skey: str) -> int:
     hash_val = 5381
@@ -45,6 +47,7 @@ def _persist_cookie_to_env(cookie: str, logger: Any) -> None:
                     new_lines[-1] = new_lines[-1] + "\n"
                 new_lines.append(cookie_line)
             env_path.write_text("".join(new_lines), encoding="utf-8")
+            _restrict_sensitive_file_permissions(env_path)
             return
         except Exception as e:
             logger.error(f"拟人插件：保存 Qzone Cookie 到 {env_path} 失败: {e}")

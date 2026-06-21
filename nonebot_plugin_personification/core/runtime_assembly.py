@@ -147,6 +147,7 @@ class PluginRuntimeBundle:
     background_intelligence: Any = None
     qzone_social_scan: Any = None
     qzone_inbound_poll: Any = None
+    qzone_generate_post: Any = None
     get_knowledge_build_task: Any = None
     set_knowledge_build_task: Any = None
 
@@ -286,7 +287,7 @@ class PluginRuntimeBundle:
             qzone_check_interval_minutes=int(
                 getattr(self.plugin_config, "personification_qzone_check_interval", 90)
             ),
-            qzone_daily_limit=int(getattr(self.plugin_config, "personification_qzone_daily_limit", 3)),
+            qzone_monthly_limit=int(getattr(self.plugin_config, "personification_qzone_monthly_limit", 30)),
             qzone_probability=float(getattr(self.plugin_config, "personification_qzone_probability", 0.35)),
             qzone_min_interval_hours=float(
                 getattr(self.plugin_config, "personification_qzone_min_interval_hours", 6.0)
@@ -315,6 +316,8 @@ class PluginRuntimeBundle:
             persona_store=self.persona_store,
             vision_caller=self.reply_processor_deps.runtime.vision_caller,
             agent_tool_caller=self.reply_processor_deps.runtime.agent_tool_caller,
+            agent_tool_registry=self.reply_processor_deps.runtime.tool_registry,
+            agent_max_steps=int(getattr(self.plugin_config, "personification_qzone_agent_max_steps", 4)),
             agent_data_dir=get_personification_data_dir(self.plugin_config),
             background_intelligence=self.background_intelligence,
         )
