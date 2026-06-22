@@ -40,6 +40,8 @@ personification_whitelist=["123456789","987654321"]
 | `personification_system_prompt` | `"你现在扮演群友白露。"` | 内置默认提示词 | 主人格系统提示词。 |
 | `personification_prompt_path` | `"configs/persona.yaml"` | `None` | 外部人格文件路径，支持文本或 YAML。 |
 | `personification_system_path` | `"configs/system.txt"` | `None` | 外部系统提示词文件路径。 |
+| `personification_core_values_enabled` | `true` | `true` | 是否在普通回复、YAML 回复、主动消息、日记和空间评论中追加基础判断底线。 |
+| `personification_core_values_prompt` | `"你有稳定的基础三观..."` | 内置基础三观提示词 | 基础判断底线文本；由模型语义判断执行，不在普通聊天路径做关键词路由。 |
 | `personification_max_output_chars` | `600` | `0` | 单次最终输出最大字符数；`0` 表示不额外截断。 |
 | `personification_max_segment_chars` | `180` | `0` | 长消息拆段阈值；`0` 表示不额外拆段。 |
 
@@ -65,6 +67,13 @@ personification_whitelist=["123456789","987654321"]
 | `personification_use_skillpacks` | `true` | `false` | 是否强制走 skillpack 体系。 |
 | `personification_github_token` | `"ghp_xxx"` | `""` | 远程 skill / GitHub 访问令牌。 |
 | `personification_plugin_knowledge_build_enabled` | `true` | `false` | 是否启用插件知识库构建能力。 |
+| `personification_plugin_invoker_enabled` | `false` | `false` | 是否允许 Agent 代执行同 bot 其它已安装插件命令并转述结果；默认关闭。 |
+| `personification_plugin_invoker_allowlist` | `["nonebot_plugin_xxx"]` | `[]` | 插件调用器白名单；非空时仅允许调用这些插件。 |
+| `personification_plugin_invoker_blocklist` | `["plugin:命令"]` | `[]` | 插件调用器黑名单，可写插件名或 `插件名:命令`。 |
+| `personification_plugin_invoker_max_calls_per_turn` | `2` | `2` | 单轮回复最多代执行其它插件命令次数。 |
+| `personification_plugin_invoker_capture_timeout` | `15.0` | `15.0` | 捕获其它插件输出的等待超时，单位秒。 |
+| `personification_plugin_invoker_max_output_chars` | `1500` | `1500` | 转述其它插件输出时的最大字符数。 |
+| `personification_plugin_invoker_extra_danger_keywords` | `["重置","删除"]` | `[]` | 插件调用器附加危险命令关键词，命中即拒绝执行。 |
 | `personification_parallel_research_enabled` | `true` | `true` | 是否启用并行研究工具。 |
 | `personification_parallel_research_lookup_enabled` | `true` | `true` | 是否允许并行研究用于复杂查询；关闭后主要用于生图准备。 |
 | `personification_parallel_research_max_workers` | `4` | `6` | 单次并行研究最多子 Agent 数，上限为 6。 |
@@ -132,6 +141,14 @@ personification_whitelist=["123456789","987654321"]
 | `personification_vision_fallback_enabled` | `true` | `true` | 视觉能力不可用时是否启用回退模型。 |
 | `personification_vision_fallback_provider` | `"openai"` | `""` | 回退视觉 provider；留空按默认路由。 |
 | `personification_vision_fallback_model` | `"gpt-4o-mini"` | `"gpt-5.4"` | 回退视觉模型。 |
+| `personification_gif_understanding_enabled` | `true` | `false` | 是否启用 GIF / 动态表情理解；默认关闭以控制延迟。 |
+| `personification_gif_understanding_timeout` | `12.0` | `12.0` | 单条 GIF 下载、抽帧、视觉摘要预算，运行时硬上限 35 秒。 |
+| `personification_gif_max_bytes` | `8388608` | `8388608` | 超过该字节数的 GIF 不做理解，仅注入动态表情占位。 |
+| `personification_gif_max_decode_frames` | `180` | `180` | 单个 GIF 最多解码帧数，避免超长动图拖慢回复。 |
+| `personification_gif_sample_frames` | `8` | `8` | 关键帧拼图最多抽取帧数。 |
+| `personification_gif_contact_sheet_long_edge` | `1600` | `1600` | GIF 关键帧拼图目标长边像素。 |
+| `personification_gif_max_per_turn` | `1` | `1` | 同一轮消息最多理解的 GIF 数量。 |
+| `personification_gif_summary_cache_enabled` | `true` | `true` | 是否按内容哈希缓存 GIF 视觉摘要。 |
 | `personification_video_understanding_enabled` | `true` | `false` | 是否启用视频理解。 |
 | `personification_video_fallback_enabled` | `true` | `true` | 视频理解不可用时是否允许回退到补充模型。 |
 | `personification_video_fallback_provider` | `"openai"` | `""` | 视频理解回退 provider。 |
@@ -155,10 +172,21 @@ personification_whitelist=["123456789","987654321"]
 | `personification_persona_prompt_max_chars` | `180` | `120` | 注入模型前的人像提示词截断上限。 |
 | `personification_favorability_attitudes` | `{"普通":"像普通朋友一样轻松交流，会主动接话。"}` | 内置映射 | 好感阶段到口吻描述的映射。 |
 | `personification_memory_enabled` | `true` | `true` | 是否启用长期记忆总开关。 |
+| `personification_agent_memory_write_enabled` | `true` | `true` | 是否允许 Agent 工具链把新事实写入长期记忆。 |
 | `personification_memory_palace_enabled` | `true` | `false` | 是否启用记忆宫殿。 |
 | `personification_memory_decay_enabled` | `true` | `true` | 是否启用记忆衰减。 |
 | `personification_memory_consolidation_enabled` | `true` | `true` | 是否启用记忆整理/固化。 |
 | `personification_memory_recall_top_k` | `8` | `6` | 长期记忆召回数量上限。 |
+| `personification_memory_capture_policy` | `"balanced"` | `"balanced"` | 记忆捕获策略；控制新记忆写入的保守/积极程度。 |
+| `personification_memory_rag_enabled` | `true` | `true` | 是否启用长期记忆 RAG 检索增强。 |
+| `personification_memory_rag_candidate_limit` | `80` | `80` | RAG 检索候选记忆数量上限。 |
+| `personification_memory_search_scan_limit` | `800` | `800` | 记忆全文/结构扫描的最大条数。 |
+| `personification_memory_vector_backend` | `"sqlite_exact"` | `"sqlite_exact"` | 记忆向量后端；默认 SQLite 精确扫描。 |
+| `personification_embedding_provider` | `"hash_bow"` | `"hash_bow"` | 记忆向量/检索使用的 embedding provider，默认本地 hash_bow。 |
+| `personification_embedding_api_url` | `"https://api.openai.com/v1"` | `""` | 真实 embedding provider API 地址；留空时复用 provider 默认。 |
+| `personification_embedding_api_key` | `"sk-xxxx"` | `""` | 真实 embedding provider API Key。 |
+| `personification_embedding_model` | `"text-embedding-3-small"` | `""` | 真实 embedding 模型名；留空使用 provider 默认。 |
+| `personification_embedding_batch_size` | `16` | `16` | 批量生成 embedding 时的 batch size。 |
 | `personification_background_intelligence_enabled` | `true` | `true` | 是否启用后台智能处理。 |
 | `personification_background_evolves_enabled` | `true` | `true` | 是否启用后台关系演化。 |
 | `personification_background_crystals_enabled` | `true` | `true` | 是否启用后台晶化/整理。 |
@@ -251,8 +279,10 @@ personification_whitelist=["123456789","987654321"]
 | `personification_qzone_proactive_enabled` | `true` | `false` | 是否启用主动检查并发说说。 |
 | `personification_qzone_check_interval` | `120` | `180` | Qzone 检查间隔，单位分钟。 |
 | `personification_qzone_daily_limit` | `3` | `2` | 每日最多自动发说说次数。 |
+| `personification_qzone_monthly_limit` | `30` | `30` | 每月最多自动发说说次数。 |
 | `personification_qzone_probability` | `0.5` | `0.35` | 命中条件后发说说的概率。 |
 | `personification_qzone_min_interval_hours` | `12.0` | `8.0` | 两次自动发说说最小间隔。 |
+| `personification_qzone_agent_max_steps` | `4` | `4` | Qzone 评论/互动 Agent 最大工具步数。 |
 
 ## 其他外部能力
 
@@ -319,6 +349,26 @@ personification_whitelist=["123456789","987654321"]
 | `personification_qzone_social_scope` | `"recent_interactions"` | 动态扫描范围（recent_interactions/all 等）。 |
 | `personification_qzone_third_party_chime_in_enabled` | `true` | 是否允许在他人动态下第三方插话。 |
 
+### 拟人发送层与协议扩展
+
+| 配置项 | 默认值 | 备注 |
+| --- | --- | --- |
+| `personification_protocol_extensions` | `"auto"` | 协议扩展档位；`auto` 自动识别 NapCat/Lagrange/LLOneBot/go-cqhttp，`none` 禁用扩展 API。 |
+| `personification_humanize_typing_enabled` | `true` | 是否按阅读/打字速度模拟发送前延迟。 |
+| `personification_humanize_typing_cps` | `7.0` | 模拟打字速度，单位字/秒。 |
+| `personification_humanize_typing_max_delay` | `5.0` | 单条消息模拟打字延迟上限，单位秒。 |
+| `personification_humanize_fragment_style` | `"prompt"` | 碎片化输出策略；`prompt` 由提示词引导 1-3 条短消息，`off` 关闭。 |
+| `personification_humanize_quote_reply_enabled` | `true` | 跨楼回复时是否自动带引用。 |
+| `personification_humanize_quote_reply_min_gap` | `4` | 被回复消息之后至少有多少条新消息才触发引用。 |
+| `personification_humanize_reaction_enabled` | `true` | 模型决定沉默时是否允许用贴表情代替完全沉默。 |
+| `personification_humanize_reaction_probability` | `0.25` | 沉默贴表情概率。 |
+| `personification_humanize_reaction_daily_limit` | `20` | 每个群每天最多贴表情次数。 |
+| `personification_humanize_typo_probability` | `0.0` | 闲聊短句注入同音错字并跟发修正的概率。 |
+| `personification_humanize_poke_back_probability` | `0.3` | 被戳一戳后拍回去的概率。 |
+| `personification_humanize_proactive_poke_enabled` | `false` | 高好感用户冒泡且本轮不回文本时是否允许主动拍一拍。 |
+| `personification_humanize_at_enabled` | `true` | 多人混聊时回复目标不是最后发言者，是否自动 @ 对方。 |
+| `personification_humanize_input_status_enabled` | `true` | 私聊且延迟较长时是否尝试发送“正在输入”状态。 |
+
 ### 群知识库与群风格自建
 
 | 配置项 | 默认值 | 备注 |
@@ -370,7 +420,6 @@ personification_whitelist=["123456789","987654321"]
 
 | 配置项 | 默认值 | 备注 |
 | --- | --- | --- |
-| `personification_embedding_provider` | `"hash_bow"` | 嵌入向量提供者（hash_bow 为本地免依赖默认）。 |
 | `personification_persona_responder_json_enabled` | `false` | 人设回复是否走 JSON 结构化模式。 |
 | `personification_proactive_require_user_profile` | `true` | 主动私聊是否要求已有用户画像。 |
 | `personification_real_embedding_enabled` | `false` | 是否启用真实嵌入模型（需对应 Provider）。 |
@@ -439,3 +488,16 @@ personification_whitelist=["123456789","987654321"]
 | --- | --- | --- |
 | `personification_turn_planner_enabled` | `false` | 是否启用回合规划器（实验）。 |
 | `personification_turn_planner_shadow_enabled` | `false` | 回合规划器影子模式（仅记录不生效）。 |
+
+### WebUI、体检与运行日志
+
+| 配置项 | 默认值 | 备注 |
+| --- | --- | --- |
+| `personification_webui_require_device_approval` | `true` | 新设备登录 WebUI 后是否需要已批准设备审批；全新部署首个设备自动批准。 |
+| `personification_webui_expose_admin_list` | `false` | 是否在未登录页暴露可登录管理员 QQ 列表；公网部署建议保持关闭。 |
+| `personification_webui_log_retention_days` | `7` | WebUI 插件日志保留天数。 |
+| `personification_webui_log_max_entries` | `10000` | 插件运行日志最大保留条数。 |
+| `personification_webui_log_capture_level` | `"INFO"` | 持久化捕获的最低日志级别，可选 DEBUG/INFO/WARNING/ERROR。 |
+| `personification_turn_trace_enabled` | `true` | 是否记录回复链路阶段 trace，供 WebUI 体检和日志排查使用。 |
+| `personification_webui_test_group_id` | `""` | 功能体检实际交互测试使用的目标群号；为空则跳过真实群聊发送。 |
+| `personification_webui_test_user_id` | `""` | 功能体检实际交互测试使用的目标 QQ；为空则跳过真实私聊发送。 |

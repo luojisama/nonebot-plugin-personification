@@ -6,6 +6,7 @@
 
 - [特性](#特性)
 - [架构图](#架构图)
+- [架构说明](#架构说明)
 - [安装](#安装)
 - [快速上手](#快速上手)
 - [人设 YAML 模板](#人设-yaml-模板)
@@ -22,8 +23,11 @@
 - **并行研究**：复杂查询和生图准备时并发聚合联网、Wiki、图片、视觉资料，最多 6 个子 Agent
 - **长期记忆**：用户画像、记忆衰减、记忆宫殿、群聊风格学习、话题摘要、上下文压缩
 - **主动行为**：主动私聊、群空闲主动发话、Qzone 说说、远程 skill 审批
-- **多模态**：贴图库自动标注、语义选图、视觉分析、视频理解、可选 LLM 决策的 TTS 语音回复
+- **多模态**：贴图库自动标注、语义选图、视觉分析、GIF 动态表情理解、视频理解、可选 LLM 决策的 TTS 语音回复
+- **拟人发送层**：打字延迟、碎片化回复、跨楼引用、多人混聊 @、沉默贴表情、戳一戳回拍、私聊输入状态
+- **WebUI 运维**：内置管理后台、设备审批、功能体检、真实交互测试、运行日志、回复链路 trace、配置热更新
 - **可扩展**：内置 skillpack 体系，支持本地 / 远程 skill 加载，可对接 MCP 桥
+- **插件调用器**：可选让 Agent 代执行同 bot 其它插件命令并转述结果，默认关闭，支持 allowlist / blocklist
 - **多 Provider 路由**：主模型 + 轻量模型 + 画像模型 + 风格模型 + 回退模型独立配置
 
 ## 架构图
@@ -33,87 +37,127 @@ flowchart TB
     %% ===== 入口层 =====
     subgraph Entry["入口层 (handlers/)"]
         OB["OneBot V11<br/>群消息 / 私聊 / 戳一戳"]
-        Matchers["chat_matchers<br/>persona_commands<br/>admin_commands<br/>tts_matchers"]
-        Pipeline["reply_pipeline<br/>yaml_pipeline<br/>(意图→改写→检索→生成→审核)"]
-        OB --> Matchers --> Pipeline
+        Matchers["reply_matchers<br/>persona/admin/runtime/tts<br/>login_approval"]
+        Buffer["reply_buffer<br/>合并短消息 / 抢占 cue / 复读跟随"]
+        Pipeline["reply_pipeline / yaml_pipeline<br/>上下文→语义帧→Agent→审阅→发送"]
+        Trace["reply_turn_trace<br/>阶段耗时 / 最近回合"]
+        OB --> Matchers --> Buffer --> Pipeline --> Trace
     end
 
     %% ===== 流程编排 =====
     subgraph Flows["流程编排 (flows/)"]
-        ChatFlow["chat / yaml_parser"]
+        ChatFlow["普通回复 / YAML 回复"]
         ProactiveFlow["proactive_flow<br/>主动私聊"]
         StyleFlow["style_flow<br/>群风格学习"]
-        DiaryFlow["diary_flow<br/>状态/日记"]
+        DiaryFlow["diary_flow<br/>日记 / Qzone 说说"]
+        QzoneFlow["qzone_social_flow<br/>好友动态扫描 / 评论"]
+        SocialFlow["social_intelligence<br/>问候 / 资讯 / 话题跟进"]
         BlacklistFlow["blacklist_flow<br/>moderation"]
     end
 
     %% ===== Agent 与技能 =====
     subgraph Agent["Agent 层 (agent/ + skills/)"]
-        Loop["agent.loop<br/>意图→工具选择→工具调用→产出"]
-        Tools["tool_registry<br/>web_search · wiki<br/>weather · news · image_gen<br/>parallel_research · memory_palace<br/>user_persona · vision_*"]
+        Loop["agent/runtime/runner.py<br/>意图→改写→工具循环→证据→回复"]
+        SimpleLoop["simple_loop<br/>轻量工具调用"]
+        Tools["tool_registry<br/>web_search · wiki · weather · news<br/>parallel_research · memory_palace<br/>plugin_invoker · image_gen · vision_*"]
         Custom["skill_runtime<br/>本地 / 远程 / MCP skill"]
         Loop --> Tools
+        SimpleLoop --> Tools
         Loop --> Custom
     end
 
     %% ===== 核心服务 =====
     subgraph Core["核心服务 (core/)"]
+        RuntimeBuilder["runtime_builder<br/>services/* 依赖装配"]
         ProviderRouter["model_router<br/>provider_router<br/>主/轻量/画像/风格/回退"]
-        PromptLoader["prompt_loader<br/>(YAML 人设模板)"]
-        Memory["memory_store · memory_curator<br/>memory_decay · memory_palace<br/>persona_service"]
+        PromptLoader["prompt_loader<br/>YAML 人设 / 基础三观底线"]
+        Memory["memory_store · memory_curator<br/>memory_decay · memory_rag<br/>persona_service"]
         Context["group_context · session_store<br/>context_policy · entity_index"]
-        Sticker["sticker_library<br/>sticker_semantics<br/>sticker_labeler"]
+        Sticker["sticker_library<br/>sticker_semantics<br/>meme_dictionary"]
+        Media["media_understanding<br/>gif_understanding<br/>visual_capabilities"]
         TTS["tts_service<br/>(TTS / 可选 LLM 决策)"]
+        Humanize["protocol_capabilities<br/>引用 / @ / 贴表情 / 输入状态"]
+        Diagnostics["diagnostics<br/>plugin_runtime_logs<br/>health routes"]
         Background["background_intelligence<br/>evolves · knowledge_builder"]
         Qzone["qzone_service"]
+    end
+
+    %% ===== WebUI =====
+    subgraph WebUI["WebUI (webui/)"]
+        Static["static/*.js/css<br/>管理后台前端"]
+        Routes["routes/*<br/>配置 / 记忆 / 群 / 画像 / QQ / QZone / 体检 / 日志"]
+        Auth["webui_auth_store<br/>设备审批 / token"]
+        Audit["webui_audit_log<br/>操作审计"]
+        Static --> Routes --> Auth
+        Routes --> Audit
     end
 
     %% ===== 数据与运行时 =====
     subgraph Runtime["运行时 / 数据 (jobs/ + plugin_data/)"]
         Scheduler["APScheduler<br/>(periodic_jobs)"]
         DataDir["localstore 数据目录<br/>SQLite · JSON · 索引"]
-        Config[".env / 群配置覆盖<br/>config_manager"]
+        Config[".env / 群配置覆盖<br/>config_manager / config_registry"]
     end
 
     %% ===== 外部依赖 =====
     subgraph External["外部能力"]
-        LLM["LLM Provider<br/>OpenAI / Codex / 兼容接口"]
-        Vision["视觉/视频模型"]
+        LLM["LLM Provider<br/>OpenAI / Anthropic / Gemini CLI<br/>Codex / Claude Code / Antigravity"]
+        Vision["视觉 / 视频 / GIF 摘要模型"]
         TTSApi["TTS Provider<br/>(mimo 等)"]
         Web["搜索 / Wiki / 60s / 图源"]
+        OneBotExt["协议端扩展 API<br/>NapCat / Lagrange / LLOneBot / go-cqhttp"]
     end
 
     Pipeline --> ChatFlow --> Agent
     Pipeline --> StyleFlow
     Matchers --> ProactiveFlow
     Matchers --> DiaryFlow
+    Matchers --> QzoneFlow
+    Scheduler --> SocialFlow
     Matchers --> BlacklistFlow
 
+    RuntimeBuilder --> ProviderRouter
+    RuntimeBuilder --> Memory
+    RuntimeBuilder --> Diagnostics
     Agent --> ProviderRouter
     ChatFlow --> PromptLoader
     ChatFlow --> Memory
     ChatFlow --> Context
     ChatFlow --> Sticker
+    ChatFlow --> Media
     ChatFlow --> TTS
+    ChatFlow --> Humanize
+    WebUI --> Diagnostics
+    WebUI --> Config
 
     ProviderRouter --> LLM
     Tools --> Web
-    Sticker --> Vision
+    Sticker --> Media --> Vision
     TTS --> TTSApi
+    Humanize --> OneBotExt
     Background --> Memory
     Qzone --> Web
 
     Scheduler --> ProactiveFlow
     Scheduler --> Background
     Scheduler --> Qzone
+    Scheduler --> QzoneFlow
     Config --> ProviderRouter
     Config --> Pipeline
     DataDir --- Memory
     DataDir --- Context
     DataDir --- Sticker
+    DataDir --- WebUI
 ```
 
-> 模块对应到目录：`handlers/` 接消息、`flows/` 编排回复链、`agent/` 跑工具循环、`skills/skillpacks/` 提供具体能力、`core/` 是状态、记忆、路由、贴图、TTS 等服务、`jobs/` 注册定时任务。
+## 架构说明
+
+- `nonebot_plugin_personification/__init__.py` 是发布包入口：注入 `plugin.personification` 兼容命名空间、加载 localstore/htmlrender、构建 runtime、注册 matcher/flow/job/WebUI。
+- `handlers/reply_buffer.py` 与 `handlers/reply_pipeline/processor.py` 是普通群聊/私聊主链路；YAML 回复走 `handlers/yaml_pipeline/processor.py`，两条路径共享语义、情绪、视觉、TTS、贴图和发送层约束。
+- `agent/runtime/runner.py` 是 LLM-led 工具循环：模型决定意图、是否查证、调用哪些工具、证据够不够以及最终回复；代码只做编排、预算、fallback 和持久化。
+- `core/runtime_builder.py` 与 `core/services/*` 装配 provider、tool registry、记忆、画像、贴图、WebUI 和运行时 IO；配置字段由 `config.py`、`core/config_registry.py`、`core/config_registry_extra.py` 和 [CONFIG.md](./CONFIG.md) 对齐。
+- WebUI 后端在 `webui/routes/*`，前端静态资源在 `webui/static/*`，支持配置、记忆、群/QQ/QZone、技能、体检、日志、审计和设备审批。
+- 发布包特有适配保留在包内：`web_console_api.py`、`plugin_data.py`、`nonebot_plugin_personification` 包名到 `plugin.personification` 的兼容导入，以及包内 `data/meme_seeds.json`。
 
 ## 安装
 
@@ -210,6 +254,7 @@ system: |
 | 时区与作息 | `personification_timezone` / `_schedule_global` |
 | 输出长度 | `personification_max_output_chars` / `_max_segment_chars` |
 | 系统提示词 | `personification_system_prompt` / `_prompt_path` / `_system_path` |
+| 基础判断底线 | `personification_core_values_enabled` / `_core_values_prompt` |
 
 ### 3. Agent / 联网 / 技能
 
@@ -219,8 +264,9 @@ system: |
 | 联网粒度 | `personification_builtin_search` / `_model_builtin_search_enabled` / `_tool_web_search_enabled` / `_tool_web_search_mode` / `_web_search_always` |
 | 自定义 skill | `personification_skills_path` / `_skill_sources` / `_skill_remote_enabled` / `_skill_cache_dir` / `_skill_update_interval` / `_skill_default_timeout` / `_skill_mcp_timeout` / `_skill_allow_unsafe_external` / `_skill_require_admin_review` / `_use_skillpacks` |
 | GitHub | `personification_github_token` |
+| 插件调用器 | `personification_plugin_invoker_enabled` / `_plugin_invoker_allowlist` / `_plugin_invoker_blocklist` / `_plugin_invoker_capture_timeout` |
 | 插件知识库 | `personification_plugin_knowledge_build_enabled` |
-| 并行研究 | `personification_parallel_research_enabled` / `_lookup_enabled` / `_max_workers` / `_worker_timeout` / `_total_timeout` / `_max_tool_rounds` |
+| 并行研究 | `personification_parallel_research_enabled` / `_lookup_enabled` / `_max_workers` / `_worker_timeout` / `_total_timeout` / `_max_tool_rounds` / `_pages_per_worker` |
 
 ### 4. 搜索 / Wiki / 外部 API
 
@@ -236,10 +282,13 @@ system: |
 | --- | --- |
 | 图片输入 | `personification_image_input_mode` / `_image_detail` |
 | 视觉回退 | `personification_vision_fallback_enabled` / `_vision_fallback_provider` / `_vision_fallback_model` |
+| GIF 理解 | `personification_gif_understanding_enabled` / `_gif_understanding_timeout` / `_gif_max_bytes` / `_gif_sample_frames` / `_gif_max_per_turn` / `_gif_summary_cache_enabled` |
 | 视频理解 | `personification_video_understanding_enabled` / `_video_fallback_*` |
 | 图片生成 | `personification_image_gen_enabled` / `_image_gen_model` / `_image_gen_background_enabled` / `_image_gen_timeout` |
 | 贴图库 | `personification_sticker_path` / `_sticker_probability` / `_sticker_semantic` |
 | 贴图标注 | `personification_labeler_enabled` / `_labeler_api_*` / `_labeler_model` / `_labeler_concurrency` |
+| 协议扩展 | `personification_protocol_extensions` |
+| 拟人发送层 | `personification_humanize_typing_enabled` / `_humanize_fragment_style` / `_humanize_quote_reply_enabled` / `_humanize_reaction_enabled` / `_humanize_at_enabled` / `_humanize_input_status_enabled` |
 
 ### 6. 用户画像 / 长期记忆 / 后台
 
@@ -247,7 +296,8 @@ system: |
 | --- | --- |
 | 画像 | `personification_persona_enabled` / `_persona_history_max` / `_persona_data_path` / `_persona_snippet_max_chars` / `_persona_prompt_max_chars` |
 | 好感映射 | `personification_favorability_attitudes` |
-| 长期记忆 | `personification_memory_enabled` / `_memory_palace_enabled` / `_memory_decay_enabled` / `_memory_consolidation_enabled` / `_memory_recall_top_k` |
+| 长期记忆 | `personification_memory_enabled` / `_memory_palace_enabled` / `_memory_decay_enabled` / `_memory_consolidation_enabled` / `_memory_recall_top_k` / `_memory_rag_enabled` / `_memory_vector_backend` |
+| Embedding | `personification_embedding_provider` / `_embedding_api_url` / `_embedding_api_key` / `_embedding_model` / `_embedding_batch_size` |
 | 后台智能 | `personification_background_intelligence_enabled` / `_background_evolves_enabled` / `_background_crystals_enabled` / `_background_max_llm_tasks_per_hour` / `_per_day` / `_background_debounce_seconds` |
 
 ### 7. 上下文 / 历史 / 压缩
@@ -288,7 +338,16 @@ system: |
 | 好友申请 | `personification_friend_request_enabled` / `_friend_request_min_fav` / `_friend_request_daily_limit` |
 | 反 KY 保护 | `personification_hot_chat_min_pass_rate` |
 | 临时黑名单 | `personification_blacklist_duration` |
-| Qzone 说说 | `personification_qzone_enabled` / `_qzone_cookie` / `_qzone_proactive_enabled` / `_qzone_check_interval` / `_qzone_daily_limit` / `_qzone_probability` / `_qzone_min_interval_hours` |
+| Qzone 说说 | `personification_qzone_enabled` / `_qzone_cookie` / `_qzone_proactive_enabled` / `_qzone_check_interval` / `_qzone_daily_limit` / `_qzone_monthly_limit` / `_qzone_probability` / `_qzone_min_interval_hours` / `_qzone_agent_max_steps` |
+
+### 11. WebUI / 体检 / 日志
+
+| 类别 | 关键配置 |
+| --- | --- |
+| 设备审批 | `personification_webui_require_device_approval` / `_webui_expose_admin_list` |
+| 插件日志 | `personification_webui_log_retention_days` / `_webui_log_max_entries` / `_webui_log_capture_level` |
+| 回复 trace | `personification_turn_trace_enabled` |
+| 真实交互体检 | `personification_webui_test_group_id` / `_webui_test_user_id` |
 
 ## 常用命令
 
@@ -327,6 +386,7 @@ system: |
 - **同步本地 `personification` 最新开发版**：迁移 0.6.0 后的 WebUI 体检、GIF 理解、基础三观提示词、Agent 查证约束、轻量路由与耗时追踪等更新。
 - **修复插件元数据 homepage**：`PluginMetadata.homepage` 改为当前发布仓库 `https://github.com/luojisama/nonebot-plugin-personification`，避免插件校验报告项目主页无法访问。
 - **补齐发布仓库测试套件**：迁移本地测试与回放样本到发布仓库根目录，并增加测试命名空间适配，便于在包仓库布局下验证 `plugin.personification` 兼容入口。
+- **补全文档与架构说明**：README 对齐当前运行时代码、WebUI、体检日志、GIF 理解、插件调用器和拟人发送层；CONFIG.md 补齐 0.6.1 新增配置字段。
 - **保留发布版专属适配**：继续保留 `web_console_api` 桥接、`nonebot_plugin_personification` 到 `plugin.personification` 的兼容命名空间，以及 localstore/htmlrender 的加载顺序保护。
 
 ### 0.6.0
