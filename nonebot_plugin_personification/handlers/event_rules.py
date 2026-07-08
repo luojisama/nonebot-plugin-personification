@@ -192,6 +192,10 @@ async def personification_rule(
             return True
 
         plain_text = str(event.get_plaintext() or "").strip()
+        if _looks_like_plugin_command_interaction(plain_text):
+            state["is_random_chat"] = False
+            state["message_target"] = TARGET_OTHERS
+            return False
         msg_len = len(plain_text)
         if get_recent_group_msgs is not None:
             try:
@@ -219,10 +223,6 @@ async def personification_rule(
         else:
             state.pop("solo_speaker_follow", None)
 
-        if message_target == TARGET_OTHERS and not solo_speaker_follow:
-            state["is_random_chat"] = False
-            return False
-
         if group_chat_active_state:
             last_user_id = str(group_chat_active_state.get("last_user_id", "") or "").strip()
             topic = str(group_chat_active_state.get("topic", "") or "").strip()
@@ -231,9 +231,11 @@ async def personification_rule(
             current_prob = float(max(0.0, min(1.0, group_chat_follow_probability)))
 
             if same_user:
-                current_prob = max(current_prob, 0.92)
+                current_prob = max(current_prob, 0.95)
             elif related_topic:
-                current_prob = max(current_prob, 0.78)
+                current_prob = max(current_prob, 0.84)
+            elif message_target == TARGET_OTHERS:
+                current_prob = 0.0
             else:
                 current_prob *= 0.35
 
@@ -242,10 +244,16 @@ async def personification_rule(
                 state["active_followup"] = group_chat_active_state
                 return True
 
+        if message_target == TARGET_OTHERS and not solo_speaker_follow:
+            state["is_random_chat"] = False
+            return False
+
         if solo_speaker_follow:
-            current_prob = min(1.0, max(probability * 1.45, 0.72))
+            current_prob = min(1.0, max(probability * 1.65, 0.78))
             if msg_len <= 4:
-                current_prob = max(current_prob, 0.68)
+                current_prob = max(current_prob, 0.70)
+            elif msg_len >= 18:
+                current_prob = max(current_prob, 0.84)
             if random.random() < current_prob:
                 state["is_random_chat"] = True
                 return True
@@ -253,13 +261,13 @@ async def personification_rule(
         is_unsuitable_time = not is_rest_time(allow_unsuitable_prob=0.0)
         current_prob = probability * (0.55 if is_unsuitable_time else 1.0)
         if message_target == TARGET_BOT:
-            current_prob = max(current_prob, probability)
+            current_prob = max(current_prob, min(1.0, max(probability * 1.8, 0.60)))
         if msg_len <= 1:
             current_prob *= 0.5
         elif msg_len <= 4:
             current_prob *= 0.8
         elif msg_len >= 24:
-            current_prob *= 1.1
+            current_prob *= 1.2
         if idle_active_state:
             topic = str(idle_active_state.get("topic", "") or "").strip()
             if topic and _topic_related(plain_text, topic):
@@ -339,14 +347,15 @@ def _extract_recordable_group_message(event: Any) -> tuple[str, int, str]:
                 if text:
                     text_parts.append(text)
             elif seg_type == "face":
-                from ..core.qq_face_names import render_face_token
+                from ..core.qq_expression_library import semantic_text_for_qq_expression_segment
 
-                token = render_face_token(data.get("id", ""))
+                token = semantic_text_for_qq_expression_segment("face", data)
                 text_parts.append(token)
                 visual_parts.append(token)
             elif seg_type == "mface":
-                summary = str(data.get("summary", "") or "表情包").strip() or "表情包"
-                token = f"[{summary}]"
+                from ..core.qq_expression_library import semantic_text_for_qq_expression_segment
+
+                token = semantic_text_for_qq_expression_segment("mface", data, default_mface_kind="super")
                 text_parts.append(token)
                 visual_parts.append(token)
             elif seg_type == "image":
@@ -368,6 +377,16 @@ def _extract_recordable_group_message(event: Any) -> tuple[str, int, str]:
     return content, image_count, visual_summary
 
 
+def _looks_like_plugin_command_interaction(text: str) -> bool:
+    """Structural command marker used only to label/skip command interactions."""
+    return str(text or "").lstrip().startswith("/")
+
+
+def _render_plugin_command_interaction(text: str) -> str:
+    command = re.sub(r"\s+", " ", str(text or "")).strip()[:180]
+    return f"[用户调用其它插件/命令] {command}" if command else "[用户调用其它插件/命令]"
+
+
 def resolve_record_message(
     event: Any,
     *,
@@ -382,8 +401,10 @@ def resolve_record_message(
         return None, False
 
     raw_msg, image_count, visual_summary = _extract_recordable_group_message(event)
-    if not raw_msg or raw_msg.startswith("/") or len(raw_msg) >= 500:
+    if not raw_msg or len(raw_msg) >= 500:
         return None, False
+    is_command_interaction = _looks_like_plugin_command_interaction(raw_msg)
+    record_content = _render_plugin_command_interaction(raw_msg) if is_command_interaction else raw_msg
 
     group_id = str(event.group_id)
     user_id = str(event.user_id)
@@ -400,15 +421,16 @@ def resolve_record_message(
         nickname = custom_title
 
     is_bot_message = bool(self_id) and user_id == self_id
+    source_kind = "plugin" if is_bot_message else ("plugin_command" if is_command_interaction else "user")
     relation_metadata = build_event_relation_metadata(
         event,
         bot_self_id=self_id,
-        source_kind="plugin" if is_bot_message else "user",
+        source_kind=source_kind,
     )
     count = record_group_msg(
         group_id,
         nickname,
-        raw_msg,
+        record_content,
         is_bot=is_bot_message,
         user_id=user_id,
         sender_role=extract_sender_role(event),
@@ -416,6 +438,8 @@ def resolve_record_message(
         visual_summary=visual_summary,
         **relation_metadata,
     )
+    if source_kind != "user":
+        return group_id, False
     if should_trigger_auto_analyze is None:
         return group_id, count >= 200
     return group_id, bool(should_trigger_auto_analyze(group_id, count))

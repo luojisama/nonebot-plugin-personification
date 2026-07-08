@@ -14,6 +14,25 @@ TARGET_UNCLEAR = "TARGET_UNCLEAR"
 TARGET_OTHERS = "TARGET_OTHERS"
 
 
+def normalize_message_target_for_review(value: Any) -> str:
+    text = str(value or "").strip()
+    lowered = text.lower()
+    if text == TARGET_BOT or lowered == "bot":
+        return "bot"
+    if text == TARGET_OTHERS or lowered in {"others", "someone_else"}:
+        return "others"
+    if lowered == "broadcast":
+        return "broadcast"
+    return "uncertain"
+
+
+def normalize_message_target_for_plan(value: Any) -> str:
+    review_target = normalize_message_target_for_review(value)
+    if review_target == "others":
+        return "someone_else"
+    return review_target
+
+
 def infer_message_target(
     event: Any,
     *,

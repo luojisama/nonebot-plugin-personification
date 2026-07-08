@@ -38,6 +38,12 @@ def _runtime(tool_caller, *, image_model: str = "gpt-image-2"):  # noqa: ANN001
     return SimpleNamespace(
         plugin_config=SimpleNamespace(
             personification_image_gen_enabled=True,
+            personification_image_gen_api_type="auto",
+            personification_image_gen_api_url="",
+            personification_image_gen_api_key="",
+            personification_api_type="openai",
+            personification_api_url="",
+            personification_api_key="",
             personification_image_gen_model=image_model,
         ),
         tool_caller=tool_caller,
@@ -175,3 +181,56 @@ def test_image_gen_skill_passes_reference_images() -> None:
     assert result == "[IMAGE_B64]QUJD[/IMAGE_B64]"
     assert caller.calls[-1]["images"] == ["https://example.com/ref.png"]
     assert caller.calls[-1]["reference_mode"] == "input_image"
+
+
+def test_image_gen_skill_registers_openai_http_route(monkeypatch) -> None:  # noqa: ANN001
+    captured: dict[str, object] = {}
+
+    class _Resp:
+        def raise_for_status(self):  # noqa: ANN201
+            return None
+
+        def json(self):  # noqa: ANN201
+            return {"data": [{"b64_json": "QUJD"}]}
+
+    class _Client:
+        def __init__(self, **kwargs):  # noqa: ANN001
+            captured["client_kwargs"] = kwargs
+
+        async def __aenter__(self):  # noqa: ANN201
+            return self
+
+        async def __aexit__(self, *_args):  # noqa: ANN001, ANN201
+            return None
+
+        async def post(self, url, json=None, headers=None):  # noqa: ANN001, ANN201
+            captured["url"] = url
+            captured["json"] = json or {}
+            captured["headers"] = headers or {}
+            return _Resp()
+
+    monkeypatch.setattr(image_gen_main.generate_image.__globals__["httpx"], "AsyncClient", _Client)
+    runtime = SimpleNamespace(
+        plugin_config=SimpleNamespace(
+            personification_image_gen_enabled=True,
+            personification_image_gen_api_type="openai",
+            personification_image_gen_api_url="https://api.example.test/v1",
+            personification_image_gen_api_key="sk-img",
+            personification_api_type="openai",
+            personification_api_url="",
+            personification_api_key="",
+            personification_image_gen_model="gpt-image-2",
+            personification_image_gen_timeout=180,
+        ),
+        tool_caller=OpenAIToolCaller(),
+        agent_tool_caller=OpenAIToolCaller(),
+    )
+    tool = image_gen_main.build_image_gen_tool(runtime)
+
+    assert tool is not None
+    result = asyncio.run(tool.handler("poster", size="横版"))
+
+    assert result == "[IMAGE_B64]QUJD[/IMAGE_B64]"
+    assert captured["url"] == "https://api.example.test/v1/images/generations"
+    assert captured["json"]["size"] == "1536x1024"
+    assert captured["headers"]["Authorization"] == "Bearer sk-img"

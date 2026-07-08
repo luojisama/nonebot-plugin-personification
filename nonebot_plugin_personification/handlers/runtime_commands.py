@@ -1329,10 +1329,14 @@ def _looks_like_network_failure(stderr: str) -> bool:
             "connection reset",
             "connection timed out",
             "operation timed out",
+            "timed out",
+            "timeout",
             "unable to access",
             "failed to connect",
             "early eof",
             "rpc failed",
+            "git 命令超时",
+            "超时",
             "网络",
             "无法访问",
         )
@@ -1377,38 +1381,35 @@ async def _run_git_with_mirror_fallback(
     *,
     cwd: str,
 ) -> tuple[int, str, str, str, list[tuple[str, bool]]]:
-    """先直连；失败且像网络错误时并行探测所有镜像，选第一个能通的重试。
+    """有镜像配置时优先探测镜像，选第一个能通的执行；镜像不可用再直连。
 
     返回 (rc, stdout, stderr, used_mirror_url_or_empty, probe_log)。
     probe_log 仅在触发镜像逻辑时非空，便于在通知里展示。
     """
-    rc, out, err = await _run_git_command(args, cwd=cwd)
-    if rc == 0:
-        return rc, out, err, "", []
     mirrors = _git_mirror_prefixes()
-    if not mirrors or not _looks_like_network_failure(err):
-        return rc, out, err, "", []
-
-    repo_url = await _get_origin_https_url(cwd)
-    if not repo_url:
-        return rc, out, err, "", []
-
-    probes = await asyncio.gather(
-        *(_probe_mirror(m, repo_url) for m in mirrors), return_exceptions=True
-    )
     probe_log: list[tuple[str, bool]] = []
-    chosen = ""
-    for mirror, ok in zip(mirrors, probes):
-        is_alive = ok is True
-        probe_log.append((mirror, is_alive))
-        if is_alive and not chosen:
-            chosen = mirror
-    if not chosen:
-        return rc, out, err, "", probe_log
 
-    rewrite = f"url.{chosen}/https://github.com/.insteadOf=https://github.com/"
-    rc2, out2, err2 = await _run_git_command(args, cwd=cwd, extra_config=[rewrite])
-    return rc2, out2, err2, chosen, probe_log
+    if mirrors:
+        repo_url = await _get_origin_https_url(cwd)
+        if repo_url:
+            probes = await asyncio.gather(
+                *(_probe_mirror(m, repo_url) for m in mirrors), return_exceptions=True
+            )
+            for mirror, ok in zip(mirrors, probes):
+                probe_log.append((mirror, ok is True))
+
+            for mirror, ok in probe_log:
+                if not ok:
+                    continue
+                rewrite = f"url.{mirror}/https://github.com/.insteadOf=https://github.com/"
+                rc, out, err = await _run_git_command(args, cwd=cwd, extra_config=[rewrite])
+                if rc == 0:
+                    return rc, out, err, mirror, probe_log
+                if not _looks_like_network_failure(err):
+                    return rc, out, err, mirror, probe_log
+
+    rc, out, err = await _run_git_command(args, cwd=cwd)
+    return rc, out, err, "", probe_log
 
 
 def _format_probe_log(probe_log: list[tuple[str, bool]]) -> str:
@@ -1548,9 +1549,9 @@ async def _handle_git_update_impl(
         if fetch_probes:
             hint = "\n镜像联通性探测结果：\n" + _format_probe_log(fetch_probes)
         elif _git_mirror_prefixes():
-            hint = "\n（已配置镜像，但错误类型未触发回退）"
+            hint = "\n（已配置镜像，但本次未能解析远端地址或镜像探测未完成）"
         else:
-            hint = "\n（可在配置里设置 personification_git_mirror_prefixes 启用镜像回退）"
+            hint = "\n（可在配置里设置 personification_git_mirror_prefixes 启用镜像优先）"
         await matcher.finish(
             f"拉取远程信息失败：{fetch_err or '未知错误（网络问题或无远程仓库）'}\n"
             "请检查网络连接和 git remote 配置。" + hint
@@ -1558,7 +1559,7 @@ async def _handle_git_update_impl(
     if fetch_used_mirror:
         probe_summary = _format_probe_log(fetch_probes)
         await matcher.send(
-            f"（直连失败，已选用镜像 {fetch_used_mirror} 拉取）\n"
+            f"（已选用镜像 {fetch_used_mirror} 拉取）\n"
             f"探测结果：\n{probe_summary}"
         )
 

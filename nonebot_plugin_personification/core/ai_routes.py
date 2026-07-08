@@ -556,6 +556,37 @@ class RoutedToolCaller:
         self._logger = logger
         self._tool_call_callers: dict[str, ToolCaller] = {}
         self._default_result_caller: ToolCaller | None = primary_callers[0] if primary_callers else fallback_caller
+        self._caller_route_keys: dict[int, str] = {}
+        self._caller_by_route_key: dict[str, ToolCaller] = {}
+        for index, caller in enumerate([*self._primary_callers, *([self._fallback_caller] if self._fallback_caller else [])]):
+            key = f"{index}:{type(caller).__name__}"
+            self._caller_route_keys[id(caller)] = key
+            self._caller_by_route_key[key] = caller
+
+    def _caller_from_tool_result_markers(self, messages: list[dict]) -> ToolCaller | None:
+        for message in reversed(list(messages or [])):
+            if not isinstance(message, dict):
+                continue
+            route_key = str(message.get("_personification_routed_caller", "") or "").strip()
+            if route_key:
+                caller = self._caller_by_route_key.get(route_key)
+                if caller is not None:
+                    return caller
+        return None
+
+    @staticmethod
+    def _strip_route_markers(messages: list[dict]) -> list[dict]:
+        cleaned: list[dict] = []
+        changed = False
+        for message in list(messages or []):
+            if isinstance(message, dict) and "_personification_routed_caller" in message:
+                cloned = dict(message)
+                cloned.pop("_personification_routed_caller", None)
+                cleaned.append(cloned)
+                changed = True
+            else:
+                cleaned.append(message)
+        return cleaned if changed else messages
 
     async def chat_with_tools(
         self,
@@ -565,12 +596,20 @@ class RoutedToolCaller:
     ) -> ToolCallerResponse:
         last_error: Exception | None = None
         saw_vision_unavailable = False
-        call_chain = list(self._primary_callers)
-        if self._fallback_caller is not None:
-            call_chain.append(self._fallback_caller)
+        pinned_caller = self._caller_from_tool_result_markers(messages)
+        if pinned_caller is not None:
+            call_chain = [pinned_caller]
+        else:
+            call_chain = list(self._primary_callers)
+            if self._fallback_caller is not None:
+                call_chain.append(self._fallback_caller)
         for caller in call_chain:
             try:
-                response = await caller.chat_with_tools(messages, tools, use_builtin_search)
+                response = await caller.chat_with_tools(
+                    self._strip_route_markers(messages),
+                    tools,
+                    use_builtin_search,
+                )
             except Exception as exc:
                 last_error = exc
                 continue
@@ -613,7 +652,13 @@ class RoutedToolCaller:
             caller = self._default_result_caller
         if caller is None:
             raise RuntimeError("no routed tool caller available")
-        return caller.build_tool_result_message(tool_call_id, tool_name, result)
+        message = caller.build_tool_result_message(tool_call_id, tool_name, result)
+        if isinstance(message, dict):
+            route_key = self._caller_route_keys.get(id(caller))
+            if route_key:
+                message = dict(message)
+                message["_personification_routed_caller"] = route_key
+        return message
 
 
 def build_routed_tool_caller(

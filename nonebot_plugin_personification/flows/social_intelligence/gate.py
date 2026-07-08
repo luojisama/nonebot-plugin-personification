@@ -1,4 +1,4 @@
-"""LLM 闸门：在 scenario 决定 draft 之后，再让 lite_model 二次判断
+"""主动社交闸门：在 scenario 决定 draft 之后，再让 Agent 二次判断
 "现在发这条合不合适"。避免 bot 显得唐突或在用户不想被打扰时推送。
 
 返回 (allow, message)：
@@ -43,6 +43,9 @@ _GATE_PROMPT = """你是一个主动社交闸门，负责判断 bot 是否应该
 async def gate_should_send(
     *,
     tool_caller: Any,
+    plugin_config: Any = None,
+    tool_registry: Any = None,
+    agent_max_steps: int = 4,
     logger: Any,
     scenario: str,
     user_id: str,
@@ -60,16 +63,31 @@ async def gate_should_send(
         persona_snippet=(persona_snippet or "<无>")[:200],
         now=now_str or "",
     )
+    messages = [{"role": "user", "content": prompt}]
     try:
-        response = await tool_caller.chat_with_tools(
-            messages=[{"role": "user", "content": prompt}],
-            tools=[],
-            use_builtin_search=False,
-        )
+        if tool_registry is not None:
+            from ...core.agent_bridge import run_text_agent
+
+            text = await run_text_agent(
+                messages=messages,
+                plugin_config=plugin_config,
+                logger=logger,
+                tool_caller=tool_caller,
+                registry=tool_registry,
+                max_steps=agent_max_steps,
+                trigger_reason=f"social_gate_{scenario}",
+                chat_intent_hint="social_gate",
+            )
+        else:
+            response = await tool_caller.chat_with_tools(
+                messages=messages,
+                tools=[],
+                use_builtin_search=False,
+            )
+            text = str(getattr(response, "content", "") or "").strip()
     except Exception as exc:
         logger.debug(f"[social_gate] LLM call failed, default allow: {exc}")
         return True, None, f"gate llm failed: {exc}"
-    text = str(getattr(response, "content", "") or "").strip()
     if not text:
         return True, None, "gate empty response, default allow"
     parsed = _parse_gate_json(text)

@@ -23,17 +23,26 @@ async def handle_perm_blacklist_set_command(
     message: Any,
     update_user_data: Callable[..., None],
     set_blacklisted: bool,
+    actor_user_id: str = "",
+    favorability_service: Any = None,
 ) -> None:
     """处理永久拉黑/取消永久拉黑命令。"""
     if not sign_in_available:
-        await matcher.finish("签到插件未就绪，无法操作。")
+        await matcher.finish("插件内好感度体系未启用，无法操作。")
 
     target_id = extract_target_user_id(args_text, message)
     if not target_id:
         usage = "永久拉黑 [用户ID/@用户]" if set_blacklisted else "取消永久拉黑 [用户ID/@用户]"
         await matcher.finish(f"用法: {usage}")
 
-    update_user_data(target_id, is_perm_blacklisted=set_blacklisted)
+    if favorability_service is not None and hasattr(favorability_service, "apply_perm_blacklist"):
+        favorability_service.apply_perm_blacklist(
+            target_id,
+            set_blacklisted=set_blacklisted,
+            actor=str(actor_user_id or ""),
+        )
+    else:
+        update_user_data(target_id, is_perm_blacklisted=set_blacklisted)
     if set_blacklisted:
         await matcher.finish(f"✅ 已将用户 {target_id} 加入永久黑名单。")
     await matcher.finish(f"✅ 已将用户 {target_id} 从永久黑名单中移除。")

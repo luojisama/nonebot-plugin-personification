@@ -81,6 +81,42 @@ def test_low_confidence_group_frame_recommends_silence() -> None:
     assert frame.ambiguity_level == "high"
 
 
+def test_semantic_frame_prompt_includes_media_context_discipline() -> None:
+    captured: dict[str, object] = {}
+
+    class _Caller:
+        async def chat_with_tools(self, messages, tools, use_builtin_search):  # noqa: ANN001
+            captured["messages"] = messages
+            return type(
+                "Response",
+                (),
+                {
+                    "content": (
+                        '{"chat_intent":"banter","plugin_question_intent":"capability",'
+                        '"ambiguity_level":"high","recommend_silence":true,'
+                        '"domain_focus":"social","confidence":0.86,"reason":"媒体占位"}'
+                    )
+                },
+            )()
+
+    frame = asyncio.run(
+        chat_intent.infer_turn_semantic_frame_with_llm(
+            "[图片·表情包]",
+            is_group=True,
+            is_random_chat=True,
+            recent_context="刚才群友在讨论一道雷劈在眼前，后面有人说吓哭了。",
+            tool_caller=_Caller(),
+        )
+    )
+
+    system_prompt = captured["messages"][0]["content"]  # type: ignore[index]
+    assert "媒体占位纪律" in system_prompt
+    assert "不要假装知道画面内容" in system_prompt
+    assert "最近上下文已经说明原因" in system_prompt
+    assert "相邻图片、表情或截图不能覆盖直接 cue 的文字问题" in system_prompt
+    assert frame.recommend_silence is True
+
+
 def test_parse_address_mode_field() -> None:
     """LLM 输出的 address_mode 被解析进语义帧；非法/缺失回退 auto。"""
     assert chat_intent._parse_turn_semantic_frame_payload(

@@ -10,7 +10,7 @@ from __future__ import annotations
 from typing import Any
 
 from .. import pending_topics as pt
-from ..framework import SocialContext
+from ..framework import SocialContext, run_social_text_agent
 from ..gate import gate_should_send
 from ..quota import is_quota_exceeded, mark_sent
 
@@ -80,6 +80,9 @@ async def topic_followup_handler(ctx: SocialContext) -> None:
         if gate_enabled:
             allow, rewritten, reason = await gate_should_send(
                 tool_caller=ctx.tool_caller,
+                plugin_config=ctx.plugin_config,
+                tool_registry=ctx.tool_registry,
+                agent_max_steps=ctx.agent_max_steps,
                 logger=ctx.logger,
                 scenario=_SCENARIO,
                 user_id=uid,
@@ -121,9 +124,23 @@ async def _generate_followup(ctx: SocialContext, topic_entry: dict) -> str:
         raw_quote=str(topic_entry.get("raw_quote", "") or "")[:200],
         topic=str(topic_entry.get("topic", "") or "")[:120],
     )
+    messages = [{"role": "user", "content": prompt}]
+    if ctx.tool_caller and ctx.tool_registry:
+        try:
+            text = await run_social_text_agent(
+                ctx,
+                messages=messages,
+                trigger_reason="social_topic_followup",
+                chat_intent_hint="social_topic_followup",
+            )
+        except Exception as exc:
+            ctx.logger.debug(f"[social/topic_followup] Agent gen failed: {exc}")
+            return ""
+        text = text.strip('"').strip("'").strip("「」").strip()
+        return text[:120] if text else ""
     try:
         response = await ctx.tool_caller.chat_with_tools(
-            messages=[{"role": "user", "content": prompt}],
+            messages=messages,
             tools=[],
             use_builtin_search=False,
         )

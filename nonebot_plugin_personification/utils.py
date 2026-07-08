@@ -483,6 +483,23 @@ def set_group_schedule_enabled(group_id: str, enabled: bool):
     get_data_store().mutate_sync(_GROUP_CONFIG_STORE, _mutate)
 
 
+def set_group_schedule_prompt(group_id: str, prompt: str | None):
+    def _mutate(current: object) -> Dict[str, dict]:
+        configs = current if isinstance(current, dict) else {}
+        group_config = configs.get(group_id)
+        if not isinstance(group_config, dict):
+            group_config = {}
+            configs[group_id] = group_config
+        text = str(prompt or "").strip()
+        if text:
+            group_config["schedule_prompt"] = text
+        else:
+            group_config.pop("schedule_prompt", None)
+        return configs
+
+    get_data_store().mutate_sync(_GROUP_CONFIG_STORE, _mutate)
+
+
 def set_group_tts_enabled(group_id: str, enabled: bool):
     def _mutate(current: object) -> Dict[str, dict]:
         configs = current if isinstance(current, dict) else {}

@@ -26,6 +26,15 @@ _SILENCE_PREFIX_PATTERN = re.compile(
     r"^\s*(?:silence|silent|no[_\s\-]?reply|noreply|沉默|不回复|无回复|静默|保持沉默)\s*[:：]\s*",
     re.IGNORECASE,
 )
+_VISIBLE_REASONING_STEP_PATTERN = re.compile(
+    r"^\s*(?:Step\s*\d+|步骤\s*\d+|第\s*[\d一二三四五六七八九十百]+\s*步)\s*(?:[:：.、)\]-]|\s+-)\s*",
+    re.IGNORECASE,
+)
+_FINAL_REPLY_LABEL_PATTERN = re.compile(
+    r"^\s*(?:最终回复|最终答案|最终输出|可见回复|回复|final\s+(?:answer|reply|output)|answer)\s*[:：]\s*",
+    re.IGNORECASE,
+)
+_ORPHAN_CONTROL_BRACKET_LINE_PATTERN = re.compile(r"^[\[\]【】()（）{}<>《》]+$")
 _SILENCE_LEADING_LINE_PATTERN = re.compile(
     r"^\s*(?:silence|silent|no[_\s\-]?reply|noreply|沉默|不回复|无回复|静默|保持沉默)\s*(?:\r?\n)+",
     re.IGNORECASE,
@@ -62,13 +71,94 @@ def sanitize_history_text(text: Any) -> str:
     return cleaned
 
 
+def looks_like_visible_reasoning_trace(text: Any) -> bool:
+    raw = str(text or "")
+    if not raw.strip():
+        return False
+    step_lines = [
+        line
+        for line in raw.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+        if _VISIBLE_REASONING_STEP_PATTERN.match(line)
+    ]
+    return len(step_lines) >= 2
+
+
+def strip_orphan_control_brackets(text: Any) -> str:
+    raw = str(text or "")
+    if not raw.strip():
+        return ""
+    lines = raw.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    kept = [line for line in lines if not _ORPHAN_CONTROL_BRACKET_LINE_PATTERN.fullmatch(line.strip())]
+    return "\n".join(kept).strip()
+
+
+def _strip_final_reply_label(text: str) -> str:
+    lines = str(text or "").replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    if len([line for line in lines if line.strip()]) == 1:
+        return _FINAL_REPLY_LABEL_PATTERN.sub("", str(text or "").strip(), count=1).strip()
+    return "\n".join(_FINAL_REPLY_LABEL_PATTERN.sub("", line, count=1) for line in lines).strip()
+
+
+def _dedupe_reasoning_remainder(text: str) -> str:
+    lines = [line.strip() for line in str(text or "").splitlines()]
+    nonempty = [line for line in lines if line]
+    if len(nonempty) >= 2 and len(set(nonempty)) == 1:
+        return nonempty[0]
+    return str(text or "").strip()
+
+
+def strip_visible_reasoning_trace(text: Any) -> str:
+    """Remove raw visible reasoning blocks such as ``Step 1... Step 2...``.
+
+    This is structural output sanitation, not dialogue intent routing. If the
+    model leaked a private planning block but also left a final short answer
+    before or after it, keep only that visible answer; otherwise drop the block.
+    """
+    raw = str(text or "")
+    if not raw.strip() or not looks_like_visible_reasoning_trace(raw):
+        return raw.strip()
+
+    lines = raw.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    step_indices = [idx for idx, line in enumerate(lines) if _VISIBLE_REASONING_STEP_PATTERN.match(line)]
+    if len(step_indices) < 2:
+        return raw.strip()
+
+    start = step_indices[0]
+    end = step_indices[-1]
+    while start > 0 and not lines[start - 1].strip():
+        start -= 1
+    while end + 1 < len(lines):
+        next_line = lines[end + 1].strip()
+        if not next_line:
+            end += 1
+            break
+        if _FINAL_REPLY_LABEL_PATTERN.match(next_line):
+            break
+        end += 1
+
+    remainder = "\n".join([*lines[:start], *lines[end + 1 :]]).strip()
+    remainder = _strip_final_reply_label(remainder)
+    remainder = strip_orphan_control_brackets(remainder)
+    return _dedupe_reasoning_remainder(remainder)
+
+
 def has_silence_control_marker(text: Any) -> bool:
     raw = str(text or "")
-    if any(marker in raw for marker in _SILENCE_MARKERS):
-        return True
-    stripped = raw.strip()
+    stripped = re.sub(
+        r"</?\s*(?:output|message)\b[^>]*>",
+        "",
+        raw,
+        flags=re.IGNORECASE,
+    ).strip()
     if not stripped:
         return False
+    if stripped in _SILENCE_MARKERS:
+        return True
+    for marker in _SILENCE_MARKERS:
+        if stripped.startswith(marker):
+            leftover = stripped[len(marker) :].strip()
+            if not leftover or leftover in {":", "："}:
+                return True
     if stripped.lower() in _SILENCE_BARE_WORDS:
         return True
     if _SILENCE_PREFIX_PATTERN.match(stripped):
@@ -106,9 +196,12 @@ def strip_response_control_markers(text: Any) -> str:
         flags=re.IGNORECASE,
     )
     for marker in _SILENCE_MARKERS:
+        cleaned = re.sub(rf"^\s*{re.escape(marker)}\s*[:：]?\s*", "", cleaned, count=1)
         cleaned = cleaned.replace(marker, "")
     cleaned = _SILENCE_LEADING_LINE_PATTERN.sub("", cleaned, count=1)
     cleaned = _SILENCE_PREFIX_PATTERN.sub("", cleaned, count=1)
+    cleaned = strip_visible_reasoning_trace(cleaned)
+    cleaned = strip_orphan_control_brackets(cleaned)
     bare = cleaned.strip()
     if bare.lower() in _SILENCE_BARE_WORDS:
         return ""

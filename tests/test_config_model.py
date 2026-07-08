@@ -61,16 +61,20 @@ def test_llm_review_features_default_disabled() -> None:
 def test_qzone_social_and_frequency_defaults() -> None:
     cfg = config_mod.Config()
 
-    assert cfg.personification_qzone_check_interval == 30
+    assert cfg.personification_qzone_check_interval == 60
     assert cfg.personification_qzone_proactive_enabled is True
     assert cfg.personification_qzone_monthly_limit == 30
-    assert cfg.personification_qzone_min_interval_hours == 6.0
+    assert cfg.personification_qzone_probability == 0.20
+    assert cfg.personification_qzone_min_interval_hours == 12.0
     assert cfg.personification_qzone_social_enabled is True
     assert cfg.personification_qzone_social_check_interval == 30
     assert cfg.personification_qzone_social_scope == "recent_interactions"
     assert cfg.personification_qzone_social_like_limit == 0
     assert cfg.personification_qzone_social_comment_limit == 0
     assert cfg.personification_qzone_social_max_feeds_per_scan == 5
+    assert cfg.personification_qzone_forward_enabled is True
+    assert cfg.personification_qzone_forward_limit == 1
+    assert cfg.personification_qzone_forward_max_per_scan == 1
     assert cfg.personification_qzone_third_party_chime_in_enabled is True
     assert cfg.personification_qzone_inbound_enabled is True
     assert cfg.personification_qzone_inbound_check_interval == 3

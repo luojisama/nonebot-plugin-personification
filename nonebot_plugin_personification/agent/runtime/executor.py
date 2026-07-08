@@ -21,7 +21,7 @@ from .tool_args import (
 
 _IMAGE_GENERATION_TOOL_NAME = "generate_image"
 _RETRYABLE_LOOKUP_TOOLS = frozenset(
-    {"parallel_research", "web_search", "search_web", "wiki_lookup", "resolve_acg_entity", "collect_resources", "search_images"}
+    {"parallel_research", "web_search", "search_web", "wiki_lookup", "resolve_acg_entity", "collect_resources", "search_images", "search_and_send_images"}
 )
 _TIME_SENSITIVE_SEARCH_TOOLS = frozenset({"web_search", "search_web"})
 _TIME_SENSITIVE_RE = re.compile("最新|近期|现在|今年|今天|当前|latest|recent|now", re.IGNORECASE)

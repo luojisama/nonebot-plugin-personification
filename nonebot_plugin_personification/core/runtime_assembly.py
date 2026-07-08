@@ -119,6 +119,7 @@ class PluginRuntimeBundle:
     publish_qzone_shuo: Any
     update_qzone_cookie: Any
     qzone_social_service: Any
+    favorability_service: Any
     get_user_data: Any
     update_user_data: Any
     load_data: Any
@@ -169,6 +170,8 @@ class PluginRuntimeBundle:
             parse_yaml_response=self.parse_yaml_response,
             logger=self.logger,
             agent_tool_caller=self.reply_processor_deps.runtime.agent_tool_caller,
+            agent_tool_registry=self.reply_processor_deps.runtime.tool_registry,
+            agent_max_steps=int(getattr(self.plugin_config, "personification_agent_max_steps", 10)),
             agent_data_dir=get_personification_data_dir(self.plugin_config),
             persona_store=self.persona_store,
             superusers=self.superusers,
@@ -258,6 +261,7 @@ class PluginRuntimeBundle:
         return JobSetupDeps(
             plugin_config=self.plugin_config,
             sign_in_available=self.sign_in_available,
+            favorability_service=self.favorability_service,
             load_data=self.load_data,
             load_proactive_state=load_proactive_state,
             get_now=get_current_local_time,
@@ -285,12 +289,12 @@ class PluginRuntimeBundle:
                 getattr(self.plugin_config, "personification_qzone_proactive_enabled", False)
             ),
             qzone_check_interval_minutes=int(
-                getattr(self.plugin_config, "personification_qzone_check_interval", 90)
+                getattr(self.plugin_config, "personification_qzone_check_interval", 60)
             ),
             qzone_monthly_limit=int(getattr(self.plugin_config, "personification_qzone_monthly_limit", 30)),
-            qzone_probability=float(getattr(self.plugin_config, "personification_qzone_probability", 0.35)),
+            qzone_probability=float(getattr(self.plugin_config, "personification_qzone_probability", 0.20)),
             qzone_min_interval_hours=float(
-                getattr(self.plugin_config, "personification_qzone_min_interval_hours", 6.0)
+                getattr(self.plugin_config, "personification_qzone_min_interval_hours", 12.0)
             ),
             qzone_quiet_hour_start=int(
                 getattr(self.plugin_config, "personification_qzone_quiet_hour_start", 0)
@@ -357,6 +361,7 @@ class PluginRuntimeBundle:
             superuser_permission=self.superuser_permission,
             superusers=self.superusers,
             sign_in_available=self.sign_in_available,
+            favorability_service=self.favorability_service,
             md_to_pic=self.md_to_pic,
             finished_exception_cls=self.finished_exception_cls,
             register_private_command_keywords=register_private_command_keywords,

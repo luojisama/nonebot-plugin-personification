@@ -145,6 +145,33 @@ def test_build_group_style_handles_invalid_json(_runtime_with_style) -> None:
     assert out == {}
 
 
+def test_group_style_source_messages_skip_bot_replies(_runtime_with_style) -> None:
+    memory_store_mod = load_personification_module("plugin.personification.core.memory_store")
+    group_knowledge_mod = load_personification_module("plugin.personification.core.group_knowledge_autobuild")
+    store = memory_store_mod.init_memory_store(_runtime_with_style.plugin_config)
+    store.append_group_message(
+        group_id="g_skip_bot",
+        role="assistant",
+        content="等下，这也太模板了吧",
+        metadata={"source_kind": "bot_reply", "user_id": "bot"},
+    )
+    store.append_group_message(
+        group_id="g_skip_bot",
+        role="user",
+        content="今天要打活动",
+        metadata={"source_kind": "user", "user_id": "u1"},
+    )
+
+    rows = group_knowledge_mod._load_messages_since(
+        memory_store=store,
+        group_id="g_skip_bot",
+        since_ts=0,
+        limit=20,
+    )
+
+    assert [row["text"] for row in rows] == ["今天要打活动"]
+
+
 # ---- WebUI 集成：style 端点 + rebuild ----
 
 
@@ -167,7 +194,7 @@ def _webui_runtime_with_style(tmp_path: Path, monkeypatch):
     for i in range(30):
         store.append_group_message(
             group_id="g_style",
-            role="user" if i % 2 == 0 else "assistant",
+            role="user",
             content={"text": f"消息 #{i}"},
             metadata={"user_id": f"u{i%5}"},
             created_at=time.time() - (30 - i),

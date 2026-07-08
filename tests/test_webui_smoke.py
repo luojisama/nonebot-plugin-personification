@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 from types import SimpleNamespace
+import re
 
 import pytest
 
@@ -60,14 +61,15 @@ def test_index_serves_static_frontend(_runtime_context) -> None:
     assert res.status_code == 200
     assert "text/html" in res.headers["content-type"]
     assert "拟人插件 控制台" in res.text
-    assert '<link rel="stylesheet" href="/personification/static/style.css">' in res.text
-    assert '<script src="/personification/static/app-core.js" defer></script>' in res.text
-    assert '<script src="/personification/static/app-activity.js" defer></script>' in res.text
-    assert '<script src="/personification/static/app-content.js" defer></script>' in res.text
-    assert '<script src="/personification/static/app-admin.js" defer></script>' in res.text
-    assert '<script src="/personification/static/app-tools.js" defer></script>' in res.text
-    assert '<script src="/personification/static/app-config.js" defer></script>' in res.text
-    assert '<script src="/personification/static/app-auth.js" defer></script>' in res.text
+    assert re.search(r'<link rel="stylesheet" href="/personification/static/style\.css\?v=[^"]+">', res.text)
+    assert re.search(r'<script src="/personification/static/app-core\.js\?v=[^"]+" defer></script>', res.text)
+    assert re.search(r'<script src="/personification/static/app-activity\.js\?v=[^"]+" defer></script>', res.text)
+    assert re.search(r'<script src="/personification/static/app-content\.js\?v=[^"]+" defer></script>', res.text)
+    assert re.search(r'<script src="/personification/static/app-admin\.js\?v=[^"]+" defer></script>', res.text)
+    assert re.search(r'<script src="/personification/static/app-tools\.js\?v=[^"]+" defer></script>', res.text)
+    assert re.search(r'<script src="/personification/static/app-config\.js\?v=[^"]+" defer></script>', res.text)
+    assert re.search(r'<script src="/personification/static/app-auth\.js\?v=[^"]+" defer></script>', res.text)
+    assert "no-store" in res.headers.get("cache-control", "")
 
 
 def test_static_frontend_assets_are_served(_runtime_context) -> None:
@@ -75,7 +77,12 @@ def test_static_frontend_assets_are_served(_runtime_context) -> None:
     js = client.get("/personification/static/app-core.js")
     assert js.status_code == 200
     assert "text/javascript" in js.headers["content-type"]
+    assert "no-cache" in js.headers.get("cache-control", "")
     assert 'const API = "/personification/api";' in js.text
+    assert "plugin_manager" in js.text
+    versioned_js = client.get("/personification/static/app-core.js?v=test")
+    assert versioned_js.status_code == 200
+    assert "immutable" in versioned_js.headers.get("cache-control", "")
 
     config_js = client.get("/personification/static/app-config.js")
     assert config_js.status_code == 200
@@ -88,6 +95,11 @@ def test_static_frontend_assets_are_served(_runtime_context) -> None:
     admin_js = client.get("/personification/static/app-admin.js")
     assert admin_js.status_code == 200
     assert "renderHealth" in admin_js.text
+    assert "runQzoneForwardTest" in admin_js.text
+
+    tools_js = client.get("/personification/static/app-tools.js")
+    assert tools_js.status_code == 200
+    assert "renderPluginManager" in tools_js.text
 
     css = client.get("/personification/static/style.css")
     assert css.status_code == 200

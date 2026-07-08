@@ -43,6 +43,8 @@ class FlowSetupDeps:
     parse_yaml_response: Any
     logger: Any
     agent_tool_caller: Any = None
+    agent_tool_registry: Any = None
+    agent_max_steps: int = 4
     agent_data_dir: Any = None
     persona_store: Any = None
     superusers: Optional[set[str]] = None
@@ -71,6 +73,8 @@ def setup_flows(*, deps: FlowSetupDeps) -> Dict[str, Any]:
         parse_yaml_response=deps.parse_yaml_response,
         logger=deps.logger,
         agent_tool_caller=deps.agent_tool_caller,
+        agent_tool_registry=deps.agent_tool_registry,
+        agent_max_steps=deps.agent_max_steps,
         agent_data_dir=deps.agent_data_dir,
         persona_store=deps.persona_store,
     )
@@ -87,6 +91,9 @@ def setup_flows(*, deps: FlowSetupDeps) -> Dict[str, Any]:
         get_now=deps.get_now,
         record_group_msg=deps.record_group_msg or (lambda group_id, nickname, content, is_bot=False: 0),
         logger=deps.logger,
+        agent_tool_caller=deps.agent_tool_caller,
+        agent_tool_registry=deps.agent_tool_registry,
+        agent_max_steps=deps.agent_max_steps,
         agent_data_dir=deps.agent_data_dir,
         superusers=deps.superusers,
         get_user_data=deps.get_user_data,

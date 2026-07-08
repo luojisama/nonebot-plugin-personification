@@ -61,6 +61,30 @@ _HIGH_VALUE_SYMBOL_HINTS = (
 )
 
 
+def _build_source_coverage_summary(
+    *,
+    snapshot_files: list[dict[str, Any]],
+    snapshot_chunks: list[dict[str, Any]],
+    total_chars: int,
+    analysis_strategy: str,
+    module_bundle_count: int,
+) -> dict[str, Any]:
+    return {
+        "analysis_scope": "full_readable_python_source",
+        "full_input": True,
+        "source_complete": True,
+        "source_truncated": False,
+        "read_mode": "full_file_text",
+        "file_pattern": "*.py",
+        "source_file_count": len(snapshot_files),
+        "source_chunk_count": len(snapshot_chunks),
+        "source_chars": int(total_chars or 0),
+        "analysis_strategy": str(analysis_strategy or "chunk_batches"),
+        "module_bundle_count": int(module_bundle_count or 0),
+        "note": "读取插件根目录下所有可读 Python 源码；大型插件只分模块或分批传入模型，不抽样。",
+    }
+
+
 def _classify_module_key(rel_path: str) -> tuple[str, str]:
     normalized = str(rel_path or "").strip().replace("\\", "/")
     if not normalized:
@@ -627,6 +651,13 @@ def extract_plugin_source_snapshot(plugin_root: Path) -> dict[str, Any] | None:
         snapshot_chunks=snapshot_chunks,
         total_chars=total_chars,
     )
+    source_coverage = _build_source_coverage_summary(
+        snapshot_files=snapshot_files,
+        snapshot_chunks=snapshot_chunks,
+        total_chars=total_chars,
+        analysis_strategy=analysis_strategy,
+        module_bundle_count=len(module_bundles),
+    )
 
     return {
         "root_kind": "file" if plugin_root.is_file() else "package",
@@ -637,5 +668,9 @@ def extract_plugin_source_snapshot(plugin_root: Path) -> dict[str, Any] | None:
         "module_bundles": module_bundles,
         "module_bundle_count": len(module_bundles),
         "analysis_strategy": analysis_strategy,
+        "analysis_scope": "full_readable_python_source",
+        "source_complete": True,
+        "source_truncated": False,
+        "source_coverage": source_coverage,
         "complete": True,
     }

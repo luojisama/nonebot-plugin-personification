@@ -2,7 +2,7 @@
 
 每天指定时点（默认 9 点）触发，调 news skillpack 拿原始日报/AI 资讯/
 历史上的今天，用 lite tool_caller 包装成更自然的口语化推送，再发送给
-配置的用户与群。
+配置的用户与群。文案包装优先走完整 Agent 路径。
 
 与 greetings 共享 quota / gate / 发送基础设施。quota key：用户用
 user_id 字面值，群用 "group:{gid}" 命名空间，互不干扰。
@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from ..framework import SocialContext
+from ..framework import SocialContext, run_social_text_agent
 from ..gate import gate_should_send
 from ..quota import is_quota_exceeded, mark_sent
 
@@ -169,13 +169,28 @@ async def _fetch_raw_news(ctx: SocialContext, source: str) -> str:
 
 async def _pack_news(ctx: SocialContext, source: str, raw_news: str) -> str:
     label = _SOURCE_LABELS.get(source, "新闻")
+    prompt = _PACK_PROMPT.format(source_label=label, raw_news=raw_news[:1500])
+    messages = [{"role": "user", "content": prompt}]
+    if ctx.tool_caller and ctx.tool_registry:
+        try:
+            text = await run_social_text_agent(
+                ctx,
+                messages=messages,
+                trigger_reason="social_news_push",
+                chat_intent_hint="social_news_push",
+                use_builtin_search_hint=True,
+            )
+        except Exception as exc:
+            ctx.logger.debug(f"[social/news] Agent pack failed: {exc}")
+            return ""
+        text = text.strip('"').strip("'").strip("「」").strip()
+        return text[:300] if text else ""
     if not ctx.tool_caller:
         # 无 tool_caller 时退化为原文截断（避免完全发不出去）
         return raw_news[:200]
-    prompt = _PACK_PROMPT.format(source_label=label, raw_news=raw_news[:1500])
     try:
         response = await ctx.tool_caller.chat_with_tools(
-            messages=[{"role": "user", "content": prompt}],
+            messages=messages,
             tools=[],
             use_builtin_search=False,
         )
@@ -193,6 +208,9 @@ async def _gate_or_pass(
         return draft
     allow, rewritten, reason = await gate_should_send(
         tool_caller=ctx.tool_caller,
+        plugin_config=ctx.plugin_config,
+        tool_registry=ctx.tool_registry,
+        agent_max_steps=ctx.agent_max_steps,
         logger=ctx.logger,
         scenario=_SCENARIO,
         user_id=target_key,

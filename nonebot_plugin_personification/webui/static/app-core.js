@@ -2,14 +2,19 @@ const API = "/personification/api";
 let state = {
   logged: false, qq: "", view: "dashboard",
   entries: [], groups: [], activeGroup: null, configSearch: "", configSearchComposing: false, configSearchDraft: "",
-  devices: [], pendingDevices: [], trustedDevices: [], devicePending: false, loginRequestId: "", loginPolling: false, alert: null, loading: false,
-  dashboard: null, dashboardWindow: "month",
+  devices: [], pendingDevices: [], trustedDevices: [], devicePending: false, loginRequestId: "", loginPolling: false, alert: null, loading: false, loadingMessage: "",
+  dashboard: null, dashboardWindow: "month", dashboardDetail: null,
   personas: [], selectedPersona: null, personaSearch: "",
-  groupList: [], selectedGroup: null, groupPersonas: [], groupStyle: null, groupKnowledge: [],
+  groupList: [], selectedGroup: null, groupPersonas: [], groupStyle: null, groupKnowledge: [], groupAliasDrafts: {}, groupSchedule: null, groupScheduleGenerating: false,
+  groupFavorability: null,
   groupSwitches: [], newGroupId: "",
-  skills: [], skillFilter: "",
+  skills: [], skillFilter: "", skillSummary: null, skillRemoteSources: [], skillMcpTools: [],
+  skillSourceForm: { source: "", name: "", ref: "", subdir: "", kind: "auto", preferFirst: false, autoApprove: false },
   testPrompt: "你好，自我介绍一下", testSystem: "你是测试助手，简洁回复。", testResult: null, testAllResult: null,
+  personaTemplateForm: { mode: "source", work_title: "", character_name: "", persona_name: "", gender: "", personality: "", traits: "", hobbies: "", description: "" }, personaTemplateResult: null, personaTemplateBusy: false, personaTemplateTask: null, personaTemplateHistory: [],
   personaPrompt: null, personaPromptPath: "", health: null, healthBusyCat: "", interactionResult: null, interactionBusy: false,
+  qzoneForwardForm: { target_user_id: "", forward_text: "" }, qzoneForwardResult: null, qzoneForwardBusy: false,
+  pluginUpdateStatus: null, pluginUpdateHistory: null, pluginUpdateBusy: false, pluginUpdateChecking: false, pluginUpdateResult: null,
   qqInfo: null, qqGroups: [], qqFriends: [],
   memory: null, memoryFilter: "", memoryInnerState: null, memoryIncludeSelf: false, memoryLimit: 200,
   memoryVectorIndex: null, memorySearchQuery: "", memorySearchResult: null, memoryVectorBusy: false,
@@ -19,7 +24,7 @@ let state = {
   stickers: null, stickerSearch: "", selectedSticker: null,
   theme: "dark", mobileNavOpen: false, eligibleAdmins: [],
   audit: null, auditFilter: "",
-  logs: null, logLevel: "", logQuery: "",
+  logs: null, traces: null, logLevel: "", logQuery: "", logTraceId: "", traceDetail: null, selectedTraceId: "",
   proactiveStats: null, proactiveRecent: null, proactiveScope: "",
 };
 
@@ -134,8 +139,33 @@ function closeMobileNav() {
   if (state.mobileNavOpen) { state.mobileNavOpen = false; render(); }
 }
 
+function loadingMessageForView(view) {
+  return ({
+    dashboard: "正在统计 Token 消耗...",
+    health: "正在跑功能体检...",
+    qzone: "正在读取 QQ 空间状态...",
+    config: "正在加载配置中心...",
+    personas: "正在读取用户画像...",
+    groups: "正在整理群信息...",
+    memory: "正在打开记忆宫殿...",
+    memory_graph: "正在绘制记忆关系...",
+    stickers: "正在加载表情包库...",
+    skills: "正在扫描 Skill 和 MCP 工具...",
+    plugin_knowledge: "正在读取插件知识库...",
+    plugin_manager: "正在检查插件更新...",
+    persona_builder: "正在准备人设构建工具...",
+    logs: "正在拉取插件日志...",
+    traces: "正在拉取消息 Trace...",
+    trace_detail: "正在打开 Trace 详情...",
+    audit: "正在读取审计记录...",
+    qq: "正在读取 QQ 账号信息...",
+  })[view] || "正在加载页面...";
+}
+
 async function loadView() {
   state.loading = true;
+  state.loadingMessage = loadingMessageForView(state.view);
+  if (state.logged) render();
   try {
     if (state.view === "config") {
       const data = await api("/config/entries");
@@ -164,8 +194,14 @@ async function loadView() {
     } else if (state.view === "skills") {
       const data = await api("/skills");
       state.skills = data.skills; state.skillsAvailable = data.available;
+      state.skillSummary = data.summary || null;
+      state.skillRemoteSources = data.remote_sources || [];
+      state.skillMcpTools = data.mcp_tools || [];
     } else if (state.view === "test") {
       /* nothing to preload */
+    } else if (state.view === "persona_builder") {
+      const history = await api("/persona-template/history?limit=8").catch(() => ({ records: [] }));
+      state.personaTemplateHistory = history.records || [];
     } else if (state.view === "qq") {
       const [info, groups, friends] = await Promise.all([
         api("/qq/info").catch(e => ({ error: e.message })),
@@ -177,6 +213,13 @@ async function loadView() {
       state.health = await api("/health/check");  // 默认读缓存，秒开
     } else if (state.view === "qzone") {
       state.qzone = await api("/qzone/status");
+    } else if (state.view === "plugin_manager") {
+      const [status, history] = await Promise.all([
+        api("/plugin-manager/status"),
+        api("/plugin-manager/history?limit=30"),
+      ]);
+      state.pluginUpdateStatus = status;
+      state.pluginUpdateHistory = history;
     } else if (state.view === "persona_prompt") {
       const qs = state.personaPromptPath ? ("?path=" + encodeURIComponent(state.personaPromptPath)) : "";
       state.personaPrompt = await api("/test/persona-prompt" + qs);
@@ -197,7 +240,16 @@ async function loadView() {
       const qs = new URLSearchParams({ limit: "220" });
       if (state.logLevel) qs.set("level", state.logLevel);
       if (state.logQuery) qs.set("q", state.logQuery);
-      state.logs = await api("/logs/recent?" + qs.toString());
+      const logs = await api("/logs/recent?" + qs.toString());
+      state.logs = logs;
+    } else if (state.view === "traces") {
+      state.traces = await api("/logs/traces?limit=120");
+    } else if (state.view === "trace_detail") {
+      if (!state.selectedTraceId) {
+        state.traceDetail = { error: "未选择 trace" };
+      } else {
+        state.traceDetail = await api("/logs/trace/" + encodeURIComponent(state.selectedTraceId)).catch(e => ({ error: e.message }));
+      }
     } else if (state.view === "stickers") {
       state.stickers = await api("/stickers");
     } else if (state.view === "memory") {
@@ -236,7 +288,7 @@ async function loadView() {
         state.groupsAvailable = groupsResp.available;
       }
     }
-  } finally { state.loading = false; }
+  } finally { state.loading = false; state.loadingMessage = ""; }
 }
 
 function render() {
@@ -273,6 +325,9 @@ function render() {
 function renderLayout() {
   const navItem = (v, label) => `<a href="#${v}" class="${state.view===v?'active':''}" onclick="closeMobileNav()">${label}</a>`;
   const themeIcon = state.theme === "dark" ? "🌙" : "☀";
+  const loadingHint = state.loading
+    ? `<div class="loading-hint"><span class="spinner"></span><span>${escapeHtml(state.loadingMessage || "正在加载页面...")}</span></div>`
+    : "";
   return `${state.loading ? '<div class="progress-bar"></div>' : ''}
     <div class="layout">
     ${state.mobileNavOpen ? '<div class="scrim" onclick="toggleMobileNav()"></div>' : ''}
@@ -291,9 +346,12 @@ function renderLayout() {
         ${navItem('stickers','表情包')}
         ${navItem('skills','Skill 管理')}
         ${navItem('plugin_knowledge','插件知识库')}
+        ${navItem('plugin_manager','插件管理')}
         ${navItem('test','模型测试')}
         ${navItem('persona_prompt','人设预览')}
+        ${navItem('persona_builder','人设构建')}
         ${navItem('proactive','主动诊断')}
+        ${navItem('traces','消息 Trace')}
         ${navItem('audit','审计日志')}
         ${navItem('logs','插件日志')}
         ${navItem('qq','QQ 管理')}
@@ -316,6 +374,7 @@ function renderLayout() {
         </div>
       </div>
       ${state.alert ? `<div class="alert ${state.alert.kind}">${escapeHtml(state.alert.text)}</div>` : ''}
+      ${loadingHint}
       ${renderView()}
     </main>
   </div>`;
@@ -330,16 +389,20 @@ function renderView() {
   if (state.view === "group_switch") return renderGroupSwitch();
   if (state.view === "skills") return renderSkills();
   if (state.view === "plugin_knowledge") return renderPluginKnowledge();
+  if (state.view === "plugin_manager") return renderPluginManager();
   if (state.view === "qq") return renderQQ();
   if (state.view === "health") return renderHealth();
   if (state.view === "qzone") return renderQzone();
   if (state.view === "test") return renderTest();
   if (state.view === "persona_prompt") return renderPersonaPrompt();
+  if (state.view === "persona_builder") return renderPersonaBuilder();
   if (state.view === "memory") return renderMemory();
   if (state.view === "memory_graph") return renderMemoryGraph();
   if (state.view === "stickers") return renderStickers();
   if (state.view === "audit") return renderAudit();
   if (state.view === "logs") return renderLogs();
+  if (state.view === "traces") return renderTraces();
+  if (state.view === "trace_detail") return renderTraceDetail();
   if (state.view === "proactive") return renderProactive();
   return `<div class="card"><h2>${escapeHtml(viewTitle())}</h2><p class="muted">该视图暂未实现。</p></div>`;
 }

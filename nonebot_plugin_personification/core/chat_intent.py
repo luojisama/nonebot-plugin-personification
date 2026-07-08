@@ -5,6 +5,7 @@ import re
 from dataclasses import dataclass
 from typing import Any, Literal
 
+from .reply_style_policy import build_context_continuity_policy_prompt
 from .sticker_semantics import (
     DEFAULT_STICKER_SEMANTIC_HINT,
     default_sticker_semantic_hint,
@@ -12,7 +13,7 @@ from .sticker_semantics import (
 )
 
 
-ChatIntent = Literal["banter", "explanation", "lookup", "plugin_question", "image_generation"]
+ChatIntent = Literal["banter", "explanation", "lookup", "plugin_question", "image_generation", "expression"]
 PluginQuestionIntent = Literal["capability", "implementation", "latest"]
 AmbiguityLevel = Literal["low", "medium", "high"]
 EmotionIntensity = Literal["low", "medium", "high"]
@@ -168,7 +169,7 @@ def _parse_turn_semantic_frame_payload(payload: Any) -> TurnSemanticFrame | None
     if not isinstance(payload, dict):
         return None
     chat_intent = str(payload.get("chat_intent", "") or "").strip()
-    if chat_intent not in {"banter", "explanation", "lookup", "plugin_question", "image_generation"}:
+    if chat_intent not in {"banter", "explanation", "lookup", "plugin_question", "image_generation", "expression"}:
         return None
     plugin_question_intent = str(payload.get("plugin_question_intent", "capability") or "capability").strip()
     if plugin_question_intent not in {"capability", "implementation", "latest"}:
@@ -276,7 +277,7 @@ async def infer_turn_semantic_frame_with_llm(
         "你是群聊/私聊的语义与情绪判别器。"
         "请根据最新一句和上下文，输出严格 JSON，不要输出 markdown 或解释。\n"
         "JSON 结构："
-        '{"chat_intent":"banter|explanation|lookup|plugin_question|image_generation",'
+        '{"chat_intent":"banter|explanation|lookup|plugin_question|image_generation|expression",'
         '"plugin_question_intent":"capability|implementation|latest",'
         '"ambiguity_level":"low|medium|high",'
         '"recommend_silence":false,'
@@ -300,8 +301,14 @@ async def infer_turn_semantic_frame_with_llm(
         "或群友分享了图片/视频/链接而你无法确定其内容或出处（例如配图只配了一个短词、视频/分享卡片标题里有陌生词），"
         "倾向 chat_intent=lookup（先查证再接话），不要只因为是短句、像闲聊就判成 banter——"
         "先搞懂群友在聊什么再接话才更像真人。\n"
+        "1c. 如果最新消息说“这个动画/这段动画/这个角色/这张图/这个场面”等指代词，且最近上下文刚出现 ACG 角色、作品、抽卡结果、图片或卡面，"
+        "要把它当成在评价那个具体对象；优先 chat_intent=lookup、domain_focus=game_anime，查清角色/作品/剧情或动画出处后再参与讨论。"
+        "不要只回“确实挺强/有那味了”这类空泛附和。\n"
         "2. plugin_question 只在对方确实在问 bot/插件/本地实现/配置/能力时使用。"
-        "用户让 bot 直接生成、绘制、制作图片/海报/头像/梗图时，chat_intent=image_generation，不要标成 plugin_question。\n"
+        "用户让 bot 直接生成、绘制、制作图片/海报/头像/梗图时，chat_intent=image_generation，不要标成 plugin_question；"
+        "用户让 bot 联网搜已有图片、壁纸、插画、图包或参考图时，chat_intent=lookup，不要误判成生成图片。\n"
+        "2b. 用户让 bot 发送 QQ 小黄脸、系统表情、收藏表情、推荐表情，或这轮明确只需要发一个 QQ 表情回应时，"
+        "chat_intent=expression；不要把这种动作请求标成普通闲聊或解释。\n"
         "3. meta_question=true 表示这句更像在问上一条消息是谁发的、为什么触发、接的是谁的话，而不是问正文知识点。\n"
         "4. requires_emotional_care=true 只在用户明显需要被安抚、接住情绪、失落/委屈/脆弱时使用；普通吐槽、调侃、玩梗不要滥开。"
         "群聊里如果不确定对方是不是在对你倾诉，优先保持 false。\n"
@@ -310,7 +317,7 @@ async def infer_turn_semantic_frame_with_llm(
         "7. bot_emotion 要结合当前内心状态、关系线索和最近互动，自然给出，不要机械复制用户情绪。\n"
         "8. expression_style 要指导本轮说话方式，偏行为策略，不要写长句。\n"
         "9. recommend_silence 只有在群聊且明显高歧义、bot 插话风险高时才为 true。\n"
-        "10. 群聊上下文中若标注“回复某人/提及某人/来源=其他插件输出/群聊旁观”，不要把它误认为用户正在要求 bot 解释内容；"
+        "10. 群聊上下文中若标注“回复某人/提及某人/来源=其他插件输出/用户调用其它插件/命令/群聊旁观”，不要把它误认为用户正在要求 bot 解释内容；"
         "除非最新消息明确指向 bot，否则应提高插话谨慎度，必要时 recommend_silence=true。\n"
         "11. sticker_mood_hint 只能从这类标签中组合："
         "情绪标签=[搞笑,开心,感动,尴尬,无语,惊讶,委屈,生气,害羞,得意,困惑,赞同,拒绝,期待,失落,撒娇,淡定,震惊]；"
@@ -331,6 +338,9 @@ async def infer_turn_semantic_frame_with_llm(
         "- quote：需要精确指向对方那条具体消息（尤其是隔了好几条、容易认错）时，引用回复\n"
         "- at_quote：两者都用（少用，仅在既要指人又要指那条消息时）\n"
         "- auto：拿不准就给 auto，交给默认规则。私聊一律 none/auto。\n"
+        "当你是在接一条 @bot 的群消息但回复内容实际需要承接前面某个群友/插件输出时，优先选择 quote 或 at_quote 指向当前触发消息，"
+        "不要让后续群友误以为你在无对象地泛泛评价。\n"
+        f"{build_context_continuity_policy_prompt()}\n"
     )
     user_content = (
         f"场景：{'群聊' if is_group else '私聊'}\n"

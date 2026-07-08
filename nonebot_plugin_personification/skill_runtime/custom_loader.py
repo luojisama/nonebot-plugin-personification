@@ -206,6 +206,12 @@ async def _register_skill(registry: ToolRegistry, logger: Any, skill_dir: Path, 
                 parameters=config.get("parameters") or {"type": "object", "properties": {}, "required": []},
                 handler=_handler,
                 local=bool(config.get("local", True)),
+                metadata={
+                    "category": "skillpack",
+                    "source_kind": str(config.get("source_kind") or "local"),
+                    "skill_dir": skill_dir.name,
+                    "isolation": str(isolation.get("mode") or "process"),
+                },
                 enabled=lambda cfg=config: bool(cfg.get("enabled", True)),
             )
         )
@@ -267,6 +273,12 @@ async def _register_skill(registry: ToolRegistry, logger: Any, skill_dir: Path, 
             parameters=config.get("parameters") or {"type": "object", "properties": {}, "required": []},
             handler=_handler,
             local=bool(config.get("local", True)),
+            metadata={
+                "category": "skillpack",
+                "source_kind": str(config.get("source_kind") or "local"),
+                "skill_dir": skill_dir.name,
+                "isolation": str(isolation.get("mode") or "inprocess"),
+            },
             enabled=lambda cfg=config: bool(cfg.get("enabled", True)),
         )
     )

@@ -16,7 +16,7 @@ async def handle_group_fav_query_command(
     logger: Any,
 ) -> None:
     if not sign_in_available:
-        await matcher.finish("签到插件未就绪，无法查询好感度。")
+        await matcher.finish("插件内好感度体系未启用，无法查询好感度。")
 
     group_key = f"group_{group_id}"
     data = get_user_data(group_key)
@@ -49,9 +49,10 @@ async def handle_set_group_fav_command(
     parse_group_fav_update_args: Callable[[str, Optional[str]], tuple[Optional[str], Optional[float], Optional[str]]],
     update_user_data: Callable[..., None],
     logger: Any,
+    favorability_service: Any = None,
 ) -> None:
     if not sign_in_available:
-        await matcher.finish("签到插件未就绪，无法设置好感度。")
+        await matcher.finish("插件内好感度体系未启用，无法设置好感度。")
 
     target_group, new_fav, error_msg = parse_group_fav_update_args(arg_str, event_group_id)
     if error_msg:
@@ -59,7 +60,15 @@ async def handle_set_group_fav_command(
     if not target_group or new_fav is None:
         await matcher.finish("未指定目标群号。")
 
-    update_user_data(f"group_{target_group}", favorability=new_fav)
+    if favorability_service is not None and hasattr(favorability_service, "set_score"):
+        favorability_service.set_score(
+            f"group_{target_group}",
+            new_fav,
+            actor=operator_user_id,
+            reason="管理员手动设置群好感度",
+        )
+    else:
+        update_user_data(f"group_{target_group}", favorability=new_fav)
     logger.info(f"管理员 {operator_user_id} 将群 {target_group} 的好感度设置为 {new_fav}")
     await matcher.finish(f"✅ 已将群 {target_group} 的好感度设置为 {new_fav:.2f}")
 

@@ -14,6 +14,7 @@ from .core.memory_defaults import (
     DEFAULT_PERSONA_HISTORY_MAX,
     DEFAULT_PRIVATE_HISTORY_TURNS,
 )
+from .core.favorability import DEFAULT_FAVORABILITY_EVENT_DELTAS, DEFAULT_FAVORABILITY_LEVELS
 
 
 DEFAULT_FAVORABILITY_ATTITUDES: Dict[str, str] = {
@@ -43,6 +44,7 @@ class Config(BaseModel):
 
     personification_agent_enabled: bool = True
     personification_agent_max_steps: int = 10
+    personification_agent_budget_mode: str = "shadow"
     personification_response_timeout: int = 180
     personification_image_input_mode: str = "auto"
     personification_image_detail: str = "auto"
@@ -82,10 +84,10 @@ class Config(BaseModel):
     # 不依赖 HTTPS_PROXY / HTTP_PROXY 环境变量（bot 进程未必继承终端 env）。
     # 留空 = 沿用 httpx 的环境变量解析（trust_env 默认 True）。
     personification_antigravity_cli_proxy: str = ""
-    # /拟人更新 走的 git 镜像反代列表（GitHub 在国内不稳时按顺序探测）。
-    # 直连失败时：并行 HEAD 探测每一项的联通性，按列表顺序选第一个能通的，
+    # /拟人更新 与 WebUI 插件更新走的 git 镜像反代列表（GitHub 在国内不稳时按顺序探测）。
+    # 有配置时：并行 HEAD 探测每一项的联通性，按列表顺序选第一个能通的，
     # 用 -c url.X.insteadOf 临时改写重试 fetch/pull，不污染全局 git config。
-    # 留空 = 关闭镜像 fallback，只走直连。
+    # 留空 = 关闭镜像优先，只走直连。
     personification_git_mirror_prefixes: List[str] = [
         "https://ghproxy.com",
         "https://gh-proxy.com",
@@ -140,6 +142,7 @@ class Config(BaseModel):
     personification_response_review_model_role: str = "review"
     personification_turn_planner_enabled: bool = False
     personification_turn_planner_shadow_enabled: bool = False
+    personification_semantic_frame_timeout: float = 8.0
     personification_evidence_synthesizer_enabled: bool = False
     personification_cross_verify_enabled: bool = False
     personification_lorebook_enabled: bool = False
@@ -216,6 +219,9 @@ class Config(BaseModel):
     personification_labeler_api_key: str = ""
     personification_labeler_model: str = ""
     personification_labeler_concurrency: int = 3
+    personification_sticker_labeler_research_enabled: bool = True
+    personification_sticker_labeler_research_max_queries: int = 2
+    personification_sticker_labeler_research_timeout: float = 12.0
     personification_fallback_enabled: bool = True
     personification_fallback_api_type: str = ""
     personification_fallback_api_url: str = ""
@@ -242,6 +248,9 @@ class Config(BaseModel):
     personification_plugin_invoker_max_output_chars: int = 1500
     personification_plugin_invoker_extra_danger_keywords: list[str] = []
     personification_image_gen_enabled: bool = True
+    personification_image_gen_api_type: str = "auto"
+    personification_image_gen_api_url: str = ""
+    personification_image_gen_api_key: str = ""
     personification_image_gen_model: str = "gpt-image-2"
     personification_image_gen_nanobanan_model: str = "gemini-3-pro-image-preview"
     personification_image_gen_background_enabled: bool = True
@@ -259,11 +268,11 @@ class Config(BaseModel):
     # DEPRECATED: use personification_qzone_cookie.
     qzone_cookie: str = ""
     personification_qzone_proactive_enabled: bool = True
-    personification_qzone_check_interval: int = 30
+    personification_qzone_check_interval: int = 60
     personification_qzone_monthly_limit: int = 30
     personification_qzone_agent_max_steps: int = 4
-    personification_qzone_probability: float = 0.35
-    personification_qzone_min_interval_hours: float = 6.0
+    personification_qzone_probability: float = 0.20
+    personification_qzone_min_interval_hours: float = 12.0
     personification_qzone_social_enabled: bool = True
     personification_qzone_social_check_interval: int = 30
     personification_qzone_social_scope: str = "recent_interactions"
@@ -271,6 +280,9 @@ class Config(BaseModel):
     personification_qzone_social_comment_limit: int = 0
     personification_qzone_social_per_friend_limit: int = 0
     personification_qzone_social_max_feeds_per_scan: int = 5
+    personification_qzone_forward_enabled: bool = True
+    personification_qzone_forward_limit: int = 1
+    personification_qzone_forward_max_per_scan: int = 1
     personification_qzone_third_party_chime_in_enabled: bool = True
     personification_qzone_inbound_enabled: bool = True
     personification_qzone_inbound_check_interval: int = 3
@@ -356,7 +368,19 @@ class Config(BaseModel):
     personification_prompt_path: Optional[str] = None
     personification_system_path: Optional[str] = None
 
+    personification_favorability_enabled: bool = True
+    personification_favorability_default_score: float = 0.0
+    personification_favorability_group_default_score: float = 100.0
+    personification_favorability_levels: Dict[str, float] = DEFAULT_FAVORABILITY_LEVELS.copy()
     personification_favorability_attitudes: Dict[str, str] = DEFAULT_FAVORABILITY_ATTITUDES.copy()
+    personification_favorability_event_deltas: Dict[str, float] = DEFAULT_FAVORABILITY_EVENT_DELTAS.copy()
+    personification_favorability_daily_positive_cap: float = 5.0
+    personification_favorability_group_daily_positive_cap: float = 10.0
+    personification_favorability_daily_negative_cap: float = 30.0
+    personification_favorability_event_log_limit: int = 50
+    personification_favorability_decay_enabled: bool = False
+    personification_favorability_decay_idle_days: int = 14
+    personification_favorability_decay_delta: float = -0.20
 
     personification_history_len: int = DEFAULT_HISTORY_LEN
     # 滚动窗口：触发压缩的条数阈值（达到此数量时压缩）
@@ -391,6 +415,13 @@ class Config(BaseModel):
     personification_sticker_second_judge_enabled: bool = False
     personification_sticker_curator_enabled: bool = False
     personification_sticker_curator_interval_days: int = 3
+    personification_qq_expression_enabled: bool = True
+    personification_qq_expression_probability: float = 0.08
+    personification_qq_expression_cooldown_seconds: int = 180
+    personification_qq_expression_daily_limit: int = 30
+    personification_qq_expression_super_probability: float = 0.02
+    personification_qq_expression_triple_probability: float = 0.02
+    personification_qq_favorite_expression_probability: float = 0.02
 
     personification_poke_probability: float = 0.35
     # DEPRECATED: replaced by the agent web_search skill configuration.

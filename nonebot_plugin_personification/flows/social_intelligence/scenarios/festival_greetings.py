@@ -12,7 +12,7 @@ import re
 from datetime import datetime
 from typing import Any
 
-from ..framework import SocialContext
+from ..framework import SocialContext, run_social_text_agent
 from ..gate import gate_should_send
 from ..quota import is_quota_exceeded, mark_sent
 
@@ -192,6 +192,9 @@ async def _try_send(
     if gate_enabled:
         allow, rewritten, reason = await gate_should_send(
             tool_caller=ctx.tool_caller,
+            plugin_config=ctx.plugin_config,
+            tool_registry=ctx.tool_registry,
+            agent_max_steps=ctx.agent_max_steps,
             logger=ctx.logger,
             scenario=scenario,
             user_id=uid,
@@ -215,12 +218,26 @@ async def _try_send(
 
 
 async def _generate(ctx: SocialContext, snippet: str, occasion_label: str) -> str:
+    prompt = _GREETING_PROMPT.format(occasion_label=occasion_label, persona_snippet=snippet or "<无画像>")
+    messages = [{"role": "user", "content": prompt}]
+    if ctx.tool_caller and ctx.tool_registry:
+        try:
+            text = await run_social_text_agent(
+                ctx,
+                messages=messages,
+                trigger_reason="social_festival_greeting",
+                chat_intent_hint="social_festival_greeting",
+            )
+        except Exception as exc:
+            ctx.logger.debug(f"[social/festival] Agent generate failed: {exc}")
+            return ""
+        text = text.strip('"').strip("'").strip("「」").strip()
+        return text[:120] if text else ""
     if not ctx.tool_caller:
         return f"{occasion_label}快乐～"
-    prompt = _GREETING_PROMPT.format(occasion_label=occasion_label, persona_snippet=snippet or "<无画像>")
     try:
         response = await ctx.tool_caller.chat_with_tools(
-            messages=[{"role": "user", "content": prompt}],
+            messages=messages,
             tools=[],
             use_builtin_search=False,
         )

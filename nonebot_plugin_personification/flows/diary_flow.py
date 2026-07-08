@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import inspect
 import json
 import random
@@ -9,12 +10,18 @@ from pathlib import Path
 from typing import Any, Awaitable, Callable, Optional
 
 from ..agent.inner_state import load_inner_state, update_state_from_diary
-from ..agent.runtime.simple_loop import run_tool_loop_text
+from ..core.agent_bridge import run_text_agent
 from ..core.context_policy import strip_response_control_markers
 from ..core.data_store import get_data_store
 from ..core.emotion_state import describe_group_emotion_memory, load_emotion_state
 from ..core.persona_profile import load_persona_profile
 from ..core.response_review import is_agent_reply_ooc, rewrite_agent_reply_ooc
+from ..core.sticker_library import (
+    list_local_sticker_files,
+    load_sticker_metadata,
+    render_sticker_semantic_summary,
+    resolve_sticker_dir,
+)
 from ..skills.skillpacks.image_gen.scripts.impl import generate_image as generate_codex_image
 
 
@@ -27,6 +34,15 @@ _FLOW_OUTPUT_GUARD = (
     "不要因为这是发动态就变成中立的旁白腔或通用助手腔。"
     "只是把输出格式换成这条用户消息里要求的纯文本/JSON，"
     "不要使用 <status>/<think>/<action>/<output>/<message> 等思维链 XML 包装。"
+)
+
+_QZONE_CASUAL_TONE_DISCIPLINE = (
+    "额外口吻纪律：不要写成镜头旁白、散文描写、状态报告或“我正在陈述一个画面”的完整句。"
+    "少用连续铺景的叙述开头（比如一上来交代时间、天气、外面声音、杯子里的东西），"
+    "也不要堆“光、风、疲惫、安静、突然发现”这类意象去撑气氛。"
+    "优先像手机上随手敲的一句：短、轻、可以半截、可以吐槽，不必把前因后果说圆。"
+    "不要写成整齐的二段式机灵句，尤其别用“脑子/胃/手/嘴先开始……”这类器官拟人、先后对仗、"
+    "看似俏皮但模板感很重的句式；宁可更普通、更像真的随手敲。"
 )
 
 
@@ -267,14 +283,147 @@ def _is_too_similar_to_recent_qzone_post(content: str, recent_posts: list[str]) 
     return False
 
 
+_QZONE_STICKER_IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png"}
+
+
+def _normalize_qzone_sticker_match_text(text: str) -> str:
+    value = str(text or "").strip().lower()
+    value = re.sub(r"\s+", "", value)
+    return re.sub(r"[^\w\u4e00-\u9fff]+", "", value)
+
+
+def _qzone_sticker_overlap_score(context: str, candidate: str) -> int:
+    current = _normalize_qzone_sticker_match_text(context)
+    target = _normalize_qzone_sticker_match_text(candidate)
+    if len(current) < 2 or len(target) < 2:
+        return 0
+    if current in target or target in current:
+        return 4
+    max_span = min(8, len(target))
+    for span in range(max_span, 1, -1):
+        for start in range(0, len(target) - span + 1):
+            if target[start : start + span] in current:
+                return 1
+    return 0
+
+
+def _score_qzone_sticker_candidate(meta: dict[str, Any], context: str) -> float:
+    if not isinstance(meta, dict):
+        meta = {}
+    if meta.get("is_sticker") is False:
+        return -1.0
+    try:
+        weight = max(0.0, float(meta.get("weight", 1.0) or 1.0))
+    except (TypeError, ValueError):
+        weight = 1.0
+    if weight <= 0.0:
+        return -1.0
+    score = weight
+    if meta.get("proactive_send") is True:
+        score += 2.0
+    style = str(meta.get("style", "anime") or "anime").strip().lower()
+    if style == "anime":
+        score += 1.0
+    elif style == "meme":
+        score += 0.3
+    summary = render_sticker_semantic_summary(meta)
+    score += _qzone_sticker_overlap_score(context, summary)
+    score += _qzone_sticker_overlap_score(context, str(meta.get("description", "") or ""))
+    score += _qzone_sticker_overlap_score(context, str(meta.get("use_hint", "") or ""))
+    score -= min(3, _qzone_sticker_overlap_score(context, str(meta.get("avoid_hint", "") or "")))
+    return score
+
+
+def _select_qzone_sticker_image(
+    *,
+    plugin_config: Any,
+    content: str,
+    image_prompt: str,
+) -> Path | None:
+    sticker_root = getattr(plugin_config, "personification_sticker_path", "data/stickers")
+    sticker_dir = resolve_sticker_dir(sticker_root)
+    files = [
+        path
+        for path in list_local_sticker_files(sticker_dir, include_gif=False)
+        if path.suffix.lower() in _QZONE_STICKER_IMAGE_SUFFIXES
+    ]
+    if not files:
+        return None
+    context = "\n".join(part for part in (str(content or ""), str(image_prompt or "")) if part.strip())
+    metadata = load_sticker_metadata(sticker_dir)
+    candidates: list[tuple[float, Path]] = []
+    for file_path in files:
+        meta = metadata.get(file_path.name, {}) if isinstance(metadata, dict) else {}
+        score = _score_qzone_sticker_candidate(meta, context)
+        if score < 0:
+            continue
+        candidates.append((score, file_path))
+    if not candidates:
+        return None
+    candidates.sort(key=lambda item: (-item[0], item[1].name))
+    top = candidates[: min(6, len(candidates))]
+    if len(top) == 1:
+        return top[0][1]
+    weights = [max(0.1, item[0]) for item in top]
+    return random.choices([item[1] for item in top], weights=weights, k=1)[0]
+
+
+async def _maybe_build_qzone_sticker_image_marker(
+    *,
+    plugin_config: Any,
+    content: str,
+    image_prompt: str,
+    logger: Any,
+) -> str:
+    if plugin_config is None:
+        return ""
+    try:
+        selected = await asyncio.to_thread(
+            _select_qzone_sticker_image,
+            plugin_config=plugin_config,
+            content=content,
+            image_prompt=image_prompt,
+        )
+    except Exception as exc:
+        if logger is not None:
+            logger.debug(f"[qzone] select sticker image failed: {exc}")
+        return ""
+    if selected is None:
+        return ""
+    try:
+        payload = await asyncio.to_thread(selected.read_bytes)
+    except Exception as exc:
+        if logger is not None:
+            logger.debug(f"[qzone] read sticker image failed: {selected}: {exc}")
+        return ""
+    if not payload:
+        return ""
+    b64 = base64.b64encode(payload).decode("ascii")
+    if logger is not None:
+        logger.info(f"[qzone] use local sticker image as post attachment: {selected.name}")
+    return f"\n[IMAGE_B64]{b64}[/IMAGE_B64]"
+
+
 async def _maybe_generate_qzone_image_marker(
     *,
     tool_caller: Any,
     image_prompt: str,
+    content: str = "",
+    plugin_config: Any = None,
     logger: Any,
 ) -> str:
     prompt = str(image_prompt or "").strip()
-    if not prompt or tool_caller is None:
+    if not prompt:
+        return ""
+    sticker_marker = await _maybe_build_qzone_sticker_image_marker(
+        plugin_config=plugin_config,
+        content=content,
+        image_prompt=prompt,
+        logger=logger,
+    )
+    if sticker_marker:
+        return sticker_marker
+    if tool_caller is None:
         return ""
     try:
         result = await generate_codex_image(
@@ -304,13 +453,22 @@ _NET_SLANG_TIC_RE = re.compile(
     re.IGNORECASE,
 )
 
+_QZONE_STIFF_TIC_RE = re.compile(
+    r"([脑胃手嘴眼心身体][子睛脚]?[没不还已]?[在先]?.{0,10}[催拐喊动馋困累]|"
+    r".{1,12}[，,；;].{0,8}先.{0,12}了|今天只想.{2,18})"
+)
+
 
 async def _rewrite_qzone_net_slang(
     text: str,
     *,
     tool_caller: Any,
+    registry: Any = None,
+    plugin_config: Any = None,
+    agent_max_steps: int = 4,
     persona_system: Any = "",
     timeout: float = 8.0,
+    logger: Any = None,
 ) -> str:
     """把带营业感叹腔/网络流行语的说说改写成平铺直叙的一句。"""
     if tool_caller is None:
@@ -326,16 +484,73 @@ async def _rewrite_qzone_net_slang(
                 "下面这条 QQ 空间说说带有营业感叹腔/网络流行语"
                 "（如『也太……了吧 / ……爆了 / 绝了 / 谁懂 / 笑死 / yyds』）。"
                 "用你自己的口吻改写成平铺直叙的一句日常碎碎念，去掉所有感叹营业腔和网络流行语，"
-                "只描述那个画面或念头本身，不喊口号、不强行制造情绪，12-50 字。只输出改写后的句子。"
+                "只描述那个画面或念头本身，不喊口号、不强行制造情绪；如果原句像散文旁白或状态报告，"
+                "也一起改成更随手、更口语的一句，12-50 字。只输出改写后的句子。"
             ),
         }
     )
     messages.append({"role": "user", "content": str(text or "").strip()[:300]})
     try:
-        response = await asyncio.wait_for(
-            tool_caller.chat_with_tools(messages, [], False),
-            timeout=timeout,
-        )
+        if registry is not None:
+            return await run_text_agent(
+                messages=messages,
+                plugin_config=plugin_config,
+                logger=logger,
+                tool_caller=tool_caller,
+                registry=registry,
+                max_steps=agent_max_steps,
+                trigger_reason="qzone_net_slang_rewrite",
+                chat_intent_hint="qzone_net_slang_rewrite",
+            )
+        response = await asyncio.wait_for(tool_caller.chat_with_tools(messages, [], False), timeout=timeout)
+    except Exception:
+        return ""
+    return str(getattr(response, "content", "") or "").strip()
+
+
+async def _rewrite_qzone_stiff_tic(
+    text: str,
+    *,
+    tool_caller: Any,
+    registry: Any = None,
+    plugin_config: Any = None,
+    agent_max_steps: int = 4,
+    persona_system: Any = "",
+    timeout: float = 8.0,
+    logger: Any = None,
+) -> str:
+    """把模板化的机灵句/器官拟人句改成更真一点的随手短句。"""
+    if tool_caller is None:
+        return ""
+    messages: list[dict[str, Any]] = []
+    persona = str(persona_system or "").strip()
+    if persona:
+        messages.append({"role": "system", "content": persona[:1200]})
+    messages.append(
+        {
+            "role": "system",
+            "content": (
+                "下面这条 QQ 空间说说有点像模板化的机灵句：二段式、先后对仗、器官拟人、"
+                "或“今天只想……”这种太工整的口播感。请保留角色口吻和原本的小念头，"
+                "改写成更像真人随手敲的一句日常碎碎念。可以更普通、更短、更松散，"
+                "不要解释为什么改，不要补设定，不要喊口号，12-45 个中文字符。只输出改写后的句子。"
+            ),
+        }
+    )
+    messages.append({"role": "user", "content": str(text or "").strip()[:300]})
+    try:
+        if registry is not None:
+            return await run_text_agent(
+                messages=messages,
+                plugin_config=plugin_config,
+                logger=logger,
+                tool_caller=tool_caller,
+                registry=registry,
+                max_steps=agent_max_steps,
+                trigger_reason="qzone_stiff_tic_rewrite",
+                chat_intent_hint="qzone_stiff_tic_rewrite",
+            )
+        response = await asyncio.wait_for(tool_caller.chat_with_tools(messages, [], False), timeout=timeout)
     except Exception:
         return ""
     return str(getattr(response, "content", "") or "").strip()
@@ -345,6 +560,9 @@ async def _review_qzone_post(
     text: str,
     *,
     tool_caller: Any,
+    registry: Any = None,
+    plugin_config: Any = None,
+    agent_max_steps: int = 4,
     persona_system: Any = "",
     logger: Any,
 ) -> str:
@@ -354,6 +572,7 @@ async def _review_qzone_post(
        用群聊同款的 `is_agent_reply_ooc` 正则 + `rewrite_agent_reply_ooc` 重写兜住；
        重写失败则丢弃该条（宁缺勿发）。
     2) 再兜一层『(也)太……了吧 / X爆了 / 绝了 / yyds』等营业感叹腔，改写成平铺直叙。
+    3) 对看起来过度工整的 QZone 机灵句做一次轻改写，避免“越改越怪”的模板感。
     """
     if not text or tool_caller is None:
         return text
@@ -373,13 +592,32 @@ async def _review_qzone_post(
         toned = await _rewrite_qzone_net_slang(
             text,
             tool_caller=tool_caller,
+            registry=registry,
+            plugin_config=plugin_config,
+            agent_max_steps=agent_max_steps,
             persona_system=persona_system,
+            logger=logger,
         )
         toned = _trim_qzone_content(toned)
         if toned and not _NET_SLANG_TIC_RE.search(toned):
             text = toned
         elif logger is not None:
             logger.info(f"[qzone] net-slang rewrite ineffective, keeping: {text}")
+    if text and _QZONE_STIFF_TIC_RE.search(text):
+        toned = await _rewrite_qzone_stiff_tic(
+            text,
+            tool_caller=tool_caller,
+            registry=registry,
+            plugin_config=plugin_config,
+            agent_max_steps=agent_max_steps,
+            persona_system=persona_system,
+            logger=logger,
+        )
+        toned = _trim_qzone_content(toned)
+        if toned and not _QZONE_STIFF_TIC_RE.search(toned):
+            text = toned
+        elif logger is not None:
+            logger.info(f"[qzone] stiff-tic rewrite ineffective, keeping: {text}")
     return text
 
 
@@ -388,6 +626,9 @@ async def _build_qzone_post_with_optional_image(
     content: str,
     image_prompt: str,
     tool_caller: Any,
+    registry: Any = None,
+    plugin_config: Any = None,
+    agent_max_steps: int = 4,
     logger: Any,
     recent_posts: Optional[list[str]] = None,
     persona_system: Any = "",
@@ -398,6 +639,9 @@ async def _build_qzone_post_with_optional_image(
     text = await _review_qzone_post(
         text,
         tool_caller=tool_caller,
+        registry=registry,
+        plugin_config=plugin_config,
+        agent_max_steps=agent_max_steps,
         persona_system=persona_system,
         logger=logger,
     )
@@ -409,17 +653,20 @@ async def _build_qzone_post_with_optional_image(
     image_marker = await _maybe_generate_qzone_image_marker(
         tool_caller=tool_caller,
         image_prompt=image_prompt,
+        content=text,
+        plugin_config=plugin_config,
         logger=logger,
     )
     return f"{text}{image_marker}"
 
 
 async def get_recent_chat_context(bot: Any, logger: Any) -> str:
-    """Sample recent group messages as diary context."""
+    """Sample recent non-bot group messages as diary context."""
     try:
         group_list = await bot.get_group_list()
         if not group_list:
             return ""
+        bot_id = str(getattr(bot, "self_id", "") or "")
 
         # 多采几个群、每群跨时间窗稀疏取样，避免说说素材被单一群的单一热议话题主导。
         selected_groups = random.sample(group_list, min(3, len(group_list)))
@@ -439,7 +686,11 @@ async def get_recent_chat_context(bot: Any, logger: Any) -> str:
 
             lines = []
             for msg in messages["messages"]:
-                sender_name = msg.get("sender", {}).get("nickname", "未知")
+                sender = msg.get("sender", {}) if isinstance(msg.get("sender"), dict) else {}
+                sender_id = str(sender.get("user_id") or msg.get("user_id") or "").strip()
+                if bot_id and sender_id == bot_id:
+                    continue
+                sender_name = sender.get("nickname", "未知")
                 raw_msg = msg.get("message", "")
                 content = ""
 
@@ -494,6 +745,7 @@ async def _generate_once(
     system_prompt: Any,
     user_prompt: str,
     *,
+    plugin_config: Any = None,
     call_ai_api: Callable[..., Awaitable[Optional[str]]],
     use_builtin_search: bool = False,
     tool_caller: Any = None,
@@ -534,16 +786,23 @@ async def _generate_once(
         _qz_token = None
     try:
         if tool_caller is not None and registry is not None:
-            # 与群聊同等：让生成过程也能按需调用 web_search 等真实工具查证内容。
-            result = await run_tool_loop_text(
-                messages,
-                registry=registry,
-                tool_caller=tool_caller,
-                logger=logger,
-                max_steps=agent_max_steps,
-                use_builtin_search=use_builtin_search,
-                chat_intent="",
-            )
+            # 与群聊同等：走完整 Agent 管线，而不是轻量工具循环。
+            try:
+                result = await run_text_agent(
+                    messages=messages,
+                    plugin_config=plugin_config,
+                    logger=logger,
+                    tool_caller=tool_caller,
+                    registry=registry,
+                    max_steps=agent_max_steps,
+                    use_builtin_search_hint=use_builtin_search,
+                    trigger_reason="qzone_diary",
+                    chat_intent_hint="qzone_diary",
+                )
+            except Exception as exc:
+                if logger is not None:
+                    logger.warning(f"[diary] full Agent failed, skip direct-model fallback: {exc}")
+                result = ""
         elif supports_builtin_search:
             result = await call_ai_api(messages, use_builtin_search=use_builtin_search)
         else:
@@ -586,6 +845,7 @@ async def generate_ai_diary(
     load_prompt: Callable[[], Any],
     call_ai_api: Callable[..., Awaitable[Optional[str]]],
     logger: Any,
+    plugin_config: Any = None,
     tool_caller: Any = None,
     data_dir: Optional[Path] = None,
     registry: Any = None,
@@ -612,13 +872,16 @@ async def generate_ai_diary(
     base_requirements = (
         "请写一条自然、像真人随手发的 QQ 空间说说，不要写周记小作文。\n"
         "输出严格 JSON：{\"content\":\"正文\",\"image_prompt\":\"可选英文配图提示词\"}。\n"
+        f"{_QZONE_CASUAL_TONE_DISCIPLINE}\n"
         "1. 正文 12-50 个中文字符，像随手发的一句日常碎碎念。\n"
         "2. 只抓一个很小的生活瞬间或念头，不要总结聊天、日报、作文或公告。\n"
         "3. 允许跳跃：可以半句话突然转到另一个画面，或在一个观察后接一句不相关的吐槽；不必上下文连贯。\n"
         "4. 标点可以省略，可用空格、句号、问号代替逗号；可以是反问、牢骚、发现、未说完的半句；不必有结论。\n"
-        "5. 语气贴合角色，但不要互联网黑话、热梗、夸张营业感、AI 客服腔、对仗工整的总结句。\n"
+        "5. 语气贴合角色，但不要互联网黑话、热梗、夸张营业感、AI 客服腔、对仗工整的总结句或文艺旁白句。\n"
         "5b. 严禁用『(也)太……了吧 / ……爆了 / ……绝了 / 谁懂啊 / 笑死 / 绷不住了 / yyds / 好耶』这类营业感叹腔收尾或起势；"
         "把这种感叹换成平铺直叙的一句话，或干脆只描述那个画面/动作本身，不喊口号、不强行制造情绪。\n"
+        "5c. 避开看似俏皮但像生成器模板的表达：不要让脑子、胃、手、嘴等器官轮流上台催促，"
+        "不要写“X 没在怎样，Y 先怎样了”这类过分整齐的对仗句。\n"
         "6. 不要列条目、不要标题、不要 hashtag、不要说自己是 AI。\n"
         "7. 必须避开最近说说已经反复出现的话题、题材、具体意象、食物、动作和句式；如果最近写过类似的，就彻底换一个不同的话题和角度。\n"
         "8. 触发点要小而具体，写成自己的即时反应，不要新闻播报、不要复述大家正在热议的主话题。\n"
@@ -642,6 +905,7 @@ async def generate_ai_diary(
         raw_rich_result = await _generate_once(
             system_prompt,
             rich_prompt,
+            plugin_config=plugin_config,
             call_ai_api=call_ai_api,
             use_builtin_search=True,
             tool_caller=tool_caller,
@@ -656,6 +920,9 @@ async def generate_ai_diary(
                 content=str(payload.get("content", "") or ""),
                 image_prompt=str(payload.get("image_prompt", "") or ""),
                 tool_caller=tool_caller,
+                registry=registry,
+                plugin_config=plugin_config,
+                agent_max_steps=agent_max_steps,
                 logger=logger,
                 recent_posts=recent_posts,
                 persona_system=system_prompt,
@@ -687,6 +954,7 @@ async def generate_ai_diary(
     raw_result = await _generate_once(
         system_prompt,
         basic_prompt,
+        plugin_config=plugin_config,
         call_ai_api=call_ai_api,
         use_builtin_search=True,
         tool_caller=tool_caller,
@@ -700,6 +968,9 @@ async def generate_ai_diary(
             content=str(payload.get("content", "") or ""),
             image_prompt=str(payload.get("image_prompt", "") or ""),
             tool_caller=tool_caller,
+            registry=registry,
+            plugin_config=plugin_config,
+            agent_max_steps=agent_max_steps,
             logger=logger,
             recent_posts=recent_posts,
             persona_system=system_prompt,
@@ -725,6 +996,7 @@ async def maybe_generate_proactive_qzone_post(
     load_prompt: Callable[[], Any],
     call_ai_api: Callable[..., Awaitable[Optional[str]]],
     logger: Any,
+    plugin_config: Any = None,
     data_dir: Optional[Path] = None,
     tool_caller: Any = None,
     registry: Any = None,
@@ -792,13 +1064,15 @@ async def maybe_generate_proactive_qzone_post(
         "4. 只写一个小瞬间、小吐槽或突然想到的念头，不要列表、标题、hashtag 或总结腔。\n"
         "5. 不要为了发而发，不要重复最近已经说过很多遍的话题或题材，每次换着不同的话题和角度来，不要互联网黑话和热梗。\n"
         "5b. 严禁用『(也)太……了吧 / ……爆了 / ……绝了 / 谁懂啊 / 笑死 / yyds』这类营业感叹腔；改成平铺直叙或只描述画面本身，不喊口号。\n"
-        "6. 触发点可以是当下心情、一个生活小观察，或今天游戏、动漫、轻新闻里的一个细节，但写成自己的日常反应、不要复述群里正在热议的主话题、不要像新闻标题。\n"
-        f"7. {_pick_diversity_hint()}\n"
-        "8. 如果适合配图，image_prompt 写英文画面描述，要求贴合人设和正文氛围；不适合就留空。"
+        f"6. {_QZONE_CASUAL_TONE_DISCIPLINE}\n"
+        "7. 触发点可以是当下心情、一个生活小观察，或今天游戏、动漫、轻新闻里的一个细节，但写成自己的日常反应、不要复述群里正在热议的主话题、不要像新闻标题。\n"
+        f"8. {_pick_diversity_hint()}\n"
+        "9. 如果适合配图，image_prompt 写英文画面描述，要求贴合人设和正文氛围；不适合就留空。"
     )
     result = await _generate_once(
         system_prompt,
         decision_prompt,
+        plugin_config=plugin_config,
         call_ai_api=call_ai_api,
         use_builtin_search=True,
         tool_caller=tool_caller,
@@ -816,6 +1090,9 @@ async def maybe_generate_proactive_qzone_post(
             content=str(payload.get("content", "") or ""),
             image_prompt=str(payload.get("image_prompt", "") or ""),
             tool_caller=tool_caller,
+            registry=registry,
+            plugin_config=plugin_config,
+            agent_max_steps=agent_max_steps,
             logger=logger,
             recent_posts=recent_posts,
             persona_system=system_prompt,
@@ -825,6 +1102,9 @@ async def maybe_generate_proactive_qzone_post(
         text = await _review_qzone_post(
             text,
             tool_caller=tool_caller,
+            registry=registry,
+            plugin_config=plugin_config,
+            agent_max_steps=agent_max_steps,
             persona_system=system_prompt,
             logger=logger,
         )

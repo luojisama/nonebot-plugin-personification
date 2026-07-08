@@ -3,7 +3,9 @@ from __future__ import annotations
 from pathlib import Path
 
 
-_PLUGIN_ROOT = Path(__file__).resolve().parent.parent / "nonebot_plugin_personification"
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+_PACKAGE_ROOT = _REPO_ROOT / "nonebot_plugin_personification"
+_PLUGIN_ROOT = _PACKAGE_ROOT if _PACKAGE_ROOT.exists() else _REPO_ROOT
 
 
 def test_search_keyword_fallback_files_have_explicit_boundaries() -> None:

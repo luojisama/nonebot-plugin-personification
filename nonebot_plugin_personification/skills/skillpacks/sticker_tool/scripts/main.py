@@ -15,6 +15,7 @@ async def run(
     proactive: bool = False,
     sticker_dir: str = "",
     user_text: str = "",
+    media_type: str = "static",
 ) -> str:
     act = str(action or "").strip().lower()
     if act == "select":
@@ -27,6 +28,7 @@ async def run(
             proactive=bool(proactive),
             plugin_config=cfg,
             skills_root=Path("plugin/personification/skills"),
+            media_type=media_type,
         )
         return selected or ""
     if act == "context":

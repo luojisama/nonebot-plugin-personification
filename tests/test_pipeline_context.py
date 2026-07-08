@@ -7,7 +7,7 @@ from ._loader import load_personification_module
 pipeline_context = load_personification_module("plugin.personification.handlers.reply_pipeline.pipeline_context")
 
 
-def test_should_use_agent_for_reply_rejects_high_ambiguity_lookup_without_direct_mention() -> None:
+def test_should_use_agent_for_reply_uses_agent_for_high_ambiguity_lookup_without_direct_mention() -> None:
     decision = pipeline_context.should_use_agent_for_reply(
         plugin_config=SimpleNamespace(
             personification_agent_enabled=True,
@@ -21,7 +21,7 @@ def test_should_use_agent_for_reply_rejects_high_ambiguity_lookup_without_direct
         has_image_input=False,
     )
 
-    assert decision is False
+    assert decision is True
 
 
 def test_should_use_agent_for_reply_keeps_direct_mention_lookup_enabled() -> None:
@@ -39,6 +39,40 @@ def test_should_use_agent_for_reply_keeps_direct_mention_lookup_enabled() -> Non
     )
 
     assert decision is True
+
+
+def test_should_use_agent_for_reply_uses_agent_for_expression_turns() -> None:
+    decision = pipeline_context.should_use_agent_for_reply(
+        plugin_config=SimpleNamespace(
+            personification_agent_enabled=True,
+            personification_web_search_always=False,
+        ),
+        tool_registry=object(),
+        agent_tool_caller=object(),
+        message_intent="expression",
+        ambiguity_level="low",
+        is_direct_mention=True,
+        has_image_input=False,
+    )
+
+    assert decision is True
+
+
+def test_should_use_agent_for_reply_respects_disabled_agent_runtime() -> None:
+    decision = pipeline_context.should_use_agent_for_reply(
+        plugin_config=SimpleNamespace(
+            personification_agent_enabled=False,
+            personification_web_search_always=False,
+        ),
+        tool_registry=object(),
+        agent_tool_caller=object(),
+        message_intent="lookup",
+        ambiguity_level="low",
+        is_direct_mention=True,
+        has_image_input=False,
+    )
+
+    assert decision is False
 
 
 def test_confidence_style_instruction_medium() -> None:

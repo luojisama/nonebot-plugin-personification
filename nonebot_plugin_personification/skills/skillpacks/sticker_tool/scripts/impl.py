@@ -45,7 +45,13 @@ SELECT_STICKER_DESCRIPTION = """从表情包库中语义选择一张合适的图
 - mood：结构化表情标签，格式固定为"情绪标签|场景标签"，如"搞笑|接梗""无语|吐槽""撒娇|卖萌"
 - context：当前对话的一句话摘要，如"对方在分享一件搞笑的事"
 - proactive：是否是你主动发出（True=主动，False=回应对方）
+- media_type：static=只选静态图，gif=只选 GIF 动图，any=静态/GIF 都可
 不要为了发表情包而发，只在真正合适的时机调用。"""
+
+SEND_STICKER_DESCRIPTION = """从本地表情包库中语义选择并发送一张表情包。
+调用时机：当你决定这一轮用表情包回应比文字更自然，或用户明确要求你发 GIF/动图/表情包时。
+media_type=gif 时只发送 GIF 动态表情；media_type=any 时允许静态图或 GIF。
+调用成功后表情包已经排队发送，最终回复请保持沉默，不要解释“我发了”。"""
 
 # Prompt sent to the vision+search LLM when identifying image subjects.
 # The LLM receives the image and is asked to first describe, then use its
@@ -280,12 +286,16 @@ def rank_sticker_candidates(
     minimum_score: int = 1,
     limit: int = 6,
     feedback_state: Optional[dict[str, Any]] = None,
+    allow_gif: bool = False,
+    gif_only: bool = False,
 ) -> List[dict[str, Any]]:
     sticker_dir = resolve_sticker_dir(sticker_dir)
     if not sticker_dir.exists():
         return []
 
-    stickers = list_local_sticker_files(sticker_dir)
+    stickers = list_local_sticker_files(sticker_dir, include_gif=bool(allow_gif or gif_only))
+    if gif_only:
+        stickers = [path for path in stickers if path.suffix.lower() == ".gif"]
     if not stickers:
         return []
 
@@ -373,6 +383,8 @@ async def choose_sticker_for_context(
     minimum_score: int = 2,
     excluded_stickers: Optional[List[str]] = None,
     feedback_state: Optional[dict[str, Any]] = None,
+    allow_gif: bool = False,
+    gif_only: bool = False,
 ) -> Path | None:
     candidates = rank_sticker_candidates(
         sticker_dir,
@@ -384,6 +396,8 @@ async def choose_sticker_for_context(
         minimum_score=minimum_score,
         limit=8,
         feedback_state=feedback_state,
+        allow_gif=allow_gif,
+        gif_only=gif_only,
     )
     if excluded_stickers:
         excluded_set = {Path(n).stem for n in excluded_stickers} | set(excluded_stickers)
@@ -466,8 +480,12 @@ def select_sticker(
     skills_root: Optional[Path] = None,
     allow_fallback: bool = True,
     minimum_score: int = 1,
+    media_type: str = "static",
 ) -> str:
     sticker_dir = resolve_sticker_dir(sticker_dir)
+    normalized_media_type = str(media_type or "static").strip().lower()
+    allow_gif = normalized_media_type in {"any", "gif"}
+    gif_only = normalized_media_type == "gif"
     candidates = rank_sticker_candidates(
         sticker_dir,
         mood=mood,
@@ -476,14 +494,56 @@ def select_sticker(
         plugin_config=plugin_config,
         skills_root=skills_root,
         minimum_score=minimum_score,
+        allow_gif=allow_gif,
+        gif_only=gif_only,
     )
     if candidates:
         return str(candidates[0]["path"])
 
     if not allow_fallback:
         return ""
-    stickers = list_local_sticker_files(sticker_dir)
+    stickers = list_local_sticker_files(sticker_dir, include_gif=allow_gif or gif_only)
+    if gif_only:
+        stickers = [path for path in stickers if path.suffix.lower() == ".gif"]
     return str(stickers[0]) if stickers else ""
+
+
+def _normalize_media_type(value: Any) -> str:
+    text = str(value or "static").strip().lower()
+    if text in {"gif", "dynamic", "animated", "动图", "动态", "gif动图"}:
+        return "gif"
+    if text in {"any", "all", "mixed", "任意", "不限"}:
+        return "any"
+    return "static"
+
+
+def _queue_action(executor: Any, action_type: str, params: dict[str, Any]) -> bool:
+    queue = getattr(executor, "queue_action", None)
+    if callable(queue):
+        queue(action_type, params)
+        return True
+    actions = getattr(executor, "pending_actions", None)
+    if isinstance(actions, list):
+        actions.append({"type": action_type, "params": dict(params or {})})
+        return True
+    return False
+
+
+def _action_result(*, ok: bool, queued: bool = False, kind: str = "", reason: str = "", **extra: Any) -> str:
+    payload: dict[str, Any] = {"ok": ok, "queued": queued}
+    if kind:
+        payload["kind"] = kind
+    if reason:
+        payload["reason"] = reason
+    payload.update(extra)
+    if queued:
+        payload["final_reply_instruction"] = "表情包已经安排发送；最终回复请只输出 [SILENCE]，不要再解释工具或重复说已发送。"
+    return json.dumps(payload, ensure_ascii=False)
+
+
+def _sticker_history_text(path: Path) -> str:
+    kind = "GIF表情包" if path.suffix.lower() == ".gif" else "表情包"
+    return f"[{kind}:{path.stem}]"
 
 
 # ---------------------------------------------------------------------------
@@ -495,7 +555,7 @@ def build_select_sticker_tool(
     plugin_config: Any,
     skills_root: Optional[Path] = None,
 ) -> AgentTool:
-    async def _handler(mood: str, context: str, proactive: bool = False) -> str:
+    async def _handler(mood: str, context: str, proactive: bool = False, media_type: str = "static") -> str:
         return select_sticker(
             Path(sticker_dir),
             mood=mood,
@@ -503,6 +563,7 @@ def build_select_sticker_tool(
             proactive=proactive,
             plugin_config=plugin_config,
             skills_root=skills_root,
+            media_type=_normalize_media_type(media_type),
         )
 
     return AgentTool(
@@ -514,10 +575,101 @@ def build_select_sticker_tool(
                     "mood": {"type": "string", "description": "结构化表情标签，格式：情绪标签|场景标签"},
                     "context": {"type": "string", "description": "当前对话的一句话摘要"},
                     "proactive": {"type": "boolean", "description": "是否主动发出"},
+                    "media_type": {
+                        "type": "string",
+                        "description": "static=只选静态图，gif=只选 GIF 动图，any=静态/GIF 都可",
+                        "enum": ["static", "gif", "any"],
+                    },
                 },
             "required": ["mood", "context"],
         },
         handler=_handler,
+        metadata={
+            "intent_tags": ["expression"],
+            "evidence_kind": "resource",
+            "latency_class": "fast",
+            "risk_level": "low",
+        },
+    )
+
+
+def build_send_sticker_tool(
+    sticker_dir: Path,
+    plugin_config: Any,
+    executor: Any,
+    skills_root: Optional[Path] = None,
+) -> AgentTool:
+    async def _handler(
+        mood: str,
+        context: str,
+        proactive: bool = False,
+        media_type: str = "any",
+        preferred_sticker: str = "",
+    ) -> str:
+        resolved_media_type = _normalize_media_type(media_type)
+        sticker_path = await choose_sticker_for_context(
+            Path(sticker_dir),
+            mood=mood,
+            context=context,
+            proactive=bool(proactive),
+            plugin_config=plugin_config,
+            preferred_sticker=preferred_sticker,
+            skills_root=skills_root,
+            minimum_score=1,
+            allow_gif=resolved_media_type in {"any", "gif"},
+            gif_only=resolved_media_type == "gif",
+        )
+        if sticker_path is None:
+            return _action_result(ok=False, reason="没有找到匹配的表情包")
+        sticker_path = Path(sticker_path)
+        if resolved_media_type == "gif" and sticker_path.suffix.lower() != ".gif":
+            return _action_result(ok=False, reason="没有找到匹配的 GIF 表情包")
+        image_uri = f"file:///{sticker_path.resolve().as_posix()}"
+        if not _queue_action(
+            executor,
+            "send_sticker",
+            {
+                "path": image_uri,
+                "history_text": _sticker_history_text(sticker_path),
+            },
+        ):
+            return _action_result(ok=False, reason="当前发送上下文不可用")
+        return _action_result(
+            ok=True,
+            queued=True,
+            kind="gif_sticker" if sticker_path.suffix.lower() == ".gif" else "local_sticker",
+            file=sticker_path.name,
+        )
+
+    return AgentTool(
+        name="send_local_sticker",
+        description=SEND_STICKER_DESCRIPTION,
+        parameters={
+            "type": "object",
+            "properties": {
+                "mood": {"type": "string", "description": "结构化表情标签，格式：情绪标签|场景标签"},
+                "context": {"type": "string", "description": "当前对话的一句话摘要"},
+                "proactive": {"type": "boolean", "description": "是否主动发出"},
+                "media_type": {
+                    "type": "string",
+                    "description": "static=静态图，gif=只发 GIF 动图，any=静态/GIF 都可",
+                    "enum": ["static", "gif", "any"],
+                },
+                "preferred_sticker": {
+                    "type": "string",
+                    "description": "可选，指定文件名或不带后缀的表情包名",
+                },
+            },
+            "required": ["mood", "context"],
+        },
+        handler=_handler,
+        local=True,
+        metadata={
+            "intent_tags": ["expression"],
+            "evidence_kind": "action",
+            "latency_class": "fast",
+            "risk_level": "low",
+        },
     )
 
 
@@ -791,7 +943,8 @@ def build_analyze_image_tool(
         name="analyze_image",
         description=(
             "分析当前对话中的图片内容，可用于图中文字翻译、人物/角色识别或场景解读。"
-            "当用户发图、要求翻译图片文字、问图中是谁或让你解读图片含义时调用。"
+            "当你需要内部理解当前图片，或用户明确要求翻译图片文字、问图中是谁、让你解读图片含义时调用。"
+            "工具结果是内部证据；除非用户明确要求说明图片，否则最终回复不要复述画面内容。"
             "image_index=1 表示最近一张图，2 表示倒数第二张。"
         ),
         parameters={

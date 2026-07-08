@@ -308,6 +308,8 @@ async def build_plugin_knowledge_async(
         for plugin in plugins:
             plugin_name = ""
             source_hash = ""
+            analysis_strategy = ""
+            module_bundle_count = 0
             try:
                 module = getattr(plugin, "module", None)
                 if module is None:
@@ -347,6 +349,10 @@ async def build_plugin_knowledge_async(
 
                 source_file_count = len(list(source_snapshot.get("files") or []))
                 source_chunk_count = len(list(source_snapshot.get("chunks") or []))
+                source_chars = int(source_snapshot.get("source_chars", 0) or 0)
+                source_coverage = source_snapshot.get("source_coverage", {})
+                if not isinstance(source_coverage, dict):
+                    source_coverage = {}
                 state_plugins[plugin_name] = {
                     **previous,
                     "hash": source_hash,
@@ -362,7 +368,11 @@ async def build_plugin_knowledge_async(
                     "root_path": str(plugin_root),
                     "source_file_count": source_file_count,
                     "source_chunk_count": source_chunk_count,
+                    "source_chars": source_chars,
                     "analysis_strategy": analysis_strategy,
+                    "analysis_scope": str(source_snapshot.get("analysis_scope", "") or source_coverage.get("analysis_scope", "")),
+                    "source_complete": bool(source_snapshot.get("source_complete", source_snapshot.get("complete", True))),
+                    "source_truncated": bool(source_snapshot.get("source_truncated", False)),
                     "module_bundle_count": module_bundle_count,
                     "failed_batch_index": 0,
                     "failed_batch_total": 0,
@@ -400,6 +410,12 @@ async def build_plugin_knowledge_async(
                 analyzed["source_hash"] = source_hash
                 analyzed["source_file_count"] = source_file_count
                 analyzed["source_chunk_count"] = source_chunk_count
+                analyzed["source_chars"] = int(analyzed.get("source_chars", source_chars) or source_chars)
+                analyzed.setdefault("analysis_scope", str(source_snapshot.get("analysis_scope", "") or source_coverage.get("analysis_scope", "")))
+                analyzed.setdefault("source_complete", bool(source_snapshot.get("source_complete", source_snapshot.get("complete", True))))
+                analyzed.setdefault("source_truncated", bool(source_snapshot.get("source_truncated", False)))
+                if not isinstance(analyzed.get("source_coverage"), dict):
+                    analyzed["source_coverage"] = source_coverage
                 analyzed["updated_at"] = _now_iso()
 
                 runtime_snapshot = scan_runtime_data(plugin_name, data_dir)
@@ -431,7 +447,12 @@ async def build_plugin_knowledge_async(
                     "root_path": str(plugin_root),
                     "source_file_count": source_file_count,
                     "source_chunk_count": source_chunk_count,
+                    "source_chars": int(analyzed.get("source_chars", source_chars) or source_chars),
                     "analysis_strategy": str(analysis_meta.get("analysis_mode", "") or analysis_strategy),
+                    "analysis_scope": str(analyzed.get("analysis_scope", "") or source_snapshot.get("analysis_scope", "") or source_coverage.get("analysis_scope", "")),
+                    "source_complete": bool(analyzed.get("source_complete", source_snapshot.get("source_complete", True))),
+                    "source_truncated": bool(analyzed.get("source_truncated", source_snapshot.get("source_truncated", False))),
+                    "source_coverage": analyzed.get("source_coverage", {}) if isinstance(analyzed.get("source_coverage"), dict) else source_coverage,
                     "module_bundle_count": int(analysis_meta.get("module_bundle_count", 0) or module_bundle_count),
                     "failed_batch_index": int(analysis_meta.get("failed_batch_index", 0) or 0),
                     "failed_batch_total": int(analysis_meta.get("failed_batch_total", 0) or 0),
@@ -456,6 +477,10 @@ async def build_plugin_knowledge_async(
                     "retry_count": int((previous or {}).get("retry_count", 0) or 0) + 1 if isinstance(previous, dict) else 1,
                     "updated_at": updated_at,
                     "last_success_at": str((previous or {}).get("last_success_at", "") or ""),
+                    "source_chars": int((previous or {}).get("source_chars", 0) or 0) if isinstance(previous, dict) else 0,
+                    "analysis_scope": str((previous or {}).get("analysis_scope", "") or "") if isinstance(previous, dict) else "",
+                    "source_complete": bool((previous or {}).get("source_complete", True)) if isinstance(previous, dict) else True,
+                    "source_truncated": bool((previous or {}).get("source_truncated", False)) if isinstance(previous, dict) else False,
                     "analysis_strategy": str((previous or {}).get("analysis_strategy", "") or analysis_strategy) if isinstance(previous, dict) else analysis_strategy,
                     "module_bundle_count": int((previous or {}).get("module_bundle_count", 0) or module_bundle_count) if isinstance(previous, dict) else module_bundle_count,
                     "failed_batch_index": failure["failed_batch_index"],

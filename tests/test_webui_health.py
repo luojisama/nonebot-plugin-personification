@@ -283,6 +283,95 @@ def test_interaction_test_group_uses_plugin_path_and_captures_reply(_runtime_con
     assert body["target_detail"]["group_id"] == _runtime_context.plugin_config.personification_webui_test_group_id
 
 
+def test_qzone_forward_test_forwards_first_feed_and_counts_quota(_runtime_context) -> None:
+    data_store_mod = load_personification_module("plugin.personification.core.data_store")
+    audit_mod = load_personification_module("plugin.personification.core.webui_audit_log")
+    cfg = _runtime_context.plugin_config
+    cfg.personification_qzone_enabled = True
+    cfg.personification_qzone_monthly_limit = 30
+    cfg.personification_qzone_min_interval_hours = 0
+
+    feed = {
+        "feed_id": "feed-first",
+        "owner_uin": "20001",
+        "nickname": "好友A",
+        "content": "第一条空间文案",
+        "created_at": 123456,
+        "unikey": "http://user.qzone.qq.com/20001/mood/feed-first",
+    }
+
+    class _FakeBot:
+        self_id = "10000"
+
+        async def call_api(self, _name: str, **kwargs):  # noqa: ANN001
+            _runtime_context.sent.append(kwargs)
+            return {"message_id": 1}
+
+        async def send_private_msg(self, **kwargs):  # noqa: ANN001
+            _runtime_context.sent.append(kwargs)
+            return {"message_id": 1}
+
+    class _FakeQzoneService:
+        def __init__(self) -> None:
+            self.fetches = []
+            self.forwarded = []
+
+        async def fetch_user_feeds(self, **kwargs):  # noqa: ANN003
+            self.fetches.append(kwargs)
+            return True, "ok", [feed, {"feed_id": "second"}]
+
+        async def forward_feed(self, **kwargs):  # noqa: ANN003
+            self.forwarded.append(kwargs)
+            return True, "ok"
+
+    service = _FakeQzoneService()
+    cookie_updates = []
+
+    async def _update_cookie(bot):  # noqa: ANN001
+        cookie_updates.append(getattr(bot, "self_id", ""))
+        return True, "ok"
+
+    logger = SimpleNamespace(info=lambda *_a, **_k: None, warning=lambda *_a, **_k: None)
+    _runtime_context.app_module.set_runtime_context(
+        plugin_config=cfg,
+        superusers={"10001"},
+        get_bots=lambda: {"10000": _FakeBot()},
+        logger=logger,
+        runtime_bundle=SimpleNamespace(
+            qzone_social_service=service,
+            update_qzone_cookie=_update_cookie,
+        ),
+    )
+
+    client = _build_client(_runtime_context)
+    _login_as_admin(client, _runtime_context)
+    _set_csrf(client)
+
+    res = client.post(
+        "/personification/api/health/qzone-forward-test",
+        json={"target_user_id": "20001", "forward_text": "这句有点东西"},
+    )
+
+    assert res.status_code == 200, res.text
+    body = res.json()
+    assert body["ok"] is True
+    assert body["target_user_id"] == "20001"
+    assert body["feed"]["feed_id"] == "feed-first"
+    assert service.fetches[0]["target_uin"] == "20001"
+    assert service.fetches[0]["count"] == 1
+    assert service.forwarded[0]["feed"] == feed
+    assert service.forwarded[0]["content"] == "这句有点东西"
+    assert cookie_updates == ["10000"]
+
+    state = data_store_mod.get_data_store().load_sync("qzone_post_state")
+    assert state["count"] == 1
+    assert state["forward_count"] == 1
+    assert body["quota"]["used"] == 1
+    rows = audit_mod.query_recent(action="qzone_forward_test", limit=5)
+    assert rows and rows[0]["target"] == "20001"
+    assert rows[0]["outcome"] == "ok"
+
+
 def test_health_requires_auth(_runtime_context) -> None:
     client = _build_client(_runtime_context)
     assert client.get("/personification/api/health/check").status_code == 401

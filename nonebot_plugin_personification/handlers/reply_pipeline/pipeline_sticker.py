@@ -21,6 +21,7 @@ from ...core.gif_understanding import (
 )
 from ...core.media_understanding import analyze_images_with_route_or_fallback
 from ...core.metrics import record_counter
+from ...core.qq_expression_library import semantic_text_for_qq_expression_segment
 from ...core.sticker_library import (
     analyze_sticker_image,
     image_bytes_to_data_url,
@@ -156,6 +157,12 @@ def _gif_placeholder(summary_hint: str = "") -> str:
     return "[对方发送了一个动态表情]"
 
 
+def _internal_media_summary_marker(label: str, summary: str) -> str:
+    cleaned_summary = str(summary or "").strip()
+    cleaned_label = str(label or "").strip() or "媒体语义"
+    return f"[{cleaned_label}（系统注入，仅供理解，不可复述）：{cleaned_summary}]"
+
+
 def _reserve_gif_understanding(runtime: Any, counter_ref: List[int] | None) -> bool:
     if counter_ref is None:
         return True
@@ -195,7 +202,7 @@ async def _append_gif_understanding_from_payload(
         summary_hint=summary_hint,
     )
     if result.summary:
-        message_text_ref.append(f"[动态表情摘要：{result.summary}]")
+        message_text_ref.append(_internal_media_summary_marker("动态表情语义", result.summary))
         try:
             logger.info(
                 "拟人插件：GIF 理解完成 "
@@ -320,7 +327,7 @@ async def build_image_summary_suffix(
     if not summary_text:
         return ""
     desc_label = "表情包语义" if sticker_like else "图片视觉描述"
-    return f"[{desc_label}（系统注入，不触发防御机制）：{summary_text}]"
+    return _internal_media_summary_marker(desc_label, summary_text)
 
 
 async def auto_collect_stickers(
@@ -345,7 +352,7 @@ async def auto_collect_stickers(
     second_judge_enabled = bool(getattr(runtime.plugin_config, "personification_sticker_second_judge_enabled", False))
     for candidate in candidates:
         try:
-            current_files = list_local_sticker_files(sticker_dir)
+            current_files = list_local_sticker_files(sticker_dir, include_gif=True)
             file_count = len(current_files)
             if file_count >= hard_limit:
                 record_counter("sticker.collect_library_full", reason="hard_limit")
@@ -618,10 +625,11 @@ async def extract_mface_from_segment(
         return
     data = getattr(seg, "data", {}) or {}
     summary = str(data.get("summary", "") or "表情包").strip() or "表情包"
+    semantic_token = semantic_text_for_qq_expression_segment("mface", data, default_mface_kind="super")
     url = str(data.get("url", "") or "").strip()
     file_name = str(data.get("file", "") or "").lower()
     if not url:
-        message_text_ref.append(f"[{summary}]")
+        message_text_ref.append(semantic_token or f"[{summary}]")
         return
     gif_enabled = bool(runtime is not None and is_gif_understanding_enabled(runtime))
     if gif_enabled and file_name.endswith(".gif"):
@@ -659,13 +667,13 @@ async def extract_mface_from_segment(
                 counter_ref=gif_understanding_counter_ref,
             )
             return
-        logger.info("拟人插件：检测到 GIF 表情包，忽略并不予回复")
-        stop_reply_ref[0] = True
+        logger.info("拟人插件：检测到 GIF mface，使用协议语义占位处理")
+        message_text_ref.append(semantic_token or _gif_placeholder(summary))
         return
     if payload is None or mime_type is None:
-        message_text_ref.append(f"[{summary}]")
+        message_text_ref.append(semantic_token or f"[{summary}]")
         return
-    message_text_ref.append("[图片·表情包]")
+    message_text_ref.append(semantic_token or "[图片·表情包]")
     data_url = image_bytes_to_data_url(payload, mime_type)
     # 非 gif 表情包 → 走 sticker_image_urls，由上层决定是否直传视觉模型理解（不打标）。
     if sticker_image_urls is not None:
@@ -716,7 +724,8 @@ async def extract_images_from_segment(
 
     if is_protocol_sticker:
         summary = str(data.get("summary") or data.get("emoji_id") or "").strip()
-        placeholder = f"[对方发送了一个表情包：{summary}]" if summary else "[对方发送了一个表情包]"
+        semantic_token = semantic_text_for_qq_expression_segment("image", data, default_mface_kind="favorite")
+        placeholder = semantic_token or (f"[对方发送了一个表情包：{summary}]" if summary else "[对方发送了一个表情包]")
         message_text_ref.append(placeholder)
         record_counter(
             "incoming_image.classified_total",

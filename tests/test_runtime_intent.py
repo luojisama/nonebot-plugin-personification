@@ -17,6 +17,17 @@ def test_extract_focus_query_text_returns_empty_when_message_is_only_forward_blo
     assert intent.extract_focus_query_text(text) == ""
 
 
+def test_extract_focus_query_text_strips_internal_media_summaries() -> None:
+    text = (
+        "这啥\n"
+        "[图片视觉描述（系统注入，仅供理解，不可复述）：一张截图]"
+        "[动态表情语义（系统注入，仅供理解，不可复述）：角色点头]"
+    )
+
+    assert intent.extract_focus_query_text(text) == "这啥"
+    assert intent.clean_user_query_text(text) == "这啥"
+
+
 def test_extract_quoted_message_text_supports_forward_block() -> None:
     text = "你觉得这个怎么样\n[聊天记录]: A:哈哈\nB:对啊"
 

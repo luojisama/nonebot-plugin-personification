@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import contextvars
 import json
+import re
 import time
 import uuid
 from typing import Any
@@ -13,6 +14,10 @@ from .plugin_runtime_logs import sanitize_text
 _CURRENT_TRACE_ID: contextvars.ContextVar[str] = contextvars.ContextVar(
     "personification_reply_trace_id",
     default="",
+)
+_ELAPSED_RE = re.compile(r"(?:elapsed_ms=|耗时\s*)(\d{1,9})(?:\s*ms)?", re.I)
+_SIGNAL_KEY_RE = re.compile(
+    r"(?:^|\s)(action|speech_act|output|intent|ambiguity|tool|budget|suggested_steps|actual_steps|suggested_seconds|actual_seconds|topic_thread|topic_speaker|reply_to_bot|bot_in_thread|parallel_threads|participants|reason|source|flags|revision|chars|address_mode|quote|at|target|query|finish)=([^\s]+)"
 )
 
 
@@ -218,6 +223,212 @@ def query_recent(
     return [_row_to_dict(row) for row in rows]
 
 
+def _stage_category(stage: dict[str, Any]) -> str:
+    key = str(stage.get("key") or "").strip().lower()
+    label = str(stage.get("label") or "").strip()
+    text = f"{key} {label}"
+    if "tool" in key or "工具" in label:
+        return "tool"
+    if key.startswith("agent_") or "agent" in text.lower():
+        return "agent"
+    if key.startswith("semantic") or key.startswith("turn_plan") or "语义" in label:
+        return "semantic"
+    if key.startswith("send") or "发送" in label:
+        return "send"
+    if key.startswith("capture") or key.startswith("reply_timeout") or "捕获" in label:
+        return "capture"
+    if key.startswith("rule") or key.startswith("buffer") or "缓冲" in label:
+        return "dispatch"
+    return "runtime"
+
+
+def _elapsed_from_detail(detail: Any) -> int | None:
+    match = _ELAPSED_RE.search(str(detail or ""))
+    if not match:
+        return None
+    try:
+        return max(0, int(match.group(1)))
+    except Exception:
+        return None
+
+
+def _signals_from_detail(detail: Any) -> dict[str, str]:
+    signals: dict[str, str] = {}
+    for match in _SIGNAL_KEY_RE.finditer(str(detail or "")):
+        key = str(match.group(1) or "").strip()
+        value = sanitize_text(match.group(2) or "")[:80]
+        if key and value and key not in signals:
+            signals[key] = value
+    return signals
+
+
+def _compact_value(value: Any, *, limit: int = 80) -> str:
+    text = sanitize_text(value)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text[:limit]
+
+
+def _append_unique(values: list[str], value: Any, *, limit: int = 80, max_items: int = 6) -> None:
+    text = _compact_value(value, limit=limit)
+    if text and text not in values and len(values) < max_items:
+        values.append(text)
+
+
+def _build_agent_inspection(items: list[dict[str, Any]]) -> dict[str, Any]:
+    understanding: dict[str, str] = {}
+    addressing: dict[str, str] = {}
+    tools: list[dict[str, Any]] = []
+    questions: list[str] = []
+    quality: list[str] = []
+    budget: dict[str, str] = {}
+    for item in items:
+        key = str(item.get("key") or "")
+        detail = str(item.get("detail") or "")
+        signals = item.get("signals") if isinstance(item.get("signals"), dict) else {}
+        if key in {"semantic_frame", "agent_intent", "agent_result"}:
+            for name in ("intent", "ambiguity", "speech_act", "output"):
+                if signals.get(name) and name not in understanding:
+                    understanding[name] = str(signals[name])
+        if key == "addressing_plan":
+            for name in ("address_mode", "source", "quote", "at", "target"):
+                if signals.get(name):
+                    addressing[name] = str(signals[name])
+        if key in {"agent_tool_call", "agent_tool_result"} or item.get("category") == "tool":
+            tool_name = str(signals.get("tool") or "")
+            if not tool_name:
+                match = re.search(r"(?:tool|name)=([^\s]+)", detail)
+                tool_name = str(match.group(1)) if match else ""
+            entry = {
+                "stage": "result" if "result" in key else "call",
+                "tool": _compact_value(tool_name or item.get("label") or key, limit=48),
+                "status": str(item.get("status") or ""),
+                "detail": _compact_value(detail, limit=180),
+                "duration_ms": item.get("duration_ms"),
+            }
+            if entry["tool"] or entry["detail"]:
+                tools.append(entry)
+        if key in {"agent_query_rewrite", "agent_budget", "semantic_frame"}:
+            for name in ("query", "reason"):
+                if signals.get(name):
+                    _append_unique(questions, signals[name])
+            if key == "agent_query_rewrite" and detail:
+                _append_unique(questions, detail, limit=140)
+        if key == "agent_reply_quality":
+            _append_unique(quality, detail, limit=160)
+        if key == "agent_budget":
+            for name in ("budget", "suggested_steps", "actual_steps", "suggested_seconds", "actual_seconds", "source"):
+                if signals.get(name):
+                    budget[name] = str(signals[name])
+    return {
+        "understanding": understanding,
+        "addressing": addressing,
+        "tools": tools[:10],
+        "questions": questions[:6],
+        "quality": quality[:4],
+        "budget": budget,
+    }
+
+
+def build_process_view(trace: dict[str, Any] | None, *, logs: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+    """Build a WebUI-safe process timeline.
+
+    This intentionally summarizes observable stages only. It does not expose
+    model hidden reasoning, prompts, raw tool arguments, or full tool results.
+    """
+
+    if not isinstance(trace, dict):
+        trace = {}
+    raw_stages = trace.get("stages") if isinstance(trace.get("stages"), list) else []
+    stages = [stage for stage in raw_stages if isinstance(stage, dict)]
+    base_ts = 0.0
+    for stage in stages:
+        try:
+            ts = float(stage.get("ts") or 0)
+        except Exception:
+            ts = 0.0
+        if ts > 0:
+            base_ts = ts
+            break
+
+    items: list[dict[str, Any]] = []
+    status_counts: dict[str, int] = {}
+    category_counts: dict[str, int] = {}
+    for index, stage in enumerate(stages):
+        try:
+            ts = float(stage.get("ts") or 0)
+        except Exception:
+            ts = 0.0
+        next_ts = 0.0
+        if index + 1 < len(stages):
+            try:
+                next_ts = float(stages[index + 1].get("ts") or 0)
+            except Exception:
+                next_ts = 0.0
+        detail = sanitize_text(stage.get("detail", ""))[:1000]
+        hint = sanitize_text(stage.get("hint", ""))[:500]
+        status = str(stage.get("status") or "info")[:16]
+        category = _stage_category(stage)
+        elapsed_ms = _elapsed_from_detail(detail)
+        if elapsed_ms is None and ts > 0 and next_ts > ts:
+            elapsed_ms = int((next_ts - ts) * 1000)
+        item = {
+            "index": index + 1,
+            "key": str(stage.get("key") or "")[:64],
+            "label": str(stage.get("label") or stage.get("key") or "")[:80],
+            "status": status,
+            "category": category,
+            "detail": detail,
+            "signals": _signals_from_detail(detail),
+            "hint": hint,
+            "ts": ts,
+            "offset_ms": int((ts - base_ts) * 1000) if ts > 0 and base_ts > 0 else 0,
+            "duration_ms": elapsed_ms,
+        }
+        items.append(item)
+        status_counts[status] = status_counts.get(status, 0) + 1
+        category_counts[category] = category_counts.get(category, 0) + 1
+
+    log_rows = logs if isinstance(logs, list) else []
+    log_levels: dict[str, int] = {}
+    for row in log_rows:
+        if not isinstance(row, dict):
+            continue
+        level = str(row.get("level") or "INFO").upper()
+        log_levels[level] = log_levels.get(level, 0) + 1
+
+    slow_items = [
+        {
+            "index": item["index"],
+            "label": item["label"],
+            "key": item["key"],
+            "duration_ms": item["duration_ms"],
+        }
+        for item in items
+        if isinstance(item.get("duration_ms"), int) and int(item["duration_ms"]) >= 1000
+    ]
+    slow_items.sort(key=lambda item: int(item.get("duration_ms") or 0), reverse=True)
+
+    outcome = str(trace.get("outcome") or "")
+    diagnosis_code = str(trace.get("diagnosis_code") or "")
+    return {
+        "summary": {
+            "trace_id": str(trace.get("trace_id") or ""),
+            "outcome": outcome,
+            "diagnosis_code": diagnosis_code,
+            "stage_count": len(items),
+            "error_count": sum(status_counts.get(name, 0) for name in ("error", "failed")),
+            "warn_count": status_counts.get("warn", 0) + status_counts.get("warning", 0),
+            "log_count": len(log_rows),
+            "status_counts": status_counts,
+            "category_counts": category_counts,
+            "log_levels": log_levels,
+            "slow_stages": slow_items[:5],
+        },
+        "items": items,
+        "agent_inspection": _build_agent_inspection(items),
+    }
+
+
 def prune_old_entries(*, retention_days: int = 7, max_entries: int = 2000) -> int:
     cutoff = time.time() - max(1, int(retention_days or 7)) * 86400
     max_keep = max(100, int(max_entries or 2000))
@@ -265,6 +476,7 @@ __all__ = [
     "current_trace_id",
     "finish_trace",
     "get_trace",
+    "build_process_view",
     "new_trace_id",
     "prune_old_entries",
     "query_recent",

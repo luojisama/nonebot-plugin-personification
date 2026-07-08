@@ -22,6 +22,104 @@ _SELF_LOG_MEMORY_TYPES: frozenset[str] = frozenset({
     "episodic",  # bot 视角的事件日志，绝大多数是它说过的话
 })
 
+_MEMORY_TYPE_LABELS: dict[str, str] = {
+    "semantic": "长期语义",
+    "fact": "事实记忆",
+    "group_knowledge": "群知识",
+    "group_meme": "群梗词典",
+    "concept_anchor": "概念锚点",
+    "user_persona": "用户画像",
+    "persona_knowledge": "人设知识",
+    "episodic": "事件片段",
+    "episodic_turn": "对话回合",
+    "conflict_memory": "冲突记忆",
+}
+
+_SOURCE_KIND_LABELS: dict[str, str] = {
+    "user": "用户发言",
+    "user_persona": "用户画像",
+    "auto_extract": "自动抽取",
+    "plugin": "插件记录",
+    "image": "图片理解",
+    "mface": "表情理解",
+    "self_log": "Bot 自身记录",
+    "self_reply": "Bot 回复记录",
+    "assistant_reply": "Bot 回复记录",
+    "bot_reply": "Bot 回复记录",
+    "system": "系统记录",
+}
+
+_TIER_LABELS: dict[str, str] = {
+    "working": "工作记忆",
+    "short": "短期记忆",
+    "long": "长期记忆",
+    "core": "核心记忆",
+    "archive": "归档记忆",
+}
+
+_NODE_KIND_LABELS: dict[str, str] = {
+    "memory": "记忆条目",
+    "entity": "实体/标签",
+    "user": "群成员",
+}
+
+_ENTITY_TYPE_LABELS: dict[str, str] = {
+    "tag": "标签",
+    "external": "外部实体",
+    "person": "人物",
+    "user": "用户",
+    "topic": "主题",
+    "place": "地点",
+    "item": "物品",
+}
+
+_RELATION_LABELS: dict[str, str] = {
+    "tag": "标签关联",
+    "related": "相关",
+    "similar": "相似",
+    "supports": "支持",
+    "contradicts": "冲突",
+    "same_topic": "同一话题",
+    "same_user": "同一用户",
+    "reply": "回复关系",
+    "mention": "提及",
+    "co_occurs": "共同出现",
+    "talks_to": "对话",
+    "reacts_to": "回应",
+    "quotes": "引用",
+}
+
+_SEARCH_SOURCE_LABELS: dict[str, str] = {
+    "fts": "全文检索",
+    "vector": "向量检索",
+    "exact": "精确匹配",
+    "hybrid": "混合检索",
+}
+
+
+def _label(mapping: dict[str, str], value: Any, fallback: str) -> str:
+    key = str(value or "").strip()
+    if not key:
+        return fallback
+    return mapping.get(key, fallback)
+
+
+def _decorate_memory_item(item: dict[str, Any]) -> dict[str, Any]:
+    rendered = dict(item)
+    rendered["memory_type_label"] = _label(_MEMORY_TYPE_LABELS, rendered.get("memory_type"), "其他记忆")
+    rendered["source_kind_label"] = _label(_SOURCE_KIND_LABELS, rendered.get("source_kind"), "其他来源")
+    rendered["tier_label"] = _label(_TIER_LABELS, rendered.get("tier"), "未分层")
+    zone = str(rendered.get("palace_zone", "") or "").strip()
+    rendered["palace_zone_label"] = zone or "未分区"
+    search_source = str(rendered.get("search_source", "") or "").strip()
+    if search_source:
+        rendered["search_source_label"] = _label(_SEARCH_SOURCE_LABELS, search_source, "其他检索")
+    return rendered
+
+
+def _relation_label(kind: Any) -> str:
+    return _label(_RELATION_LABELS, kind, "其他关联")
+
 
 def _memory_store(runtime) -> Any | None:
     bundle = getattr(runtime, "runtime_bundle", None)
@@ -96,9 +194,12 @@ def build_memory_router(*, runtime) -> APIRouter:
                     "memory_id": str(item.get("memory_id", "") or ""),
                     "summary": str(item.get("summary", "") or "")[:300],
                     "memory_type": str(item.get("memory_type", "") or ""),
+                    "memory_type_label": _label(_MEMORY_TYPE_LABELS, item.get("memory_type"), "其他记忆"),
                     "palace_zone": str(item.get("palace_zone", "") or ""),
+                    "palace_zone_label": str(item.get("palace_zone", "") or "").strip() or "未分区",
                     "score": float(item.get("score", 0) or 0),
                     "search_source": str(item.get("search_source", "") or ""),
+                    "search_source_label": _label(_SEARCH_SOURCE_LABELS, item.get("search_source"), "其他检索"),
                     "why_relevant": str(item.get("why_relevant", "") or ""),
                     "group_id": str(item.get("group_id", "") or ""),
                     "user_id": str(item.get("user_id", "") or ""),
@@ -145,7 +246,7 @@ def build_memory_router(*, runtime) -> APIRouter:
             if not include_self and _looks_like_bot_self_entry(item):
                 hidden += 1
                 continue
-            rendered.append({
+            rendered.append(_decorate_memory_item({
                 "memory_id": str(item.get("memory_id", "") or ""),
                 "memory_type": str(item.get("memory_type", "") or ""),
                 "group_id": str(item.get("group_id", "") or ""),
@@ -157,7 +258,7 @@ def build_memory_router(*, runtime) -> APIRouter:
                 "confidence": float(item.get("confidence", 0) or 0),
                 "salience": float(item.get("salience", 0) or 0),
                 "updated_at": float(item.get("updated_at", 0) or 0),
-            })
+            }))
             if len(rendered) >= int(limit):
                 break
         return {
@@ -261,7 +362,8 @@ def build_memory_router(*, runtime) -> APIRouter:
             related = list(store.list_related_memory_candidates(memory_id=memory_id, limit=8))
         except Exception:
             related = []
-        return {"memory_id": memory_id, "item": item, "related": related}
+        decorated_related = [_decorate_memory_item(r) for r in related if isinstance(r, dict)]
+        return {"memory_id": memory_id, "item": _decorate_memory_item(item), "related": decorated_related}
 
     @router.get("/graph")
     async def memory_graph(
@@ -320,12 +422,15 @@ def build_memory_router(*, runtime) -> APIRouter:
                     nodes[f"m:{mid}"] = {
                         "id": f"m:{mid}",
                         "kind": "memory",
+                        "kind_label": _NODE_KIND_LABELS["memory"],
                         "memory_type": str(row["memory_type"] or ""),
+                        "memory_type_label": _label(_MEMORY_TYPE_LABELS, row["memory_type"], "其他记忆"),
                         "label": (str(row["summary"] or "")[:40] or mid)[:40],
                         "salience": float(row["salience"] or 0),
                         "confidence": float(row["confidence"] or 0),
                         "updated_at": float(row["updated_at"] or 0),
                         "palace_zone": str(row["palace_zone"] or ""),
+                        "palace_zone_label": str(row["palace_zone"] or "").strip() or "未分区",
                         "group_id": str(row["group_id"] or ""),
                         "user_id": str(row["user_id"] or ""),
                     }
@@ -350,7 +455,9 @@ def build_memory_router(*, runtime) -> APIRouter:
                             nodes[ent_id] = {
                                 "id": ent_id,
                                 "kind": "entity",
+                                "kind_label": _NODE_KIND_LABELS["entity"],
                                 "entity_type": str(row["entity_type"] or "tag"),
+                                "entity_type_label": _label(_ENTITY_TYPE_LABELS, row["entity_type"], "实体"),
                                 "label": ent[:24],
                                 "weight": float(row["weight"] or 0),
                             }
@@ -359,6 +466,7 @@ def build_memory_router(*, runtime) -> APIRouter:
                                 "src": ent_id,
                                 "dst": f"m:{mid}",
                                 "kind": "tag",
+                                "kind_label": _relation_label("tag"),
                                 "weight": float(row["weight"] or 1),
                             }
                         )
@@ -386,7 +494,9 @@ def build_memory_router(*, runtime) -> APIRouter:
                                 {
                                     "id": tgt_id,
                                     "kind": "entity",
+                                    "kind_label": _NODE_KIND_LABELS["entity"],
                                     "entity_type": "external",
+                                    "entity_type_label": _ENTITY_TYPE_LABELS["external"],
                                     "label": tgt_ref[:24],
                                     "weight": 0.0,
                                 },
@@ -396,6 +506,7 @@ def build_memory_router(*, runtime) -> APIRouter:
                                 "src": src_mid,
                                 "dst": tgt_id,
                                 "kind": str(row["relation_type"] or "related"),
+                                "kind_label": _relation_label(row["relation_type"]),
                                 "weight": float(row["weight"] or 0),
                             }
                         )
@@ -433,17 +544,18 @@ def build_memory_router(*, runtime) -> APIRouter:
                     dst_id = f"u:{dst}"
                     nodes.setdefault(
                         src_id,
-                        {"id": src_id, "kind": "user", "label": src, "weight": 0.0},
+                        {"id": src_id, "kind": "user", "kind_label": _NODE_KIND_LABELS["user"], "label": src, "weight": 0.0},
                     )
                     nodes.setdefault(
                         dst_id,
-                        {"id": dst_id, "kind": "user", "label": dst, "weight": 0.0},
+                        {"id": dst_id, "kind": "user", "kind_label": _NODE_KIND_LABELS["user"], "label": dst, "weight": 0.0},
                     )
                     edges.append(
                         {
                             "src": src_id,
                             "dst": dst_id,
                             "kind": str(row["edge_kind"] or "related"),
+                            "kind_label": _relation_label(row["edge_kind"]),
                             "weight": round(w, 2),
                         }
                     )

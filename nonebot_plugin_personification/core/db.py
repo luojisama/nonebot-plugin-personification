@@ -164,6 +164,33 @@ DDL_STATEMENTS = (
     CREATE INDEX IF NOT EXISTS idx_token_usage_group ON token_usage_ledger(group_id, bucket_day)
     """,
     """
+    CREATE TABLE IF NOT EXISTS token_usage_hourly_ledger (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        bucket_hour TEXT NOT NULL,
+        bucket_day TEXT NOT NULL,
+        group_id TEXT NOT NULL DEFAULT '',
+        user_id TEXT NOT NULL DEFAULT '',
+        model TEXT NOT NULL DEFAULT '',
+        purpose TEXT NOT NULL DEFAULT '',
+        prompt_tokens INTEGER NOT NULL DEFAULT 0,
+        completion_tokens INTEGER NOT NULL DEFAULT 0,
+        total_tokens INTEGER NOT NULL DEFAULT 0,
+        call_count INTEGER NOT NULL DEFAULT 0,
+        updated_at REAL NOT NULL
+    )
+    """,
+    """
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_token_usage_hour_bucket
+        ON token_usage_hourly_ledger(bucket_hour, group_id, user_id, model, purpose)
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS idx_token_usage_hour ON token_usage_hourly_ledger(bucket_hour)
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS idx_token_usage_hour_group
+        ON token_usage_hourly_ledger(group_id, bucket_hour)
+    """,
+    """
     CREATE TABLE IF NOT EXISTS group_style_snapshots (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         group_id TEXT NOT NULL,

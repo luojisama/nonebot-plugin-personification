@@ -2,7 +2,7 @@
 
 两段式：
 1. pre_filter(text)：纯正则关键短语筛，快、零 LLM 成本。不匹配就直接跳。
-2. extract_pending_topic(text, now_ts, tool_caller)：匹配的消息再走 LLM
+2. extract_pending_topic(text, now_ts, tool_caller)：匹配的消息优先走完整 Agent
    抽 (topic, time_hint_ts, confidence)，confidence < 0.5 丢弃。
 
 设计上让 hook 把热路径开销控到极低（正则 → 99% 早退），只对真正的
@@ -68,6 +68,9 @@ async def extract_pending_topic(
     *,
     now: datetime | None = None,
     tool_caller: Any,
+    plugin_config: Any = None,
+    tool_registry: Any = None,
+    agent_max_steps: int = 4,
     logger: Any,
 ) -> dict | None:
     """让 LLM 抽 pending topic。失败返回 None。
@@ -82,16 +85,31 @@ async def extract_pending_topic(
         now_str=now_dt.strftime("%Y-%m-%d %H:%M (%A)"),
         text=text[:300],
     )
+    messages = [{"role": "user", "content": prompt}]
     try:
-        response = await tool_caller.chat_with_tools(
-            messages=[{"role": "user", "content": prompt}],
-            tools=[],
-            use_builtin_search=False,
-        )
+        if tool_registry is not None:
+            from ...core.agent_bridge import run_text_agent
+
+            content = await run_text_agent(
+                messages=messages,
+                plugin_config=plugin_config,
+                logger=logger,
+                tool_caller=tool_caller,
+                registry=tool_registry,
+                max_steps=agent_max_steps,
+                trigger_reason="social_topic_extract",
+                chat_intent_hint="social_topic_extract",
+            )
+        else:
+            response = await tool_caller.chat_with_tools(
+                messages=messages,
+                tools=[],
+                use_builtin_search=False,
+            )
+            content = str(getattr(response, "content", "") or "").strip()
     except Exception as exc:
         logger.debug(f"[topic_extract] LLM call failed: {exc}")
         return None
-    content = str(getattr(response, "content", "") or "").strip()
     parsed = _parse_json_object(content)
     if not parsed:
         return None

@@ -92,6 +92,7 @@ _STRUCTURED_FIELD_MAP: dict[str, str] = {
     "情绪基线": "emotion_baseline", "社交模式": "social_mode", "知识结构": "knowledge",
     "称呼与昵称": "nickname_pref", "关系与亲密度": "relationship", "雷区与禁忌": "taboos",
     "记忆锚点": "memory_anchors", "近期关注": "recent_focus", "内容偏好": "content_pref",
+    "人物描述": "portrait", "互动建议": "interaction_advice",
 }
 
 _STRUCTURED_LINE = re.compile(r"[【\[]\s*([^】\]]+?)\s*[】\]]\s*[:：]?\s*(.+)")
@@ -307,18 +308,23 @@ class PersonaStore:
                 existing = None
             # 保留历史用户更正（除非本次显式覆盖）
             prior_corrections: dict = {}
+            prior_profile_meta: dict = {}
             if existing is not None and isinstance(getattr(existing, "profile_json", None), dict):
                 prior_corrections = dict(existing.profile_json.get("user_corrections", {}) or {})
+                prior_profile_meta = dict(existing.profile_json.get("qq_profile", {}) or {})
             if corrections:
                 prior_corrections.update(corrections)
+            profile_json = {
+                "updated_by": "persona_service",
+                "structured": structured,
+                "user_corrections": prior_corrections,
+            }
+            if prior_profile_meta:
+                profile_json["qq_profile"] = prior_profile_meta
             self._profile_service.upsert_core_profile(
                 user_id=str(user_id),
                 profile_text=entry.data,
-                profile_json={
-                    "updated_by": "persona_service",
-                    "structured": structured,
-                    "user_corrections": prior_corrections,
-                },
+                profile_json=profile_json,
                 source="persona_service",
             )
         with connect_sync() as conn:

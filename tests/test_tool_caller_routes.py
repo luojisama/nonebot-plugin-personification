@@ -83,6 +83,70 @@ def test_normalize_api_type_keeps_existing_routes() -> None:
     assert caller_impl._normalize_api_type("codex") == "openai_codex"
 
 
+def test_openai_and_gemini_base_urls_fill_version_suffixes() -> None:
+    assert caller_impl._normalize_openai_base_url("https://anti.zellon.me") == "https://anti.zellon.me/v1"
+    assert caller_impl._normalize_openai_base_url("https://anti.zellon.me/v1/chat/completions") == "https://anti.zellon.me/v1"
+    assert caller_impl._normalize_gemini_base_url("https://anti.zellon.me") == "https://anti.zellon.me/v1beta"
+    assert (
+        caller_impl._normalize_gemini_base_url(
+            "https://anti.zellon.me/v1beta/models/gemini-3-flash-agent:generateContent"
+        )
+        == "https://anti.zellon.me/v1beta"
+    )
+
+
+def test_custom_gemini_endpoint_uses_bearer_and_v1beta(monkeypatch) -> None:
+    captured: dict = {}
+
+    class _Response:
+        status_code = 200
+
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self):  # noqa: ANN201
+            return {
+                "candidates": [
+                    {"content": {"parts": [{"text": "ok"}], "role": "model"}, "finishReason": "STOP"}
+                ],
+                "usageMetadata": {"promptTokenCount": 1, "candidatesTokenCount": 1, "totalTokenCount": 2},
+            }
+
+    class _Client:
+        def __init__(self, **kwargs) -> None:  # noqa: ANN001
+            captured["client_kwargs"] = kwargs
+
+        async def __aenter__(self):  # noqa: ANN201
+            return self
+
+        async def __aexit__(self, *_args) -> None:
+            return None
+
+        async def post(self, url, headers=None, params=None, json=None):  # noqa: ANN001, ANN201
+            captured["url"] = url
+            captured["headers"] = headers or {}
+            captured["params"] = params or {}
+            captured["json"] = json or {}
+            return _Response()
+
+    monkeypatch.setattr(caller_impl.httpx, "AsyncClient", _Client)
+    caller = caller_impl.GeminiToolCaller(
+        api_key="sk-test",
+        base_url="https://anti.zellon.me",
+        model="gemini-3-flash-agent",
+        thinking_mode="none",
+    )
+
+    response = asyncio.run(caller.chat_with_tools([{"role": "user", "content": "hi"}], [], False))
+
+    assert captured["url"] == "https://anti.zellon.me/v1beta/models/gemini-3-flash-agent:generateContent"
+    assert captured["headers"]["Authorization"] == "Bearer sk-test"
+    assert captured["params"] == {}
+    assert "generationConfig" not in captured["json"]
+    assert response.content == "ok"
+    assert response.usage["total_tokens"] == 2
+
+
 def test_mimo_endpoint_detection_accepts_api_and_token_plan_urls() -> None:
     assert caller_impl._is_mimo_endpoint("https://api.xiaomimimo.com/v1") is True
     assert caller_impl._is_mimo_endpoint("https://token-plan-cn.xiaomimimo.com/v1") is True
@@ -534,9 +598,8 @@ def test_nanobanan_tool_only_on_gemini_cli_route() -> None:
     runtime = _DummyRuntime(plugin_config=cfg, tool_caller=gemini_caller)
     nano_tool = build_image_gen_nanobanan_tool(runtime)
     codex_tool = build_image_gen_tool(runtime)
-    assert nano_tool is not None and nano_tool.name == "generate_image_nanobanan"
-    # Codex 路由的 generate_image 不应该在 gemini-cli caller 上激活
-    assert codex_tool is None
+    assert nano_tool is not None and nano_tool.name == "generate_image"
+    assert codex_tool is not None and codex_tool.name == "generate_image"
 
 
 def test_nanobanan_tool_available_on_antigravity_cli_route() -> None:
@@ -544,7 +607,7 @@ def test_nanobanan_tool_available_on_antigravity_cli_route() -> None:
     agy_caller = caller_impl.AntigravityCliToolCaller(model="gemini-3.1-pro-preview")
     runtime = _DummyRuntime(plugin_config=cfg, tool_caller=agy_caller)
     nano_tool = build_image_gen_nanobanan_tool(runtime)
-    assert nano_tool is not None and nano_tool.name == "generate_image_nanobanan"
+    assert nano_tool is not None and nano_tool.name == "generate_image"
 
 
 def test_nanobanan_tool_disabled_on_openai_route() -> None:

@@ -2,7 +2,7 @@
 
 每天早 / 晚两个 cron 时点触发；handler 从 persona_store 拿最近活跃用户
 （按 core profile 的 updated_at 排序）作为候选，给每位生成一段自然语气
-的问候（用 lite tool_caller 包装而不是写死模板），再走 gate 二次决策
+的问候（优先走完整 Agent 包装而不是写死模板），再走 gate 二次决策
 是否发送，最后调 bot.send_private_msg。
 
 quota.py 管"每用户每天最多 N 条主动消息"+"同场景冷却"，避免骚扰。
@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from ..framework import SocialContext
+from ..framework import SocialContext, run_social_text_agent
 from ..gate import gate_should_send
 from ..quota import is_quota_exceeded, mark_sent
 
@@ -88,6 +88,9 @@ async def _run_greetings(ctx: SocialContext, *, time_of_day: str) -> None:
         if gate_enabled:
             allow, rewritten, reason = await gate_should_send(
                 tool_caller=ctx.tool_caller,
+                plugin_config=ctx.plugin_config,
+                tool_registry=ctx.tool_registry,
+                agent_max_steps=ctx.agent_max_steps,
                 logger=ctx.logger,
                 scenario=scenario,
                 user_id=user_id,
@@ -152,11 +155,25 @@ def _get_first_bot(ctx: SocialContext) -> Any | None:
 async def _generate_greeting(ctx: SocialContext, persona_snippet: str, time_of_day: str) -> str:
     label = "早安问候" if time_of_day == "morning" else "晚安问候"
     prompt = _GREETING_PROMPT.format(time_label=label, persona_snippet=persona_snippet or "<无画像>")
+    messages = [{"role": "user", "content": prompt}]
+    if ctx.tool_caller and ctx.tool_registry:
+        try:
+            text = await run_social_text_agent(
+                ctx,
+                messages=messages,
+                trigger_reason=f"social_{time_of_day}_greeting",
+                chat_intent_hint="social_greeting",
+            )
+        except Exception as exc:
+            ctx.logger.debug(f"[social/greetings] Agent generate failed: {exc}")
+            return ""
+        text = text.strip('"').strip("'").strip("「」").strip()
+        return text[:60] if text else ""
     if not ctx.tool_caller:
         return _fallback_text(time_of_day)
     try:
         response = await ctx.tool_caller.chat_with_tools(
-            messages=[{"role": "user", "content": prompt}],
+            messages=messages,
             tools=[],
             use_builtin_search=False,
         )

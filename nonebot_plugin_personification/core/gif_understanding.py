@@ -266,6 +266,17 @@ def _build_contact_sheet_data_url(payload: bytes, config: Any) -> _ContactSheet:
     )
 
 
+def build_gif_contact_sheet_data_url(payload: bytes, config: Any) -> dict[str, Any]:
+    """Build a public, serializable GIF contact-sheet payload for visual labeling."""
+    sheet = _build_contact_sheet_data_url(payload, config)
+    return {
+        "data_url": sheet.data_url,
+        "frame_count": sheet.frame_count,
+        "sampled_frames": sheet.sampled_frames,
+        "duration_ms": sheet.duration_ms,
+    }
+
+
 def _select_frame_indices(frame_count: int, max_samples: int) -> list[int]:
     frame_count = max(0, int(frame_count or 0))
     max_samples = max(1, int(max_samples or 1))
@@ -398,6 +409,7 @@ __all__ = [
     "get_gif_max_bytes",
     "get_gif_max_per_turn",
     "get_gif_understanding_timeout",
+    "build_gif_contact_sheet_data_url",
     "is_gif_understanding_enabled",
     "summarize_gif_bytes",
 ]

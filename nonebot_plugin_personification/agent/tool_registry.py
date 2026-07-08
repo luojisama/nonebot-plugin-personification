@@ -32,6 +32,18 @@ def _override_is_disabled(name: str) -> bool:
         return False
 
 
+def _health_is_disabled(name: str) -> bool:
+    """临时健康屏蔽：联网工具探测失败时不暴露给模型。"""
+    try:
+        from ..core.tool_health import is_tool_temporarily_disabled
+    except Exception:
+        return False
+    try:
+        return bool(is_tool_temporarily_disabled(name))
+    except Exception:
+        return False
+
+
 class ToolRegistry:
     def __init__(self) -> None:
         self._tools: Dict[str, AgentTool] = {}
@@ -49,6 +61,8 @@ class ToolRegistry:
         active_tools: List[AgentTool] = []
         for tool in self._tools.values():
             if _override_is_disabled(tool.name):
+                continue
+            if _health_is_disabled(tool.name):
                 continue
             try:
                 if tool.enabled():

@@ -1,8 +1,8 @@
 """QQ 内置表情（OneBot `face` 段）id → 中文名称映射。
 
-`face` 段没有可下载图片，主对话模型只能看到 `[表情id:N]` 这种神秘符号，无从理解。
+`face` 段没有可下载图片，主对话模型只能看到 `[QQ表情id:N]` 这种神秘符号，无从理解。
 这里给高频内置表情补一个可读名称，让模型把它当语气线索理解。
-未知 id 由调用方回退到 `[表情id:N]`。
+未知 id 由调用方回退到 `[QQ表情id:N]`。
 
 数据来源：OneBot v11 / 腾讯 QQ 经典表情常用 id（覆盖高频项，不求全）。
 """
@@ -239,15 +239,15 @@ QQ_FACE_NAMES: dict[int, str] = {
 
 
 def render_face_token(face_id: str | int) -> str:
-    """把 face 段 id 渲染成可读 token；未知 id 回退 `[表情id:N]`。"""
+    """把 face 段 id 渲染成可读 token；未知 id 回退 `[QQ表情id:N]`。"""
     raw = str(face_id or "").strip()
     if not raw:
-        return "[表情]"
+        return "[QQ表情]"
     try:
         name = QQ_FACE_NAMES.get(int(raw))
     except (TypeError, ValueError):
         name = None
-    return f"[表情:{name}]" if name else f"[表情id:{raw}]"
+    return f"[QQ表情:{name}]" if name else f"[QQ表情id:{raw}]"
 
 
 __all__ = ["QQ_FACE_NAMES", "render_face_token"]

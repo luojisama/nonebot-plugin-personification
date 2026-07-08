@@ -45,11 +45,13 @@ def _extract_plain_text(event: Any) -> str:
             if seg_type == "text":
                 parts.append(str(data.get("text", "") or ""))
             elif seg_type == "mface":
-                parts.append(str(data.get("summary", "") or ""))
-            elif seg_type == "face":
-                from ..core.qq_face_names import render_face_token
+                from ..core.qq_expression_library import semantic_text_for_qq_expression_segment
 
-                parts.append(render_face_token(data.get("id", "")))
+                parts.append(semantic_text_for_qq_expression_segment("mface", data, default_mface_kind="super"))
+            elif seg_type == "face":
+                from ..core.qq_expression_library import semantic_text_for_qq_expression_segment
+
+                parts.append(semantic_text_for_qq_expression_segment("face", data))
     except Exception:
         return ""
     return "".join(parts).strip()

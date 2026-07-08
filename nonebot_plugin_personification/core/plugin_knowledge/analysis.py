@@ -160,10 +160,39 @@ def _analysis_strategy(source_snapshot: dict[str, Any]) -> str:
 def _chunk_lookup(source_snapshot: dict[str, Any]) -> dict[str, dict[str, Any]]:
     lookup: dict[str, dict[str, Any]] = {}
     for chunk in _sorted_source_chunks(source_snapshot):
-        chunk_id = str(chunk.get("chunk_id", "") or "").strip()
+        chunk_id = _chunk_identity(chunk)
         if chunk_id:
             lookup[chunk_id] = chunk
     return lookup
+
+
+def _chunk_identity(chunk: dict[str, Any]) -> str:
+    chunk_id = str(chunk.get("chunk_id", "") or "").strip()
+    if chunk_id:
+        return chunk_id
+    file_path = str(chunk.get("file", "") or "").strip() or "unknown.py"
+    start_line = int(chunk.get("start_line", 0) or 0)
+    end_line = int(chunk.get("end_line", 0) or 0)
+    return f"{file_path}:{start_line}-{end_line}"
+
+
+def _analysis_units_cover_all_chunks(
+    ordered_chunks: list[dict[str, Any]],
+    units: list[dict[str, Any]],
+) -> bool:
+    expected = [_chunk_identity(chunk) for chunk in ordered_chunks]
+    expected = [chunk_id for chunk_id in expected if chunk_id]
+    if not expected:
+        return False
+
+    seen: list[str] = []
+    for unit in units:
+        for chunk in list(unit.get("chunks") or []):
+            if isinstance(chunk, dict):
+                chunk_id = _chunk_identity(chunk)
+                if chunk_id:
+                    seen.append(chunk_id)
+    return len(seen) == len(set(seen)) and set(seen) == set(expected)
 
 
 def _build_analysis_units(source_snapshot: dict[str, Any]) -> tuple[str, list[dict[str, Any]]]:
@@ -206,7 +235,7 @@ def _build_analysis_units(source_snapshot: dict[str, Any]) -> tuple[str, list[di
                     "chunks": chunks,
                 }
             )
-        if units:
+        if units and _analysis_units_cover_all_chunks(ordered_chunks, units):
             return "module_bundle_multistage", units
     fallback_units = []
     for index, batch in enumerate(_build_source_batches(source_snapshot), start=1):
@@ -219,6 +248,66 @@ def _build_analysis_units(source_snapshot: dict[str, Any]) -> tuple[str, list[di
             }
         )
     return "chunk_batch_multistage", fallback_units
+
+
+def _build_source_coverage(
+    source_snapshot: dict[str, Any],
+    *,
+    analysis_units: list[dict[str, Any]],
+    analysis_mode: str,
+) -> dict[str, Any]:
+    source_chunks = _sorted_source_chunks(source_snapshot)
+    source_chunk_ids = [_chunk_identity(chunk) for chunk in source_chunks]
+    source_chunk_ids = [chunk_id for chunk_id in source_chunk_ids if chunk_id]
+
+    analyzed_ids: list[str] = []
+    analyzed_files: set[str] = set()
+    for unit in analysis_units:
+        for chunk in list(unit.get("chunks") or []):
+            if not isinstance(chunk, dict):
+                continue
+            chunk_id = _chunk_identity(chunk)
+            if chunk_id:
+                analyzed_ids.append(chunk_id)
+            file_path = str(chunk.get("file", "") or "").strip()
+            if file_path:
+                analyzed_files.add(file_path)
+
+    duplicate_count = max(0, len(analyzed_ids) - len(set(analyzed_ids)))
+    unique_analyzed = len(set(analyzed_ids))
+    source_chunk_count = len(source_chunk_ids)
+    coverage_percent = 100.0 if source_chunk_count and set(analyzed_ids) == set(source_chunk_ids) else 0.0
+    if source_chunk_count and unique_analyzed < source_chunk_count:
+        coverage_percent = round(unique_analyzed * 100.0 / source_chunk_count, 2)
+
+    snapshot_coverage = source_snapshot.get("source_coverage", {})
+    if not isinstance(snapshot_coverage, dict):
+        snapshot_coverage = {}
+
+    source_chars = int(source_snapshot.get("source_chars", 0) or snapshot_coverage.get("source_chars", 0) or 0)
+    return {
+        "analysis_scope": str(
+            source_snapshot.get("analysis_scope", "")
+            or snapshot_coverage.get("analysis_scope", "")
+            or "full_readable_python_source"
+        ),
+        "full_input": bool(source_chunk_count and set(analyzed_ids) == set(source_chunk_ids) and duplicate_count == 0),
+        "source_complete": bool(source_snapshot.get("source_complete", source_snapshot.get("complete", True))),
+        "source_truncated": bool(source_snapshot.get("source_truncated", False)),
+        "source_file_count": len(list(source_snapshot.get("files") or [])),
+        "source_chunk_count": source_chunk_count,
+        "source_chars": source_chars,
+        "analysis_strategy": str(source_snapshot.get("analysis_strategy", "") or snapshot_coverage.get("analysis_strategy", "") or ""),
+        "analysis_mode": analysis_mode,
+        "analysis_unit_count": len(analysis_units),
+        "analyzed_chunk_count": len(analyzed_ids),
+        "unique_analyzed_chunk_count": unique_analyzed,
+        "duplicate_analyzed_chunk_count": duplicate_count,
+        "analyzed_file_count": len(analyzed_files),
+        "module_bundle_count": int(source_snapshot.get("module_bundle_count", 0) or 0),
+        "coverage_percent": coverage_percent,
+        "note": "源码按完整快照分单元传入模型；module/chunk 只是分批策略，不代表抽样。",
+    }
 
 
 async def _call_json(tool_caller: ToolCaller, *, system_prompt: str, user_prompt: str) -> dict[str, Any]:
@@ -534,6 +623,7 @@ def _normalize_final_analysis(
     source_snapshot: dict[str, Any],
     analyzed_batch_count: int,
     analysis_mode: str,
+    analysis_units: list[dict[str, Any]],
 ) -> dict[str, Any]:
     normalized = raw if isinstance(raw, dict) else {}
     features = normalized.get("features", {})
@@ -585,12 +675,22 @@ def _normalize_final_analysis(
     normalized["entrypoints"] = _dedupe_dicts(list(normalized.get("entrypoints") or []), limit=64)
     normalized["implementation_map"] = _dedupe_dicts(list(normalized.get("implementation_map") or []), limit=64)
     normalized["data_access"] = _dedupe_dicts(list(normalized.get("data_access") or []), limit=48)
+    source_coverage = _build_source_coverage(
+        source_snapshot,
+        analysis_units=analysis_units,
+        analysis_mode=analysis_mode,
+    )
+    normalized["analysis_scope"] = source_coverage["analysis_scope"]
     normalized["analysis_mode"] = analysis_mode
     normalized["analyzed_batch_count"] = int(analyzed_batch_count)
     normalized["analyzed_unit_count"] = int(analyzed_batch_count)
-    normalized["analyzed_chunk_count"] = len(_sorted_source_chunks(source_snapshot))
-    normalized["analyzed_file_count"] = len(list(source_snapshot.get("files") or []))
+    normalized["analyzed_chunk_count"] = int(source_coverage["unique_analyzed_chunk_count"])
+    normalized["analyzed_file_count"] = int(source_coverage["analyzed_file_count"])
     normalized["analyzed_module_count"] = int(source_snapshot.get("module_bundle_count", 0) or 0)
+    normalized["source_chars"] = int(source_coverage["source_chars"])
+    normalized["source_complete"] = bool(source_coverage["source_complete"])
+    normalized["source_truncated"] = bool(source_coverage["source_truncated"])
+    normalized["source_coverage"] = source_coverage
     return normalized
 
 
@@ -610,6 +710,7 @@ async def _synthesize_plugin_analysis_with_llm(
     user_prompt = (
         "请基于以下“完整源码分析单元结果”生成最终插件知识条目。\n"
         "重点要求：功能描述和实现方式都要完整，技术细节回答要能落到文件、函数、数据流。\n"
+        "源码可能按模块或 chunk 被分成多次分析，但分析单元覆盖完整源码快照，不是抽样。\n"
         "输出 JSON 结构必须为：\n"
         "{\n"
         '  "display_name":"插件名",\n'
@@ -636,6 +737,7 @@ async def _synthesize_plugin_analysis_with_llm(
         '  "data_access":[{"kind":"database|file|cache|network|memory|external|unknown","target":"目标","location":"文件","description":"说明"}]\n'
         "}\n\n"
         f"插件名: {plugin_name}\n"
+        f"分析策略: {str(source_snapshot.get('analysis_strategy', '') or '')}\n"
         f"源码文件数: {len(list(source_snapshot.get('files') or []))}\n"
         f"源码 chunk 数: {len(_sorted_source_chunks(source_snapshot))}\n"
         f"源码文件清单: {json.dumps(list(source_snapshot.get('files') or []), ensure_ascii=False)}\n"
@@ -725,6 +827,7 @@ async def analyze_plugin_with_llm(
         source_snapshot=source_snapshot,
         analyzed_batch_count=len(analysis_units),
         analysis_mode=analysis_mode,
+        analysis_units=analysis_units,
     )
     normalized["_analysis_meta"] = {
         "status": "degraded" if degraded else "success",
@@ -736,6 +839,7 @@ async def analyze_plugin_with_llm(
         "failed_batch_total": int(error_history[-1]["failed_batch_total"]) if error_history else len(analysis_units),
         "analysis_mode": analysis_mode,
         "module_bundle_count": int(source_snapshot.get("module_bundle_count", 0) or 0),
+        "source_coverage": normalized.get("source_coverage", {}),
         "recent_errors": error_history[-3:],
     }
     return normalized

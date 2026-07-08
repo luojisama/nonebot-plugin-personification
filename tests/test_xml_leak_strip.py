@@ -1,11 +1,14 @@
 """Tests for the cleanup path that prevents thinking-chain XML from leaking to users."""
 from __future__ import annotations
 
-from plugin.personification.core.context_policy import (
-    has_silence_control_marker,
-    strip_response_control_markers,
-)
-from plugin.personification.flows.yaml_parser import parse_yaml_response
+from ._loader import load_personification_module
+
+context_policy = load_personification_module("plugin.personification.core.context_policy")
+yaml_parser = load_personification_module("plugin.personification.flows.yaml_parser")
+
+has_silence_control_marker = context_policy.has_silence_control_marker
+strip_response_control_markers = context_policy.strip_response_control_markers
+parse_yaml_response = yaml_parser.parse_yaml_response
 
 
 def test_strip_full_status_think_action_block() -> None:
@@ -19,6 +22,31 @@ def test_strip_full_status_think_action_block() -> None:
     assert "心情" not in cleaned, cleaned
     assert "Step 1" not in cleaned, cleaned
     assert "晚上好呀" in cleaned
+
+
+def test_strip_raw_visible_step_reasoning_block_keeps_final_reply() -> None:
+    raw = (
+        "轻松\n\n"
+        "Step 1: 安全性 - 只是普通闲聊。\n\n"
+        "Step 2: 作息 - 关闭，跳过。\n\n"
+        "Step 3: 上下文 - 接上一句即可。\n\n"
+        "Step 4: 角色语气 - 短句。\n\n"
+        "Step 5: 重复检查 - 无。\n\n"
+        "轻松"
+    )
+    cleaned = strip_response_control_markers(raw)
+    assert cleaned == "轻松"
+    assert "Step 1" not in cleaned
+
+
+def test_strip_raw_visible_step_reasoning_block_uses_final_label() -> None:
+    raw = "步骤 1：先判断\n步骤 2：再检查\n最终回复：在"
+    assert strip_response_control_markers(raw) == "在"
+
+
+def test_strip_orphan_control_bracket() -> None:
+    assert strip_response_control_markers("[") == ""
+    assert strip_response_control_markers("[\n收到") == "收到"
 
 
 def test_strip_unclosed_think_block_does_not_leak_inner_text() -> None:

@@ -97,6 +97,9 @@ function renderAudit() {
     {key:"sticker_delete", label:"表情删除"},
     {key:"sticker_upload", label:"表情上传"},
     {key:"skill_toggle", label:"Skill 启停"},
+    {key:"remote_skill_source_add", label:"远程添加"},
+    {key:"remote_skill_review", label:"远程审核"},
+    {key:"skill_runtime_reload", label:"Skill 重载"},
     {key:"style_rebuild", label:"风格重建"},
   ];
   const filterBar = actionFilters.map(f => `<button class="${state.auditFilter===f.key?'active':''}" onclick="pickAuditFilter('${f.key}')">${escapeHtml(f.label)}</button>`).join("");
@@ -127,6 +130,217 @@ async function pickAuditFilter(action) {
   try { await loadView(); render(); } catch (e) { alertFlash("err", e.message); }
 }
 
+function traceSignalLabel(key) {
+  return ({
+    action: "动作",
+    speech_act: "说话",
+    output: "输出",
+    intent: "意图",
+    ambiguity: "歧义",
+    tool: "工具",
+    budget: "预算",
+    suggested_steps: "建议步数",
+    actual_steps: "实际步数",
+    suggested_seconds: "建议秒数",
+    actual_seconds: "实际秒数",
+    topic_thread: "话题线程",
+    topic_speaker: "当前发言",
+    reply_to_bot: "回复bot",
+    bot_in_thread: "bot在线程",
+    parallel_threads: "并行线程",
+    participants: "参与者",
+    reason: "原因",
+    source: "来源",
+    flags: "质量标记",
+    revision: "修订",
+    chars: "字数",
+    address_mode: "指向",
+    quote: "引用",
+    at: "@",
+    target: "目标",
+    query: "查询",
+    finish: "结束",
+  })[key] || key;
+}
+
+function renderTraceSignalTags(signals) {
+  const entries = Object.entries(signals || {}).filter(([key, value]) => key && value);
+  if (!entries.length) return "";
+  return `<div class="trace-step-signals">${
+    entries.map(([key, value]) =>
+      `<span class="tag" title="${escapeAttr(key)}">${escapeHtml(traceSignalLabel(key))}: ${escapeHtml(String(value))}</span>`
+    ).join("")
+  }</div>`;
+}
+
+function renderTraceProcess() {
+  const detail = state.traceDetail;
+  const activeTraceId = state.selectedTraceId || state.logTraceId || "";
+  if (!activeTraceId) return "";
+  if (!detail) return `<div class="card muted">正在读取 trace 过程…</div>`;
+  if (detail.error) return `<div class="card"><div class="alert err">读取 trace 失败：${escapeHtml(detail.error)}</div></div>`;
+  const trace = detail.trace || {};
+  const process = detail.process || {};
+  const summary = process.summary || {};
+  const items = process.items || [];
+  const inspection = process.agent_inspection || {};
+  const categoryLabel = {
+    agent: "Agent",
+    tool: "工具",
+    semantic: "语义",
+    send: "发送",
+    capture: "捕获",
+    dispatch: "分发",
+    runtime: "运行时",
+  };
+  const statusMeta = {
+    ok: { label: "正常", cls: "hs-ok" },
+    info: { label: "信息", cls: "hs-info" },
+    warn: { label: "注意", cls: "hs-warn" },
+    warning: { label: "注意", cls: "hs-warn" },
+    error: { label: "异常", cls: "hs-error" },
+    failed: { label: "异常", cls: "hs-error" },
+  };
+  const slow = (summary.slow_stages || []).map(item =>
+    `<span class="tag">${escapeHtml(item.label || item.key || "-")} · ${Number(item.duration_ms || 0).toLocaleString()}ms</span>`
+  ).join("");
+  const statCards = [
+    ["阶段", summary.stage_count || 0],
+    ["警告", summary.warn_count || 0],
+    ["错误", summary.error_count || 0],
+    ["日志", summary.log_count || 0],
+  ].map(([label, value]) => `<div class="trace-stat"><strong>${escapeHtml(String(value))}</strong><span>${escapeHtml(label)}</span></div>`).join("");
+  const understanding = inspection.understanding || {};
+  const addressing = inspection.addressing || {};
+  const budget = inspection.budget || {};
+  const readableKeys = {
+    intent: "理解",
+    ambiguity: "歧义",
+    speech_act: "说话动作",
+    output: "输出模式",
+    address_mode: "发送方式",
+    source: "来源",
+    quote: "引用",
+    at: "@",
+    target: "目标",
+    budget: "预算",
+    suggested_steps: "建议步数",
+    actual_steps: "实际步数",
+    suggested_seconds: "建议秒数",
+    actual_seconds: "实际秒数",
+  };
+  const kvTags = (obj) => Object.entries(obj || {})
+    .filter(([_, value]) => value)
+    .map(([key, value]) => `<span class="tag" title="${escapeAttr(key)}">${escapeHtml(readableKeys[key] || key)}: ${escapeHtml(String(value))}</span>`)
+    .join("");
+  const toolRows = (inspection.tools || []).map(tool => `<tr>
+    <td><span class="tag">${escapeHtml(tool.stage === "result" ? "结果" : "调用")}</span></td>
+    <td><code>${escapeHtml(tool.tool || "-")}</code></td>
+    <td>${escapeHtml(tool.status || "-")}</td>
+    <td>${tool.duration_ms != null ? `${Number(tool.duration_ms || 0).toLocaleString()}ms` : "-"}</td>
+    <td>${escapeHtml(tool.detail || "")}</td>
+  </tr>`).join("");
+  const questionTags = (inspection.questions || []).map(q => `<span class="tag">${escapeHtml(q)}</span>`).join("");
+  const qualityTags = (inspection.quality || []).map(q => `<div class="trace-step-detail">${escapeHtml(q)}</div>`).join("");
+  const inspectionBlock = `<div class="trace-inspection-grid">
+    <div class="trace-inspection-card">
+      <h3>怎么理解发言</h3>
+      <div class="trace-step-signals">${kvTags(understanding) || '<span class="muted">暂无语义信号</span>'}</div>
+    </div>
+    <div class="trace-inspection-card">
+      <h3>怎么发送</h3>
+      <div class="trace-step-signals">${kvTags(addressing) || '<span class="muted">默认直发</span>'}</div>
+    </div>
+    <div class="trace-inspection-card">
+      <h3>想查什么</h3>
+      <div class="trace-step-signals">${questionTags || '<span class="muted">本轮未记录检索计划</span>'}</div>
+    </div>
+    <div class="trace-inspection-card">
+      <h3>预算</h3>
+      <div class="trace-step-signals">${kvTags(budget) || '<span class="muted">暂无预算信号</span>'}</div>
+    </div>
+  </div>
+  <details class="trace-tool-detail" ${toolRows ? "open" : ""}>
+    <summary>工具调用明细（${Number((inspection.tools || []).length || 0)}）</summary>
+    ${toolRows ? `<table><thead><tr><th>阶段</th><th>工具</th><th>状态</th><th>耗时</th><th>脱敏摘要</th></tr></thead><tbody>${toolRows}</tbody></table>` : '<p class="muted">本轮未调用工具。</p>'}
+  </details>
+  ${qualityTags ? `<details class="trace-tool-detail"><summary>回复质量闭环</summary>${qualityTags}</details>` : ""}`;
+  const timeline = items.map(item => {
+    const meta = statusMeta[String(item.status || "info").toLowerCase()] || statusMeta.info;
+    const duration = item.duration_ms != null ? `${Number(item.duration_ms || 0).toLocaleString()}ms` : "";
+    const offset = item.offset_ms ? `+${Number(item.offset_ms).toLocaleString()}ms` : "+0ms";
+    return `<div class="trace-step ${escapeAttr(item.category || "runtime")}">
+      <div class="trace-step-dot ${meta.cls}"></div>
+      <div class="trace-step-body">
+        <div class="trace-step-head">
+          <strong>${escapeHtml(item.label || item.key || "-")}</strong>
+          <span class="tag">${escapeHtml(categoryLabel[item.category] || item.category || "阶段")}</span>
+          <code>${escapeHtml(item.key || "")}</code>
+          <span class="muted">${escapeHtml(offset)}${duration ? " · " + escapeHtml(duration) : ""}</span>
+        </div>
+        ${renderTraceSignalTags(item.signals)}
+        ${item.detail ? `<div class="trace-step-detail">${escapeHtml(item.detail)}</div>` : ""}
+        ${item.hint ? `<div class="trace-step-hint">${escapeHtml(item.hint)}</div>` : ""}
+      </div>
+    </div>`;
+  }).join("");
+  return `<div class="card trace-panel">
+    <div class="between" style="gap:10px;flex-wrap:wrap">
+      <h2 style="margin:0">Agent 过程可视化</h2>
+      <div class="row" style="gap:6px">
+        <span class="tag">trace ${escapeHtml(summary.trace_id || activeTraceId)}</span>
+        ${summary.outcome ? `<span class="tag">outcome ${escapeHtml(summary.outcome)}</span>` : ""}
+        ${summary.diagnosis_code ? `<span class="tag">诊断 ${escapeHtml(summary.diagnosis_code)}</span>` : ""}
+      </div>
+    </div>
+    <p class="muted" style="font-size:12px;margin:8px 0 12px">展示的是可审计的运行阶段、耗时、工具名和脱敏摘要，不包含模型隐藏推理或完整工具结果。</p>
+    <div class="trace-stat-grid">${statCards}</div>
+    ${inspectionBlock}
+    ${slow ? `<div class="trace-slow"><span class="muted">较慢阶段</span>${slow}</div>` : ""}
+    <div class="trace-timeline">${timeline || '<p class="muted">该 trace 暂无阶段记录。</p>'}</div>
+  </div>`;
+}
+
+function renderTraceDetail() {
+  return `<div class="between" style="margin-bottom:10px;gap:8px;flex-wrap:wrap">
+    <button class="btn small" onclick="state.view='traces'; loadView().then(render)">返回消息 Trace</button>
+    ${state.selectedTraceId ? `<button class="btn small" onclick="openLogsForTrace('${escapeAttr(state.selectedTraceId)}')">查看同 Trace 日志</button>` : ""}
+  </div>
+  ${renderTraceProcess()}`;
+}
+
+function renderTraces() {
+  const data = state.traces;
+  if (!data) return `<div class="card muted">加载中…</div>`;
+  const outcomeLabel = (value) => {
+    const text = String(value || "-");
+    const cls = text === "ok" ? "hs-ok" : (text === "failed" ? "hs-error" : (text === "no_reply" ? "hs-warn" : "hs-info"));
+    return `<span class="tag"><span class="dot ${cls}" style="display:inline-block;width:7px;height:7px;border-radius:50%;margin-right:4px"></span>${escapeHtml(text)}</span>`;
+  };
+  const rows = (data.entries || []).map(e => {
+    const time = e.ts ? new Date(e.ts * 1000).toLocaleString() : "-";
+    const scene = e.session_type === "group" ? `群 ${e.group_id || "-"}` : "私聊";
+    const traceBtn = `<button class="btn small" onclick="openTraceDetail('${escapeAttr(e.trace_id)}')">${escapeHtml(e.trace_id || "-")}</button>`;
+    return `<tr>
+      <td class="muted" style="font-size:12px;white-space:nowrap">${escapeHtml(time)}</td>
+      <td>${escapeHtml(scene)}<br><code style="font-size:11px">${escapeHtml(e.user_id || "-")}</code></td>
+      <td style="white-space:pre-wrap;word-break:break-word">${escapeHtml(e.incoming_text || "")}</td>
+      <td style="white-space:pre-wrap;word-break:break-word">${escapeHtml(e.outgoing_text || "")}</td>
+      <td>${outcomeLabel(e.outcome)}<br><span class="muted" style="font-size:11px">${escapeHtml(e.diagnosis_code || "")}</span></td>
+      <td>${traceBtn}<br><span class="muted" style="font-size:11px">阶段 ${Number(e.stage_count || 0)} · 警告 ${Number(e.warn_count || 0)} · 异常 ${Number(e.error_count || 0)}</span></td>
+    </tr>`;
+  }).join("");
+  return `<div class="card">
+    <div class="between" style="gap:10px;flex-wrap:wrap">
+      <h2 style="margin:0">收/发消息与 Trace</h2>
+      <button class="btn small" onclick="loadView().then(render)">刷新</button>
+    </div>
+    <p class="muted" style="font-size:12px;margin:8px 0 12px">这里按回合展示收到什么、最终发出什么和对应 Trace。点击 Trace 进入独立详情页查看可审计过程、工具调用、预算、发送指向和异常阶段。</p>
+    <div class="table-wrap"><table><thead><tr><th>时间</th><th>会话</th><th>收到</th><th>发出</th><th>结果</th><th>Trace</th></tr></thead>
+    <tbody>${rows || '<tr><td colspan="6" class="muted">暂无 Trace</td></tr>'}</tbody></table></div>
+  </div>`;
+}
+
 function renderLogs() {
   const data = state.logs;
   if (!data) return `<div class="card muted">加载中…</div>`;
@@ -142,7 +356,7 @@ function renderLogs() {
     const time = new Date(e.ts * 1000).toLocaleString();
     const level = String(e.level || "INFO");
     const cls = level === "ERROR" || level === "CRITICAL" ? "hs-error" : (level === "WARNING" ? "hs-warn" : (level === "DEBUG" ? "hs-info" : "hs-ok"));
-    const trace = e.trace_id ? `<button class="btn small" onclick="filterLogsByTrace('${escapeAttr(e.trace_id)}')">${escapeHtml(e.trace_id)}</button>` : '<span class="muted">-</span>';
+    const trace = e.trace_id ? `<button class="btn small" onclick="openTraceDetail('${escapeAttr(e.trace_id)}')">${escapeHtml(e.trace_id)}</button>` : '<span class="muted">-</span>';
     return `<tr>
       <td class="muted" style="font-size:12px;white-space:nowrap">${escapeHtml(time)}</td>
       <td><span class="dot ${cls}" style="display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:5px"></span><code style="font-size:11px">${escapeHtml(level)}</code></td>
@@ -161,7 +375,7 @@ function renderLogs() {
       <div class="field-input" style="margin-bottom:10px">
         <input id="log-query" type="text" placeholder="搜索消息 / source / trace_id" value="${escapeAttr(state.logQuery||'')}" onkeydown="if(event.key==='Enter') applyLogQuery()">
         <button class="btn small" onclick="applyLogQuery()">搜索</button>
-        <button class="btn small" onclick="state.logQuery=''; loadView().then(render)">重置</button>
+        <button class="btn small" onclick="state.logQuery=''; state.logTraceId=''; state.traceDetail=null; loadView().then(render)">重置</button>
       </div>
       <table><thead><tr><th>时间</th><th>级别</th><th>来源</th><th>消息</th><th>Trace</th></tr></thead>
       <tbody>${rows || '<tr><td colspan="5" class="muted">暂无</td></tr>'}</tbody></table>
@@ -175,18 +389,29 @@ async function pickLogLevel(level) {
 
 async function applyLogQuery() {
   state.logQuery = (document.getElementById("log-query")?.value || "").trim();
+  state.logTraceId = "";
+  state.traceDetail = null;
   try { await loadView(); render(); } catch (e) { alertFlash("err", e.message); }
 }
 
 async function filterLogsByTrace(traceId) {
   state.logQuery = traceId || "";
+  state.logTraceId = traceId || "";
   state.logLevel = "";
+  try { await loadView(); render(); } catch (e) { alertFlash("err", e.message); }
+}
+
+async function openTraceDetail(traceId) {
+  state.view = "trace_detail";
+  state.selectedTraceId = traceId || "";
+  state.logTraceId = "";
   try { await loadView(); render(); } catch (e) { alertFlash("err", e.message); }
 }
 
 async function openLogsForTrace(traceId) {
   state.view = "logs";
   state.logQuery = traceId || "";
+  state.logTraceId = "";
   state.logLevel = "";
   try { await loadView(); render(); } catch (e) { alertFlash("err", e.message); }
 }

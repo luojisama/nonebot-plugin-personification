@@ -4,8 +4,10 @@ from typing import Any
 
 from fastapi import APIRouter, Body, Depends, HTTPException
 
-from ...core.onebot_cache import get_user_nickname
+from ...core.onebot_cache import get_user_nickname, get_user_profile
+from ...core.user_profile_meta import compact_user_profile_meta_summary
 from ..deps import AdminIdentity, require_admin
+from .favorability_view import serialize_favorability
 
 
 def _profile_service(runtime) -> Any | None:
@@ -36,6 +38,14 @@ def _get_first_bot(runtime) -> Any | None:
     return next(iter(bots.values()), None) if bots else None
 
 
+def _merge_display_profile(stored: dict[str, Any], live: dict[str, Any]) -> dict[str, Any]:
+    merged = dict(stored or {})
+    for key, value in (live or {}).items():
+        if value not in (None, "", [], {}):
+            merged[key] = value
+    return merged
+
+
 def build_persona_router(*, runtime) -> APIRouter:
     router = APIRouter(prefix="/api/personas", tags=["personas"])
 
@@ -49,13 +59,28 @@ def build_persona_router(*, runtime) -> APIRouter:
         items: list[dict[str, Any]] = []
         for p in profiles:
             uid = p["user_id"]
+            profile_json = p.get("profile_json", {}) if isinstance(p.get("profile_json", {}), dict) else {}
+            stored_qq_profile = profile_json.get("qq_profile", {}) if isinstance(profile_json.get("qq_profile", {}), dict) else {}
+            live_qq_profile = await get_user_profile(bot, uid)
+            qq_profile = _merge_display_profile(stored_qq_profile, live_qq_profile)
+            nickname = str(qq_profile.get("nickname", "") or "") or await get_user_nickname(bot, uid)
+            snippet = (p["profile_text"] or "")[:140] or compact_user_profile_meta_summary(qq_profile)
             items.append(
                 {
                     "user_id": uid,
-                    "nickname": await get_user_nickname(bot, uid),
-                    "snippet": (p["profile_text"] or "")[:140],
+                    "nickname": nickname,
+                    "avatar_url": str(qq_profile.get("avatar_url", "") or ""),
+                    "homepage_url": str(qq_profile.get("homepage_url", "") or ""),
+                    "qq_profile": qq_profile,
+                    "snippet": snippet,
                     "updated_at": p.get("updated_at", 0),
                     "source": p.get("source", ""),
+                    "favorability": serialize_favorability(
+                        runtime,
+                        str(uid),
+                        scope="user",
+                        include_events=False,
+                    ),
                 }
             )
         return {"profiles": items, "available": True}
@@ -81,6 +106,9 @@ def build_persona_router(*, runtime) -> APIRouter:
                 }
             )
         core_json = (core.profile_json if core and isinstance(core.profile_json, dict) else {}) or {}
+        stored_qq_profile = core_json.get("qq_profile", {}) if isinstance(core_json.get("qq_profile", {}), dict) else {}
+        live_qq_profile = await get_user_profile(_get_first_bot(runtime), user_id)
+        qq_profile = _merge_display_profile(stored_qq_profile, live_qq_profile)
         structured = core_json.get("structured") or {}
         if not structured and core:
             # 旧画像没有结构化字段时，即时解析一次（不写库）
@@ -92,13 +120,27 @@ def build_persona_router(*, runtime) -> APIRouter:
                 structured = {}
         return {
             "user_id": user_id,
+            "favorability": serialize_favorability(
+                runtime,
+                str(user_id),
+                scope="user",
+                include_events=True,
+            ),
             "core_profile": {
                 "profile_text": core.profile_text if core else "",
                 "profile_json": core_json,
                 "structured": structured,
+                "qq_profile": qq_profile,
                 "user_corrections": core_json.get("user_corrections", {}),
                 "updated_at": core.updated_at if core else 0,
-            } if core else None,
+            } if core else {
+                "profile_text": "",
+                "profile_json": {},
+                "structured": {},
+                "qq_profile": qq_profile,
+                "user_corrections": {},
+                "updated_at": 0,
+            },
             "local_profiles": local_profiles,
             "prompt_block": svc.build_prompt_block(user_id=user_id, group_id=""),
         }

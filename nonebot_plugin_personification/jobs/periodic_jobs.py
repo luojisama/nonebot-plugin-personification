@@ -1,4 +1,5 @@
 import calendar
+import random
 import re
 import time
 from typing import Any, Callable, Dict, Iterable
@@ -70,10 +71,10 @@ def _remember_qzone_post(state: dict[str, Any], content: str, *, max_items: int 
     state["last_content"] = compact
 
 
-def record_qzone_post(content: str, *, now: Any) -> Dict[str, Any]:
-    """发布一条空间说说后更新 qzone_post_state（按月计数 +1、记录去重）。
+def record_qzone_post(content: str, *, now: Any, kind: str = "post") -> Dict[str, Any]:
+    """发布一条空间内容后更新 qzone_post_state（按月总数 +1、记录去重）。
 
-    供 WebUI 手动「立即发一条」复用，保证手动发布也计入月度额度。
+    供 WebUI 手动「立即发一条」和自动转发复用，保证所有外显空间发布都计入月度额度。
     """
     store = get_data_store()
     state = store.load_sync("qzone_post_state")
@@ -92,6 +93,10 @@ def record_qzone_post(content: str, *, now: Any) -> Dict[str, Any]:
         }
     state["period"] = period
     state["count"] = int(state.get("count", 0) or 0) + 1
+    kind_key = str(kind or "post").strip().lower()
+    if kind_key and kind_key != "post":
+        counter_key = f"{kind_key}_count"
+        state[counter_key] = int(state.get(counter_key, 0) or 0) + 1
     state["last_post_at"] = time.time()
     _remember_qzone_post(state, content)
     store.save_sync("qzone_post_state", state)
@@ -170,6 +175,29 @@ async def run_daily_group_fav_report(
     except Exception as e:
         logger.error(f"执行每日好感度统计任务出错: {e}")
         return 0
+
+
+async def run_favorability_maintenance(
+    *,
+    sign_in_available: bool,
+    favorability_service: Any,
+    logger: Any,
+) -> dict[str, Any]:
+    """Run plugin-owned favorability maintenance such as optional decay."""
+    if not sign_in_available or favorability_service is None:
+        return {"enabled": False, "checked": 0, "decayed": 0, "events": []}
+    try:
+        result = favorability_service.run_decay_once()
+        if result.get("enabled") and int(result.get("decayed", 0) or 0) > 0:
+            logger.info(
+                "拟人插件：好感度维护完成，"
+                f"检查 {int(result.get('checked', 0) or 0)} 个档案，"
+                f"衰减 {int(result.get('decayed', 0) or 0)} 个。"
+            )
+        return result
+    except Exception as exc:
+        logger.error(f"执行好感度维护任务出错: {exc}")
+        return {"enabled": False, "checked": 0, "decayed": 0, "events": [], "error": str(exc)}
 
 
 async def run_auto_post_diary(
@@ -264,7 +292,6 @@ async def run_proactive_qzone_post(
     """
     if not qzone_publish_available or not qzone_proactive_enabled:
         return False
-    _ = qzone_probability  # 兼容旧配置；是否发布交给 LLM 决定，仍受每日上限与最小间隔限制。
     bots = get_bots()
     if not bots:
         return False
@@ -301,6 +328,16 @@ async def run_proactive_qzone_post(
     min_interval_seconds = max(0.0, float(qzone_min_interval_hours)) * 3600
     last_post_at = float(state.get("last_post_at", 0) or 0)
     if min_interval_seconds and last_post_at and now_ts - last_post_at < min_interval_seconds:
+        return False
+
+    try:
+        probability = max(0.0, min(1.0, float(qzone_probability)))
+    except Exception:
+        probability = 0.0
+    if probability <= 0.0:
+        return False
+    if probability < 1.0 and random.random() >= probability:
+        logger.debug(f"[qzone] skip proactive post by probability gate p={probability:.2f}")
         return False
 
     # 把月度额度快照交给 agent，让它自己把控发不发、发的节奏（硬上限仍由上面的 gate 兜底）。
@@ -371,7 +408,8 @@ async def run_qzone_social_scan(
         logger.info(
             "拟人插件：空间互动扫描完成，"
             f"用户 {result.get('scanned_users', 0)}，动态 {result.get('feeds_seen', 0)}，"
-            f"点赞 {result.get('liked', 0)}，评论 {result.get('commented', 0)}。"
+            f"点赞 {result.get('liked', 0)}，评论 {result.get('commented', 0)}，"
+            f"转发 {result.get('forwarded', 0)}。"
         )
     else:
         logger.warning(f"拟人插件：空间互动扫描跳过或失败：{result.get('last_error')}")

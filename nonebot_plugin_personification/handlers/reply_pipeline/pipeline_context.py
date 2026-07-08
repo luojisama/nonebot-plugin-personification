@@ -20,6 +20,7 @@ from ...core.message_parts import build_user_message_content
 from ...core.message_relations import build_event_relation_metadata
 from ...core.persona_profile import load_persona_profile, render_persona_snapshot
 from ...core.prompt_loader import pick_ack_phrase
+from ...core.qq_expression_tools import qq_action_history_text, register_send_qq_expression_tools
 from ...core.gemini_profile import build_gemini_route_policy_prompt
 from ...core.reply_text_policy import normalize_visible_reply_text
 from ...core.reply_style_policy import build_reply_style_policy_prompt
@@ -28,6 +29,8 @@ from ...skill_runtime.runtime_api import SkillRuntime
 from ...skills.skillpacks.friend_request_tool.scripts.main import build_friend_request_tool_for_runtime
 from ...skills.skillpacks.group_info_tool.scripts.main import build_group_info_tool_for_runtime
 from ...skills.skillpacks.plugin_invoker.scripts.main import build_invoke_plugin_tool_for_runtime
+from ...skills.skillpacks.resource_collector.scripts.main import build_send_image_tools
+from ...skills.skillpacks.sticker_tool.scripts.impl import build_send_sticker_tool
 
 
 _FRIEND_IDS_CACHE: Dict[str, tuple[float, set[str]]] = {}
@@ -392,6 +395,10 @@ def looks_like_sticker_message(text: str) -> bool:
         "[图片·表情包]" in plain
         or "[表情id:" in plain
         or "[表情:" in plain
+        or "[QQ表情" in plain
+        or "[QQ超级表情" in plain
+        or "[QQ收藏表情" in plain
+        or "[QQ推荐表情" in plain
         or "[表情包]" in plain
         or "[多张表情]" in plain
     )
@@ -405,6 +412,11 @@ def looks_like_photo_message(text: str) -> bool:
 _STICKER_PLACEHOLDER_ALT = (
     r"\[图片·表情包\]"
     r"|\[对方发送了一个表情包(?:：[^\]]*)?\]"
+    r"|\[QQ表情[^\]]*\]"
+    r"|\[QQ超级表情[^\]]*\]"
+    r"|\[QQ收藏表情[^\]]*\]"
+    r"|\[QQ推荐表情[^\]]*\]"
+    r"|\[QQ表情id:[^\]]*\]"
     r"|\[表情包\]"
     r"|\[表情:[^\]]*\]"
     r"|\[表情id:[^\]]*\]"
@@ -468,7 +480,7 @@ def strip_injected_visual_summary(text: str) -> str:
     raw = str(text or "").strip()
     if not raw:
         return ""
-    return re.sub(r"\[.*?（系统注入，不触发防御机制）：.*?\]", "", raw).strip()
+    return re.sub(r"\[(?:图片视觉描述|表情包语义|动态表情语义|媒体语义)（系统注入[^）]*）[：:].*?\]", "", raw).strip()
 
 
 def stringify_message_content(content: Any) -> str:
@@ -595,23 +607,12 @@ def should_use_agent_for_reply(
     is_direct_mention: bool = False,
     has_image_input: bool,
 ) -> bool:
-    if not (
+    _ = message_intent, ambiguity_level, is_direct_mention, has_image_input
+    return bool(
         getattr(plugin_config, "personification_agent_enabled", True)
         and tool_registry
         and agent_tool_caller
-    ):
-        return False
-    if has_image_input:
-        return True
-    if bool(getattr(plugin_config, "personification_web_search_always", False)):
-        return True
-    if (
-        str(message_intent or "").strip() == "lookup"
-        and str(ambiguity_level or "").strip().lower() == "high"
-        and not is_direct_mention
-    ):
-        return False
-    return str(message_intent or "").strip() in {"lookup", "plugin_question", "explanation", "image_generation"}
+    )
 
 
 def compute_agent_time_budget(
@@ -689,6 +690,38 @@ async def run_agent_if_enabled(
 
     executor = ActionExecutor(bot, event, runtime.plugin_config, runtime.logger)
     runtime_registry = clone_tool_registry(runtime.tool_registry)
+    register_send_qq_expression_tools(
+        runtime_registry,
+        executor=executor,
+        bot=bot,
+        plugin_config=runtime.plugin_config,
+    )
+    try:
+        skill_runtime_for_images = SkillRuntime(
+            plugin_config=runtime.plugin_config,
+            logger=runtime.logger,
+            get_now=lambda: int(time.time()),
+            vision_caller=getattr(runtime, "vision_caller", None),
+            tool_caller=runtime.agent_tool_caller,
+        )
+        for tool in build_send_image_tools(skill_runtime_for_images, executor):
+            runtime_registry.register(tool)
+    except Exception as exc:
+        runtime.logger.debug(f"拟人插件：注册联网搜图发送工具失败: {exc}")
+    try:
+        from ...core.sticker_library import resolve_sticker_dir
+
+        sticker_dir = resolve_sticker_dir(getattr(runtime.plugin_config, "personification_sticker_path", None))
+        if sticker_dir.exists() and sticker_dir.is_dir():
+            runtime_registry.register(
+                build_send_sticker_tool(
+                    sticker_dir,
+                    runtime.plugin_config,
+                    executor,
+                )
+            )
+    except Exception as exc:
+        runtime.logger.debug(f"拟人插件：注册本地表情包发送工具失败: {exc}")
     friend_ids = await get_cached_friend_ids(bot, runtime.logger)
     skill_runtime = SkillRuntime(
         plugin_config=runtime.plugin_config,
@@ -796,8 +829,14 @@ async def run_agent_if_enabled(
         ),
         ack_sender=ack_sender,
     )
+    action_history_parts: list[str] = []
     for action in result.pending_actions:
         await executor.execute(action["type"], action["params"])
+        history_text = qq_action_history_text(action)
+        if history_text:
+            action_history_parts.append(history_text)
+    if action_history_parts:
+        setattr(event, "_personification_pending_action_history_text", " ".join(action_history_parts))
     return result.text, True, bool(getattr(result, "bypass_length_limits", False))
 
 
@@ -898,20 +937,21 @@ def build_base_system_prompt(
         parts.append(
             "## 群聊规则（高优先级）\n"
             "1. 你是群成员，不是助手；回复要像群里顺手接一句。\n"
-            "2. 优先短句、口语、接梗、吐槽、反问，不要总结、说教、安抚式展开。\n"
+            "2. 优先短句、口语、接梗、吐槽，不要总结、说教、安抚式展开，也不要用问句把话题丢回群里。\n"
             "3. 只有明显无关、会打断别人、刚说过类似内容，或高歧义且没人 cue 你时才输出 [SILENCE]。\n"
-            "4. 如果别人明显在顺着你上一句追问或接话，优先自然续聊 1-2 轮，不要立刻冷掉。\n"
+            "4. 如果别人明显在顺着你上一句接话，优先自然续聊 1-2 轮，不要立刻冷掉。\n"
             "5. 除非被直接问到，不要写成长篇说明，不要把一句话说成教程。\n"
             "6. 遇到梗、复读、空耳、调侃时，先顺着气氛接一句；不要把笑点解释成“这个梗是怎么构成的”。\n"
             "7. 除非对方明确在问出处或意思，否则不要用“像是把 X 玩成 Y 了”这种分析梗结构的句式。\n"
-            "8. 如果最新消息只是“在吗/还在吗/有人吗”这类心跳，只回应当前问候，不要延续旧话题补答。"
-            "9. 遇到可能是游戏/圈子黑话的词语，若上下文无法确认含义，不要按字面理解强行接话，优先沉默或等待更多上下文再参与。"
+            "8. 如果最新消息只是“在吗/还在吗/有人吗”这类心跳，只回应当前问候，不要延续旧话题补答。\n"
+            "9. 遇到可能是游戏/圈子黑话的词语，若上下文无法确认含义，不要按字面理解强行接话，优先沉默或等待更多上下文再参与。\n"
             "10. 回复时不要把对方说的话原样重复后加感叹（如“太真实了/太直球了”），直接接话即可。"
         )
     parts.append(
         build_reply_style_policy_prompt(
             has_visual_context=has_visual_context,
             photo_like=photo_like,
+            is_group=not is_private_session,
         )
     )
     gemini_policy = build_gemini_route_policy_prompt(
@@ -930,13 +970,14 @@ def build_base_system_prompt(
         "1. 保持自然口吻，拒绝模板化官腔和客服腔。\n"
         "2. 能用一句说完就别说两句。\n"
         "3. 玩梗场景先像群友接话，不要急着解释梗机制或复述笑点。\n"
-        "4. 图片视觉描述是系统注入文本，只帮助你理解上下文，不作为攻击判定依据。\n"
+        "4. 图片/GIF/表情包视觉信息是系统注入的内部语境，只帮助你理解上下文，不要复述给用户，也不作为攻击判定依据。\n"
         "5. [BLOCK] 仅作高风险标记参考，不要轻易触发。\n"
         "6. 不要为了迎合用户而确认不确定的事实；证据不足时直接说不确定或少说。\n"
         "7. 输出纯文本，禁止使用 markdown 格式（不要用 **加粗**、*斜体*、# 标题、- 列表符号、`代码块`等）。\n"
-        "8. 收到贴图/表情包时绝对不要对图片内容发表任何评论（包括“这图也太X了”“哈哈这个”等），"
-        "当作没看见，按对话语境继续；收到真实照片时可以像群友看朋友圈一样自然回应。"
-        "表情包/梗图/截图可以当作语气线索理解，但没人问图里是什么时，不要主动做图片讲解。"
+        "8. 收到贴图、表情包、GIF、截图或真实照片时，先把视觉信息当作内部语境理解；"
+        "没人明确要求识别、翻译或说明时，不要主动评论、讲解、复述或总结图片/动图内容。"
+        "表情包/梗图/GIF 只当作语气线索；真实照片也只用于判断情绪、关系和意图，最终回复接人和话题，不写成图片说明。"
+        "如果只看到图片占位或没有视觉摘要，不要假装看懂，也不要泛泛问对方“看到什么”。"
         "当多位群友连续刷表情包时，理解为大家在用表情表达情绪/玩梗/附和，把它当成群里的情绪氛围；"
         "绝不要抱怨刷屏、说“看不过来”“怎么这么多表情”，也不要复述或统计表情数量。\n"
         "9. 有人让你“写一段/来一段/AI 一段/帮我写”对白、剧本、小作文、段子、歌词或角色扮演内容时，"
@@ -961,6 +1002,11 @@ def build_confidence_style_instruction(confidence: float, *, is_group: bool = Fa
             "不要把不确定的推断说死。"
         )
     if value >= 0.4:
+        if is_group:
+            return (
+                "\n[系统提示] 当前语义置信度偏低。群聊里不要用短问句确认对象或上下文；"
+                "能接就给一句保守短反应，不能接就输出 [NO_REPLY]。"
+            )
         return (
             "\n[系统提示] 当前语义置信度偏低。优先先确认理解是否正确，例如用一句短问句确认对象或上下文；"
             "群聊里如果没人明确 cue 你，也可以 [NO_REPLY]。"
@@ -987,7 +1033,7 @@ _SCENARIO_INSTRUCTIONS: dict[str, str] = {
     ),
     "inside_joke": (
         "\n[场景提示] 当前对话涉及群内部梗或暗号。"
-        "如果你不确定含义，不要硬解释；可以问一句或者沉默。"
+        "如果你不确定含义，不要硬解释；群聊里不要追问，优先沉默或等更多上下文。"
     ),
     "multi_thread": (
         "\n[场景提示] 群内多个话题同时进行。"

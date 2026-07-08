@@ -15,6 +15,13 @@ _IMAGE_REQUIRED_TOOL_NAMES = frozenset(
     }
 )
 _IMAGE_GENERATION_TOOL_NAMES = frozenset({"generate_image"})
+_QQ_EXPRESSION_TOOL_NAMES = frozenset(
+    {
+        "send_qq_face",
+        "send_qq_favorite_expression",
+        "send_qq_recommended_expression",
+    }
+)
 # 闲聊/接梗场景也放行的一组"轻量查证"工具：遇到看不懂的梗/专有名词/外号/分享内容时，
 # 模型应先查清楚再用自己的口吻接话；runner 会用模型侧草稿审查兜底。
 _LIGHTWEIGHT_LOOKUP_TOOL_NAMES = frozenset(
@@ -36,6 +43,7 @@ _IMAGE_GENERATION_CONTEXT_TOOL_NAMES = frozenset(
         "web_search",
         "search_web",
         "search_images",
+        "search_and_send_images",
         "collect_resources",
         "wiki_lookup",
         "resolve_acg_entity",
@@ -67,6 +75,7 @@ _NETWORK_TOOL_NAMES = frozenset(
         "multi_search_engine",
         "collect_resources",
         "search_images",
+        "search_and_send_images",
         "search_official_site",
         "search_github_repos",
         "wiki_lookup",
@@ -94,6 +103,12 @@ _ADMIN_TOOL_NAMES = frozenset(
     }
 )
 _MEMORY_TOOL_NAMES = frozenset({"memory_recall", "recall_user_memory", "recall_group_memory", "get_user_persona"})
+_SEND_MESSAGE_ACTION_TOOL_NAMES = _QQ_EXPRESSION_TOOL_NAMES | frozenset(
+    {
+        "send_local_sticker",
+        "search_and_send_images",
+    }
+)
 
 
 def _coerce_tags(value: Any) -> set[str]:
@@ -113,6 +128,9 @@ def _default_tool_metadata(tool_name: str) -> dict[str, Any]:
         "requires_image": False,
         "latency_class": "normal",
         "risk_level": "low",
+        "side_effect": "none",
+        "final_behavior": "continue",
+        "retryable": False,
     }
     if name in _ADMIN_TOOL_NAMES:
         metadata.update({"risk_level": "admin", "intent_tags": ["admin"]})
@@ -133,6 +151,17 @@ def _default_tool_metadata(tool_name: str) -> dict[str, Any]:
                 "latency_class": "slow",
             }
         )
+    if name in _QQ_EXPRESSION_TOOL_NAMES:
+        metadata.update(
+            {
+                "intent_tags": ["expression"],
+                "evidence_kind": "action",
+                "latency_class": "fast",
+                "risk_level": "low",
+                "side_effect": "send_message",
+                "final_behavior": "silence_on_success",
+            }
+        )
     if name in _IMAGE_GENERATION_CONTEXT_TOOL_NAMES:
         tags = _coerce_tags(metadata.get("intent_tags"))
         tags.update({"lookup", "image_generation"})
@@ -142,6 +171,7 @@ def _default_tool_metadata(tool_name: str) -> dict[str, Any]:
                 "evidence_kind": "web" if name in _NETWORK_TOOL_NAMES else "resource",
                 "requires_network": name in _NETWORK_TOOL_NAMES,
                 "latency_class": "slow" if name == "parallel_research" else "normal",
+                "retryable": name not in _SEND_MESSAGE_ACTION_TOOL_NAMES,
             }
         )
     if name in _PLUGIN_LOCAL_TOOL_NAMES:
@@ -160,6 +190,7 @@ def _default_tool_metadata(tool_name: str) -> dict[str, Any]:
                 "intent_tags": sorted(tags),
                 "evidence_kind": "web",
                 "requires_network": True,
+                "retryable": True,
             }
         )
     if name in _NETWORK_TOOL_NAMES:
@@ -171,6 +202,7 @@ def _default_tool_metadata(tool_name: str) -> dict[str, Any]:
                 "evidence_kind": "web",
                 "requires_network": True,
                 "latency_class": "slow" if name == "parallel_research" else metadata.get("latency_class", "normal"),
+                "retryable": name not in _SEND_MESSAGE_ACTION_TOOL_NAMES,
             }
         )
     if name in _MEMORY_TOOL_NAMES:
@@ -181,6 +213,19 @@ def _default_tool_metadata(tool_name: str) -> dict[str, Any]:
                 "intent_tags": sorted(tags),
                 "evidence_kind": "memory",
                 "latency_class": "fast",
+            }
+        )
+    if name in _SEND_MESSAGE_ACTION_TOOL_NAMES:
+        tags = _coerce_tags(metadata.get("intent_tags"))
+        if name == "send_local_sticker":
+            tags.add("expression")
+        metadata.update(
+            {
+                "intent_tags": sorted(tags),
+                "evidence_kind": "action",
+                "side_effect": "send_message",
+                "final_behavior": "silence_on_success",
+                "retryable": False,
             }
         )
     return metadata
@@ -194,8 +239,16 @@ def apply_tool_metadata_defaults(registry: ToolRegistry) -> None:
         tool.metadata = metadata
 
 
+def tool_runtime_metadata(registry: ToolRegistry | None, tool_name: str) -> dict[str, Any]:
+    metadata = dict(_default_tool_metadata(tool_name))
+    tool = registry.get(tool_name) if registry is not None else None
+    if tool is not None:
+        metadata.update(tool.metadata or {})
+    return metadata
+
+
 def tool_planner_metadata(tool: AgentTool) -> dict[str, Any]:
-    metadata = dict(_default_tool_metadata(tool.name))
+    metadata = tool_runtime_metadata(None, tool.name)
     metadata.update(tool.metadata or {})
     return {
         "name": tool.name,
@@ -206,6 +259,9 @@ def tool_planner_metadata(tool: AgentTool) -> dict[str, Any]:
         "requires_image": bool(metadata.get("requires_image", False)),
         "latency_class": str(metadata.get("latency_class", "normal") or "normal"),
         "risk_level": str(metadata.get("risk_level", "low") or "low"),
+        "side_effect": str(metadata.get("side_effect", "none") or "none"),
+        "final_behavior": str(metadata.get("final_behavior", "continue") or "continue"),
+        "retryable": bool(metadata.get("retryable", False)),
         "local": bool(tool.local),
     }
 
@@ -233,10 +289,7 @@ def schema_tool_name(schema: dict) -> str:
 
 
 def _tool_metadata_for_name(registry: ToolRegistry, name: str) -> dict[str, Any]:
-    tool = registry.get(name)
-    if tool is None:
-        return _default_tool_metadata(name)
-    return tool_planner_metadata(tool)
+    return tool_runtime_metadata(registry, name)
 
 
 def _tool_tags(registry: ToolRegistry, name: str) -> set[str]:
@@ -273,7 +326,18 @@ def select_tool_schemas(
             for schema in schemas
             if (
                 schema_tool_name(schema) in _LIGHTWEIGHT_LOOKUP_TOOL_NAMES
+                or schema_tool_name(schema) in _QQ_EXPRESSION_TOOL_NAMES
+                or "expression" in _tool_tags(registry, schema_tool_name(schema))
                 or (has_images and _tool_requires_image(registry, schema_tool_name(schema)))
+            )
+        ]
+    elif effective_chat_intent == "expression":
+        result_schemas = [
+            schema
+            for schema in schemas
+            if (
+                schema_tool_name(schema) in _QQ_EXPRESSION_TOOL_NAMES
+                or "expression" in _tool_tags(registry, schema_tool_name(schema))
             )
         ]
     elif effective_chat_intent == "image_generation":
@@ -329,8 +393,11 @@ def semantic_tool_guidance() -> str:
         "怪物/装备/地图名、外号、别称、缩写、谐音、空耳、梗或活动名时，如果可用工具里有 web_search、search_web、"
         "wiki_lookup、resolve_acg_entity 或 parallel_research，必须先调用合适工具查证；不要凭记忆猜，也不要直接在群里问"
         "“这是什么梗/哪个游戏/什么意思”。"
+        "当用户用“这个/这段/这角色/这动画/这张图”承接最近 ACG 角色、作品、抽卡卡面、图片或视频时，也按指代消解处理，"
+        "先结合上下文查角色/作品/剧情锚点，再短句参与讨论。"
         "插件技术问题优先本地插件知识和源码工具。"
         "用户明确要求生成图片时，必须调用 generate_image，不要只给提示词。"
+        "用户明确要求联网搜已有图片或壁纸并发出来时，优先调用 search_and_send_images，不要把搜索链接当最终回复。"
         "涉及本地天气、出行、城市或附近状态时，如果用户没明说地点，先看已注入的用户档案；仍不确定可调用记忆工具确认，不能猜城市。"
         "最终回复只输出纯文本，不要 markdown、项目符号列表、编号列表，也不要说正在查询、根据搜索结果或我需要确认一下。"
         "群聊接梗场景优先像群友接话，不要为了显得聪明而滥用工具。"
@@ -348,4 +415,5 @@ __all__ = [
     "select_tool_schemas",
     "semantic_tool_guidance",
     "tool_planner_metadata",
+    "tool_runtime_metadata",
 ]

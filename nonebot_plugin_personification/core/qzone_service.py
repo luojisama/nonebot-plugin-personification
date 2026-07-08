@@ -657,6 +657,88 @@ class QzoneSocialService:
         payload = _parse_qzone_jsonp(resp.text)
         return _qzone_payload_success(payload, resp.text)
 
+    async def forward_feed(
+        self,
+        *,
+        feed: dict[str, Any],
+        bot_id: str,
+        content: str = "",
+    ) -> tuple[bool, str]:
+        ok, msg, ctx = self._context(bot_id)
+        if not ok:
+            return False, msg
+        feed_identity = _qzone_feed_reply_identity(feed)
+        owner = feed_identity["owner"]
+        feed_id = feed_identity["feed_id"]
+        topic_id = feed_identity["topic_id"]
+        appid = feed_identity["appid"] or "311"
+        unikey = str(feed.get("unikey", "") or feed.get("curkey", "") or "").strip()
+        if not owner or not feed_id or not topic_id:
+            return False, "动态缺少转发所需字段"
+        text = _clean_qzone_text(content)[:120]
+        full_cookie = str(ctx.get("cookie", "") or ctx.get("formatted_cookie", ""))
+        headers = _qzone_headers(ctx, referer_uin=owner)
+        headers["Cookie"] = full_cookie
+        headers["Content-Type"] = "application/x-www-form-urlencoded"
+        base_data: dict[str, str] = {
+            "uin": str(ctx["qq"]),
+            "hostuin": str(ctx["qq"]),
+            "hostUin": str(ctx["qq"]),
+            "owneruin": owner,
+            "ownerUin": owner,
+            "t1_uin": owner,
+            "t1_tid": feed_id,
+            "tid": feed_id,
+            "topicId": topic_id,
+            "topicid": topic_id,
+            "appid": appid,
+            "con": text,
+            "content": text,
+            "format": "json",
+            "feedsType": "100",
+            "with_cmt": "0",
+            "private": "0",
+            "paramstr": "1",
+            "plat": "qzone",
+            "source": "ic",
+            "ref": "feeds",
+            "platformid": "52",
+            "inCharset": "utf-8",
+            "outCharset": "utf-8",
+            "qzreferrer": f"https://user.qzone.qq.com/{owner}",
+        }
+        if unikey:
+            base_data["curkey"] = unikey
+            base_data["unikey"] = unikey
+
+        attempts: list[tuple[str, dict[str, str]]] = [
+            (
+                "https://user.qzone.qq.com/proxy/domain/taotao.qzone.qq.com/cgi-bin/emotion_cgi_forward_v6",
+                base_data,
+            ),
+            (
+                "https://user.qzone.qq.com/proxy/domain/taotao.qq.com/cgi-bin/emotion_cgi_re_feeds",
+                {**base_data, "forward": "1", "richtype": "", "richval": ""},
+            ),
+        ]
+        last_msg = ""
+        for url, data in attempts:
+            try:
+                async with httpx.AsyncClient(timeout=10.0) as client:
+                    resp = await client.post(url, params={"g_tk": str(ctx["g_tk"])}, data=data, headers=headers)
+            except Exception as exc:
+                last_msg = f"转发失败：{exc}"
+                continue
+            if resp.status_code != 200:
+                last_msg = f"转发失败，状态码：{resp.status_code}"
+                continue
+            payload = _parse_qzone_jsonp(resp.text)
+            success, payload_msg = _qzone_payload_success(payload, resp.text)
+            if success:
+                return True, "ok"
+            last_msg = payload_msg
+        return False, last_msg or "转发失败"
+
     async def _reply_comment_sub(
         self,
         *,

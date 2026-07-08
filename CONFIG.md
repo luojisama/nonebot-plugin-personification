@@ -292,6 +292,70 @@ personification_whitelist=["123456789","987654321"]
 | `personification_60s_local_api_base` | `"http://127.0.0.1:4399"` | `"http://127.0.0.1:4399"` | 本地 60s 服务接口。 |
 | `personification_60s_enabled` | `true` | `true` | 是否启用 60s 新闻能力。 |
 
+## 0.6.2 新增配置项
+
+> 以下配置项随 0.6.2 全量同步补齐，均为可选；未设置时使用代码默认值。对普通聊天语义的控制仍通过模型提示、Agent 规划和工具契约完成，不应改成本地关键词分支。
+
+### Agent 预算与语义帧
+
+| 配置项 | 默认值 | 备注 |
+| --- | --- | --- |
+| `personification_agent_budget_mode` | `"shadow"` | Agent 预算模式；`shadow` 只记录建议，`adaptive` 才接管步数和剩余时间。 |
+| `personification_semantic_frame_timeout` | `8.0` | 语义帧 / TurnPlan 前置判断总预算，超时后走结构 fallback。 |
+
+### 表情包打标联网复核
+
+| 配置项 | 默认值 | 备注 |
+| --- | --- | --- |
+| `personification_sticker_labeler_research_enabled` | `true` | 贴图打标时是否允许轻量模型规划检索词并联网复核出处/OCR/梗义。 |
+| `personification_sticker_labeler_research_max_queries` | `2` | 单张贴图最多联网检索词数量；模型返回空检索词时不联网。 |
+| `personification_sticker_labeler_research_timeout` | `12.0` | 打标联网复核总超时，单位秒。 |
+
+### 图片生成路由
+
+| 配置项 | 默认值 | 备注 |
+| --- | --- | --- |
+| `personification_image_gen_api_type` | `"auto"` | 独立绘图 API 类型；`auto` 时按当前路由或主模型配置自动选择。 |
+| `personification_image_gen_api_url` | `""` | 独立绘图 API 地址；留空复用主模型/CLI/OAuth 路由。 |
+| `personification_image_gen_api_key` | `""` | 独立绘图 API Key；留空按 provider 默认凭证处理。 |
+
+### QZone 转发
+
+| 配置项 | 默认值 | 备注 |
+| --- | --- | --- |
+| `personification_qzone_forward_enabled` | `true` | 是否允许 QZone 好友动态转发能力。 |
+| `personification_qzone_forward_limit` | `1` | 每个额度周期内的转发上限；与原创说说共享月度额度记录。 |
+| `personification_qzone_forward_max_per_scan` | `1` | 单次扫描最多转发动态数量。 |
+
+### 插件内好感度
+
+| 配置项 | 默认值 | 备注 |
+| --- | --- | --- |
+| `personification_favorability_enabled` | `true` | 是否启用插件自有好感度档案和事件账本。 |
+| `personification_favorability_default_score` | `0.0` | 新用户默认好感度。 |
+| `personification_favorability_group_default_score` | `100.0` | 新群默认好感度。 |
+| `personification_favorability_levels` | 内置等级表 | 好感度等级阈值与展示标签，JSON 对象/数组均可按实现解析。 |
+| `personification_favorability_event_deltas` | 内置事件分值 | 各类互动事件的分值增减映射。 |
+| `personification_favorability_daily_positive_cap` | `5.0` | 单用户每日正向事件加分上限。 |
+| `personification_favorability_group_daily_positive_cap` | `10.0` | 单群每日正向事件加分上限。 |
+| `personification_favorability_daily_negative_cap` | `30.0` | 单用户每日负向事件扣分上限。 |
+| `personification_favorability_event_log_limit` | `50` | 每个对象保留的最近好感事件数量。 |
+| `personification_favorability_decay_enabled` | `false` | 是否启用长时间无互动后的好感衰减。 |
+| `personification_favorability_decay_idle_days` | `14` | 启用衰减后，连续多少天无互动才触发。 |
+| `personification_favorability_decay_delta` | `-0.2` | 每次衰减应用的分值变化。 |
+
+### QQ 表情工具
+
+| 配置项 | 默认值 | 备注 |
+| --- | --- | --- |
+| `personification_qq_expression_enabled` | `true` | 是否启用 QQ 小黄脸/超级表情/收藏表情发送能力。 |
+| `personification_qq_expression_probability` | `0.08` | 自动附加 QQ 表情的基础概率。 |
+| `personification_qq_expression_cooldown_seconds` | `180` | 同一会话自动 QQ 表情冷却时间。 |
+| `personification_qq_expression_daily_limit` | `30` | 每日自动 QQ 表情发送上限。 |
+| `personification_qq_expression_super_probability` | `0.02` | 在可用时选择超级表情的概率。 |
+| `personification_qq_expression_triple_probability` | `0.02` | 发送三连 QQ 表情的概率。 |
+| `personification_qq_favorite_expression_probability` | `0.02` | 在可用时选择收藏/推荐表情的概率。 |
+
 ## 签到联动说明
 
 - `nonebot-plugin-shiro-signin` 目前暂未发布，因此本插件不会将其作为必装依赖。

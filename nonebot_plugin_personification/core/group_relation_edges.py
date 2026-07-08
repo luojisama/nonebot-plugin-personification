@@ -28,7 +28,7 @@ def _normalize_user_id(value: Any) -> str:
 def _is_human_source(source_kind: Any, *, is_bot: bool) -> bool:
     if is_bot:
         return False
-    return str(source_kind or "user").strip().lower() not in {"bot", "plugin", "system"}
+    return str(source_kind or "user").strip().lower() not in {"bot", "plugin", "plugin_command", "system"}
 
 
 def upsert_group_relation_edge(
@@ -171,7 +171,7 @@ def update_relation_edges_from_message(
         """
         SELECT user_id, content, timestamp
         FROM group_messages
-        WHERE group_id=? AND user_id<>? AND is_bot=0 AND source_kind NOT IN ('bot', 'plugin', 'system')
+        WHERE group_id=? AND user_id<>? AND is_bot=0 AND source_kind NOT IN ('bot', 'plugin', 'plugin_command', 'system')
         ORDER BY timestamp DESC
         LIMIT 6
         """,
@@ -231,7 +231,7 @@ def update_relation_edges_from_message(
             SELECT user_id, timestamp
             FROM group_messages
             WHERE group_id=? AND thread_id=? AND user_id<>? AND is_bot=0
-              AND source_kind NOT IN ('bot', 'plugin', 'system')
+              AND source_kind NOT IN ('bot', 'plugin', 'plugin_command', 'system')
             ORDER BY timestamp DESC
             LIMIT 12
             """,

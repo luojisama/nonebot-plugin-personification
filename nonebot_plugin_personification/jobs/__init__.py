@@ -4,6 +4,7 @@ from typing import Any, Dict
 from .periodic_jobs import (
     run_auto_post_diary,
     run_daily_group_fav_report,
+    run_favorability_maintenance,
     run_proactive_qzone_post,
     run_qzone_inbound_poll,
     run_qzone_social_scan,
@@ -11,6 +12,7 @@ from .periodic_jobs import (
 from .scheduler_registration import (
     register_background_intelligence_job,
     register_daily_group_fav_report_job,
+    register_favorability_maintenance_job,
     register_group_idle_topic_job,
     register_proactive_messaging_job,
     register_proactive_qzone_job,
@@ -24,6 +26,7 @@ from .scheduler_registration import (
 from .task_builders import (
     build_auto_post_diary_task,
     build_daily_group_fav_report_task,
+    build_favorability_maintenance_task,
     build_generate_ai_diary_task,
     build_group_idle_topic_task,
     build_maybe_generate_qzone_post_task,
@@ -37,6 +40,7 @@ from .task_builders import (
 class JobSetupDeps:
     plugin_config: Any
     sign_in_available: bool
+    favorability_service: Any
     load_data: Any
     load_proactive_state: Any
     get_now: Any
@@ -57,10 +61,10 @@ class JobSetupDeps:
     group_idle_enabled: bool = True
     group_idle_check_interval_minutes: int = 15
     qzone_proactive_enabled: bool = False
-    qzone_check_interval_minutes: int = 90
+    qzone_check_interval_minutes: int = 60
     qzone_monthly_limit: int = 30
-    qzone_probability: float = 0.35
-    qzone_min_interval_hours: float = 6.0
+    qzone_probability: float = 0.20
+    qzone_min_interval_hours: float = 12.0
     qzone_quiet_hour_start: int = 0
     qzone_quiet_hour_end: int = 7
     qzone_social_enabled: bool = False
@@ -94,11 +98,23 @@ def setup_jobs(*, scheduler: Any, deps: JobSetupDeps) -> Dict[str, Any]:
         daily_job=daily_group_fav_report,
         logger=deps.logger,
     )
+    favorability_maintenance = build_favorability_maintenance_task(
+        run_favorability_maintenance=run_favorability_maintenance,
+        sign_in_available=deps.sign_in_available,
+        favorability_service=deps.favorability_service,
+        logger=deps.logger,
+    )
+    register_favorability_maintenance_job(
+        scheduler=scheduler,
+        maintenance_job=favorability_maintenance,
+        logger=deps.logger,
+    )
 
     # generate_ai_diary 任务仍保留：供"发个说说"手动命令使用（见 matcher 接线）。
     # 但"定时发送"（每周五 19:00 到点必发的 run_auto_post_diary + register_weekly_diary_job）
     # 已弃用——自动发空间改由下方 proactive 路径，让 agent 按 inner_state 自主判断 skip|post。
     generate_ai_diary = build_generate_ai_diary_task(
+        plugin_config=deps.plugin_config,
         generate_ai_diary_flow=deps.generate_ai_diary_flow,
         load_prompt=deps.load_prompt,
         call_ai_api=deps.call_ai_api,
@@ -119,6 +135,7 @@ def setup_jobs(*, scheduler: Any, deps: JobSetupDeps) -> Dict[str, Any]:
     if deps.qzone_publish_available:
         if deps.qzone_proactive_enabled and deps.maybe_generate_proactive_qzone_post_flow is not None:
             maybe_generate_qzone_post = build_maybe_generate_qzone_post_task(
+                plugin_config=deps.plugin_config,
                 maybe_generate_proactive_qzone_post_flow=deps.maybe_generate_proactive_qzone_post_flow,
                 load_prompt=deps.load_prompt,
                 call_ai_api=deps.call_ai_api,
@@ -168,6 +185,9 @@ def setup_jobs(*, scheduler: Any, deps: JobSetupDeps) -> Dict[str, Any]:
                     persona_store=deps.persona_store,
                     vision_caller=deps.vision_caller,
                     agent_data_dir=deps.agent_data_dir,
+                    agent_tool_caller=deps.agent_tool_caller,
+                    agent_tool_registry=deps.agent_tool_registry,
+                    agent_max_steps=deps.agent_max_steps,
                     target_user_id=target_user_id,
                     allow_open_user=allow_open_user,
                 )
@@ -201,6 +221,9 @@ def setup_jobs(*, scheduler: Any, deps: JobSetupDeps) -> Dict[str, Any]:
                     logger=deps.logger,
                     persona_store=deps.persona_store,
                     agent_data_dir=deps.agent_data_dir,
+                    agent_tool_caller=deps.agent_tool_caller,
+                    agent_tool_registry=deps.agent_tool_registry,
+                    agent_max_steps=deps.agent_max_steps,
                 )
 
             qzone_inbound_poll = build_qzone_inbound_poll_task(
@@ -297,6 +320,7 @@ def setup_jobs(*, scheduler: Any, deps: JobSetupDeps) -> Dict[str, Any]:
 
     return {
         "daily_group_fav_report": daily_group_fav_report,
+        "favorability_maintenance": favorability_maintenance,
         # generate_ai_diary 仍供"发个说说"手动命令使用；auto_post_diary（定时发送）已弃用。
         "generate_ai_diary": generate_ai_diary,
         "auto_post_diary": auto_post_diary,
@@ -310,11 +334,13 @@ def setup_jobs(*, scheduler: Any, deps: JobSetupDeps) -> Dict[str, Any]:
 __all__ = [
     "run_auto_post_diary",
     "run_daily_group_fav_report",
+    "run_favorability_maintenance",
     "run_proactive_qzone_post",
     "run_qzone_inbound_poll",
     "run_qzone_social_scan",
     "register_weekly_diary_job",
     "register_daily_group_fav_report_job",
+    "register_favorability_maintenance_job",
     "register_group_idle_topic_job",
     "register_proactive_messaging_job",
     "register_proactive_qzone_job",
@@ -322,6 +348,7 @@ __all__ = [
     "register_qzone_social_scan_job",
     "build_auto_post_diary_task",
     "build_daily_group_fav_report_task",
+    "build_favorability_maintenance_task",
     "build_generate_ai_diary_task",
     "build_group_idle_topic_task",
     "build_maybe_generate_qzone_post_task",

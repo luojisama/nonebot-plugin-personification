@@ -183,13 +183,38 @@ def _normalize_thinking_mode(mode: Optional[str], default: str = "none") -> str:
     return default
 
 
+def _strip_llm_endpoint_suffix(base_url: str) -> str:
+    url = (base_url or "").strip().rstrip("/")
+    for suffix in ("/chat/completions", "/messages", "/responses", "/models"):
+        if url.endswith(suffix):
+            return url[: -len(suffix)].rstrip("/")
+    match = re.match(r"^(?P<root>.+/(?:v1beta|v1))/models/[^/]+:generateContent$", url)
+    if match:
+        return match.group("root").rstrip("/")
+    return url
+
+
 def _normalize_openai_base_url(base_url: str) -> str:
-    url = (base_url or "").strip()
+    url = _strip_llm_endpoint_suffix(base_url)
     if "generativelanguage.googleapis.com" in url and "openai" not in url:
         return "https://generativelanguage.googleapis.com/v1beta/openai/"
-    if url and "generativelanguage.googleapis.com" not in url and not url.endswith(("/v1", "/v1/")):
+    if url and "generativelanguage.googleapis.com" not in url and not re.search(r"/v\d+(?:beta)?(?:/|$)", url):
         return url.rstrip("/") + "/v1"
     return url
+
+
+def _normalize_gemini_base_url(base_url: str) -> str:
+    url = _strip_llm_endpoint_suffix(base_url)
+    if not url:
+        return ""
+    match = re.match(r"^(?P<root>.+/(?:v1beta|v1))(?:/.*)?$", url)
+    if match:
+        return match.group("root").rstrip("/")
+    return f"{url.rstrip('/')}/v1beta"
+
+
+def _is_google_gemini_base_url(base_url: str) -> bool:
+    return "generativelanguage.googleapis.com" in str(base_url or "").lower()
 
 
 def _split_data_url(data_url: str) -> Optional[Tuple[str, str]]:
@@ -1115,9 +1140,72 @@ class GeminiToolCaller(ToolCaller):
         thinking_mode: str = "none",
     ) -> None:
         self.api_key = api_key
-        self.base_url = (base_url or "").strip()
+        self.base_url = _normalize_gemini_base_url(base_url)
         self.model = model
         self.thinking_mode = _normalize_thinking_mode(thinking_mode)
+
+    async def _chat_with_custom_gemini_endpoint(
+        self,
+        messages: List[dict],
+        tools: List[dict],
+        use_builtin_search: bool,
+    ) -> ToolCallerResponse:
+        system_instruction, contents = _convert_messages_to_gemini(messages)
+        tool_payload: List[dict] = []
+        if tools:
+            tool_payload.append(
+                {
+                    "function_declarations": [
+                        _convert_openai_tool_to_gemini(tool)
+                        for tool in tools
+                    ]
+                }
+            )
+        if use_builtin_search:
+            tool_payload.append(_gemini_builtin_search_tool(self.model))
+
+        payload: Dict[str, Any] = {"contents": contents}
+        if system_instruction:
+            payload["systemInstruction"] = {"parts": [{"text": system_instruction}]}
+        if tool_payload:
+            payload["tools"] = tool_payload
+        if self.thinking_mode != "none":
+            payload["generationConfig"] = {
+                "thinkingConfig": {
+                    "thinkingBudget": GEMINI_THINKING_BUDGET_MAP[self.thinking_mode]
+                }
+            }
+
+        url = f"{self.base_url.rstrip('/')}/models/{self.model}:generateContent"
+        headers = {"Content-Type": "application/json"}
+        params: Dict[str, str] = {}
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
+        async with httpx.AsyncClient(timeout=httpx.Timeout(120.0, connect=10.0), follow_redirects=True) as client:
+            response = await client.post(url, headers=headers, json=payload)
+            if response.status_code in {401, 403} and self.api_key:
+                headers.pop("Authorization", None)
+                params["key"] = self.api_key
+                response = await client.post(url, headers=headers, params=params, json=payload)
+            response.raise_for_status()
+            data = response.json()
+
+        candidates = list(_obj_get(data, "candidates", []) or [])
+        if not candidates:
+            return ToolCallerResponse("stop", "", [], data)
+        content = _obj_get(candidates[0], "content", {})
+        parts = list(_obj_get(content, "parts", []) or [])
+        tool_calls = _extract_gemini_tool_calls(parts)
+        text = _extract_gemini_text(parts)
+        return ToolCallerResponse(
+            finish_reason="tool_calls" if tool_calls else "stop",
+            content=text,
+            tool_calls=tool_calls,
+            raw=data,
+            used_builtin_search=_gemini_used_builtin_search(data),
+            usage=_extract_usage(data),
+            model_used=str(self.model or ""),
+        )
 
     async def chat_with_tools(
         self,
@@ -1126,10 +1214,13 @@ class GeminiToolCaller(ToolCaller):
         use_builtin_search: bool,
     ) -> ToolCallerResponse:
         messages = inject_current_time_context(messages)
-        import google.generativeai as genai
-
         contains_image_input = _messages_contain_images(messages)
         try:
+            if self.base_url and not _is_google_gemini_base_url(self.base_url):
+                return await self._chat_with_custom_gemini_endpoint(messages, tools, use_builtin_search)
+
+            import google.generativeai as genai
+
             _configure_genai(self.api_key, self.base_url)
             system_instruction, contents = _convert_messages_to_gemini(messages)
 
@@ -1146,11 +1237,11 @@ class GeminiToolCaller(ToolCaller):
             if use_builtin_search:
                 tool_payload.append(_gemini_builtin_search_tool(self.model))
 
-            generation_config: Dict[str, Any] = {
-                "thinking_config": {
+            generation_config: Dict[str, Any] = {}
+            if self.thinking_mode != "none":
+                generation_config["thinking_config"] = {
                     "thinking_budget": GEMINI_THINKING_BUDGET_MAP[self.thinking_mode]
                 }
-            }
             model = genai.GenerativeModel(
                 model_name=self.model,
                 system_instruction=system_instruction,
@@ -1158,7 +1249,7 @@ class GeminiToolCaller(ToolCaller):
             )
             response = await model.generate_content_async(
                 contents,
-                generation_config=generation_config,
+                generation_config=generation_config or None,
             )
 
             candidates = list(_obj_get(response, "candidates", []) or [])

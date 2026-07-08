@@ -182,3 +182,37 @@ def test_at_skipped_when_quoting_or_single_speaker() -> None:
         is_private=False,
         quote_message_id=None,
     ) is None
+
+
+def test_decide_addressing_respects_semantic_frame_mode() -> None:
+    plan = humanize.decide_addressing(
+        plugin_config=_config(),
+        state={},
+        event=_event(message_id=42),
+        group_id="g1",
+        user_id="u1",
+        is_private=False,
+        address_mode="at_quote",
+    )
+
+    assert plan["source"] == "semantic_frame"
+    assert plan["mode"] == "at_quote"
+    assert plan["quote_message_id"] == 42
+    assert plan["at_target"] == "u1"
+
+
+def test_decide_addressing_auto_uses_existing_heuristics() -> None:
+    state = {"batched_events": [_event(1, "u1"), _event(2, "u2")]}
+    plan = humanize.decide_addressing(
+        plugin_config=_config(),
+        state=state,
+        event=_event(1, "u1"),
+        group_id="g1",
+        user_id="u1",
+        is_private=False,
+        address_mode="auto",
+    )
+
+    assert plan["source"] == "auto"
+    assert plan["mode"] == "at"
+    assert plan["at_target"] == "u1"

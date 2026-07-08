@@ -122,6 +122,9 @@ def test_default_filter_hides_self_log_and_episodic(_runtime_with_memory) -> Non
     # 真正的 2 条画像/知识在
     assert any("东方系列" in s for s in summaries)
     assert any("肉鸽" in s for s in summaries)
+    fact = next(it for it in body["items"] if it["memory_id"] == "mem-3")
+    assert fact["memory_type_label"] == "事实记忆"
+    assert fact["source_kind_label"] == "用户画像"
 
 
 def test_include_self_returns_all(_runtime_with_memory) -> None:
@@ -144,6 +147,19 @@ def test_source_kind_filter(_runtime_with_memory) -> None:
     items = res.json()["items"]
     assert len(items) == 1
     assert items[0]["source_kind"] == "user_persona"
+    assert items[0]["source_kind_label"] == "用户画像"
+
+
+def test_memory_graph_returns_chinese_display_labels(_runtime_with_memory) -> None:
+    client = _build_client(_runtime_with_memory)
+    _login(client, _runtime_with_memory)
+    res = client.get("/personification/api/memory/graph?group_id=g1&limit=20")
+    assert res.status_code == 200, res.text
+    body = res.json()
+    assert body["available"] is True
+    node = next(n for n in body["nodes"] if n["id"] == "m:mem-3")
+    assert node["kind_label"] == "记忆条目"
+    assert node["memory_type_label"] == "事实记忆"
 
 
 def test_raw_chat_requires_group_id(_runtime_with_memory) -> None:

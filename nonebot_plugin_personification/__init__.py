@@ -645,6 +645,18 @@ async def _load_custom_skills() -> None:
         )
     else:
         logger.info("[custom_skills] 已加载内置 skill")
+    try:
+        from .core.tool_health import schedule_tool_health_probes
+
+        schedule_tool_health_probes(
+            registry=registry,
+            scheduler=scheduler,
+            logger=logger,
+            startup_delay_seconds=10.0,
+            timeout_seconds=20.0,
+        )
+    except Exception as exc:
+        logger.warning(f"[tool_health] 启动工具巡检失败：{exc}")
 
 
 @get_driver().on_startup
@@ -727,6 +739,8 @@ async def _setup_social_intelligence() -> None:
             persona_store=bundle.persona_store,
             data_dir=get_personification_data_dir(plugin_config),
             get_now=get_current_local_time,
+            tool_registry=bundle.reply_processor_deps.runtime.tool_registry,
+            agent_max_steps=int(getattr(plugin_config, "personification_agent_max_steps", 10)),
         )
         registered = setup_social_intelligence_jobs(scheduler=scheduler, ctx=ctx)
         if registered > 0:

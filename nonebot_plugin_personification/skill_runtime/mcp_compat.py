@@ -326,6 +326,13 @@ async def register_mcp_tools(
                 parameters=parameters,
                 handler=_handler,
                 local=False,
+                metadata={
+                    "category": "mcp",
+                    "source_kind": "mcp",
+                    "mcp_base": base_name,
+                    "remote_name": remote_name,
+                    "transport": "stdio",
+                },
             )
         )
         count += 1

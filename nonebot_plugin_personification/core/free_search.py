@@ -29,7 +29,7 @@ DEFAULT_SEARXNG_INSTANCES: tuple[str, ...] = (
 )
 
 _WIKIPEDIA_UA = (
-    "PersonificationBot/1.0 (https://github.com/luojisama/personification) "
+    "PersonificationBot/1.0 (https://github.com/luojisama/nonebot-plugin-shiro-personification) "
     "httpx/python"
 )
 

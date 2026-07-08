@@ -6,4 +6,4 @@ def test_plugin_homepage_points_to_release_repository() -> None:
 
     metadata = plugin_meta.build_plugin_metadata(object)
 
-    assert metadata.homepage == "https://github.com/luojisama/nonebot-plugin-personification"
+    assert metadata.homepage == "https://github.com/luojisama/nonebot-plugin-shiro-personification"

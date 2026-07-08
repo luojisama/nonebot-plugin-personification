@@ -87,16 +87,24 @@ def get_activity_status() -> str:
     return "夜深了，应该准备休息，或者已经在熬夜。"
 
 
-def get_schedule_prompt_injection() -> str:
+def get_schedule_prompt_injection(custom_schedule: str = "") -> str:
     now = get_current_local_time()
-    status = get_activity_status()
+    schedule_text = str(custom_schedule or "").strip()
+    if schedule_text:
+        return (
+            "## 当前时间与自定义作息参考\n"
+            f"- 当前时间：{now.strftime('%Y-%m-%d %H:%M:%S')} [{format_time_context(now)}]\n"
+            "- 角色作息：\n"
+            f"{schedule_text[:1200]}\n"
+            "- 用途：只作为生活状态和时间感参考，不能压过眼前正在聊的话题。\n"
+            "- 如果决定回复，优先顺着对话自然接话，再少量带出作息状态。"
+        )
     return (
         "## 当前时间与状态参考\n"
         f"- 当前时间：{now.strftime('%Y-%m-%d %H:%M:%S')} [{format_time_context(now)}]\n"
-        f"- 时段背景：{status}\n"
-        "- 用途：帮助回复保持真实的时间感和生活气，不要把时段设定当成主题。\n"
-        "- 约束：时段背景只是轻量参考，不能压过眼前正在聊的话题。\n"
-        "- 如果决定回复，优先顺着对话自然接话，再少量带出时间感。\n"
+        "- 角色作息：未配置具体作息表。\n"
+        "- 用途：仅提供当前时间感；不要自动推断上课、上班、睡觉或偷偷玩手机等状态。\n"
+        "- 如需作息模拟，请在 WebUI 群信息里自动生成或手动填写本群作息表。"
     )
 
 

@@ -34,8 +34,8 @@ def _build_status(runtime) -> dict[str, Any]:
     enabled = bool(getattr(cfg, "personification_qzone_enabled", False))
     proactive_enabled = bool(getattr(cfg, "personification_qzone_proactive_enabled", False))
     monthly_limit = int(getattr(cfg, "personification_qzone_monthly_limit", 30) or 30)
-    min_interval_hours = float(getattr(cfg, "personification_qzone_min_interval_hours", 6.0) or 0)
-    check_interval = int(getattr(cfg, "personification_qzone_check_interval", 90) or 90)
+    min_interval_hours = float(getattr(cfg, "personification_qzone_min_interval_hours", 12.0) or 0)
+    check_interval = int(getattr(cfg, "personification_qzone_check_interval", 60) or 60)
     quiet_start = int(getattr(cfg, "personification_qzone_quiet_hour_start", 0) or 0)
     quiet_end = int(getattr(cfg, "personification_qzone_quiet_hour_end", 7) or 7)
 
@@ -123,7 +123,7 @@ def build_qzone_router(*, runtime) -> APIRouter:
             state=state,
             now=get_configured_now(),
             monthly_limit=int(getattr(cfg, "personification_qzone_monthly_limit", 30) or 30),
-            min_interval_hours=float(getattr(cfg, "personification_qzone_min_interval_hours", 6.0) or 0),
+            min_interval_hours=float(getattr(cfg, "personification_qzone_min_interval_hours", 12.0) or 0),
         )
         if logger is not None:
             logger.info(f"[webui] 管理员 {admin.qq} 手动发布了一条空间说说。")

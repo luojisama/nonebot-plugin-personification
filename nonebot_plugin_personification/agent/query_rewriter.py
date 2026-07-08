@@ -28,6 +28,10 @@ _CHINESE_WEB_SLANG_HINT_RE = re.compile(
     r"(梗|黑话|外号|别称|绰号|简称|缩写|谐音|空耳|打错|错字|玩梗|出处|来源|什么意思|"
     r"什么东西|是什么|是谁|谁啊|谁来着|哪来的|怎么回事)"
 )
+_DEICTIC_CONTEXT_HINT_RE = re.compile(
+    r"(这个|这段|这张|这图|这个图|这动画|这个动画|这角色|这个角色|这卡|这个卡|这场面|这个场面)"
+)
+_NOISY_CONTEXT_LINE_RE = re.compile(r"(仅本次|本小时|次数已用完|签订契约|可回复本消息)")
 
 
 @dataclass(slots=True)
@@ -112,6 +116,16 @@ def _pick_recent_entity_anchor(
             continue
         if _has_anchor_overlap(normalized_candidate, latest):
             return candidate
+    if _DEICTIC_CONTEXT_HINT_RE.search(_normalize_text(history_last)):
+        for candidate in candidates:
+            cleaned = _normalize_text(candidate)
+            if not cleaned or _NOISY_CONTEXT_LINE_RE.search(cleaned):
+                continue
+            if cleaned.startswith("[我]:"):
+                continue
+            normalized_candidate = _normalized_anchor_text(cleaned)
+            if len(normalized_candidate) >= 2:
+                return cleaned
     return ""
 
 
@@ -209,9 +223,12 @@ def _choose_primary_query(
     base = _compact_query_text(history_last) or _normalize_text(history_last)
     if not base:
         return ""
-    if not _looks_like_colloquial_query(history_last):
-        return base
+    deictic_reference = bool(_DEICTIC_CONTEXT_HINT_RE.search(_normalize_text(history_last)))
     anchor = _compact_query_text(recent_anchor) or _normalize_text(recent_anchor)
+    if deictic_reference and anchor:
+        return f"{anchor} {base}".strip()
+    if not _looks_like_colloquial_query(history_last) and not _DEICTIC_CONTEXT_HINT_RE.search(_normalize_text(history_last)):
+        return base
     topic = _compact_query_text(topic_hint) or _normalize_text(topic_hint)
     quoted = _compact_query_text(quoted_message) or _normalize_text(quoted_message)
     for candidate in (anchor, quoted, topic):
@@ -292,10 +309,12 @@ def _fallback_rewrite(
         quoted_message=quoted_message,
         topic_hint=topic_hint,
     )
-    if colloquial_hint and primary_query:
+    if (colloquial_hint or _DEICTIC_CONTEXT_HINT_RE.search(_normalize_text(history_last))) and primary_query:
         query_candidates = _dedupe_candidates(
             [
                 *query_candidates,
+                f"{primary_query} 角色 作品",
+                f"{primary_query} 动画 剧情",
                 f"{primary_query} 梗",
                 f"{primary_query} 出处",
                 f"{primary_query} 来源",
@@ -308,7 +327,7 @@ def _fallback_rewrite(
     need_image_understanding = bool(images)
     if need_image_understanding:
         recommended_tools = ["vision_analyze", "resolve_acg_entity", "web_search"]
-    elif colloquial_hint:
+    elif colloquial_hint or _DEICTIC_CONTEXT_HINT_RE.search(_normalize_text(history_last)):
         recommended_tools = ["resolve_acg_entity", "web_search", "wiki_lookup"]
     else:
         recommended_tools = list(_DEFAULT_RECOMMENDED_TOOLS)
@@ -394,6 +413,9 @@ async def contextual_query_rewriter(
         "不要擅自跳到更常见但无上下文依据的百科实体。"
         "遇到中文互联网梗、黑话、缩写、别称、外号、谐音梗、空耳、错别字时，"
         "要主动补出更正式的实体名、出处、原句或作品线索，并把它们放进 query_candidates。"
+        "如果当前最新一句只说“这个动画/这段动画/这个角色/这张图/这场面”等指代，"
+        "必须从最近对话、引用内容和图片上下文抽出被指代的角色/作品/抽卡卡面作为 primary_query，"
+        "并把“角色 作品”“动画 剧情”“出场剧情”等查询变体放进 query_candidates。"
         "若图片对识别对象很关键，请把 need_image_understanding 设为 true。"
         "只输出 JSON，不要输出解释、markdown 或代码块。\n\n"
         "JSON 字段：\n"
@@ -402,7 +424,7 @@ async def contextual_query_rewriter(
         '  "query_candidates": ["首轮失败后可依次尝试的候选查询"],\n'
         '  "context_clues": ["影响检索的上下文线索"],\n'
         '  "need_image_understanding": true,\n'
-        '  "recommended_tools": ["按优先级排序的工具名，如 vision_analyze/resolve_acg_entity/collect_resources/wiki_lookup/web_search/search_images"],\n'
+        '  "recommended_tools": ["按优先级排序的工具名，如 vision_analyze/resolve_acg_entity/collect_resources/wiki_lookup/web_search/search_images/search_and_send_images"],\n'
         '  "search_plan": ["1-3 步中文短句，说明应该怎样检索"]\n'
         "}"
     )

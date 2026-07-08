@@ -3,6 +3,7 @@ from typing import Any, Awaitable, Callable
 
 def build_generate_ai_diary_task(
     *,
+    plugin_config: Any,
     generate_ai_diary_flow: Callable[..., Awaitable[str]],
     load_prompt: Callable[[], Any],
     call_ai_api: Callable[..., Awaitable[str]],
@@ -18,6 +19,7 @@ def build_generate_ai_diary_task(
             load_prompt=load_prompt,
             call_ai_api=call_ai_api,
             logger=logger,
+            plugin_config=plugin_config,
             tool_caller=agent_tool_caller,
             registry=agent_tool_registry,
             agent_max_steps=agent_max_steps,
@@ -138,6 +140,7 @@ def build_qzone_inbound_poll_task(
 
 def build_maybe_generate_qzone_post_task(
     *,
+    plugin_config: Any,
     maybe_generate_proactive_qzone_post_flow: Callable[..., Awaitable[str]],
     load_prompt: Callable[[], Any],
     call_ai_api: Callable[..., Awaitable[str]],
@@ -153,6 +156,7 @@ def build_maybe_generate_qzone_post_task(
             load_prompt=load_prompt,
             call_ai_api=call_ai_api,
             logger=logger,
+            plugin_config=plugin_config,
             data_dir=agent_data_dir,
             tool_caller=agent_tool_caller,
             registry=agent_tool_registry,
@@ -184,6 +188,23 @@ def build_daily_group_fav_report_task(
         )
 
     return _daily_group_fav_report
+
+
+def build_favorability_maintenance_task(
+    *,
+    run_favorability_maintenance: Callable[..., Awaitable[dict[str, Any]]],
+    sign_in_available: bool,
+    favorability_service: Any,
+    logger: Any,
+) -> Callable[[], Awaitable[dict[str, Any]]]:
+    async def _favorability_maintenance() -> dict[str, Any]:
+        return await run_favorability_maintenance(
+            sign_in_available=sign_in_available,
+            favorability_service=favorability_service,
+            logger=logger,
+        )
+
+    return _favorability_maintenance
 
 
 def build_group_idle_topic_task(

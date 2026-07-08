@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
+from types import SimpleNamespace
 
 from ._loader import load_personification_module
 
@@ -98,6 +100,8 @@ def test_generate_ai_diary_injects_recent_posts_and_enables_builtin_search(monke
     prompt = calls[0]["messages"][1]["content"]
     assert "明天先靠炸鸡排和摸鱼慢慢回血" in prompt
     assert "游戏、动漫、轻新闻" in prompt
+    assert "不要写成镜头旁白" in prompt
+    assert "状态报告" in prompt
 
 
 def test_generate_ai_diary_skips_too_similar_recent_post(monkeypatch) -> None:  # noqa: ANN001
@@ -256,6 +260,31 @@ def test_review_qzone_post_rewrites_net_slang_tic() -> None:
     assert not diary_flow._NET_SLANG_TIC_RE.search(result)
 
 
+def test_review_qzone_post_rewrites_stiff_qzone_tic() -> None:
+    """器官拟人/先后对仗这类模板化机灵句会被改松一点。"""
+
+    class _Caller:
+        async def chat_with_tools(self, messages, tools, use_builtin_search):  # noqa: ANN001
+            assert tools == []
+            assert "模板化的机灵句" in messages[1]["content"]
+            return _Resp("有点想吃夜宵了")
+
+        def build_tool_result_message(self, *_a):  # noqa: ANN001
+            return {}
+
+    result = asyncio.run(
+        diary_flow._review_qzone_post(
+            "脑子没在加班，胃先开始催了。",
+            tool_caller=_Caller(),
+            persona_system="你是某角色",
+            logger=_Logger(),
+        )
+    )
+
+    assert result == "有点想吃夜宵了"
+    assert not diary_flow._QZONE_STIFF_TIC_RE.search(result)
+
+
 def test_review_qzone_post_keeps_clean_text_untouched() -> None:
     """不含营业感叹腔/搜索腔的正文不调用改写，原样返回。"""
 
@@ -276,6 +305,77 @@ def test_review_qzone_post_keeps_clean_text_untouched() -> None:
     )
 
     assert result == "下午三点的阳光有点刺眼"
+
+
+def test_build_qzone_post_can_attach_local_sticker_image(tmp_path) -> None:
+    """有 image_prompt 时，QZone 配图可优先使用外置表情包库静态图。"""
+    payload = b"\x89PNG\r\n\x1a\nlocal-qzone-sticker"
+    image_path = tmp_path / "mood.png"
+    image_path.write_bytes(payload)
+    (tmp_path / "stickers.json").write_text(
+        json.dumps(
+            {
+                "mood.png": {
+                    "description": "窗边发呆的日常氛围图",
+                    "use_hint": "适合日常碎碎念配图",
+                    "mood_tags": ["淡定"],
+                    "scene_tags": ["冷场时"],
+                    "proactive_send": True,
+                    "style": "anime",
+                    "weight": 1.5,
+                }
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    class _Caller:
+        async def chat_with_tools(self, *_args, **_kwargs):  # noqa: ANN001
+            raise AssertionError("clean post with local sticker should not call LLM")
+
+    result = asyncio.run(
+        diary_flow._build_qzone_post_with_optional_image(
+            content="下午三点的阳光有点刺眼",
+            image_prompt="quiet daily anime image by the window",
+            tool_caller=_Caller(),
+            plugin_config=SimpleNamespace(personification_sticker_path=str(tmp_path)),
+            logger=_Logger(),
+            recent_posts=[],
+            persona_system="x",
+        )
+    )
+
+    assert result.startswith("下午三点的阳光有点刺眼")
+    assert f"[IMAGE_B64]{base64.b64encode(payload).decode('ascii')}[/IMAGE_B64]" in result
+
+
+def test_recent_chat_context_filters_bot_self_messages() -> None:
+    """发空间参考聊天时跳过 bot 自己发的消息，避免采样其它插件输出。"""
+
+    class _HistoryBot:
+        self_id = "99999"
+
+        async def get_group_list(self):  # noqa: ANN201
+            return [{"group_id": 1, "group_name": "测试群"}]
+
+        async def get_group_msg_history(self, *, group_id, count):  # noqa: ANN001, ANN201
+            return {
+                "messages": [
+                    {
+                        "sender": {"user_id": "99999", "nickname": "bot"},
+                        "message": [{"type": "text", "data": {"text": "其它插件自动播报"}}],
+                    },
+                    {
+                        "sender": {"user_id": "10001", "nickname": "好友"},
+                        "message": [{"type": "text", "data": {"text": "今晚风好大"}}],
+                    },
+                ]
+            }
+
+    result = asyncio.run(diary_flow.get_recent_chat_context(_HistoryBot(), _Logger()))
+    assert "今晚风好大" in result
+    assert "其它插件自动播报" not in result
 
 
 def test_generate_once_reinforces_persona_in_system_prompt() -> None:
@@ -366,4 +466,6 @@ def test_maybe_generate_proactive_injects_quota(monkeypatch) -> None:  # noqa: A
     )
     user_prompt = captured["messages"][1]["content"]
     assert "本月发空间额度" in user_prompt and "已发 27 条" in user_prompt
+    assert "不要写成镜头旁白" in user_prompt
+    assert "手机上随手敲的一句" in user_prompt
     assert result == ""  # action=skip

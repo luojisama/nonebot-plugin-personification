@@ -24,6 +24,9 @@ entrypoint: scripts/main.py
 ### `search_web` / `search_github_repos` / `search_official_site` / `search_images`
 原始结构化检索工具。适合模型已经明确知道自己要查什么时直接调用。
 
+### `search_and_send_images`
+当前聊天专用工具。用户明确让 bot 搜图、找壁纸、来几张参考图时，联网搜索已有图片并直接把图片发回群里；不是生成图片。
+
 ## 原则
 
 - 不要靠固定关键词先决定资源类型或搜索方式

@@ -9,7 +9,7 @@ from .constants import MAX_LOOKUP_QUERY_VARIANTS
 from .intent import compact_lookup_query
 
 _RETRYABLE_LOOKUP_TOOLS = frozenset(
-    {"web_search", "search_web", "wiki_lookup", "resolve_acg_entity", "collect_resources", "search_images"}
+    {"web_search", "search_web", "wiki_lookup", "resolve_acg_entity", "collect_resources", "search_images", "search_and_send_images"}
 )
 def _parse_json_tool_result(text: str) -> dict[str, Any] | None:
     raw = str(text or "").strip()

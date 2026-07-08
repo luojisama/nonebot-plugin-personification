@@ -178,6 +178,7 @@ def _render_turn_plan(plan: TurnPlan | Any) -> str:
         return "{}"
     payload = {
         "reply_action": str(getattr(plan, "reply_action", "") or ""),
+        "speech_act": str(getattr(plan, "speech_act", "") or ""),
         "memory_need": str(getattr(plan, "memory_need", "") or ""),
         "research_need": str(getattr(plan, "research_need", "") or ""),
         "vision_need": str(getattr(plan, "vision_need", "") or ""),

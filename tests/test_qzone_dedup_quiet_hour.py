@@ -166,6 +166,46 @@ def test_proactive_qzone_post_runs_outside_quiet_hour(tmp_path, monkeypatch) -> 
     assert result is False
 
 
+def test_proactive_qzone_probability_gate_skips_generation(tmp_path, monkeypatch) -> None:
+    """概率闸门为 0 时，连 LLM 生成都不触发。"""
+    _seed_state(tmp_path, monkeypatch, {"period": "2026-06", "count": 0, "last_post_at": 0, "recent_contents": []})
+    fake_now = datetime(2026, 6, 18, 14, 0)
+    generated: list = []
+    published: list = []
+
+    async def _fake_update_cookie(_bot):
+        raise AssertionError("probability gate should run before cookie refresh")
+
+    async def _fake_maybe_generate(_bot, quota=None):
+        generated.append(True)
+        return "不该生成"
+
+    async def _fake_publish(content, self_id):
+        published.append((content, self_id))
+        return True, "ok"
+
+    result = asyncio.run(periodic_jobs.run_proactive_qzone_post(
+        qzone_publish_available=True,
+        qzone_proactive_enabled=True,
+        qzone_probability=0.0,
+        qzone_monthly_limit=30,
+        qzone_min_interval_hours=0,
+        get_bots=lambda: {"1": SimpleNamespace(self_id="1")},
+        get_now=lambda: fake_now,
+        update_qzone_cookie=_fake_update_cookie,
+        maybe_generate_qzone_post=_fake_maybe_generate,
+        publish_qzone_shuo=_fake_publish,
+        logger=SimpleNamespace(debug=lambda *_a, **_k: None, warning=lambda *_a, **_k: None,
+                               info=lambda *_a, **_k: None, error=lambda *_a, **_k: None),
+        quiet_hour_start=0,
+        quiet_hour_end=7,
+    ))
+
+    assert result is False
+    assert generated == []
+    assert published == []
+
+
 # ---- 月度限额 ----
 
 

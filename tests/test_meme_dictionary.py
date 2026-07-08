@@ -85,3 +85,32 @@ def test_meme_hint_confidence_rules(tmp_path) -> None:
     hint = meme_dictionary.format_meme_hint(entries)
 
     assert "只理解不主动使用" in hint
+
+
+def test_group_meme_query_keeps_older_entries_beyond_view_window(tmp_path) -> None:
+    _init_store(tmp_path)
+    meme_dictionary.upsert_meme_entry(
+        {
+            "term": "老梗锚点",
+            "meaning": "很早记录的群内梗",
+            "scope": "group",
+            "group_id": "g3",
+            "confidence": 0.9,
+            "updated_at": 1,
+        }
+    )
+    for idx in range(620):
+        meme_dictionary.upsert_meme_entry(
+            {
+                "term": f"新梗{idx}",
+                "meaning": "后来的群内梗",
+                "scope": "group",
+                "group_id": "g3",
+                "confidence": 0.7,
+                "updated_at": 10 + idx,
+            }
+        )
+
+    entries = meme_dictionary.query_meme_dictionary("g3", "老梗锚点刚才又被提到了")
+
+    assert entries and entries[0]["term"] == "老梗锚点"

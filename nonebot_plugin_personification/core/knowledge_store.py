@@ -205,6 +205,17 @@ class PluginKnowledgeStore:
                     "summary": str(entry.get("summary", "") or ""),
                     "keywords": merged_keywords,
                     "updated_at": str(entry.get("updated_at", "") or ""),
+                    "analysis_mode": str(entry.get("analysis_mode", "") or current.get("analysis_mode", "") or current.get("analysis_strategy", "") or ""),
+                    "analysis_strategy": str(current.get("analysis_strategy", "") or entry.get("analysis_strategy", "") or entry.get("analysis_mode", "") or ""),
+                    "analysis_scope": str(entry.get("analysis_scope", "") or current.get("analysis_scope", "") or ""),
+                    "source_chars": int(entry.get("source_chars", current.get("source_chars", 0) or 0) or 0),
+                    "source_complete": bool(entry.get("source_complete", current.get("source_complete", True))),
+                    "source_truncated": bool(entry.get("source_truncated", current.get("source_truncated", False))),
+                    "source_coverage": (
+                        entry.get("source_coverage")
+                        if isinstance(entry.get("source_coverage"), dict)
+                        else current.get("source_coverage", {})
+                    ),
                 }
                 return index
 
@@ -270,10 +281,20 @@ class PluginKnowledgeStore:
                 current = plugins.get(plugin_name, {}) if isinstance(plugins.get(plugin_name), dict) else {}
                 files = snapshot.get("files", [])
                 chunks = snapshot.get("chunks", [])
+                coverage = snapshot.get("source_coverage", {})
+                if not isinstance(coverage, dict):
+                    coverage = {}
                 current["has_source_data"] = True
                 current["source_file"] = f"source/{plugin_name}.json"
                 current["source_file_count"] = len(files) if isinstance(files, list) else 0
                 current["source_chunk_count"] = len(chunks) if isinstance(chunks, list) else 0
+                current["source_chars"] = int(snapshot.get("source_chars", coverage.get("source_chars", 0) or 0) or 0)
+                current["analysis_strategy"] = str(snapshot.get("analysis_strategy", coverage.get("analysis_strategy", "") or "") or "")
+                current["analysis_scope"] = str(snapshot.get("analysis_scope", coverage.get("analysis_scope", "") or "") or "")
+                current["module_bundle_count"] = int(snapshot.get("module_bundle_count", coverage.get("module_bundle_count", 0) or 0) or 0)
+                current["source_complete"] = bool(snapshot.get("source_complete", snapshot.get("complete", coverage.get("source_complete", True))))
+                current["source_truncated"] = bool(snapshot.get("source_truncated", coverage.get("source_truncated", False)))
+                current["source_coverage"] = coverage
                 current["source_terms"] = self._collect_source_terms(snapshot)
                 plugins[plugin_name] = {
                     "plugin_name": plugin_name,

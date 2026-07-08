@@ -62,6 +62,7 @@ class ConfigEntryView(BaseModel):
     advanced: bool = False
     example: str = ""
     aliases: list[str] = []
+    search_index: list[str] = []
     default: Any = None
     current: Any = None
     active_source: str = "default"

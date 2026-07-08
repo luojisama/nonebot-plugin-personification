@@ -12,6 +12,7 @@ _SEED_FILE = Path(__file__).resolve().parents[1] / "data" / "meme_seeds.json"
 _VALID_SCOPES = {"public", "group", "concept"}
 _VALID_RISKS = {"low", "medium", "high"}
 _seeds_loaded = False
+_MAX_LIST_LIMIT = 10000
 
 
 def _json_list(value: Any) -> list[str]:
@@ -148,6 +149,16 @@ def delete_meme_entry(*, term: str, scope: str = "group", group_id: str = "") ->
     return changed
 
 
+def _resolve_list_limit(value: Any, *, default: int = 100) -> int:
+    try:
+        limit = int(value)
+    except (TypeError, ValueError):
+        limit = int(default)
+    if limit <= 0:
+        return 0
+    return max(1, min(limit, _MAX_LIST_LIMIT))
+
+
 def list_meme_entries(*, group_id: str = "", scope: str = "", limit: int = 100) -> list[dict[str, Any]]:
     global _seeds_loaded
     if not _seeds_loaded:
@@ -165,8 +176,11 @@ def list_meme_entries(*, group_id: str = "", scope: str = "", limit: int = 100) 
     query = "SELECT * FROM meme_dictionary"
     if clauses:
         query += " WHERE " + " AND ".join(clauses)
-    query += " ORDER BY scope DESC, updated_at DESC LIMIT ?"
-    params.append(max(1, min(int(limit or 100), 500)))
+    query += " ORDER BY scope DESC, updated_at DESC"
+    resolved_limit = _resolve_list_limit(limit)
+    if resolved_limit:
+        query += " LIMIT ?"
+        params.append(resolved_limit)
     with connect_sync() as conn:
         rows = conn.execute(query, tuple(params)).fetchall()
     return [_row_to_entry(row) for row in rows]
@@ -176,7 +190,7 @@ def query_meme_dictionary(group_id: str, message_text: str, *, top_k: int = 8) -
     text = str(message_text or "").strip().lower()
     if not text:
         return []
-    entries = list_meme_entries(group_id=str(group_id), limit=400)
+    entries = list_meme_entries(group_id=str(group_id), limit=0)
     matched: list[tuple[float, int, dict[str, Any]]] = []
     for entry in entries:
         candidates = [entry["term"], *entry.get("aliases", [])]

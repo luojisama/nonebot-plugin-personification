@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -62,3 +63,52 @@ def test_summary_by_group_excludes_empty(_ledger) -> None:
     group_ids = [row["group_id"] for row in summary["by_group"]]
     assert "g1" in group_ids
     assert "" not in group_ids
+
+
+def test_day_summary_uses_full_24_hour_buckets(_ledger) -> None:
+    ledger = _ledger
+    current_hour = datetime.now().replace(minute=0, second=0, microsecond=0)
+    first_hour = current_hour - timedelta(hours=23)
+    middle_hour = current_hour - timedelta(hours=5)
+
+    ledger.record_llm_call(
+        model="gpt-early",
+        prompt_tokens=10,
+        completion_tokens=5,
+        group_id="g1",
+        bucket_hour=first_hour.strftime("%Y-%m-%d %H:00"),
+    )
+    ledger.record_llm_call(
+        model="gpt-middle",
+        prompt_tokens=20,
+        completion_tokens=8,
+        group_id="g2",
+        bucket_hour=middle_hour.strftime("%Y-%m-%d %H:00"),
+    )
+    ledger.record_llm_call(
+        model="gpt-now",
+        prompt_tokens=30,
+        completion_tokens=12,
+        group_id="g1",
+        bucket_hour=current_hour.strftime("%Y-%m-%d %H:00"),
+    )
+
+    summary = ledger.query_summary("24h")
+
+    assert summary["window"] == "day"
+    assert summary["start_hour"] == first_hour.strftime("%Y-%m-%d %H:00")
+    assert len(summary["series"]) == 24
+    assert summary["series"][0]["bucket"] == first_hour.strftime("%Y-%m-%d %H:00")
+    assert summary["series"][-1]["bucket"] == current_hour.strftime("%Y-%m-%d %H:00")
+    series_by_bucket = {row["bucket"]: row for row in summary["series"]}
+    assert series_by_bucket[first_hour.strftime("%Y-%m-%d %H:00")]["total_tokens"] == 15
+    assert series_by_bucket[middle_hour.strftime("%Y-%m-%d %H:00")]["total_tokens"] == 28
+    assert series_by_bucket[current_hour.strftime("%Y-%m-%d %H:00")]["total_tokens"] == 42
+    assert summary["total"]["total_tokens"] == 15 + 28 + 42
+    assert {row["model"] for row in summary["by_model"]} == {"gpt-early", "gpt-middle", "gpt-now"}
+
+    detail = ledger.query_group_detail("g1", "day")
+    assert {row["bucket_hour"] for row in detail["rows"]} == {
+        first_hour.strftime("%Y-%m-%d %H:00"),
+        current_hour.strftime("%Y-%m-%d %H:00"),
+    }

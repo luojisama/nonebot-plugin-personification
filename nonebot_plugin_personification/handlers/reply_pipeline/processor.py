@@ -40,13 +40,17 @@ from ...agent.runtime.responder import (
     with_persona_responder_instruction,
 )
 from ...core.prompt_hooks import HookContext, get_hook_registry
-from ...core.group_context import build_group_conversation_context, render_group_conversation_context
+from ...core.group_context import (
+    build_group_conversation_context,
+    render_group_conversation_context,
+    render_topic_state_trace_detail,
+)
 from ...core.group_mute import refresh_bot_group_mute_state
 from ...core.group_roles import extract_sender_role
 from ...core.target_inference import TARGET_OTHERS, TARGET_UNCLEAR, infer_message_target
 from ...core.tts_service import extract_persona_tts_config
 from ...core.repeat_follow import maybe_follow_repeat_cluster
-from ...core.reply_style_policy import build_direct_visual_identity_guard
+from ...core.reply_style_policy import build_direct_visual_identity_guard, build_speech_act_policy_prompt
 from ...core.response_review import (
     is_agent_reply_ooc,
     make_passthrough_review_decision,
@@ -60,6 +64,15 @@ from ...skills.skillpacks.sticker_tool.scripts.impl import (
     set_current_image_context,
 )
 from ...core.proactive_store import update_group_chat_active
+from ...core.qq_expression_library import (
+    build_qq_expression_prompt,
+    contains_qq_expression_marker,
+    history_text_for_qq_expression,
+    maybe_choose_auto_qq_expression_marker,
+    qq_expression_enabled,
+    render_qq_expression_message,
+    semantic_text_for_qq_expression_segment,
+)
 from ...core.sticker_feedback import (
     build_sticker_feedback_scene_key,
     mark_pending_sticker_reaction,
@@ -68,7 +81,12 @@ from ...core.sticker_feedback import (
 )
 from ...core.web_grounding import extract_forward_message_content
 from ...utils import build_group_context_window, get_recent_group_msgs
-from ..event_rules import _extract_recordable_group_message, split_segment_if_long
+from ..event_rules import (
+    _extract_recordable_group_message,
+    _looks_like_plugin_command_interaction,
+    _render_plugin_command_interaction,
+    split_segment_if_long,
+)
 from .pipeline_context import (
     batch_has_newer_messages as _batch_has_newer_messages,
     build_base_system_prompt as _build_base_system_prompt,
@@ -153,8 +171,10 @@ def _record_muted_group_message(
     if bool(getattr(event, "_personification_muted_recorded", False)):
         return
     raw_msg, image_count, visual_summary = _extract_recordable_group_message(event)
-    if not raw_msg or raw_msg.startswith("/") or len(raw_msg) >= 500:
+    if not raw_msg or len(raw_msg) >= 500:
         return
+    is_command_interaction = _looks_like_plugin_command_interaction(raw_msg)
+    record_content = _render_plugin_command_interaction(raw_msg) if is_command_interaction else raw_msg
     user_id = str(getattr(event, "user_id", "") or "")
     sender = getattr(event, "sender", None)
     nickname = (
@@ -167,10 +187,15 @@ def _record_muted_group_message(
         nickname = custom_title
     from ...core.message_relations import build_event_relation_metadata
 
+    source_kind = (
+        "plugin"
+        if bot_self_id and user_id == bot_self_id
+        else ("plugin_command" if is_command_interaction else "user")
+    )
     runtime.record_group_msg(
         str(getattr(event, "group_id", "") or ""),
         str(nickname or user_id),
-        raw_msg,
+        record_content,
         is_bot=bool(bot_self_id and user_id == bot_self_id),
         user_id=user_id,
         sender_role=extract_sender_role(event),
@@ -179,13 +204,23 @@ def _record_muted_group_message(
         **build_event_relation_metadata(
             event,
             bot_self_id=bot_self_id,
-            source_kind="plugin" if bot_self_id and user_id == bot_self_id else "user",
+            source_kind=source_kind,
         ),
     )
     try:
         setattr(event, "_personification_muted_recorded", True)
     except Exception:
         pass
+
+
+def _consume_pending_action_history_text(event: Any) -> str:
+    text = str(getattr(event, "_personification_pending_action_history_text", "") or "").strip()
+    if text:
+        try:
+            setattr(event, "_personification_pending_action_history_text", "")
+        except Exception:
+            pass
+    return re.sub(r"\s+", " ", text).strip()
 
 
 @dataclass
@@ -214,6 +249,7 @@ class PersonaDeps:
     favorability_attitudes: Dict[str, str]
     get_custom_title: Callable[[str], str]
     default_bot_nickname: str
+    favorability_service: Any = None
 
 
 @dataclass
@@ -378,6 +414,81 @@ async def process_response_logic(bot: Any, event: Any, state: Dict[str, Any], de
             reset_llm_context(token)
 
 
+def _build_image_only_context_message(
+    *,
+    sender_name: str,
+    is_private_context: bool,
+    is_active_followup: bool,
+    followup_topic: str,
+    is_solo_speaker_follow: bool,
+    solo_follow_topic: str,
+    is_random_chat: bool,
+) -> str:
+    if is_private_context:
+        return (
+            "[对方发送了一张图片。若没有直接看到图片或可见摘要，不要假装看懂；"
+            "先结合最近对话短句回应，必要时请对方补一句]"
+        )
+    if is_active_followup:
+        return (
+            f"[对方正在顺着你刚才的话题继续聊，并发来了一条图片/表情消息。"
+            f"刚才的话题：{followup_topic or '上一轮对话'}。"
+            "若没有清楚的视觉摘要，不要评价图片内容；只有能从前文确定是在接话时才短句回应，否则保持安静]"
+        )
+    if is_solo_speaker_follow:
+        return (
+            f"[群里 {sender_name} 已经连续说了一阵，并发来了一条图片/表情消息。"
+            f"当前延续的话题：{solo_follow_topic or '刚才这串内容'}。"
+            "若没有清楚的视觉摘要，不要假装看懂图片；只有能从前文确定是在接话时才短句回应，否则保持安静]"
+        )
+    if is_random_chat:
+        return (
+            f"[群里 {sender_name} 发了一条图片/表情消息，你只是路过看到。"
+            "没人 cue 你且没有明确文字意图时保持安静，不要评论图片或表情内容]"
+        )
+    return (
+        "[对方发送了一张图片，是在对你说话。"
+        "如果看不清内容，先接文字或最近上下文；信息不足时给一句保守短反应或保持安静，不要追问图里是什么]"
+    )
+
+
+async def _capture_user_protocol_profile(
+    *,
+    runtime: Any,
+    bot: Any,
+    event: Any,
+    user_id: str,
+    source: str,
+) -> None:
+    profile_service = getattr(runtime, "profile_service", None)
+    if profile_service is None or not str(user_id or "").strip():
+        return
+    try:
+        from ...core.onebot_cache import get_user_profile
+        from ...core.user_profile_meta import build_user_profile_meta
+
+        protocol_profile = await get_user_profile(bot, str(user_id))
+        meta = build_user_profile_meta(
+            str(user_id),
+            sender=getattr(event, "sender", None),
+            stranger_info=protocol_profile,
+            source=source,
+        )
+        if meta:
+            profile_service.upsert_user_profile_meta(
+                user_id=str(user_id),
+                meta=meta,
+                source=source,
+            )
+    except Exception as exc:
+        logger = getattr(runtime, "logger", None)
+        if logger is not None:
+            try:
+                logger.debug(f"[user_profile_meta] capture failed uid={user_id}: {exc}")
+            except Exception:
+                pass
+
+
 async def _process_response_logic_impl(bot: Any, event: Any, state: Dict[str, Any], deps: ReplyProcessorDeps) -> None:
     session = deps.session
     persona = deps.persona
@@ -497,9 +608,7 @@ async def _process_response_logic_impl(bot: Any, event: Any, state: Dict[str, An
             if seg.type == "text":
                 message_text_parts.append(seg.data.get("text", ""))
             elif seg.type == "face":
-                from ...core.qq_face_names import render_face_token
-
-                message_text_parts.append(render_face_token(seg.data.get("id", "")))
+                message_text_parts.append(semantic_text_for_qq_expression_segment("face", seg.data))
             elif seg.type == "mface":
                 await _extract_mface_from_segment(
                     seg,
@@ -585,6 +694,16 @@ async def _process_response_logic_impl(bot: Any, event: Any, state: Dict[str, An
                             data = getattr(seg, "data", None) or (seg.get("data") if isinstance(seg, dict) else {})
                             if seg_type == "text":
                                 message_text_parts.append(data.get("text", ""))
+                            elif seg_type == "face":
+                                message_text_parts.append(semantic_text_for_qq_expression_segment("face", data))
+                            elif seg_type == "mface":
+                                message_text_parts.append(
+                                    semantic_text_for_qq_expression_segment(
+                                        "mface",
+                                        data,
+                                        default_mface_kind="super",
+                                    )
+                                )
                             elif seg_type == "image":
                                 await _extract_reply_images(
                                     seg_type,
@@ -624,6 +743,17 @@ async def _process_response_logic_impl(bot: Any, event: Any, state: Dict[str, An
         message_text = _fold_consecutive_sticker_placeholders(message_text)
         raw_message_text = message_text
         message_content = message_text.strip()
+        try:
+            from ...core import reply_turn_trace
+
+            reply_turn_trace.record_stage(
+                key="incoming_message",
+                label="收到消息",
+                status="info",
+                detail=(raw_message_text or message_content or "")[:500],
+            )
+        except Exception:
+            pass
         is_private_context = str(group_id).startswith(session.private_session_prefix)
         if isinstance(event, types.private_message_event_cls) and session.looks_like_private_command(message_content):
             runtime.logger.debug(f"拟人插件：私聊命令消息已跳过，用户 {user_id}")
@@ -689,29 +819,38 @@ async def _process_response_logic_impl(bot: Any, event: Any, state: Dict[str, An
                 trigger_reason = f"对方（{sender_name}）正在【主动】与你搭话，请认真回复。"
 
             if image_urls and not message_content:
-                message_content = "[发送了一张图片]"
+                message_content = _build_image_only_context_message(
+                    sender_name=sender_name,
+                    is_private_context=is_private_context,
+                    is_active_followup=is_active_followup,
+                    followup_topic=followup_topic,
+                    is_solo_speaker_follow=is_solo_speaker_follow,
+                    solo_follow_topic=solo_follow_topic,
+                    is_random_chat=is_random_chat,
+                )
         else:
             if is_private_context:
                 if image_urls and not message_content:
-                    message_content = "[发送了一张图片]"
+                    message_content = _build_image_only_context_message(
+                        sender_name=sender_name,
+                        is_private_context=True,
+                        is_active_followup=False,
+                        followup_topic="",
+                        is_solo_speaker_follow=False,
+                        solo_follow_topic="",
+                        is_random_chat=False,
+                    )
             else:
                 if image_urls and not message_content:
-                    if is_active_followup:
-                        message_content = (
-                            f"[对方正在顺着你刚才的话题继续聊，并发来了一张图片。"
-                            f"刚才的话题：{followup_topic or '上一轮对话'}。"
-                            "如果图片明显是在接前文，就自然评价一句；否则保持安静]"
-                        )
-                    elif is_solo_speaker_follow:
-                        message_content = (
-                            f"[群里 {sender_name} 已经连续说了一阵，并发来了一张图片。"
-                            f"当前延续的话题：{solo_follow_topic or '刚才这串内容'}。"
-                            "如果图片和前文接得上，就像群友顺手接一句；明显不合适再安静]"
-                        )
-                    elif is_random_chat:
-                        message_content = f"[群里 {sender_name} 发了一张图片，你只是路过看到。要是自然能接一句就接，不然保持安静]"
-                    else:
-                        message_content = "[对方发送了一张图片，是在对你说话]"
+                    message_content = _build_image_only_context_message(
+                        sender_name=sender_name,
+                        is_private_context=False,
+                        is_active_followup=is_active_followup,
+                        followup_topic=followup_topic,
+                        is_solo_speaker_follow=is_solo_speaker_follow,
+                        solo_follow_topic=solo_follow_topic,
+                        is_random_chat=is_random_chat,
+                    )
                 elif is_active_followup:
                     message_content = (
                         f"[对方正在顺着你刚才的话继续聊，刚才的话题：{followup_topic or '上一轮对话'}。"
@@ -746,6 +885,7 @@ async def _process_response_logic_impl(bot: Any, event: Any, state: Dict[str, An
         isinstance(event, types.group_message_event_cls)
         and (not is_direct_mention)
         and (not is_active_followup)
+        and (not is_solo_speaker_follow)
         and runtime.should_avoid_interrupting(str(group_id), is_random_chat)
     ):
         runtime.logger.info(f"拟人插件：群 {group_id} 讨论热度高，触发 KY 规避，本轮保持沉默。")
@@ -863,6 +1003,14 @@ async def _process_response_logic_impl(bot: Any, event: Any, state: Dict[str, An
         sender_role = extract_sender_role(event)
         if sender_role:
             incoming_relation_metadata["sender_role"] = sender_role
+    if isinstance(event, types.message_event_cls):
+        await _capture_user_protocol_profile(
+            runtime=runtime,
+            bot=bot,
+            event=event,
+            user_id=user_id,
+            source="reply_pipeline",
+        )
 
     tool_image_urls = list(image_urls)
     # 真实照片（不含表情包），仅这部分允许走文本摘要降级；表情包不打标。
@@ -990,6 +1138,20 @@ async def _process_response_logic_impl(bot: Any, event: Any, state: Dict[str, An
         )
         recent_context_hint = render_group_conversation_context(conversation_context)
         relationship_hint = conversation_context.relationship_hint
+        try:
+            from ...core import reply_turn_trace
+
+            topic_detail = render_topic_state_trace_detail(conversation_context.topic_state)
+            if topic_detail:
+                reply_turn_trace.record_stage(
+                    key="topic_state",
+                    label="短期话题状态",
+                    status="info",
+                    detail=topic_detail,
+                    hint="结构化线索用于判断当前消息接谁的话，不替代 LLM 语义判断",
+                )
+        except Exception:
+            pass
     if not is_private_session and sticker_candidates:
         _spawn_auto_collect_stickers(
             runtime=runtime,
@@ -1059,6 +1221,8 @@ async def _process_response_logic_impl(bot: Any, event: Any, state: Dict[str, An
             detail=(
                 f"intent={message_intent} ambiguity={getattr(intent_decision, 'ambiguity_level', '')} "
                 f"silence={getattr(intent_decision, 'recommend_silence', False)} "
+                f"speech_act={getattr(semantic_frame, 'speech_act', '-') or '-'} "
+                f"address_mode={getattr(semantic_frame, 'address_mode', '-') or '-'} "
                 f"emotion={getattr(semantic_frame, 'bot_emotion', '')} "
                 f"output={getattr(semantic_frame, 'output_mode', '') or '-'} "
                 f"elapsed_ms={int((time.monotonic() - started_at) * 1000)}"
@@ -1136,6 +1300,58 @@ async def _process_response_logic_impl(bot: Any, event: Any, state: Dict[str, An
         current_user_content,
     )
 
+    def _record_pending_action_history_if_any() -> bool:
+        action_history_text = _consume_pending_action_history_text(event)
+        if not action_history_text:
+            return False
+        max_chars = getattr(runtime.plugin_config, "personification_max_output_chars", 0)
+        final_history_text = _build_final_visible_reply_text(
+            action_history_text,
+            max_chars=max_chars,
+            sanitize_history_text=session.sanitize_history_text,
+        )
+        if not final_history_text:
+            return False
+        bot_nickname = persona.default_bot_nickname or str(getattr(bot, "self_id", "") or "bot")
+        assistant_metadata = {
+            "scene": "reply",
+            "sticker_sent": None,
+            "speaker": bot_nickname,
+            "user_id": bot_self_id or None,
+            "source_kind": "bot_reply",
+        }
+        if isinstance(event, types.group_message_event_cls):
+            assistant_metadata.update(
+                {
+                    "group_id": str(event.group_id),
+                    "message_id": None,
+                    "reply_to_msg_id": incoming_relation_metadata.get("message_id"),
+                    "reply_to_user_id": user_id,
+                    "mentioned_ids": [],
+                    "is_at_bot": False,
+                }
+            )
+        session.append_session_message(
+            session_id,
+            "assistant",
+            final_history_text,
+            legacy_session_id=legacy_session_id,
+            **assistant_metadata,
+        )
+        if isinstance(event, types.group_message_event_cls):
+            runtime.record_group_msg(
+                str(event.group_id),
+                bot_nickname,
+                final_history_text,
+                is_bot=True,
+                user_id=bot_self_id,
+                reply_to_msg_id=incoming_relation_metadata.get("message_id"),
+                reply_to_user_id=user_id,
+                mentioned_ids=[],
+                source_kind="bot_reply",
+            )
+        return True
+
     base_prompt = persona.load_prompt(str(group_id))
     if isinstance(base_prompt, dict):
         try:
@@ -1180,6 +1396,7 @@ async def _process_response_logic_impl(bot: Any, event: Any, state: Dict[str, An
             has_newer_batch=_batch_has_newer_messages(state),
             batch_runtime_ref=state.get("batch_runtime_ref"),
             solo_speaker_follow=is_solo_speaker_follow,
+            favorability_service=persona.favorability_service,
         )
         return
 
@@ -1238,6 +1455,13 @@ async def _process_response_logic_impl(bot: Any, event: Any, state: Dict[str, An
             get_configured_api_providers=runtime.get_configured_api_providers,
         ),
     )
+    turn_plan = getattr(semantic_frame, "turn_plan", None)
+    system_prompt += "\n\n" + build_speech_act_policy_prompt(
+        speech_act=str(getattr(turn_plan, "speech_act", getattr(semantic_frame, "speech_act", "")) or ""),
+        output_mode=str(getattr(turn_plan, "output_mode", getattr(semantic_frame, "output_mode", "")) or ""),
+        session_goal=str(getattr(turn_plan, "session_goal", getattr(semantic_frame, "session_goal", "")) or ""),
+        is_group=not is_private_session,
+    )
     _msg_target = state.get("message_target")
     if _msg_target in (TARGET_OTHERS, TARGET_UNCLEAR):
         system_prompt += (
@@ -1273,15 +1497,23 @@ async def _process_response_logic_impl(bot: Any, event: Any, state: Dict[str, An
     system_prompt += _build_scenario_instruction(
         str(getattr(semantic_frame, "conversation_scenario", "") or ""),
     )
+    if qq_expression_enabled(runtime.plugin_config):
+        system_prompt += "\n\n" + build_qq_expression_prompt()
     if arbitration == "clarify":
-        system_prompt += (
-            "\n[系统提示] 这轮高歧义但对方像是在直接问你。"
-            "优先用一句短澄清问句确认对象或范围，不要硬猜。"
-        )
+        if is_private_session:
+            system_prompt += (
+                "\n[系统提示] 这轮高歧义但对方像是在直接问你。"
+                "优先用一句短澄清问句确认对象或范围，不要硬猜。"
+            )
+        else:
+            system_prompt += (
+                "\n[系统提示] 这轮高歧义但对方像是在直接问你。"
+                "群聊里不要用澄清问句追问；能判断就给一句保守短反应，不能判断就输出 [NO_REPLY]。"
+            )
     if has_photo_input:
         system_prompt += (
-            "\n[系统提示] 当前消息包含真实照片，可以像群友看到朋友圈一样自然回应图片内容，"
-            "不需要等对方先提问。"
+            "\n[系统提示] 当前消息包含真实照片。照片只作为内部语境帮助你理解对方的情绪、关系和意图；"
+            "除非对方明确要求说明/识别/翻译图片，最终回复不要讲解、复述或总结画面细节。"
         )
     if tool_image_urls:
         system_prompt += build_direct_visual_identity_guard()
@@ -1491,27 +1723,21 @@ async def _process_response_logic_impl(bot: Any, event: Any, state: Dict[str, An
             finally:
                 reset_current_image_context(image_ctx_token)
         if used_agent and reply_content in ("[NO_REPLY]", "<NO_REPLY>"):
-            if is_random_chat:
-                runtime.logger.info("拟人插件：Agent 在随机插话场景选择 NO_REPLY，保持沉默。")
-                try:
-                    from ...core import reply_turn_trace
+            runtime.logger.info("拟人插件：Agent 返回 NO_REPLY，保持沉默。")
+            try:
+                from ...core import reply_turn_trace
 
-                    reply_turn_trace.record_stage(
-                        key="no_reply",
-                        label="静默",
-                        status="warn",
-                        detail="agent returned NO_REPLY in random chat",
-                    )
-                    reply_turn_trace.finish_trace(outcome="no_reply", diagnosis_code="no_reply", detail={"reason": "agent_no_reply_random"})
-                except Exception:
-                    pass
-                await _maybe_silence_reaction()
-                return
-            else:
-                runtime.logger.info("拟人插件：Agent 返回 NO_REPLY，回退基础模型生成文本回复。")
-                used_agent = False
-                reply_content = ""
-                bypass_length_limits = False
+                reply_turn_trace.record_stage(
+                    key="no_reply",
+                    label="静默",
+                    status="warn",
+                    detail="agent returned NO_REPLY",
+                )
+                reply_turn_trace.finish_trace(outcome="no_reply", diagnosis_code="no_reply", detail={"reason": "agent_no_reply"})
+            except Exception:
+                pass
+            await _maybe_silence_reaction()
+            return
         if not used_agent:
             fallback_started_at = time.monotonic()
             try:
@@ -1616,7 +1842,7 @@ async def _process_response_logic_impl(bot: Any, event: Any, state: Dict[str, An
             is_random_chat=is_random_chat,
             raw_message_text=raw_message_text or message_text,
             message_intent=message_intent,
-        ):
+        ) and not used_agent:
             try:
                 rewrite_messages = list(messages) + [
                     {
@@ -1638,25 +1864,17 @@ async def _process_response_logic_impl(bot: Any, event: Any, state: Dict[str, An
         if has_block_marker:
             reply_content = reply_content.replace("[BLOCK]", "").replace("<BLOCK>", "").strip()
 
-        has_silence_marker = "[SILENCE]" in reply_content or "<SILENCE>" in reply_content
+        has_silence_marker = has_silence_control_marker(reply_content)
         if has_silence_marker:
+            if _record_pending_action_history_if_any():
+                runtime.logger.info("拟人插件：Agent 静默动作已写入会话历史。")
             runtime.logger.info(f"AI 决定结束与群 {group_id} 中 {user_name}({user_id}) 的对话 (SILENCE)")
             return
 
-        if used_agent and ("[NO_REPLY]" in reply_content or "<NO_REPLY>" in reply_content):
-            if is_random_chat:
-                await _maybe_silence_reaction()
-                return
-            else:
-                runtime.logger.info("拟人插件：Agent 文本含 NO_REPLY 标记，回退基础模型重试。")
-                reply_content = await _call_text_model_with_retry(fallback_model_messages)
-                bypass_length_limits = False
-                if not reply_content:
-                    runtime.logger.warning("拟人插件：Agent 回退基础模型后仍无回复内容")
-                    if is_direct_mention:
-                        reply_content = random.choice(_FALLBACK_REPLIES)
-                    else:
-                        return
+        if used_agent and has_silence_control_marker(reply_content):
+            runtime.logger.info("拟人插件：Agent 文本含 NO_REPLY 标记，保持沉默。")
+            await _maybe_silence_reaction()
+            return
 
         if has_block_marker:
             runtime.logger.warning(
@@ -1703,29 +1921,44 @@ async def _process_response_logic_impl(bot: Any, event: Any, state: Dict[str, An
                 try:
                     is_private_context = str(group_id).startswith("private_")
                     if not is_private_context:
-                        group_key = f"group_{group_id}"
-                        group_data = persona.get_user_data(group_key)
-
-                        today = runtime.get_current_time().strftime("%Y-%m-%d")
-                        last_update = group_data.get("last_update", "")
-                        daily_count = group_data.get("daily_fav_count", 0.0)
-
-                        if last_update != today:
-                            daily_count = 0.0
-
-                        if daily_count < 10.0:
-                            g_current_fav = float(group_data.get("favorability", 100.0))
-                            g_new_fav = round(g_current_fav + 0.1, 2)
-                            daily_count = round(float(daily_count) + 0.1, 2)
-                            persona.update_user_data(
-                                group_key,
-                                favorability=g_new_fav,
-                                daily_fav_count=daily_count,
-                                last_update=today,
+                        service = getattr(persona, "favorability_service", None)
+                        if service is not None and hasattr(service, "apply_group_good_atmosphere"):
+                            result = service.apply_group_good_atmosphere(
+                                str(group_id),
+                                now=runtime.get_current_time(),
                             )
-                            runtime.logger.info(
-                                f"AI 觉得群 {group_id} 氛围良好，好感度 +0.10 (今日已加: {daily_count:.2f}/10.00)"
-                            )
+                            delta = float(result.get("delta", 0.0) or 0.0)
+                            if delta > 0:
+                                runtime.logger.info(
+                                    f"AI 觉得群 {group_id} 氛围良好，好感度 +{delta:.2f} "
+                                    f"(今日已加: {float(result.get('daily_used', 0.0) or 0.0):.2f}/"
+                                    f"{float(result.get('daily_cap', 0.0) or 0.0):.2f})"
+                                )
+                        else:
+                            group_key = f"group_{group_id}"
+                            group_data = persona.get_user_data(group_key)
+
+                            today = runtime.get_current_time().strftime("%Y-%m-%d")
+                            last_update = group_data.get("last_update", "")
+                            daily_count = group_data.get("daily_fav_count", 0.0)
+
+                            if last_update != today:
+                                daily_count = 0.0
+
+                            if daily_count < 10.0:
+                                g_current_fav = float(group_data.get("favorability", 100.0))
+                                g_new_fav = round(g_current_fav + 0.1, 2)
+                                daily_count = round(float(daily_count) + 0.1, 2)
+                                persona.update_user_data(
+                                    group_key,
+                                    favorability=g_new_fav,
+                                    daily_fav_count=daily_count,
+                                    last_update=today,
+                                )
+                                runtime.logger.info(
+                                    f"AI 觉得群 {group_id} 氛围良好，好感度 +0.10 "
+                                    f"(今日已加: {daily_count:.2f}/10.00)"
+                                )
                 except Exception as e:
                     runtime.logger.error(f"增加群聊好感度失败: {e}")
 
@@ -1734,31 +1967,47 @@ async def _process_response_logic_impl(bot: Any, event: Any, state: Dict[str, An
             reply_content = reply_content.replace("[有趣]", "").strip()
             if persona.sign_in_available:
                 try:
-                    user_data = persona.get_user_data(user_id)
-                    today = runtime.get_current_time().strftime("%Y-%m-%d")
-
-                    last_fav_date = user_data.get("last_interesting_date", "")
-                    daily_interesting_count = float(user_data.get("daily_interesting_count", 0.0))
-                    if last_fav_date != today:
-                        daily_interesting_count = 0.0
-
-                    DAILY_LIMIT = 5.0
-                    INCREMENT = 0.05
-
-                    if daily_interesting_count < DAILY_LIMIT:
-                        current_fav = float(user_data.get("favorability", 0.0))
-                        new_fav = round(current_fav + INCREMENT, 2)
-                        daily_interesting_count = round(daily_interesting_count + INCREMENT, 2)
-                        persona.update_user_data(
+                    service = getattr(persona, "favorability_service", None)
+                    if service is not None and hasattr(service, "apply_user_interesting_chat"):
+                        result = service.apply_user_interesting_chat(
                             user_id,
-                            favorability=new_fav,
-                            daily_interesting_count=daily_interesting_count,
-                            last_interesting_date=today,
+                            now=runtime.get_current_time(),
+                            group_id="" if is_private_session else str(group_id),
                         )
-                        runtime.logger.info(
-                            f"AI 觉得与 {user_name}({user_id}) 聊天有趣，"
-                            f"好感度 +{INCREMENT} (今日已加: {daily_interesting_count:.2f}/{DAILY_LIMIT:.1f})"
-                        )
+                        delta = float(result.get("delta", 0.0) or 0.0)
+                        if delta > 0:
+                            runtime.logger.info(
+                                f"AI 觉得与 {user_name}({user_id}) 聊天有趣，"
+                                f"好感度 +{delta:.2f} "
+                                f"(今日已加: {float(result.get('daily_used', 0.0) or 0.0):.2f}/"
+                                f"{float(result.get('daily_cap', 0.0) or 0.0):.1f})"
+                            )
+                    else:
+                        user_data = persona.get_user_data(user_id)
+                        today = runtime.get_current_time().strftime("%Y-%m-%d")
+
+                        last_fav_date = user_data.get("last_interesting_date", "")
+                        daily_interesting_count = float(user_data.get("daily_interesting_count", 0.0))
+                        if last_fav_date != today:
+                            daily_interesting_count = 0.0
+
+                        DAILY_LIMIT = 5.0
+                        INCREMENT = 0.05
+
+                        if daily_interesting_count < DAILY_LIMIT:
+                            current_fav = float(user_data.get("favorability", 0.0))
+                            new_fav = round(current_fav + INCREMENT, 2)
+                            daily_interesting_count = round(daily_interesting_count + INCREMENT, 2)
+                            persona.update_user_data(
+                                user_id,
+                                favorability=new_fav,
+                                daily_interesting_count=daily_interesting_count,
+                                last_interesting_date=today,
+                            )
+                            runtime.logger.info(
+                                f"AI 觉得与 {user_name}({user_id}) 聊天有趣，"
+                                f"好感度 +{INCREMENT} (今日已加: {daily_interesting_count:.2f}/{DAILY_LIMIT:.1f})"
+                            )
                 except Exception as e:
                     runtime.logger.error(f"增加用户好感度失败: {e}")
 
@@ -1831,6 +2080,8 @@ async def _process_response_logic_impl(bot: Any, event: Any, state: Dict[str, An
             reply_content = review_decision.text.strip()
 
         if has_silence_control_marker(reply_content):
+            if _record_pending_action_history_if_any():
+                runtime.logger.info("拟人插件：静默动作已写入会话历史。")
             runtime.logger.info(
                 f"拟人插件：最终回复含沉默控制标记，group={group_id} user={user_id}"
             )
@@ -1888,13 +2139,31 @@ async def _process_response_logic_impl(bot: Any, event: Any, state: Dict[str, An
             except Exception as exc:
                 log_exception(runtime.logger, "[reply_processor] get_group_member_info failed", exc, level="debug")
         final_reply = normalize_visible_reply_text(reply_content)
+        qq_auto_marker = maybe_choose_auto_qq_expression_marker(
+            plugin_config=runtime.plugin_config,
+            semantic_frame=semantic_frame,
+            reply_text=final_reply,
+            raw_message_text=raw_message_text or message_text or message_content,
+            message_intent=message_intent,
+            group_id=str(group_id),
+            user_id=user_id,
+            is_private=is_private_session,
+            is_random_chat=is_random_chat,
+            force_mode=force_mode,
+            has_rich_sticker=bool(sticker_segment),
+        )
+        if qq_auto_marker:
+            if message_intent == "expression" and not contains_qq_expression_marker(final_reply):
+                final_reply = qq_auto_marker
+            else:
+                final_reply = f"{final_reply}{qq_auto_marker}".strip()
         max_chars = 0 if bypass_length_limits else getattr(runtime.plugin_config, "personification_max_output_chars", 0)
         final_reply, image_b64_payloads = _extract_image_b64_markers(final_reply)
         if max_chars and max_chars > 0 and len(final_reply) > max_chars:
             final_reply = _truncate_at_punctuation(final_reply, max_chars)
         # session/history 只记录最终对用户生效的文本，避免原始长回复与实际可见内容漂移。
         final_visible_reply_text = _build_final_visible_reply_text(
-            final_reply or ("[发送了一张图片]" if image_b64_payloads else ""),
+            history_text_for_qq_expression(final_reply) or ("[发送了一张图片]" if image_b64_payloads else ""),
             max_chars=max_chars,
             sanitize_history_text=session.sanitize_history_text,
         )
@@ -1908,6 +2177,7 @@ async def _process_response_logic_impl(bot: Any, event: Any, state: Dict[str, An
         if (
             final_reply
             and not sticker_segment
+            and not contains_qq_expression_marker(final_reply)
             and tts_service is not None
         ):
             try:
@@ -1970,44 +2240,34 @@ async def _process_response_logic_impl(bot: Any, event: Any, state: Dict[str, An
                         )
                         segments[typo_idx] = mutated
 
-                # @ / 引用 由 LLM 决定（semantic_frame.address_mode）更拟人；
-                # auto 或私聊时回退到原有启发式规则，行为平滑兜底。
-                _addr_mode = str(getattr(semantic_frame, "address_mode", "auto") or "auto").lower()
-                if not is_private_session and _addr_mode in ("none", "at", "quote", "at_quote"):
-                    _quote_enabled = bool(
-                        getattr(runtime.plugin_config, "personification_humanize_quote_reply_enabled", True)
+                address_plan = _humanize.decide_addressing(
+                    plugin_config=runtime.plugin_config,
+                    state=state,
+                    event=event,
+                    group_id=str(group_id),
+                    user_id=user_id,
+                    is_private=is_private_session,
+                    has_newer_batch=_batch_has_newer_messages(state),
+                    address_mode=getattr(semantic_frame, "address_mode", "auto"),
+                )
+                quote_message_id = address_plan.get("quote_message_id")
+                at_target = address_plan.get("at_target")
+                try:
+                    from ...core import reply_turn_trace
+
+                    reply_turn_trace.record_stage(
+                        key="addressing_plan",
+                        label="发送指向",
+                        status="info",
+                        detail=(
+                            f"address_mode={address_plan.get('mode') or 'none'} "
+                            f"source={address_plan.get('source') or '-'} "
+                            f"quote={bool(quote_message_id)} at={bool(at_target)} "
+                            f"target={str(at_target or '-')}"
+                        ),
                     )
-                    _at_enabled = bool(
-                        getattr(runtime.plugin_config, "personification_humanize_at_enabled", True)
-                    )
-                    quote_message_id = (
-                        getattr(event, "message_id", None)
-                        if (_addr_mode in ("quote", "at_quote") and _quote_enabled)
-                        else None
-                    )
-                    at_target = (
-                        user_id
-                        if (_addr_mode in ("at", "at_quote") and _at_enabled and user_id)
-                        else None
-                    )
-                else:
-                    quote_message_id = _humanize.should_quote_reply(
-                        plugin_config=runtime.plugin_config,
-                        state=state,
-                        event=event,
-                        group_id=str(group_id),
-                        user_id=user_id,
-                        is_private=is_private_session,
-                        has_newer_batch=_batch_has_newer_messages(state),
-                    )
-                    at_target = _humanize.should_at_target(
-                        plugin_config=runtime.plugin_config,
-                        state=state,
-                        event=event,
-                        user_id=user_id,
-                        is_private=is_private_session,
-                        quote_message_id=quote_message_id,
-                    )
+                except Exception:
+                    pass
 
                 humanize_typing = _humanize.typing_enabled(runtime.plugin_config)
                 typing_cps = float(
@@ -2067,21 +2327,26 @@ async def _process_response_logic_impl(bot: Any, event: Any, state: Dict[str, An
                     if stale_reason:
                         runtime.logger.info(f"拟人插件：{stale_reason}")
                         return
-                    outgoing: Any = seg
+                    rendered_seg = await render_qq_expression_message(
+                        seg,
+                        message_segment_cls=runtime.message_segment_cls,
+                        bot=bot,
+                        plugin_config=runtime.plugin_config,
+                        logger=runtime.logger,
+                    )
+                    outgoing: Any = rendered_seg.message
+                    if not outgoing:
+                        continue
                     if i == 0:
                         try:
-                            seg_cls = runtime.message_segment_cls
-                            prefix = None
-                            if quote_message_id is not None:
-                                prefix = seg_cls.reply(int(quote_message_id))
-                            if at_target:
-                                at_seg = seg_cls.at(int(at_target))
-                                prefix = at_seg if prefix is None else (prefix + at_seg)
-                                outgoing = prefix + f" {seg}"
-                            elif prefix is not None:
-                                outgoing = prefix + seg
+                            outgoing = _humanize.prepend_addressing_segments(
+                                message_segment_cls=runtime.message_segment_cls,
+                                outgoing=outgoing,
+                                quote_message_id=quote_message_id,
+                                at_target=at_target,
+                            )
                         except Exception:
-                            outgoing = seg
+                            outgoing = rendered_seg.message
                     send_result = await bot.send(event, outgoing)
                     if not sent_message_id:
                         sent_message_id = extract_send_message_id(send_result)
@@ -2148,6 +2413,25 @@ async def _process_response_logic_impl(bot: Any, event: Any, state: Dict[str, An
             assistant_text=final_visible_reply_text,
             is_private=is_private_session,
         )
+        try:
+            service = getattr(persona, "favorability_service", None)
+            if service is not None and hasattr(service, "apply_user_reply_interaction"):
+                result = service.apply_user_reply_interaction(
+                    user_id,
+                    now=runtime.get_current_time(),
+                    group_id="" if is_private_session else str(group_id),
+                    is_direct=bool(is_direct_mention or not is_random_chat or is_active_followup),
+                    is_random_chat=bool(is_random_chat),
+                )
+                delta = float(result.get("delta", 0.0) or 0.0)
+                if delta > 0:
+                    runtime.logger.debug(
+                        f"拟人插件：记录与 {user_name}({user_id}) 的成功回复互动，好感度 +{delta:.2f} "
+                        f"(今日已加: {float(result.get('daily_used', 0.0) or 0.0):.2f}/"
+                        f"{float(result.get('daily_cap', 0.0) or 0.0):.2f})"
+                    )
+        except Exception as exc:
+            runtime.logger.debug(f"拟人插件：记录成功回复互动好感事件失败: {exc}")
         schedule_inner_state_update_after_reply(
             runtime=runtime,
             user_text=raw_message_text or message_text or message_content,
@@ -2190,7 +2474,7 @@ async def _process_response_logic_impl(bot: Any, event: Any, state: Dict[str, An
                     "message_id": sent_message_id or None,
                     "reply_to_msg_id": incoming_relation_metadata.get("message_id"),
                     "reply_to_user_id": user_id,
-                    "mentioned_ids": [],
+                    "mentioned_ids": [str(at_target)] if at_target else [],
                     "is_at_bot": False,
                 }
             )
@@ -2259,6 +2543,12 @@ async def _process_response_logic_impl(bot: Any, event: Any, state: Dict[str, An
             from ...core import reply_turn_trace
 
             reply_turn_trace.record_stage(
+                key="outgoing_message",
+                label="发送消息",
+                status="ok",
+                detail=str(final_visible_reply_text or "")[:500],
+            )
+            reply_turn_trace.record_stage(
                 key="reply_success",
                 label="回复完成",
                 status="ok",
@@ -2271,6 +2561,8 @@ async def _process_response_logic_impl(bot: Any, event: Any, state: Dict[str, An
                     "reply_chars": len(final_visible_reply_text),
                     "tts": bool(sent_as_tts),
                     "sticker": bool(sticker_name),
+                    "incoming_text": str(raw_message_text or message_text or message_content or "")[:500],
+                    "outgoing_text": str(final_visible_reply_text or "")[:500],
                 },
             )
         except Exception:

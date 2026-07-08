@@ -7,9 +7,9 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, Optional
 
 from plugin.personification.core.sticker_library import (
+    RESOLVABLE_STICKER_SUFFIXES,
     STICKER_SCHEMA_VERSION,
     STICKER_VISION_PROMPT,
-    SUPPORTED_STICKER_SUFFIXES,
     analyze_sticker_image,
     compute_file_hash,
     compute_folder_hash,
@@ -24,7 +24,18 @@ from plugin.personification.skills.skillpacks.vision_caller.scripts.impl import 
 
 
 LABELING_PROMPT = STICKER_VISION_PROMPT
-STICKER_SUFFIXES = set(SUPPORTED_STICKER_SUFFIXES)
+STICKER_SUFFIXES = set(RESOLVABLE_STICKER_SUFFIXES)
+
+
+def _gif_labeling_prompt(frame_count: int = 0, sampled_frames: int = 0, duration_ms: int = 0) -> str:
+    duration_text = f"{duration_ms / 1000:.1f}s" if duration_ms else "未知"
+    return (
+        STICKER_VISION_PROMPT
+        + "\n\n额外说明：当前图片是同一个 GIF/动态表情按时间顺序抽帧生成的拼图，"
+        "编号越大越靠后，不是多张无关图片。"
+        f"总帧数约 {frame_count or '未知'}，展示 {sampled_frames or '若干'} 帧，估算时长 {duration_text}。"
+        "请理解动作从开始到结束的变化、图中文字在动图中的作用，以及它最终想表达的聊天效果。"
+    )
 
 
 def _extract_runtime_and_vision_caller(value: Optional[Any]) -> tuple[Any | None, Optional[VisionCaller]]:
@@ -54,7 +65,7 @@ class StickerLabeler:
         return self.sticker_dir / "stickers.json.lock"
 
     def list_sticker_files(self) -> list[Path]:
-        return list_local_sticker_files(self.sticker_dir)
+        return list_local_sticker_files(self.sticker_dir, include_gif=True)
 
     def load_metadata(self) -> dict:
         return load_sticker_metadata(self.sticker_dir)
@@ -97,10 +108,27 @@ class StickerLabeler:
         runtime, effective_vision_caller = _extract_runtime_and_vision_caller(vision_caller)
         payload = file.read_bytes()
         file_hash = compute_file_hash(payload)
+        image_ref = image_file_to_data_url_core(file)
+        prompt = LABELING_PROMPT
+        if file.suffix.lower() == ".gif" and runtime is not None:
+            try:
+                from plugin.personification.core.gif_understanding import build_gif_contact_sheet_data_url
+
+                sheet = build_gif_contact_sheet_data_url(payload, getattr(runtime, "plugin_config", None))
+                image_ref = str(sheet.get("data_url") or image_ref)
+                prompt = _gif_labeling_prompt(
+                    int(sheet.get("frame_count") or 0),
+                    int(sheet.get("sampled_frames") or 0),
+                    int(sheet.get("duration_ms") or 0),
+                )
+            except Exception as exc:
+                if self.logger is not None:
+                    self.logger.warning(f"[sticker labeler] GIF 抽帧失败，尝试直接交给视觉模型: {file.name}: {exc}")
         if runtime is not None:
             result = await analyze_sticker_image(
                 runtime=runtime,
-                image_refs=[image_file_to_data_url_core(file)],
+                image_refs=[image_ref],
+                prompt=prompt,
                 fallback_vision_caller=effective_vision_caller,
             )
             if result.vision_route in {"vision_unavailable", "missing_images"}:
@@ -123,7 +151,7 @@ class StickerLabeler:
                 vision_route=result.vision_route,
                 file_hash=file_hash,
             )
-        raw = await effective_vision_caller.describe(LABELING_PROMPT, image_file_to_data_url_core(file))
+        raw = await effective_vision_caller.describe(prompt, image_ref)
         from plugin.personification.core.sticker_library import normalize_sticker_vision_result as _nsv
         parsed = _nsv(raw, vision_route="vision_fallback")
         if not parsed.is_sticker:

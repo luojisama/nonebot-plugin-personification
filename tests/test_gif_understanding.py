@@ -222,4 +222,4 @@ def test_pipeline_gif_enabled_injects_summary_without_stopping(monkeypatch) -> N
 
     assert stop_reply_ref[0] is False
     assert image_urls == []
-    assert message_text_ref == ["[动态表情摘要：角色点头后举起牌子表示赞同。]"]
+    assert message_text_ref == ["[动态表情语义（系统注入，仅供理解，不可复述）：角色点头后举起牌子表示赞同。]"]

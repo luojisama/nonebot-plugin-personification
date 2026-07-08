@@ -2,10 +2,15 @@ function normalizeConfigSearchText(value) {
   return String(value || "").normalize("NFKC").trim().toLowerCase();
 }
 
+function compactConfigSearchText(value) {
+  return normalizeConfigSearchText(value).replace(/[^\w\u4e00-\u9fff]+/g, "");
+}
+
 function configSearchHaystack(entry) {
   if (!entry) return "";
   if (!entry._searchText) {
     const aliases = Array.isArray(entry.aliases) ? entry.aliases.join(" ") : "";
+    const searchIndex = Array.isArray(entry.search_index) ? entry.search_index.join(" ") : "";
     entry._searchText = normalizeConfigSearchText([
       entry.key,
       entry.field_name,
@@ -13,9 +18,86 @@ function configSearchHaystack(entry) {
       entry.description,
       entry.group,
       aliases,
+      searchIndex,
     ].join(" "));
+    entry._searchCompact = compactConfigSearchText(entry._searchText);
+    entry._searchParts = entry._searchText.split(/[\s,，;；/|]+/).map(compactConfigSearchText).filter(Boolean);
   }
   return entry._searchText;
+}
+
+function configSearchCompactHaystack(entry) {
+  configSearchHaystack(entry);
+  return entry && entry._searchCompact || "";
+}
+
+function configSearchNeedleVariants(token) {
+  const raw = normalizeConfigSearchText(token);
+  const compact = compactConfigSearchText(raw);
+  return Array.from(new Set([raw, compact].filter(Boolean)));
+}
+
+function isConfigSubsequence(needle, haystack) {
+  if (!needle || !haystack || needle.length < 2) return false;
+  let idx = 0;
+  for (const ch of haystack) {
+    if (ch === needle[idx]) idx += 1;
+    if (idx >= needle.length) return true;
+  }
+  return false;
+}
+
+function configEditDistanceWithin(a, b, maxDistance) {
+  if (!a || !b) return false;
+  if (Math.abs(a.length - b.length) > maxDistance) return false;
+  const prev = Array.from({ length: b.length + 1 }, (_, i) => i);
+  const curr = new Array(b.length + 1);
+  for (let i = 1; i <= a.length; i++) {
+    curr[0] = i;
+    let rowMin = curr[0];
+    for (let j = 1; j <= b.length; j++) {
+      const cost = a[i - 1] === b[j - 1] ? 0 : 1;
+      curr[j] = Math.min(prev[j] + 1, curr[j - 1] + 1, prev[j - 1] + cost);
+      rowMin = Math.min(rowMin, curr[j]);
+    }
+    if (rowMin > maxDistance) return false;
+    for (let j = 0; j <= b.length; j++) prev[j] = curr[j];
+  }
+  return prev[b.length] <= maxDistance;
+}
+
+function configSearchTokenScore(entry, token) {
+  const haystack = configSearchHaystack(entry);
+  const compactHaystack = configSearchCompactHaystack(entry);
+  const variants = configSearchNeedleVariants(token);
+  if (!variants.length) return 0;
+  for (const variant of variants) {
+    if (haystack.includes(variant)) return 120 - Math.min(40, variant.length);
+    if (compactHaystack.includes(variant)) return 110 - Math.min(40, variant.length);
+  }
+  const compactNeedle = variants[variants.length - 1];
+  if (isConfigSubsequence(compactNeedle, compactHaystack)) return 56;
+  if (compactNeedle.length >= 3) {
+    const maxDistance = compactNeedle.length <= 5 ? 1 : 2;
+    const parts = entry._searchParts || [];
+    for (const part of parts) {
+      if (part.length < 2) continue;
+      if (configEditDistanceWithin(compactNeedle, part, maxDistance)) return 48;
+      if (part.length > compactNeedle.length && configEditDistanceWithin(compactNeedle, part.slice(0, compactNeedle.length), maxDistance)) return 44;
+    }
+  }
+  return -1;
+}
+
+function configSearchEntryScore(entry, tokens) {
+  let score = 0;
+  for (const token of tokens) {
+    const tokenScore = configSearchTokenScore(entry, token);
+    if (tokenScore < 0) return -1;
+    score += tokenScore;
+  }
+  if (entry && entry.advanced) score -= 1;
+  return score;
 }
 
 function renderConfig() {
@@ -24,7 +106,11 @@ function renderConfig() {
   let items = state.entries;
   let activeGroup = state.activeGroup;
   if (searchTokens.length) {
-    items = items.filter(e => searchTokens.every(token => configSearchHaystack(e).includes(token)));
+    items = items
+      .map(e => ({ entry: e, score: configSearchEntryScore(e, searchTokens) }))
+      .filter(item => item.score >= 0)
+      .sort((a, b) => b.score - a.score || String(a.entry.group).localeCompare(String(b.entry.group), "zh-CN") || String(a.entry.label).localeCompare(String(b.entry.label), "zh-CN"))
+      .map(item => item.entry);
     activeGroup = null;
   } else if (activeGroup) {
     items = items.filter(e => e.group === activeGroup);
@@ -181,6 +267,54 @@ function normalizeApiPoolValue(value) {
   return [];
 }
 
+function sanitizeApiProvider(provider) {
+  const out = {...(provider || {})};
+  delete out._model_options;
+  delete out._model_source;
+  delete out._model_probe_done;
+  return out;
+}
+
+function sanitizeApiProviders(providers) {
+  return (providers || []).map(p => sanitizeApiProvider(p));
+}
+
+const apiProviderModelProbeCache = new Map();
+
+function apiProviderProbeCacheKey(field, index, provider) {
+  const parts = [
+    field,
+    index,
+    provider && provider.name,
+    provider && provider.api_type,
+    provider && provider.api_url,
+    provider && provider.auth_path,
+    provider && provider.project,
+  ];
+  return parts.map(item => String(item == null ? "" : item)).join("\u001f");
+}
+
+function cacheApiProviderModelProbe(field, index, provider) {
+  const key = apiProviderProbeCacheKey(field, index, provider);
+  if (provider && Array.isArray(provider._model_options)) {
+    apiProviderModelProbeCache.set(key, {
+      models: normalizeApiProviderModels(provider._model_options),
+      source: String(provider._model_source || ""),
+      done: provider._model_probe_done === true,
+    });
+  }
+}
+
+function hydrateApiProviderModelProbe(field, index, provider) {
+  const cloned = {...(provider || {})};
+  const cached = apiProviderModelProbeCache.get(apiProviderProbeCacheKey(field, index, cloned));
+  if (!cached) return cloned;
+  cloned._model_options = cached.models;
+  cloned._model_source = cached.source;
+  cloned._model_probe_done = cached.done;
+  return cloned;
+}
+
 function defaultApiProvider(index) {
   return {
     name: `provider_${index + 1}`,
@@ -208,8 +342,78 @@ function apiProviderFieldVisible(apiType, field) {
   return !["auth_path", "project"].includes(field);
 }
 
+function apiProviderModelId(item) {
+  if (typeof item === "string") return item.trim();
+  if (!item || typeof item !== "object") return "";
+  return String(item.id || item.model || item.name || item.slug || "").trim();
+}
+
+function apiProviderModelLabel(item, id) {
+  if (typeof item === "string") return id;
+  if (!item || typeof item !== "object") return id;
+  return String(item.label || item.display_name || item.displayName || item.source || id || "").trim();
+}
+
+function normalizeApiProviderModels(items) {
+  const rawItems = Array.isArray(items) ? items : [];
+  const seen = new Set();
+  const models = [];
+  rawItems.forEach(item => {
+    const id = apiProviderModelId(item);
+    if (!id) return;
+    const key = id.toLowerCase();
+    if (seen.has(key)) return;
+    seen.add(key);
+    const label = apiProviderModelLabel(item, id);
+    models.push({id, label});
+  });
+  return models;
+}
+
+function renderApiProviderModelDatalistOptions(models) {
+  return normalizeApiProviderModels(models).map(item =>
+    `<option value="${escapeAttr(item.id)}" label="${escapeAttr(item.label || item.id)}"></option>`
+  ).join("");
+}
+
+function renderApiProviderModelSelectOptions(models, value) {
+  return normalizeApiProviderModels(models).map(item => {
+    const text = item.label && item.label !== item.id ? `${item.id} · ${item.label}` : item.id;
+    return `<option value="${escapeAttr(item.id)}" ${value===item.id?'selected':''}>${escapeHtml(text)}</option>`;
+  }).join("");
+}
+
+function updateApiProviderModelControls(card, models, source) {
+  if (!card) return;
+  const field = card.querySelector('[data-provider-field="model"]');
+  if (!field) return;
+  const input = field.querySelector("[data-provider-model-input]");
+  const select = field.querySelector("[data-provider-model-select]");
+  const datalistId = input ? input.getAttribute("list") : "";
+  const datalist = datalistId ? document.getElementById(datalistId) : null;
+  const currentValue = input ? input.value : "";
+  const normalized = normalizeApiProviderModels(models);
+  if (select) {
+    const placeholder = normalized.length ? "选择模型" : "未探测到可选模型";
+    select.innerHTML = `<option value="">${escapeHtml(placeholder)}</option>${renderApiProviderModelSelectOptions(normalized, currentValue)}`;
+    select.value = normalized.some(item => item.id === currentValue) ? currentValue : "";
+  }
+  if (datalist) datalist.innerHTML = renderApiProviderModelDatalistOptions(normalized);
+  const oldHint = field.querySelector("[data-provider-model-hint]");
+  if (oldHint) oldHint.remove();
+  const hint = document.createElement("div");
+  hint.className = "muted";
+  hint.dataset.providerModelHint = "1";
+  hint.style.fontSize = "11px";
+  const modelSource = source ? `，来源：${source}` : "";
+  hint.textContent = normalized.length ? `已探测 ${normalized.length} 个模型${modelSource}，可输入筛选或手填。` : "未探测到可选模型，仍可手动填写模型 ID。";
+  field.appendChild(hint);
+}
+
 function renderApiPoolEditor(e) {
-  const providers = normalizeApiPoolValue(e.current);
+  const providers = normalizeApiPoolValue(e.current).map((provider, index) =>
+    hydrateApiProviderModelProbe(e.field_name, index, provider || {})
+  );
   const cards = providers.map((provider, index) => renderApiProviderCard(e.field_name, provider || {}, index)).join("");
   return `<div class="api-pool-editor" data-api-pool-field="${escapeAttr(e.field_name)}">
     <div class="api-provider-actions">
@@ -223,6 +427,7 @@ function renderApiPoolEditor(e) {
 }
 
 function renderApiProviderCard(field, provider, index) {
+  provider = hydrateApiProviderModelProbe(field, index, provider || {});
   const apiType = provider.api_type || "openai";
   const choices = ["openai", "openai_codex", "gemini", "gemini_cli", "antigravity_cli", "anthropic", "claude_code"];
   const typeOptions = choices.map(c => `<option value="${escapeAttr(c)}" ${apiType===c?'selected':''}>${escapeHtml(c)}</option>`).join("");
@@ -232,6 +437,35 @@ function renderApiProviderCard(field, provider, index) {
     return `<div class="api-provider-field" data-provider-field="${escapeAttr(name)}">
       <label>${escapeHtml(label)}</label>
       <input type="${escapeAttr(type)}" value="${escapeAttr(value)}" ${extra}>
+    </div>`;
+  };
+  const modelFieldHtml = () => {
+    if (!apiProviderFieldVisible(apiType, "model")) return "";
+    const value = provider.model == null ? "" : provider.model;
+    const options = Array.isArray(provider._model_options) ? provider._model_options : [];
+    const listId = `api-provider-models-${field}-${index}`.replace(/[^\w-]/g, "-");
+    const selectId = `${listId}-select`;
+    const normalizedOptions = normalizeApiProviderModels(options);
+    const optionHtml = renderApiProviderModelDatalistOptions(normalizedOptions);
+    const probeDone = provider._model_probe_done === true;
+    const selectPlaceholder = normalizedOptions.length ? "选择模型" : (probeDone ? "未探测到可选模型" : "先探测模型");
+    const selectHtml = `<select id="${escapeAttr(selectId)}" data-provider-model-select onchange="selectApiProviderModel(this)" aria-label="选择模型">
+      <option value="">${escapeHtml(selectPlaceholder)}</option>
+      ${renderApiProviderModelSelectOptions(normalizedOptions, value)}
+    </select>`;
+    const modelSource = provider._model_source ? `，来源：${provider._model_source}` : "";
+    const sourceHint = normalizedOptions.length
+      ? `<div class="muted" data-provider-model-hint style="font-size:11px">已探测 ${normalizedOptions.length} 个模型${escapeHtml(modelSource)}，可输入筛选或手填。</div>`
+      : (probeDone ? `<div class="muted" data-provider-model-hint style="font-size:11px">未探测到可选模型，仍可手动填写模型 ID。</div>` : "");
+    return `<div class="api-provider-field api-provider-model-field" data-provider-field="model">
+      <label>模型</label>
+      <div class="api-provider-model-row">
+        <input type="text" data-provider-model-input list="${escapeAttr(listId)}" value="${escapeAttr(value)}" placeholder="先探测或手动填写模型 ID" oninput="syncApiProviderModelSelect(this)">
+        ${selectHtml}
+        <button class="btn small" type="button" onclick="probeApiProviderModels('${escapeAttr(field)}', ${index}, this)">探测模型</button>
+      </div>
+      <datalist id="${escapeAttr(listId)}">${optionHtml}</datalist>
+      ${sourceHint}
     </div>`;
   };
   return `<div class="api-provider-card" data-provider-index="${index}">
@@ -251,7 +485,7 @@ function renderApiProviderCard(field, provider, index) {
       </div>
       ${fieldHtml("api_url", "API URL")}
       ${fieldHtml("api_key", "API Key", "password")}
-      ${fieldHtml("model", "模型")}
+      ${modelFieldHtml()}
       ${fieldHtml("auth_path", "Auth Path")}
       ${fieldHtml("project", "Project")}
       ${fieldHtml("proxy", "代理")}
@@ -267,6 +501,23 @@ function renderApiProviderCard(field, provider, index) {
   </div>`;
 }
 
+function selectApiProviderModel(select) {
+  const field = select.closest("[data-provider-field]");
+  const input = field ? field.querySelector("[data-provider-model-input]") : null;
+  if (!input) return;
+  input.value = select.value || "";
+  markDirty(input);
+}
+
+function syncApiProviderModelSelect(input) {
+  markDirty(input);
+  const field = input.closest("[data-provider-field]");
+  const select = field ? field.querySelector("[data-provider-model-select]") : null;
+  if (!select) return;
+  const hasOption = Array.from(select.options).some(option => option.value === input.value);
+  select.value = hasOption ? input.value : "";
+}
+
 function readApiPoolEditor(field) {
   const root = document.querySelector(`[data-api-pool-field="${CSS.escape(field)}"]`);
   if (!root) return [];
@@ -274,12 +525,12 @@ function readApiPoolEditor(field) {
   if (raw && raw.style.display !== "none" && raw.value.trim()) {
     try {
       const parsed = JSON.parse(raw.value);
-      return Array.isArray(parsed) ? parsed : [];
+      return Array.isArray(parsed) ? sanitizeApiProviders(parsed) : [];
     } catch {
       throw new Error("API Pool JSON 格式错误");
     }
   }
-  return Array.from(root.querySelectorAll(".api-provider-card")).map((card, index) => {
+  return sanitizeApiProviders(Array.from(root.querySelectorAll(".api-provider-card")).map((card, index) => {
     const provider = defaultApiProvider(index);
     card.querySelectorAll("[data-provider-field]").forEach(wrap => {
       const name = wrap.dataset.providerField;
@@ -292,7 +543,7 @@ function readApiPoolEditor(field) {
       else delete provider[name];
     });
     return provider;
-  });
+  }));
 }
 
 function writeApiPoolEditor(field, providers) {
@@ -301,7 +552,7 @@ function writeApiPoolEditor(field, providers) {
   const list = root.querySelector(".api-provider-list");
   list.innerHTML = providers.map((provider, index) => renderApiProviderCard(field, provider, index)).join("") || '<div class="api-pool-empty">暂无 provider，点击“添加 Provider”创建。</div>';
   const raw = root.querySelector("[data-api-pool-raw]");
-  if (raw) raw.value = JSON.stringify(providers, null, 2);
+  if (raw) raw.value = JSON.stringify(sanitizeApiProviders(providers), null, 2);
 }
 
 function refreshApiPoolEditor(field) {
@@ -337,6 +588,38 @@ async function saveApiPool(field) {
   try {
     await saveField(field, readApiPoolEditor(field));
   } catch (e) { alertFlash("err", e.message); }
+}
+
+async function probeApiProviderModels(field, index, btn) {
+  let providers;
+  try {
+    providers = readApiPoolEditor(field);
+  } catch (e) {
+    alertFlash("err", e.message);
+    return;
+  }
+  const provider = providers[index];
+  if (!provider) return;
+  const oldText = btn ? btn.textContent : "";
+  if (btn) { btn.disabled = true; btn.textContent = "探测中…"; }
+  try {
+    const result = await api("/config/provider-models", {
+      method:"POST",
+      headers:{"content-type":"application/json"},
+      body: JSON.stringify({provider}),
+    });
+    const models = normalizeApiProviderModels(result.models);
+    providers[index] = {...provider, _model_options: models, _model_source: result.source || "", _model_probe_done: true};
+    cacheApiProviderModelProbe(field, index, providers[index]);
+    const card = btn ? btn.closest(".api-provider-card") : null;
+    updateApiProviderModelControls(card, models, result.source || "");
+    writeApiPoolEditor(field, providers);
+    alertFlash(models.length ? "ok" : "err", models.length ? `已探测 ${models.length} 个模型` : "未探测到模型，请手动填写");
+  } catch (e) {
+    alertFlash("err", "模型探测失败：" + e.message);
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = oldText || "探测模型"; }
+  }
 }
 
 function activeSourceLabel(src) {

@@ -7,7 +7,8 @@ from ..skills.skillpacks.friend_request_tool.scripts.impl import check_friend_re
 from ..utils import build_group_context_window, get_group_topic_summary
 from .chat_intent import infer_turn_semantic_frame_with_llm
 from .context_policy import sanitize_history_text
-from .group_context import render_group_context_structured
+from .group_context import build_group_conversation_context, render_group_conversation_context
+from .group_member_aliases import render_group_alias_context
 from .group_relations import summarize_group_relationships
 from .message_relations import extract_event_message_id, extract_reply_message_id
 from .prompt_hooks import HookContext, register_prompt_hook
@@ -72,6 +73,9 @@ def _format_recent_group_context(
     limit: int = 6,
     trigger_msg_id: str = "",
     reply_to_msg_id: str = "",
+    trigger_user_id: str = "",
+    bot_self_id: str = "",
+    repeat_clusters: list[dict[str, Any]] | None = None,
 ) -> str:
     recent = build_group_context_window(
         group_id,
@@ -80,7 +84,14 @@ def _format_recent_group_context(
     )
     if not recent:
         return ""
-    return render_group_context_structured(recent, trigger_msg_id=trigger_msg_id)
+    context = build_group_conversation_context(
+        recent_messages=recent,
+        trigger_msg_id=trigger_msg_id,
+        trigger_user_id=trigger_user_id,
+        bot_self_id=bot_self_id,
+        repeat_clusters=repeat_clusters,
+    )
+    return render_group_conversation_context(context)
 
 
 def _is_domain_sensitive_frame(frame: Any) -> bool:
@@ -124,10 +135,11 @@ async def _schedule_hook(ctx: HookContext) -> Optional[str]:
             "仅用于保持时间语义自然，比如早晚问候、作息口吻，不强制限制是否回复。"
         )
 
+    schedule_text = str(group_config.get("schedule_prompt", "") or "").strip()
     return (
         "## 当前时间与状态参考\n"
         f"- 当前时间：{ctx.current_time_str}\n"
-        f"{ctx.runtime.get_schedule_prompt_injection()}"
+        f"{ctx.runtime.get_schedule_prompt_injection(schedule_text)}"
     )
 
 
@@ -224,6 +236,9 @@ async def _recent_group_context_hook(ctx: HookContext) -> Optional[str]:
         limit=6,
         trigger_msg_id=extract_event_message_id(ctx.event),
         reply_to_msg_id=extract_reply_message_id(ctx.event),
+        trigger_user_id=ctx.user_id,
+        bot_self_id=str(getattr(ctx.bot, "self_id", "") or ""),
+        repeat_clusters=ctx.repeat_clusters,
     )
     frame = await _ensure_semantic_frame(ctx, recent_context=base_recent)
     is_meta_question = bool(getattr(frame, "meta_question", False))
@@ -233,6 +248,9 @@ async def _recent_group_context_hook(ctx: HookContext) -> Optional[str]:
         limit=8 if is_meta_question else 6,
         trigger_msg_id=extract_event_message_id(ctx.event),
         reply_to_msg_id=extract_reply_message_id(ctx.event),
+        trigger_user_id=ctx.user_id,
+        bot_self_id=str(getattr(ctx.bot, "self_id", "") or ""),
+        repeat_clusters=ctx.repeat_clusters,
     )
     if not recent_block:
         return None
@@ -268,6 +286,34 @@ async def _group_relationship_hook(ctx: HookContext) -> Optional[str]:
         bot_self_id=str(getattr(ctx.bot, "self_id", "") or ""),
     )
     return summary or None
+
+
+async def _group_member_alias_hook(ctx: HookContext) -> Optional[str]:
+    if ctx.is_private:
+        return None
+    recent = build_group_context_window(ctx.group_id, limit=30)
+    known_names: dict[str, list[str]] = {}
+    for msg in recent:
+        if not isinstance(msg, dict):
+            continue
+        uid = str(msg.get("user_id", "") or "").strip()
+        nickname = str(
+            msg.get("nickname")
+            or msg.get("speaker")
+            or msg.get("user_name")
+            or msg.get("role")
+            or ""
+        ).strip()
+        if uid and nickname:
+            known_names.setdefault(uid, [])
+            if nickname not in known_names[uid]:
+                known_names[uid].append(nickname)
+    return render_group_alias_context(
+        ctx.group_id,
+        user_id=ctx.user_id,
+        known_names=known_names,
+        limit=20,
+    ) or None
 
 
 async def _web_search_hook(ctx: HookContext) -> Optional[str]:
@@ -408,8 +454,9 @@ async def _group_idle_hook(ctx: HookContext) -> Optional[str]:
         ctx.message_content = (
             "[提示：你刚刚在群里主动起了个头，当前处于短暂活跃期。"
             f"刚才的话题：{topic_hint}。"
-            f"现在你观察到群里 {ctx.user_name} 发送了一张图片，若是在接前面的话茬，可以更自然地评价一下；"
-            "若明显无关，回复 [SILENCE]]"
+            f"现在你观察到群里 {ctx.user_name} 发送了一条图片/表情消息。"
+            "若没有清楚的视觉摘要，不要假装看懂或评价图片内容；"
+            "只有能从前文确定是在接话时才短句回应，若明显无关就回复 [SILENCE]]"
         )
         return None
 
@@ -491,6 +538,7 @@ async def _pending_topic_extract_hook(ctx: HookContext) -> Optional[str]:
         return None
 
     tool_caller = getattr(ctx.runtime, "agent_tool_caller", None)
+    tool_registry = getattr(ctx.runtime, "tool_registry", None)
     logger = getattr(ctx.runtime, "logger", None)
     if not tool_caller or not logger:
         return None
@@ -503,7 +551,14 @@ async def _pending_topic_extract_hook(ctx: HookContext) -> Optional[str]:
             from ..flows.social_intelligence.pending_topics import add_pending_topic
             from ..flows.social_intelligence.topic_extractor import extract_pending_topic
 
-            result = await extract_pending_topic(text, tool_caller=tool_caller, logger=logger)
+            result = await extract_pending_topic(
+                text,
+                plugin_config=ctx.plugin_config,
+                tool_caller=tool_caller,
+                tool_registry=tool_registry,
+                agent_max_steps=int(getattr(ctx.plugin_config, "personification_agent_max_steps", 10)),
+                logger=logger,
+            )
             if not result:
                 return
             tid = add_pending_topic(
@@ -535,6 +590,7 @@ def register_all_builtin_hooks() -> None:
     register_prompt_hook("group_anti_loop", _group_anti_loop_hook, priority=41, phase="system_context")
     register_prompt_hook("user_persona", _user_persona_hook, priority=20, phase="system_context")
     register_prompt_hook("private_memory_recall", _private_memory_recall_hook, priority=21, phase="system_context")
+    register_prompt_hook("group_member_alias", _group_member_alias_hook, priority=24, phase="system_context")
     register_prompt_hook("group_style", _group_style_hook, priority=25, phase="system_context")
     register_prompt_hook("recent_group_context", _recent_group_context_hook, priority=26, phase="system_context")
     register_prompt_hook("group_relationship", _group_relationship_hook, priority=27, phase="system_context")

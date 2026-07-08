@@ -9,5 +9,23 @@ parameters:
     action:
       type: string
       description: select/context
+    mood:
+      type: string
+      description: select 时的情绪|场景标签
+    context:
+      type: string
+      description: select 时的当前对话摘要
+    proactive:
+      type: boolean
+      description: 是否主动发送
+    media_type:
+      type: string
+      description: static=静态图，gif=只选 GIF 动图，any=静态/GIF 都可
+    sticker_dir:
+      type: string
+      description: 可选表情包目录
+    user_text:
+      type: string
+      description: context 动作时的补充文本
   required:
     - action

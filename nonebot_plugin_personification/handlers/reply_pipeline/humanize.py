@@ -191,6 +191,110 @@ def should_at_target(
     return target
 
 
+_VALID_ADDRESS_MODES = {"auto", "none", "at", "quote", "at_quote"}
+
+
+def normalize_address_mode(value: Any) -> str:
+    normalized = str(value or "auto").strip().lower()
+    return normalized if normalized in _VALID_ADDRESS_MODES else "auto"
+
+
+def decide_addressing(
+    *,
+    plugin_config: Any,
+    state: dict[str, Any],
+    event: Any,
+    group_id: str,
+    user_id: str,
+    is_private: bool,
+    has_newer_batch: bool = False,
+    address_mode: Any = "auto",
+) -> dict[str, Any]:
+    """Resolve quote/@ addressing for a reply turn.
+
+    The LLM can choose an explicit address mode in the semantic frame.  When it
+    leaves the mode as ``auto`` we keep the older structural heuristics.
+    """
+
+    mode = normalize_address_mode(address_mode)
+    if is_private:
+        return {
+            "mode": "none",
+            "source": "private",
+            "quote_message_id": None,
+            "at_target": None,
+        }
+    if mode in {"none", "at", "quote", "at_quote"}:
+        quote_enabled = bool(getattr(plugin_config, "personification_humanize_quote_reply_enabled", True))
+        at_enabled = bool(getattr(plugin_config, "personification_humanize_at_enabled", True))
+        quote_message_id = (
+            getattr(event, "message_id", None)
+            if mode in {"quote", "at_quote"} and quote_enabled
+            else None
+        )
+        at_target = user_id if mode in {"at", "at_quote"} and at_enabled and user_id else None
+        return {
+            "mode": mode,
+            "source": "semantic_frame",
+            "quote_message_id": quote_message_id,
+            "at_target": at_target,
+        }
+    quote_message_id = should_quote_reply(
+        plugin_config=plugin_config,
+        state=state,
+        event=event,
+        group_id=str(group_id),
+        user_id=user_id,
+        is_private=is_private,
+        has_newer_batch=has_newer_batch,
+    )
+    at_target = should_at_target(
+        plugin_config=plugin_config,
+        state=state,
+        event=event,
+        user_id=user_id,
+        is_private=is_private,
+        quote_message_id=quote_message_id,
+    )
+    resolved_mode = "at_quote" if quote_message_id is not None and at_target else (
+        "quote" if quote_message_id is not None else ("at" if at_target else "none")
+    )
+    return {
+        "mode": resolved_mode,
+        "source": "auto",
+        "quote_message_id": quote_message_id,
+        "at_target": at_target,
+    }
+
+
+def _coerce_segment_id(value: Any) -> Any:
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return value
+
+
+def prepend_addressing_segments(
+    *,
+    message_segment_cls: Any,
+    outgoing: Any,
+    quote_message_id: Any = None,
+    at_target: Any = None,
+) -> Any:
+    prefix = None
+    if quote_message_id is not None:
+        prefix = message_segment_cls.reply(_coerce_segment_id(quote_message_id))
+    if at_target:
+        at_seg = message_segment_cls.at(_coerce_segment_id(at_target))
+        prefix = at_seg if prefix is None else (prefix + at_seg)
+        return prefix + message_segment_cls.text(" ") + outgoing
+    if prefix is not None:
+        return prefix + outgoing
+    return outgoing
+
+
 def reset_humanize_state() -> None:
     """测试用：清空模块内的轻量状态。"""
     _last_quote.clear()
@@ -200,6 +304,9 @@ __all__ = [
     "compute_typing_delay",
     "compute_gap_delay",
     "maybe_inject_typo",
+    "decide_addressing",
+    "normalize_address_mode",
+    "prepend_addressing_segments",
     "should_quote_reply",
     "should_at_target",
     "typing_enabled",

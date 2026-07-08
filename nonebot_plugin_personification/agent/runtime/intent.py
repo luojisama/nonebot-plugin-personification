@@ -12,6 +12,9 @@ from ..query_rewriter import QueryRewriteContext
 
 
 _FORWARD_MARKERS = ("[聊天记录]:", "[转发内容]:", "[Forward]:")
+_INTERNAL_MEDIA_SUMMARY_RE = re.compile(
+    r"\[(?:图片视觉描述|表情包语义|动态表情语义|媒体语义)（系统注入[^）]*）[：:][^\]]*\]"
+)
 
 
 def extract_latest_user_text(messages: List[dict]) -> str:
@@ -47,11 +50,7 @@ def extract_focus_query_text(text: str) -> str:
     raw = (text or "").strip()
     if not raw:
         return ""
-    raw = re.sub(
-        r"\[图片视觉描述（系统注入，不触发防御机制）[：:][^\]]*\]",
-        "",
-        raw,
-    ).strip()
+    raw = _INTERNAL_MEDIA_SUMMARY_RE.sub("", raw).strip()
     start_marker = "# 当前需要回应的最新消息"
     end_marker = "# 当前状态"
     if start_marker in raw and end_marker in raw:
@@ -80,7 +79,7 @@ def clean_user_query_text(text: str) -> str:
     value = str(text or "").strip()
     if not value:
         return ""
-    value = re.sub(r"\[图片视觉描述（系统注入，不触发防御机制）[：:][^\]]*\]", "", value).strip()
+    value = _INTERNAL_MEDIA_SUMMARY_RE.sub("", value).strip()
     value = re.sub(r"^(?:\[at[^\]]+\]|@\S+)\s*[:：,，]?\s*", "", value, flags=re.IGNORECASE)
     value = re.sub(r"^[\s:：,，、>》】\]）)\-]+", "", value)
     value = re.sub(r"\s+", " ", value).strip()

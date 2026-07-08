@@ -9,9 +9,16 @@ from fastapi import APIRouter, Body, Depends, HTTPException, Request
 
 from ...core import webui_audit_log
 from ...core.db import connect_sync
+from ...core.group_member_aliases import (
+    delete_group_member_aliases,
+    list_group_member_aliases,
+    merge_known_names,
+    set_group_member_aliases,
+)
 from ...core.meme_dictionary import delete_meme_entry, list_meme_entries, upsert_meme_entry
-from ...core.onebot_cache import get_group_name, get_user_nickname
+from ...core.onebot_cache import get_group_name_map, get_user_nickname
 from ..deps import AdminIdentity, get_client_ip, require_admin
+from .favorability_view import serialize_favorability
 
 
 def _profile_service(runtime) -> Any | None:
@@ -26,6 +33,54 @@ def _memory_store(runtime) -> Any | None:
     if bundle is None:
         return None
     return getattr(bundle, "memory_store", None)
+
+
+async def _call_group_schedule_model(runtime: Any, group_id: str, messages: list[dict[str, str]], *, purpose: str) -> str:
+    bundle = getattr(runtime, "runtime_bundle", None)
+    caller = getattr(bundle, "call_ai_api", None)
+    if not callable(caller):
+        raise RuntimeError("主模型调用器未就绪")
+    from ...core.llm_context import reset_llm_context, set_llm_context
+
+    token = set_llm_context(purpose=purpose, group_id=str(group_id or ""))
+    try:
+        result = await caller(messages, use_builtin_search=False, temperature=0.15, timeout=60)
+    finally:
+        reset_llm_context(token)
+    return str(result or "").strip()
+
+
+def _group_schedule_context(runtime: Any, group_id: str) -> str:
+    store = _memory_store(runtime)
+    parts: list[str] = []
+    if store is not None:
+        try:
+            profiles = list(store.list_local_profiles(str(group_id)))[:20]
+            if profiles:
+                lines = []
+                for row in profiles[:12]:
+                    uid = str(row.get("user_id", "") or "")
+                    snippet = str(row.get("profile_text", "") or "").strip()[:160]
+                    if uid and snippet:
+                        lines.append(f"- {uid}: {snippet}")
+                if lines:
+                    parts.append("群成员画像：\n" + "\n".join(lines))
+        except Exception:
+            pass
+        try:
+            rows = list(store.list_recent_memories(group_id=str(group_id), limit=30))
+            mems = [
+                f"- {str(row.get('memory_type',''))}: {str(row.get('summary','')).strip()[:140]}"
+                for row in rows[:12]
+                if str(row.get("summary", "") or "").strip()
+            ]
+            if mems:
+                parts.append("近期群记忆：\n" + "\n".join(mems))
+        except Exception:
+            pass
+    if not parts:
+        parts.append("（暂无足够群画像/记忆；请生成保守、可编辑的空白作息建议。）")
+    return "\n\n".join(parts)
 
 
 def _knowledge_autobuild_status(runtime, group_id: str) -> dict[str, Any]:
@@ -81,17 +136,124 @@ def _knowledge_autobuild_status(runtime, group_id: str) -> dict[str, Any]:
 
 
 def _get_first_bot(runtime) -> Any | None:
-    bundle = getattr(runtime, "runtime_bundle", None)
-    if bundle is None:
-        return None
-    get_bots = getattr(bundle, "get_bots", None)
-    if not callable(get_bots):
-        return None
+    for holder in (getattr(runtime, "runtime_bundle", None), runtime):
+        if holder is None:
+            continue
+        get_bots = getattr(holder, "get_bots", None)
+        if not callable(get_bots):
+            continue
+        try:
+            bots = get_bots() or {}
+        except Exception:
+            continue
+        bot = next(iter(bots.values()), None) if bots else None
+        if bot is not None:
+            return bot
+    return None
+
+
+def _load_recent_group_member_names(group_id: str, *, limit: int = 500) -> dict[str, list[str]]:
+    names: dict[str, list[str]] = {}
     try:
-        bots = get_bots() or {}
+        with connect_sync() as conn:
+            rows = conn.execute(
+                """
+                SELECT user_id, nickname
+                FROM group_messages
+                WHERE group_id=? AND user_id<>'' AND nickname<>''
+                ORDER BY timestamp DESC
+                LIMIT ?
+                """,
+                (str(group_id), max(1, int(limit))),
+            ).fetchall()
     except Exception:
-        return None
-    return next(iter(bots.values()), None) if bots else None
+        return {}
+    for row in rows:
+        uid = str(row["user_id"] if hasattr(row, "__getitem__") else "").strip()
+        nickname = str(row["nickname"] if hasattr(row, "__getitem__") else "").strip()
+        if not uid or not nickname:
+            continue
+        names[uid] = merge_known_names(names.get(uid, []), nickname)
+    return names
+
+
+def _load_member_relationship_edges(
+    group_id: str,
+    member_ids: set[str],
+    *,
+    names_by_user: dict[str, list[str]],
+    limit_per_member: int = 5,
+) -> dict[str, list[dict[str, Any]]]:
+    if not member_ids:
+        return {}
+    try:
+        import time as _time
+
+        from ...core.group_relation_edges import _decayed_weight
+
+        with connect_sync() as conn:
+            rows = conn.execute(
+                """
+                SELECT src_user_id, dst_user_id, edge_kind, weight, last_seen_at
+                FROM group_relation_edges
+                WHERE group_id=?
+                ORDER BY last_seen_at DESC
+                LIMIT 500
+                """,
+                (str(group_id),),
+            ).fetchall()
+        now_ts = _time.time()
+    except Exception:
+        return {}
+
+    def _label(uid: str) -> str:
+        names = merge_known_names(names_by_user.get(uid, []))
+        return names[0] if names else uid
+
+    by_user: dict[str, list[dict[str, Any]]] = {uid: [] for uid in member_ids}
+    for row in rows:
+        src = str(row["src_user_id"] if hasattr(row, "__getitem__") else "").strip()
+        dst = str(row["dst_user_id"] if hasattr(row, "__getitem__") else "").strip()
+        if not src or not dst or (src not in member_ids and dst not in member_ids):
+            continue
+        try:
+            decayed = _decayed_weight(
+                float(row["weight"] if hasattr(row, "__getitem__") else 0.0),
+                float(row["last_seen_at"] if hasattr(row, "__getitem__") else 0.0),
+                now_ts=now_ts,
+            )
+        except Exception:
+            decayed = 0.0
+        if decayed <= 0.1:
+            continue
+        edge_kind = str(row["edge_kind"] if hasattr(row, "__getitem__") else "").strip()
+        last_seen_at = float(row["last_seen_at"] if hasattr(row, "__getitem__") else 0.0)
+        if src in member_ids:
+            by_user.setdefault(src, []).append(
+                {
+                    "direction": "out",
+                    "peer_user_id": dst,
+                    "peer_label": _label(dst),
+                    "kind": edge_kind,
+                    "weight": round(decayed, 2),
+                    "last_seen_at": last_seen_at,
+                }
+            )
+        if dst in member_ids:
+            by_user.setdefault(dst, []).append(
+                {
+                    "direction": "in",
+                    "peer_user_id": src,
+                    "peer_label": _label(src),
+                    "kind": edge_kind,
+                    "weight": round(decayed, 2),
+                    "last_seen_at": last_seen_at,
+                }
+            )
+    for uid, edges in list(by_user.items()):
+        edges.sort(key=lambda item: (-float(item.get("weight", 0) or 0), str(item.get("peer_user_id", ""))))
+        by_user[uid] = edges[: max(1, int(limit_per_member))]
+    return by_user
 
 
 _REBUILD_RATELIMIT_NS = "group_style_rebuild_ratelimit"
@@ -138,14 +300,21 @@ def build_group_router(*, runtime) -> APIRouter:
         svc = _profile_service(runtime)
         all_ids, source_map = _collect_all_known_groups(runtime)
         bot = _get_first_bot(runtime)
+        name_map = await get_group_name_map(bot, all_ids)
         items: list[dict[str, Any]] = []
         for gid in all_ids:
             items.append(
                 {
                     "group_id": gid,
-                    "group_name": await get_group_name(bot, gid),
+                    "group_name": name_map.get(gid, ""),
                     "source": source_map.get(gid, ""),
                     "has_memory": source_map.get(gid) == "memory",
+                    "favorability": serialize_favorability(
+                        runtime,
+                        f"group_{gid}",
+                        scope="group",
+                        include_events=False,
+                    ),
                 }
             )
         return {"groups": items, "available": svc is not None}
@@ -161,6 +330,7 @@ def build_group_router(*, runtime) -> APIRouter:
         group_configs = load_group_configs()
         known_from_svc = [str(g) for g in (svc.list_groups() if svc else [])]
         all_ids = sorted({str(g) for g in known_from_svc} | set(dynamic_whitelist) | set(config_whitelist))
+        name_map = await get_group_name_map(bot, all_ids)
         items: list[dict[str, Any]] = []
         for gid in all_ids:
             enabled = is_group_whitelisted(gid, config_whitelist)
@@ -178,7 +348,7 @@ def build_group_router(*, runtime) -> APIRouter:
             items.append(
                 {
                     "group_id": gid,
-                    "group_name": await get_group_name(bot, gid),
+                    "group_name": name_map.get(gid, ""),
                     "enabled": enabled,
                     "source": source,
                     "readonly": gid in config_whitelist and "enabled" not in cfg,
@@ -229,6 +399,8 @@ def build_group_router(*, runtime) -> APIRouter:
             raise HTTPException(status_code=503, detail="profile_service 未就绪")
         profiles = svc.list_local_profiles(group_id)
         seen = {str(p.get("user_id", "")) for p in profiles}
+        aliases_by_user = list_group_member_aliases(group_id)
+        recent_names_by_user = _load_recent_group_member_names(group_id)
         # 本地群画像通常为空（没有专门的本地画像构建流程）。回退：把本群近期活跃成员
         # 的【全局画像】并进来，避免「群内成员画像」一直显示为 0。
         try:
@@ -254,8 +426,30 @@ def build_group_router(*, runtime) -> APIRouter:
                 seen.add(uid)
         except Exception as exc:
             getattr(runtime, "logger", None) and runtime.logger.debug(f"[group personas] 全局画像回退失败: {exc}")
+        for uid in sorted(set(aliases_by_user.keys()) - seen):
+            profiles.append(
+                {
+                    "user_id": uid,
+                    "profile_text": "",
+                    "profile_json": {"scope": "group_alias"},
+                    "updated_at": float(aliases_by_user.get(uid, {}).get("updated_at", 0) or 0),
+                }
+            )
+            seen.add(uid)
         profiles.sort(key=lambda p: float(p.get("updated_at", 0) or 0), reverse=True)
         bot = _get_first_bot(runtime)
+
+        names_for_edges = {
+            uid: merge_known_names(names, aliases_by_user.get(uid, {}).get("aliases", []))
+            for uid, names in recent_names_by_user.items()
+        }
+        for uid, entry in aliases_by_user.items():
+            names_for_edges[uid] = merge_known_names(names_for_edges.get(uid, []), entry.get("aliases", []))
+        relationship_edges = _load_member_relationship_edges(
+            group_id,
+            {str(p.get("user_id", "") or "").strip() for p in profiles if str(p.get("user_id", "") or "").strip()},
+            names_by_user=names_for_edges,
+        )
 
         # 拉一次 emotion_state 给每条 persona 附上"近期情绪"
         emotion_per_user: dict[str, dict[str, Any]] = {}
@@ -271,13 +465,28 @@ def build_group_router(*, runtime) -> APIRouter:
 
         items: list[dict[str, Any]] = []
         for p in profiles:
-            uid = p["user_id"]
+            uid = str(p["user_id"])
             text = p.get("profile_text") or ""
             entry_emotion = emotion_per_user.get(str(uid), {})
+            nickname = await get_user_nickname(bot, uid)
+            alias_entry = aliases_by_user.get(
+                str(uid),
+                {"user_id": str(uid), "aliases": [], "note": "", "updated_at": 0.0, "updated_by": ""},
+            )
+            known_names = merge_known_names(
+                nickname,
+                recent_names_by_user.get(str(uid), []),
+                alias_entry.get("aliases", []),
+            )
             items.append(
                 {
                     "user_id": uid,
-                    "nickname": await get_user_nickname(bot, uid),
+                    "nickname": nickname,
+                    "known_names": known_names,
+                    "aliases": list(alias_entry.get("aliases") or []),
+                    "alias_note": str(alias_entry.get("note", "") or ""),
+                    "alias_updated_at": float(alias_entry.get("updated_at", 0) or 0),
+                    "alias_updated_by": str(alias_entry.get("updated_by", "") or ""),
                     "snippet": str(text)[:240],
                     "profile_text": str(text),
                     "updated_at": p.get("updated_at", 0),
@@ -287,9 +496,195 @@ def build_group_router(*, runtime) -> APIRouter:
                         "expression_style": str(entry_emotion.get("expression_style", "") or "")[:60],
                         "updated_at": str(entry_emotion.get("updated_at", "") or ""),
                     },
+                    "favorability": serialize_favorability(
+                        runtime,
+                        str(uid),
+                        scope="user",
+                        include_events=False,
+                    ),
+                    "relationship_edges": relationship_edges.get(str(uid), []),
                 }
             )
-        return {"group_id": group_id, "profiles": items}
+        return {
+            "group_id": group_id,
+            "profiles": items,
+            "group_aliases": sorted(aliases_by_user.values(), key=lambda item: str(item.get("user_id", ""))),
+            "group_favorability": serialize_favorability(
+                runtime,
+                f"group_{group_id}",
+                scope="group",
+                include_events=True,
+            ),
+        }
+
+    @router.get("/{group_id}/aliases")
+    async def aliases(group_id: str, _: AdminIdentity = Depends(require_admin)) -> dict:
+        entries = list_group_member_aliases(group_id)
+        return {
+            "group_id": str(group_id),
+            "aliases": sorted(entries.values(), key=lambda item: str(item.get("user_id", ""))),
+        }
+
+    @router.put("/{group_id}/aliases/{user_id}")
+    async def save_aliases(
+        group_id: str,
+        user_id: str,
+        request: Request,
+        body: dict = Body(default_factory=dict),
+        admin: AdminIdentity = Depends(require_admin),
+    ) -> dict:
+        try:
+            payload = dict(body or {})
+            aliases_value = payload.get("aliases", payload.get("alias_text", ""))
+            entry = set_group_member_aliases(
+                group_id,
+                user_id,
+                aliases_value,
+                note=str(payload.get("note", "") or ""),
+                updated_by=admin.qq,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        webui_audit_log.record(
+            action="group_alias_upsert",
+            qq=admin.qq,
+            device_id=admin.device_id,
+            target=f"{group_id}:{user_id}",
+            ip_hash=get_client_ip(request),
+            detail={"aliases": entry.get("aliases", []), "has_note": bool(entry.get("note"))},
+        )
+        entries = list_group_member_aliases(group_id)
+        return {
+            "success": True,
+            "entry": entry,
+            "aliases": sorted(entries.values(), key=lambda item: str(item.get("user_id", ""))),
+        }
+
+    @router.delete("/{group_id}/aliases/{user_id}")
+    async def delete_aliases(
+        group_id: str,
+        user_id: str,
+        request: Request,
+        admin: AdminIdentity = Depends(require_admin),
+    ) -> dict:
+        changed = delete_group_member_aliases(group_id, user_id)
+        webui_audit_log.record(
+            action="group_alias_delete",
+            qq=admin.qq,
+            device_id=admin.device_id,
+            target=f"{group_id}:{user_id}",
+            ip_hash=get_client_ip(request),
+            detail={"changed": changed},
+        )
+        entries = list_group_member_aliases(group_id)
+        return {
+            "success": True,
+            "deleted": changed,
+            "aliases": sorted(entries.values(), key=lambda item: str(item.get("user_id", ""))),
+        }
+
+    @router.get("/{group_id}/schedule")
+    async def group_schedule(group_id: str, _: AdminIdentity = Depends(require_admin)) -> dict:
+        from ...utils import get_group_config
+
+        cfg = get_group_config(str(group_id))
+        return {
+            "group_id": str(group_id),
+            "enabled": bool(cfg.get("schedule_enabled", False)),
+            "schedule_prompt": str(cfg.get("schedule_prompt", "") or ""),
+            "global_enabled": bool(getattr(runtime.plugin_config, "personification_schedule_global", False)),
+        }
+
+    @router.put("/{group_id}/schedule")
+    async def save_group_schedule(
+        group_id: str,
+        request: Request,
+        payload: dict = Body(default_factory=dict),
+        admin: AdminIdentity = Depends(require_admin),
+    ) -> dict:
+        from ...utils import set_group_schedule_enabled, set_group_schedule_prompt
+
+        enabled = bool(payload.get("enabled", False))
+        prompt = str(payload.get("schedule_prompt", payload.get("prompt", "")) or "").strip()
+        set_group_schedule_enabled(str(group_id), enabled)
+        set_group_schedule_prompt(str(group_id), prompt)
+        webui_audit_log.record(
+            action="group_schedule_update",
+            qq=admin.qq,
+            device_id=admin.device_id,
+            target=group_id,
+            ip_hash=get_client_ip(request),
+            detail={"enabled": enabled, "chars": len(prompt)},
+        )
+        return {"success": True, "group_id": str(group_id), "enabled": enabled, "schedule_prompt": prompt}
+
+    @router.post("/{group_id}/schedule/auto-generate")
+    async def auto_generate_group_schedule(
+        group_id: str,
+        request: Request,
+        body: dict = Body(default_factory=dict),
+        admin: AdminIdentity = Depends(require_admin),
+    ) -> dict:
+        context = _group_schedule_context(runtime, str(group_id))
+        persona_hint = str(body.get("persona_hint", "") or "").strip()
+        base_user = (
+            "请为拟人 bot 生成一份可编辑的本群角色作息表。"
+            "目标不是限制回复，而是给角色更自然的生活状态。"
+            "只基于给定画像/群记忆/人设补充；证据不足要保守。"
+            "\n\n群上下文：\n"
+            f"{context}\n\n"
+            f"人设补充：{persona_hint or '（无）'}"
+        )
+        focus_items = [
+            ("日常节律子agent", "提取可推断的昼夜节律、在线时段、休息时段，不足就写未知"),
+            ("群聊状态子agent", "判断哪些状态适合群聊中自然带出，哪些不应限制回复"),
+            ("交叉验证子agent", "找出冲突、过度臆测和应留空的部分"),
+        ]
+        subagents: list[dict[str, str]] = []
+        for name, focus in focus_items:
+            raw = await _call_group_schedule_model(
+                runtime,
+                str(group_id),
+                [
+                    {"role": "system", "content": "你是作息表生成的只读子agent，只输出简短要点，不要写成最终表格。"},
+                    {"role": "user", "content": f"{base_user}\n\n你的关注点：{focus}"},
+                ],
+                purpose="group_schedule_research",
+            )
+            subagents.append({"name": name, "focus": focus, "raw": raw[:1200]})
+        synthesis = await _call_group_schedule_model(
+            runtime,
+            str(group_id),
+            [
+                {
+                    "role": "system",
+                    "content": (
+                        "你是拟人插件的作息表合成器。输出一份可直接注入 prompt 的中文作息表，"
+                        "默认保守、可编辑，不要编造学校/工作等身份。"
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": (
+                        f"{base_user}\n\n三个子agent报告：\n"
+                        + json.dumps(subagents, ensure_ascii=False, indent=2)
+                        + "\n\n输出要求：6-10 行以内；包含在线/休息/高能量/低能量/不确定项；"
+                        "明确写“作息仅作背景，不限制是否回复”。只输出作息表正文。"
+                    ),
+                },
+            ],
+            purpose="group_schedule_synthesis",
+        )
+        prompt = synthesis.strip()[:1600]
+        webui_audit_log.record(
+            action="group_schedule_generate",
+            qq=admin.qq,
+            device_id=admin.device_id,
+            target=group_id,
+            ip_hash=get_client_ip(request),
+            detail={"chars": len(prompt), "subagent_count": len(subagents)},
+        )
+        return {"group_id": str(group_id), "schedule_prompt": prompt, "subagents": subagents}
 
     @router.get("/{group_id}/style")
     async def style(group_id: str, _: AdminIdentity = Depends(require_admin)) -> dict:
@@ -444,22 +839,36 @@ def build_group_router(*, runtime) -> APIRouter:
             now_ts = _time.time()
             from ...core.group_relation_edges import _decayed_weight
 
+            aliases_by_user = list_group_member_aliases(group_id)
+            recent_names_by_user = _load_recent_group_member_names(group_id)
+
+            def _member_label(uid: str) -> str:
+                alias_entry = aliases_by_user.get(uid, {})
+                names = merge_known_names(recent_names_by_user.get(uid, []), alias_entry.get("aliases", []))
+                return names[0] if names else uid
+
             scored = []
             for row in rows:
                 w = _decayed_weight(float(row["weight"] or 0), float(row["last_seen_at"] or 0), now_ts=now_ts)
                 if w <= 0.1:
                     continue
+                src = str(row["src_user_id"] or "")
+                dst = str(row["dst_user_id"] or "")
                 scored.append(
                     {
-                        "src": str(row["src_user_id"] or ""),
-                        "dst": str(row["dst_user_id"] or ""),
+                        "src": src,
+                        "dst": dst,
+                        "src_label": _member_label(src),
+                        "dst_label": _member_label(dst),
+                        "src_aliases": list((aliases_by_user.get(src) or {}).get("aliases") or []),
+                        "dst_aliases": list((aliases_by_user.get(dst) or {}).get("aliases") or []),
                         "kind": str(row["edge_kind"] or ""),
                         "weight": round(w, 2),
                         "last_seen_at": float(row["last_seen_at"] or 0),
                     }
                 )
             scored.sort(key=lambda e: e["weight"], reverse=True)
-            top_edges = scored[:10]
+            top_edges = scored[:24]
         except Exception:
             top_edges = []
 
@@ -512,13 +921,13 @@ def build_group_router(*, runtime) -> APIRouter:
     @router.get("/{group_id}/knowledge")
     async def group_knowledge(
         group_id: str,
-        limit: int = 50,
+        limit: int = 1000,
         _: AdminIdentity = Depends(require_admin),
     ) -> dict:
         store = _memory_store(runtime)
         if store is None:
             raise HTTPException(status_code=503, detail="memory_store 未就绪")
-        per_type_limit = max(1, min(int(limit), 200))
+        per_type_limit = max(1, min(int(limit), 2000))
         knowledge: list[dict[str, Any]] = []
         try:
             for memory_type in ("group_knowledge", "group_meme", "concept_anchor"):
@@ -623,11 +1032,11 @@ def build_group_router(*, runtime) -> APIRouter:
     @router.get("/{group_id}/memes")
     async def group_memes(
         group_id: str,
-        limit: int = 100,
+        limit: int = 1000,
         _: AdminIdentity = Depends(require_admin),
     ) -> dict:
         try:
-            items = list_meme_entries(group_id=group_id, limit=max(1, min(int(limit), 300)))
+            items = list_meme_entries(group_id=group_id, limit=max(1, min(int(limit), 2000)))
         except Exception as exc:
             raise HTTPException(status_code=500, detail=str(exc))
         return {"group_id": group_id, "memes": items}

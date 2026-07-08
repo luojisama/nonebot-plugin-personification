@@ -18,10 +18,38 @@ class SocialContext:
     logger: Any
     get_bots: Callable[[], dict]
     get_whitelisted_groups: Callable[[], list[str]]
-    tool_caller: Any  # 用于 LLM 决策与文案包装（建议传 lite_tool_caller）
+    tool_caller: Any  # 用于 Agent 决策与文案包装（建议传 agent_tool_caller）
     persona_store: Any
     data_dir: Any
     get_now: Callable[[], Any]
+    tool_registry: Any = None
+    agent_max_steps: int = 4
+
+
+async def run_social_text_agent(
+    ctx: SocialContext,
+    *,
+    messages: list[dict[str, Any]],
+    trigger_reason: str,
+    chat_intent_hint: str = "",
+    use_builtin_search_hint: bool = False,
+) -> str:
+    """Run social-intelligence text generation through the full Agent path."""
+    if ctx.tool_caller is None or ctx.tool_registry is None:
+        return ""
+    from ...core.agent_bridge import run_text_agent
+
+    return await run_text_agent(
+        messages=messages,
+        plugin_config=ctx.plugin_config,
+        logger=ctx.logger,
+        tool_caller=ctx.tool_caller,
+        registry=ctx.tool_registry,
+        max_steps=ctx.agent_max_steps,
+        use_builtin_search_hint=use_builtin_search_hint,
+        trigger_reason=trigger_reason,
+        chat_intent_hint=chat_intent_hint or trigger_reason,
+    )
 
 
 @dataclass
@@ -61,6 +89,7 @@ def clear_social_triggers_for_testing() -> None:
 __all__ = [
     "SocialContext",
     "SocialTrigger",
+    "run_social_text_agent",
     "register_social_trigger",
     "list_social_triggers",
     "clear_social_triggers_for_testing",

@@ -97,6 +97,8 @@ def test_silence_marker_detects_prefix_only_messages() -> None:
     assert has("SILENCE: 实际回复") is False
     assert has("沉默：今天有事先撤") is False
     assert has("SILENCE\n今天先这样") is False
+    assert has("[SILENCE]: 实际回复") is False
+    assert has("[NO_REPLY]\n今天先这样") is False
 
 
 def test_strip_response_control_markers_removes_bare_silence() -> None:
@@ -107,6 +109,8 @@ def test_strip_response_control_markers_removes_bare_silence() -> None:
     # 前缀+冒号砍掉，保留正文
     assert strip("SILENCE: 实际回复") == "实际回复"
     assert strip("沉默：今天有事先撤") == "今天有事先撤"
+    assert strip("[SILENCE]: 实际回复") == "实际回复"
+    assert strip("[NO_REPLY]\n今天先这样") == "今天先这样"
     # 前缀+换行砍掉，保留正文
     assert strip("SILENCE\n今天先这样") == "今天先这样"
     assert strip("silence\n\n下午再聊") == "下午再聊"

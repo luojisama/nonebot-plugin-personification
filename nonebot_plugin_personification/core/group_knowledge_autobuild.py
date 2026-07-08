@@ -84,7 +84,7 @@ def _load_messages_since(
     with _connect(group_dir / "chat_history.db") as conn:
         result = conn.execute(
             """
-            SELECT content, metadata, created_at
+            SELECT role, content, metadata, created_at
             FROM messages
             WHERE created_at > ?
             ORDER BY id ASC
@@ -95,6 +95,20 @@ def _load_messages_since(
         for row in result:
             content = _json_loads(row["content"], row["content"])
             metadata = _json_loads(row["metadata"], {})
+            role = str(row["role"] or "").strip().lower()
+            source_kind = str(metadata.get("source_kind", "") or "").strip().lower()
+            if role in {"assistant", "bot", "system"}:
+                continue
+            if bool(metadata.get("is_bot")) or source_kind in {
+                "bot",
+                "bot_reply",
+                "plugin",
+                "plugin_command",
+                "system",
+                "self_log",
+                "self_reply",
+            }:
+                continue
             text = ""
             if isinstance(content, list):
                 parts = [str(p.get("text", "")).strip() for p in content if isinstance(p, dict)]

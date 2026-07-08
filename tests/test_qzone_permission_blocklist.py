@@ -14,7 +14,10 @@ def _load_flow_module():
     """
     # 测试纯工具函数，直接构造一个 minimal module 复用源码片段
     # （避免完整 import 链）
-    source_path = Path(__file__).parent.parent / "nonebot_plugin_personification" / "flows" / "qzone_social_flow.py"
+    repo_root = Path(__file__).parent.parent
+    package_root = repo_root / "nonebot_plugin_personification"
+    source_root = package_root if package_root.exists() else repo_root
+    source_path = source_root / "flows" / "qzone_social_flow.py"
     source = source_path.read_text(encoding="utf-8")
     # 提取黑名单相关函数（从 _PERMISSION_BLOCK_RECHECK_SECONDS 到 _handle_qzone_fetch_outcome 结束）
     start_marker = "# 权限保密用户黑名单"

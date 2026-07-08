@@ -7,7 +7,12 @@ from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Iterable
 
 from ..agent.runtime.planner import OUTPUT_MODE_LENGTHS
-from .reply_text_policy import looks_like_markdown_reply, normalize_visible_reply_text
+from .reply_text_policy import (
+    looks_like_formulaic_reply_tic,
+    looks_like_markdown_reply,
+    looks_like_visible_reasoning_trace,
+    normalize_visible_reply_text,
+)
 
 
 @dataclass(frozen=True)
@@ -114,6 +119,8 @@ _AGENT_REPLY_OOC_PATTERNS = re.compile(
     r"以下是(相关|查到的|找到的)|"
     r"(参考链接|相关链接|来源)[：:]|"
     r"(http|https)://\S{15,}|"
+    r"(?:我)?先(?:潜水|围观|看看情况|看下情况|蹲一下|路过|观望)|"
+    r"(?:等(?:一会儿?|会儿?|下)?|晚点|回头)再(?:说|看|聊)|"
     r"这(图|张图|个表情|表情包)(也太|真的|好|太)|"
     r"哈哈(这个|这张|这图)|"
     r"(图|表情包)(发的|选的|真的|也太)",
@@ -145,7 +152,16 @@ def arbitrate_reply_mode(
         and message_target == "others"
         and confidence >= _SILENCE_CONFIDENCE_THRESHOLD
     )
-    if hard_silence:
+    random_chat_structural_silence = (
+        not is_private
+        and is_random_chat
+        and not is_direct_mention
+        and not solo_speaker_follow
+        and recommend_silence
+        and ambiguity == "high"
+        and message_target in {"", "others", "uncertain"}
+    )
+    if hard_silence or random_chat_structural_silence:
         return "no_reply"
     if ambiguity == "high" and (is_private or is_direct_mention or message_target == "bot"):
         return "clarify"
@@ -153,7 +169,12 @@ def arbitrate_reply_mode(
 
 
 def is_agent_reply_ooc(text: str) -> bool:
-    return bool(_AGENT_REPLY_OOC_PATTERNS.search(str(text or "")) or looks_like_markdown_reply(text))
+    return bool(
+        _AGENT_REPLY_OOC_PATTERNS.search(str(text or ""))
+        or looks_like_formulaic_reply_tic(text)
+        or looks_like_visible_reasoning_trace(text)
+        or looks_like_markdown_reply(text)
+    )
 
 
 def _parse_review_payload(raw: str) -> ResponseReviewDecision | None:
@@ -351,10 +372,17 @@ async def review_response_text(
                 "{\"action\":\"rewrite\",\"text\":\"改写后的最终回复\",\"reason\":\"...\"}。"
                 "如果这轮更适合沉默，输出 {\"action\":\"no_reply\",\"text\":\"\",\"reason\":\"...\"}。"
                 f"{'当前是直呼/提及 bot 的消息，禁止输出 no_reply。' if is_direct_mention else ''}"
+                f"{'当前是群聊，改写时不要用问句、反问句、澄清问句或征询式结尾；信息不足就给保守短反应或 no_reply。' if not is_private else ''}"
                 "普通短句 banter、顺着上一句接话、轻量吐槽，优先 accept 或 rewrite，不要轻易 no_reply。"
                 "只输出 JSON，不要解释。"
-                "\n## 必须 rewrite 的 AI 味回复模式（重点检查）\n1. 「回声评论」：把用户说的话原样重复后加“太真实了/太直球了/太 X 了吧/真的假的”等感叹——必须改写为不重复原话的短句接话。\n2. 候选回复中超过 3 个连续字与用户原话重叠，且没有新增信息或立场——必须 rewrite。\n3. 候选只是在用感叹词复述用户语义，没有新事实、延续话题、转向或明确态度——必须 rewrite。\n4. 「安抚式客服腔」：以“别这么说/已经很够用了/不要这样想/你很棒的”开头——改写为自然接话。\n5. 「旁白式观察」：类似“真去做了啊/真的行动了/居然真的 XX 了”的旁白——改写为参与式短句。\n6. 「梗分析腔」：用“像是把 X 玩成 Y 了/意思就是/可以理解成”解释梗结构——改写为直接接梗。\n7. 「营业感叹腔」：用“(也)太……了吧/……爆了/绝了/谁懂啊/笑死/绷不住了/yyds”这类口号式感叹收尾或起势——改写成平铺直叙的接话，去掉感叹营业腔和网络流行语，不喊口号。\n改写原则：去掉对用户发言的复述和分析，按 output_mode 的长度要求输出；改写后不得引入新的回声模式或营业感叹腔。"
-                "\n8. 出现 markdown 格式、标题、项目符号列表、编号列表、代码块、链接列表时，必须改成纯文本短句。"
+                "\n## 必须 rewrite 的 AI 味回复模式（重点检查）\n1. 「回声评论」：把用户说的话原样重复后加“太真实了/太直球了/太 X 了吧/真的假的”等感叹——必须改写为不重复原话的短句接话。\n2. 候选回复中超过 3 个连续字与用户原话重叠，且没有新增信息或立场——必须 rewrite。\n3. 候选只是在用感叹词复述用户语义，没有新事实、延续话题、转向或明确态度——必须 rewrite。\n4. 「安抚式客服腔」：以“别这么说/已经很够用了/不要这样想/你很棒的”开头——改写为自然接话。\n5. 「旁白式观察」：类似“真去做了啊/真的行动了/居然真的 XX 了”的旁白——改写为参与式短句。\n6. 「梗分析腔」：用“像是把 X 玩成 Y 了/意思就是/可以理解成”解释梗结构——改写为直接接梗。\n7. 「营业感叹腔」：用“(也)太……了吧/……爆了/绝了/谁懂啊/笑死/绷不住了/yyds”这类口号式感叹收尾或起势——改写成平铺直叙的接话，去掉感叹营业腔和网络流行语，不喊口号。\n8. 「固定起手口癖」：用“等下，/等一下，”开头，或反复用“这也/这也太/你这也/这听着也”评价用户、图片、表情、剧情——必须换一种自然说法，不要保留这个开头或句式。\n改写原则：去掉对用户发言的复述和分析，按 output_mode 的长度要求输出；改写后不得引入新的回声模式、营业感叹腔或固定起手口癖。"
+                "\n9. 出现 markdown 格式、标题、项目符号列表、编号列表、代码块、链接列表时，必须改成纯文本短句。"
+                "\n10. 出现 Step 1/Step 2、步骤 1/步骤 2 这类内部推理、审查清单或草稿过程时，必须 rewrite，只保留最终要对用户说的一句。"
+                "\n11. 「自我行动宣告」：类似“我先潜水/围观/看看情况/先看看情况/等会再说/蹲一下/路过”的句子是在宣告 bot 自己的观察姿态，"
+                "不是在参与当前话题；如果不是直呼 bot 的消息，优先 no_reply，必须回应时改成一句具体的参与式反应。"
+                "\n12. 「附和感叹/转述聊天」：候选只是说“确实/太真实了/真的假的/有点东西”这类空泛反应，"
+                "或只是把当前原话、最近上下文换一种说法复述，没有自己的态度、具体追问或话题推进——必须 rewrite。"
+                f"{'改写时以讨论、闲聊为主基调：给一个具体看法、接住一个点或顺着话题推进半步，不要改成问题句。' if not is_private else '改写时以讨论、闲聊为主基调：给一个具体看法、接住一个点，或抛一个贴着当前话题的小问题。'}"
                 "\n如果语义情绪帧里 persona_info_added=tone_only 且 persona_echoed_user_phrase=true，也必须 rewrite。"
             ),
         },
@@ -398,6 +426,7 @@ async def rewrite_agent_reply_ooc(
     persona_system: str = "",
     timeout: float = 8.0,
     output_mode: str = "chat_short",
+    avoid_questions: bool = False,
 ) -> str:
     if tool_caller is None:
         return ""
@@ -412,8 +441,9 @@ async def rewrite_agent_reply_ooc(
             "content": (
                 "下面这句话听起来像 AI 助手而不像普通群友。"
                 f"把它用你自己的口吻重说一次，{min_chars}-{max_chars} 字以内。"
-                "去掉【搜索/查询/结果/链接/来源】类表述和 URL，不要解释改写过程。"
-                "只输出纯文本，不要 markdown、标题、项目符号列表或编号列表。"
+                "去掉【搜索/查询/结果/链接/来源】类表述和 URL，也去掉“我先看看情况/等会再说/先围观/蹲一下”这类观望或延后宣告。"
+                f"{'当前是群聊，不要改成问句、反问句或澄清问句；改成参与讨论、闲聊推进、保守短反应，或没有可说的新东西时输出 [SILENCE]。' if avoid_questions else '改成参与讨论、闲聊推进或一个具体追问；没有可说的新东西时输出 [SILENCE]。'}"
+                "只输出纯文本，不要 markdown、标题、项目符号列表、编号列表，也不要解释改写过程。"
             ),
         }
     )

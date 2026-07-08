@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 from pathlib import Path
@@ -14,8 +15,18 @@ from ._loader import load_personification_module
 def _runtime_context(tmp_path: Path, monkeypatch):
     data_store_mod = load_personification_module("plugin.personification.core.data_store")
     paths = load_personification_module("plugin.personification.core.paths")
+    tool_health = load_personification_module("plugin.personification.core.tool_health")
+    tool_health.reset_tool_health_statuses()
     monkeypatch.setattr(paths, "get_data_dir", lambda _cfg=None: tmp_path)
-    cfg = SimpleNamespace(personification_data_dir=str(tmp_path), personification_agent_max_steps=5)
+    cfg = SimpleNamespace(
+        personification_data_dir=str(tmp_path),
+        personification_agent_max_steps=5,
+        personification_skill_sources=[],
+        personification_skill_remote_enabled=False,
+        personification_skill_require_admin_review=True,
+        personification_skill_allow_unsafe_external=False,
+        personification_use_skillpacks=False,
+    )
     data_store_mod.init_data_store(cfg)
 
     tool_registry_mod = load_personification_module("plugin.personification.agent.tool_registry")
@@ -117,6 +128,135 @@ def test_toggle_unknown_skill_returns_404(_runtime_context) -> None:
     _login(client, _runtime_context)
     res = client.post("/personification/api/skills/not_exist/toggle", json={"disabled": True})
     assert res.status_code == 404
+
+
+def test_skill_page_reports_remote_sources_and_mcp_tools(_runtime_context) -> None:
+    mcp_mod = load_personification_module("plugin.personification.skill_runtime.mcp_compat")
+    original = dict(mcp_mod._REGISTERED_MCP_TOOLS)
+    mcp_mod._REGISTERED_MCP_TOOLS.clear()
+    mcp_mod.register_mcp_endpoint(
+        registered_name="demo_mcp_tool",
+        remote_name="search",
+        command="python",
+        args=["server.py"],
+        env={"TOKEN": "secret"},
+        cwd="D:\\demo",
+        timeout=7,
+    )
+    try:
+        _runtime_context.plugin_config.personification_skill_sources = [
+            {
+                "name": "demo_remote",
+                "source": "https://github.com/example/skillpack",
+                "ref": "main",
+                "subdir": "skills/demo",
+            }
+        ]
+        _runtime_context.plugin_config.personification_skill_remote_enabled = True
+        client = _build_client(_runtime_context)
+        _login(client, _runtime_context)
+
+        res = client.get("/personification/api/skills")
+        assert res.status_code == 200, res.text
+        body = res.json()
+        assert body["summary"]["remote_enabled"] is True
+        assert body["summary"]["remote_sources"] == 1
+        assert body["summary"]["remote_pending"] == 1
+        assert body["summary"]["mcp_tools"] == 1
+        assert body["remote_sources"][0]["status"] == "pending"
+        assert body["mcp_tools"][0]["name"] == "demo_mcp_tool"
+        assert body["mcp_tools"][0]["env_count"] == 1
+    finally:
+        mcp_mod._REGISTERED_MCP_TOOLS.clear()
+        mcp_mod._REGISTERED_MCP_TOOLS.update(original)
+
+
+def test_skill_page_reports_tool_health_disabled(_runtime_context) -> None:
+    tool_health = load_personification_module("plugin.personification.core.tool_health")
+    web_search = _runtime_context.registry.get("web_search")
+    assert web_search is not None
+    web_search.metadata.update({"requires_network": True, "side_effect": "none"})
+
+    result = asyncio.run(tool_health.probe_registry_tools(registry=_runtime_context.registry, timeout_seconds=1))
+    assert result["disabled"] == 1
+
+    client = _build_client(_runtime_context)
+    _login(client, _runtime_context)
+    res = client.get("/personification/api/skills")
+    assert res.status_code == 200, res.text
+    body = res.json()
+    names = {s["name"]: s for s in body["skills"]}
+    assert names["web_search"]["health_disabled"] is True
+    assert names["web_search"]["health"]["available"] is False
+    assert body["summary"]["health_disabled"] == 1
+    assert body["summary"]["active"] == 1
+
+
+def test_remote_skill_review_endpoint_updates_status(_runtime_context) -> None:
+    _runtime_context.plugin_config.personification_skill_sources = [
+        {
+            "name": "demo_remote",
+            "source": "https://github.com/example/skillpack",
+            "ref": "main",
+            "subdir": "skills/demo",
+        }
+    ]
+    client = _build_client(_runtime_context)
+    _login(client, _runtime_context)
+
+    listed = client.get("/personification/api/skills").json()
+    selector = listed["remote_sources"][0]["key"]
+    res = client.post(
+        "/personification/api/skills/remote/review",
+        json={"selector": selector, "status": "approved"},
+    )
+    assert res.status_code == 200, res.text
+    assert res.json()["matched_count"] == 1
+
+    listed_after = client.get("/personification/api/skills").json()
+    assert listed_after["summary"]["remote_approved"] == 1
+    assert listed_after["remote_sources"][0]["status"] == "approved"
+
+
+def test_add_remote_skill_source_persists_config_and_auto_approves(_runtime_context, tmp_path: Path) -> None:
+    client = _build_client(_runtime_context)
+    _login(client, _runtime_context)
+
+    res = client.post(
+        "/personification/api/skills/remote/source",
+        json={
+            "name": "demo_remote",
+            "source": "https://github.com/example/skillpack/tree/main/skills/demo",
+            "auto_approve": True,
+            "prefer_first": True,
+        },
+    )
+    assert res.status_code == 200, res.text
+    body = res.json()
+    assert body["success"] is True
+    assert body["auto_approved"] is True
+    assert _runtime_context.plugin_config.personification_skill_remote_enabled is True
+    assert _runtime_context.plugin_config.personification_skill_sources[0]["name"] == "demo_remote"
+
+    env_json = json.loads((tmp_path / "env.json").read_text(encoding="utf-8"))
+    assert env_json["personification_skill_remote_enabled"] is True
+    assert env_json["personification_skill_sources"][0]["source"].startswith("https://github.com/example/skillpack")
+    assert env_json["personification_skill_sources"][0]["ref"] == "main"
+    assert env_json["personification_skill_sources"][0]["subdir"] == "skills/demo"
+
+    listed = client.get("/personification/api/skills").json()
+    assert listed["remote_sources"][0]["status"] == "approved"
+
+
+def test_skill_runtime_reload_endpoint_calls_bundle(_runtime_context) -> None:
+    calls: list[int] = []
+    _runtime_context.runtime_bundle.reload_runtime_services = lambda: calls.append(1)
+    client = _build_client(_runtime_context)
+    _login(client, _runtime_context)
+
+    res = client.post("/personification/api/skills/reload")
+    assert res.status_code == 200, res.text
+    assert calls == [1]
 
 
 def test_model_test_chat_returns_response(_runtime_context) -> None:

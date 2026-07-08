@@ -118,8 +118,45 @@ def test_registry_planner_metadata_applies_name_defaults() -> None:
 
     assert by_name["parallel_research"]["requires_network"] is True
     assert "lookup" in by_name["parallel_research"]["intent_tags"]
+    assert by_name["parallel_research"]["retryable"] is True
+    assert by_name["parallel_research"]["side_effect"] == "none"
+    assert by_name["parallel_research"]["final_behavior"] == "continue"
     assert by_name["vision_analyze"]["requires_image"] is True
     assert "vision" in by_name["vision_analyze"]["intent_tags"]
+
+
+def test_action_tool_metadata_declares_side_effect_contract() -> None:
+    registry = tool_registry.ToolRegistry()
+    _register(registry, "send_local_sticker")
+    _register(registry, "search_and_send_images")
+    _register(registry, "send_qq_face")
+
+    by_name = {item["name"]: item for item in tool_catalog.registry_planner_metadata(registry)}
+
+    for name in ("send_local_sticker", "search_and_send_images", "send_qq_face"):
+        assert by_name[name]["evidence_kind"] == "action"
+        assert by_name[name]["side_effect"] == "send_message"
+        assert by_name[name]["final_behavior"] == "silence_on_success"
+        assert by_name[name]["retryable"] is False
+
+
+def test_runtime_metadata_merges_custom_tool_contract() -> None:
+    registry = tool_registry.ToolRegistry()
+    _register(
+        registry,
+        "custom_send_tool",
+        {
+            "intent_tags": ["expression"],
+            "side_effect": "send_message",
+            "final_behavior": "silence_on_success",
+        },
+    )
+
+    metadata = tool_catalog.tool_runtime_metadata(registry, "custom_send_tool")
+
+    assert "expression" in metadata["intent_tags"]
+    assert metadata["side_effect"] == "send_message"
+    assert metadata["final_behavior"] == "silence_on_success"
 
 
 def test_select_tool_schemas_banter_exposes_lightweight_lookup_tools() -> None:

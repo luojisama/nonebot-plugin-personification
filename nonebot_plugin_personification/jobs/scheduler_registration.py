@@ -63,6 +63,26 @@ def register_daily_group_fav_report_job(
         logger.error(f"拟人插件：注册每日群好感统计任务失败: {e}")
 
 
+def register_favorability_maintenance_job(
+    *,
+    scheduler: Any,
+    maintenance_job: Any,
+    logger: Any,
+) -> None:
+    try:
+        scheduler.add_job(
+            maintenance_job,
+            "cron",
+            hour=4,
+            minute=10,
+            id="personification_favorability_maintenance",
+            replace_existing=True,
+        )
+        logger.info("拟人插件：已成功注册好感度维护任务 (04:10)")
+    except Exception as e:
+        logger.error(f"拟人插件：注册好感度维护任务失败: {e}")
+
+
 def register_group_idle_topic_job(
     *,
     scheduler: Any,

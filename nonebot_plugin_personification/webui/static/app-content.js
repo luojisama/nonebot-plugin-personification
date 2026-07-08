@@ -140,6 +140,57 @@ async function deleteStickerByName(name) {
   } catch (e) { alertFlash("err", "删除失败：" + e.message); }
 }
 
+function formatInnerPendingThoughts(value) {
+  if (!value || (Array.isArray(value) && !value.length)) return "-";
+  const items = Array.isArray(value) ? value : [value];
+  const texts = items.map(item => {
+    if (item == null) return "";
+    if (typeof item === "string" || typeof item === "number" || typeof item === "boolean") {
+      return String(item).trim();
+    }
+    if (typeof item === "object") {
+      const primary = item.thought || item.text || item.summary || item.content || item.title;
+      if (primary) return String(primary).trim();
+      try { return JSON.stringify(item); } catch (_e) { return ""; }
+    }
+    return String(item || "").trim();
+  }).filter(Boolean);
+  return texts.slice(-3).join(" / ") || "-";
+}
+
+const MEMORY_TYPE_LABELS = {
+  semantic: "长期语义", fact: "事实记忆", group_knowledge: "群知识", group_meme: "群梗词典",
+  concept_anchor: "概念锚点", user_persona: "用户画像", persona_knowledge: "人设知识",
+  episodic: "事件片段", episodic_turn: "对话回合", conflict_memory: "冲突记忆",
+};
+const MEMORY_TIER_LABELS = { working: "工作记忆", short: "短期记忆", long: "长期记忆", core: "核心记忆", archive: "归档记忆" };
+const MEMORY_KIND_LABELS = { memory: "记忆条目", entity: "实体/标签", user: "群成员" };
+const MEMORY_RELATION_LABELS = {
+  tag: "标签关联", related: "相关", similar: "相似", supports: "支持", contradicts: "冲突",
+  same_topic: "同一话题", same_user: "同一用户", reply: "回复关系", mention: "提及",
+  co_occurs: "共同出现", talks_to: "对话", reacts_to: "回应", quotes: "引用",
+};
+
+function memoryTypeLabel(value, fallback) {
+  if (value && typeof value === "object") return value.memory_type_label || MEMORY_TYPE_LABELS[value.memory_type] || fallback || "其他记忆";
+  return MEMORY_TYPE_LABELS[value] || fallback || "其他记忆";
+}
+
+function memoryTierLabel(value, fallback) {
+  if (value && typeof value === "object") return value.tier_label || MEMORY_TIER_LABELS[value.tier] || fallback || "未分层";
+  return MEMORY_TIER_LABELS[value] || fallback || "未分层";
+}
+
+function memoryRelationLabel(value, fallback) {
+  if (value && typeof value === "object") return value.kind_label || MEMORY_RELATION_LABELS[value.kind] || fallback || "其他关联";
+  return MEMORY_RELATION_LABELS[value] || fallback || "其他关联";
+}
+
+function memoryNodeKindLabel(value, fallback) {
+  if (value && typeof value === "object") return value.kind_label || MEMORY_KIND_LABELS[value.kind] || fallback || "节点";
+  return MEMORY_KIND_LABELS[value] || fallback || "节点";
+}
+
 function renderMemory() {
   const mem = state.memory;
   const inner = state.memoryInnerState;
@@ -150,16 +201,16 @@ function renderMemory() {
       <p class="muted">memory palace 未启用。要查看长期记忆，需在配置中开启 <code>personification_memory_palace_enabled</code>。</p></div>`;
   }
   const filters = ["", "group_knowledge", "user_persona", "fact"].map(t =>
-    `<button class="${state.memoryFilter===t?'active':''}" onclick="pickMemoryFilter('${t}')">${t || '全部类型'}</button>`
+    `<button class="${state.memoryFilter===t?'active':''}" onclick="pickMemoryFilter('${t}')">${t ? memoryTypeLabel(t) : '全部类型'}</button>`
   ).join("");
   const zoneOptions = ['<option value="">全部分区</option>'].concat(
     (state.memoryPalaceZones || []).map(z => `<option value="${escapeAttr(z)}" ${state.memoryPalaceZone===z?'selected':''}>${escapeHtml(z)}</option>`)
   ).join("");
   const rows = (mem.items || []).map(it => `<tr>
-    <td><span class="tag">${escapeHtml(it.memory_type||'-')}</span>${it.tier ? `<br><span class="muted" style="font-size:11px">${escapeHtml(it.tier)}</span>` : ''}</td>
+    <td><span class="tag">${escapeHtml(memoryTypeLabel(it))}</span>${it.tier ? `<br><span class="muted" style="font-size:11px">${escapeHtml(memoryTierLabel(it))}</span>` : ''}</td>
     <td><code style="font-size:11px">${escapeHtml(it.group_id||'')}${it.user_id ? '/'+escapeHtml(it.user_id) : ''}</code></td>
     <td>${escapeHtml(it.summary)}</td>
-    <td class="muted" style="font-size:12px">conf=${it.confidence.toFixed(2)}<br>sal=${it.salience.toFixed(2)}</td>
+    <td class="muted" style="font-size:12px">置信 ${it.confidence.toFixed(2)}<br>显著 ${it.salience.toFixed(2)}</td>
     <td class="muted" style="font-size:12px">${it.updated_at?new Date(it.updated_at*1000).toLocaleString():'-'}</td>
     <td><button class="btn small" onclick="openMemoryDetail('${escapeAttr(it.memory_id)}')">详情</button></td>
   </tr>`).join("");
@@ -175,7 +226,7 @@ function renderMemory() {
       <div class="row" style="gap:30px;flex-wrap:wrap">
         <div><div class="muted">mood</div><div style="font-size:18px;margin-top:4px">${escapeHtml(String(s.mood||'-'))}</div></div>
         <div><div class="muted">energy</div><div style="font-size:18px;margin-top:4px">${escapeHtml(String(s.energy||'-'))}</div></div>
-        <div><div class="muted">pending</div><div style="font-size:13px;margin-top:4px">${escapeHtml(String(s.pending_thoughts||'-')).slice(0,80)||'-'}</div></div>
+        <div><div class="muted">pending</div><div style="font-size:13px;margin-top:4px">${escapeHtml(formatInnerPendingThoughts(s.pending_thoughts)).slice(0,120)||'-'}</div></div>
       </div>
       ${warmRows ? `<h3 style="margin-top:14px;margin-bottom:6px;font-size:13px">用户好感度</h3><table style="max-width:420px"><thead><tr><th>用户</th><th>好感</th></tr></thead><tbody>${warmRows}</tbody></table>`:''}</div>`;
   }
@@ -219,7 +270,7 @@ function renderMemoryVectorPanel() {
     ? `<span class="tag ${idx.enabled ? 'source-env_json' : ''}">${idx.enabled ? '已启用' : '未启用'}</span>`
     : `<span class="tag required">不可用</span>`;
   const searchRows = ((state.memorySearchResult || {}).items || []).map(it => `<tr>
-    <td><code style="font-size:11px">${escapeHtml(it.memory_id || '')}</code><br><span class="tag">${escapeHtml(it.search_source || '-')}</span></td>
+    <td><code style="font-size:11px">${escapeHtml(it.memory_id || '')}</code><br><span class="tag">${escapeHtml(it.search_source_label || '检索结果')}</span></td>
     <td>${escapeHtml(it.summary || '')}</td>
     <td class="muted" style="font-size:12px">${escapeHtml(it.why_relevant || '')}</td>
     <td>${Number(it.score || 0).toFixed(3)}</td>
@@ -326,35 +377,35 @@ function renderMemoryDetail() {
   const related = d.related || [];
   const tagLine = (label, arr) => arr && arr.length ? `<div style="margin:4px 0"><span class="muted" style="font-size:12px">${escapeHtml(label)}：</span>${arr.map(v => `<span class="tag">${escapeHtml(String(v))}</span>`).join("")}</div>` : '';
   const relatedRows = related.map(r => `<tr>
-    <td><span class="tag">${escapeHtml(r.memory_type||'-')}</span></td>
+    <td><span class="tag">${escapeHtml(memoryTypeLabel(r))}</span></td>
     <td>${escapeHtml((r.summary||'').slice(0,120))}</td>
     <td><button class="btn small" onclick="openMemoryDetail('${escapeAttr(r.memory_id||'')}')">查看</button></td>
   </tr>`).join("");
   return `<div class="row" style="margin-bottom:10px"><button class="btn small" onclick="state.selectedMemory=null;render()">返回列表</button><span class="muted">记忆 ${escapeHtml(d.memory_id)}</span></div>
     <div class="card">
-      <h2>${escapeHtml(it.memory_type || '-')} <code style="font-size:13px;color:var(--muted)">${escapeHtml(d.memory_id)}</code></h2>
+      <h2>${escapeHtml(memoryTypeLabel(it))} <code style="font-size:13px;color:var(--muted)">${escapeHtml(d.memory_id)}</code></h2>
       <div class="row" style="gap:20px;flex-wrap:wrap;font-size:13px">
-        ${it.palace_zone ? `<div><span class="muted">palace_zone：</span><strong>${escapeHtml(it.palace_zone)}</strong></div>` : ''}
-        ${it.group_id ? `<div><span class="muted">group_id：</span><code>${escapeHtml(it.group_id)}</code></div>` : ''}
-        ${it.user_id ? `<div><span class="muted">user_id：</span><code>${escapeHtml(it.user_id)}</code></div>` : ''}
-        <div><span class="muted">confidence：</span>${(it.confidence||0).toFixed(2)}</div>
-        <div><span class="muted">salience：</span>${(it.salience||0).toFixed(2)}</div>
-        ${typeof it.stability === 'number' ? `<div><span class="muted">stability：</span>${it.stability.toFixed(2)}</div>` : ''}
+        ${it.palace_zone ? `<div><span class="muted">记忆分区：</span><strong>${escapeHtml(it.palace_zone_label || it.palace_zone)}</strong></div>` : ''}
+        ${it.group_id ? `<div><span class="muted">群：</span><code>${escapeHtml(it.group_id)}</code></div>` : ''}
+        ${it.user_id ? `<div><span class="muted">用户：</span><code>${escapeHtml(it.user_id)}</code></div>` : ''}
+        <div><span class="muted">置信度：</span>${(it.confidence||0).toFixed(2)}</div>
+        <div><span class="muted">显著度：</span>${(it.salience||0).toFixed(2)}</div>
+        ${typeof it.stability === 'number' ? `<div><span class="muted">稳定度：</span>${it.stability.toFixed(2)}</div>` : ''}
       </div>
       <h3 style="margin-top:14px">摘要</h3>
       <pre style="white-space:pre-wrap;margin:0;font-family:inherit">${escapeHtml(it.summary || '')}</pre>
-      ${tagLine('topic_tags', it.topic_tags)}
-      ${tagLine('entity_tags', it.entity_tags)}
-      ${tagLine('aliases', it.aliases)}
+      ${tagLine('主题标签', it.topic_tags)}
+      ${tagLine('实体标签', it.entity_tags)}
+      ${tagLine('别名', it.aliases)}
       ${it.why_relevant ? `<h3>关联说明</h3><p>${escapeHtml(it.why_relevant)}</p>` : ''}
       ${it.time_hint ? `<p class="muted" style="font-size:12px">时间提示：${escapeHtml(it.time_hint)}</p>` : ''}
-      <details style="margin-top:12px"><summary class="muted">完整 payload</summary><pre style="white-space:pre-wrap;font-size:12px;background:#0b0d12;padding:10px;border-radius:6px;overflow-x:auto">${escapeHtml(JSON.stringify(it, null, 2))}</pre></details>
+      <details style="margin-top:12px"><summary class="muted">完整数据</summary><pre style="white-space:pre-wrap;font-size:12px;background:#0b0d12;padding:10px;border-radius:6px;overflow-x:auto">${escapeHtml(JSON.stringify(it, null, 2))}</pre></details>
     </div>
     ${related.length ? `<div class="card"><h3>关联记忆（${related.length}）</h3><table><tbody>${relatedRows}</tbody></table></div>` : ''}`;
 }
 
 function viewTitle() {
-  return ({dashboard:"仪表盘",config:"配置中心",personas:"用户画像",groups:"群信息",group_switch:"群开关",memory:"Agent 记忆",memory_graph:"记忆宫殿",stickers:"表情包",skills:"Skill 管理",plugin_knowledge:"插件知识库",test:"模型测试",audit:"审计日志",logs:"插件日志",proactive:"主动诊断",health:"功能体检",qzone:"QQ 空间",qq:"QQ 管理",devices:"设备管理"})[state.view] || state.view;
+  return ({dashboard:"仪表盘",config:"配置中心",personas:"用户画像",groups:"群信息",group_switch:"群开关",memory:"Agent 记忆",memory_graph:"记忆宫殿",stickers:"表情包",skills:"Skill 管理",plugin_knowledge:"插件知识库",plugin_manager:"插件管理",test:"模型测试",persona_prompt:"人设预览",persona_builder:"人设构建",audit:"审计日志",logs:"插件日志",traces:"消息 Trace",trace_detail:"Trace 详情",proactive:"主动诊断",health:"功能体检",qzone:"QQ 空间",qq:"QQ 管理",devices:"设备管理"})[state.view] || state.view;
 }
 
 // ---------------------------------------------------------------------------
@@ -437,7 +488,7 @@ async function renderMemoryGraphCanvas() {
     const w = Number(n.salience || n.weight || 0.3) || 0.3;
     return {
       data: {
-        id: n.id, label: n.label || n.id, kind: n.kind, color: _memoryGraphColor(n.kind),
+        id: n.id, label: n.label || n.id, kind: n.kind, kindLabel: memoryNodeKindLabel(n), color: _memoryGraphColor(n.kind),
         size: 16 + Math.min(30, w * 40),
         raw: n,
       }
@@ -446,7 +497,7 @@ async function renderMemoryGraphCanvas() {
   const edges = (data.edges || []).map((e, i) => ({
     data: {
       id: 'e' + i, source: e.src, target: e.dst,
-      kind: e.kind, weight: e.weight,
+      kind: e.kind, kindLabel: memoryRelationLabel(e), weight: e.weight,
       thickness: Math.max(1, Math.min(6, Number(e.weight || 1))),
     }
   }));
@@ -467,7 +518,9 @@ async function renderMemoryGraphCanvas() {
       }},
       { selector: 'edge', style: {
         'width': 'data(thickness)', 'line-color': edgeColor, 'curve-style': 'bezier',
-        'opacity': 0.65, 'target-arrow-shape': 'none',
+        'opacity': 0.72, 'target-arrow-shape': 'none',
+        'label': 'data(kindLabel)', 'font-size': '8px', 'color': labelColor,
+        'text-outline-width': 1, 'text-outline-color': labelOutline,
       }},
       { selector: 'node:selected', style: { 'border-width': 2, 'border-color': selectedBorder }},
     ],
@@ -480,13 +533,27 @@ async function renderMemoryGraphCanvas() {
     if (!detail) return;
     const lines = [
       `<strong>${escapeHtml(raw.label || raw.id)}</strong>`,
-      raw.kind ? `<span class="tag">${escapeHtml(raw.kind)}</span>` : '',
-      raw.memory_type ? `<span class="muted">type=${escapeHtml(raw.memory_type)}</span>` : '',
-      raw.palace_zone ? `<span class="muted">zone=${escapeHtml(raw.palace_zone)}</span>` : '',
-      typeof raw.salience === 'number' ? `<span class="muted">salience=${raw.salience.toFixed(2)}</span>` : '',
-      raw.group_id ? `<span class="muted">group=${escapeHtml(raw.group_id)}</span>` : '',
+      raw.kind ? `<span class="tag">${escapeHtml(memoryNodeKindLabel(raw))}</span>` : '',
+      raw.memory_type ? `<span class="muted">记忆类型：${escapeHtml(memoryTypeLabel(raw))}</span>` : '',
+      raw.palace_zone ? `<span class="muted">分区：${escapeHtml(raw.palace_zone_label || raw.palace_zone)}</span>` : '',
+      typeof raw.salience === 'number' ? `<span class="muted">显著度：${raw.salience.toFixed(2)}</span>` : '',
+      raw.group_id ? `<span class="muted">群：${escapeHtml(raw.group_id)}</span>` : '',
     ].filter(Boolean);
     detail.innerHTML = lines.join(' · ');
+  });
+  _cytoscapeInstance.on('tap', 'edge', evt => {
+    const edge = evt.target.data() || {};
+    const detail = document.getElementById('memory-graph-detail');
+    if (!detail) return;
+    const source = edge.source || "";
+    const target = edge.target || "";
+    const weight = Number(edge.weight || 0);
+    detail.innerHTML = [
+      `<strong>${escapeHtml(edge.kindLabel || "关联")}</strong>`,
+      `<span class="muted">来源：${escapeHtml(source)}</span>`,
+      `<span class="muted">目标：${escapeHtml(target)}</span>`,
+      `<span class="muted">权重：${weight.toFixed(2)}</span>`,
+    ].join(' · ');
   });
 }
 

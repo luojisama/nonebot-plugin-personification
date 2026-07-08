@@ -60,6 +60,15 @@ def test_update_prompt_explicitly_forbids_fabrication() -> None:
     assert "不要" in prompt and "编造" in prompt
 
 
+def test_structured_parser_keeps_portrait_and_interaction_advice() -> None:
+    parsed = persona_service.parse_persona_structured(
+        "【人物描述】：经常半夜冒泡的 ACG 玩家，说话短促但会照顾熟人。\n"
+        "【互动建议】：用熟人式短句接话，少讲大道理。"
+    )
+    assert parsed["portrait"].startswith("经常半夜冒泡")
+    assert parsed["interaction_advice"] == "用熟人式短句接话，少讲大道理。"
+
+
 def test_field_guide_singleton_constant() -> None:
     guide = persona_service._PERSONA_FIELD_GUIDE
     # 字段总数：原 4 个 + 新增 7 个 = 11 段

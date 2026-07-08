@@ -19,13 +19,14 @@
 ## 特性
 
 - **群聊 / 私聊回复**：随机插话、戳一戳响应、私聊上下文记忆，支持作息模拟与情绪状态
-- **Agent 工具调用**：联网搜索、Wiki/Fandom、天气、新闻、群信息、好友申请、定时任务、图片生成
+- **Agent 工具调用**：联网搜索、Wiki/Fandom、天气、新闻、群信息、好友申请、定时任务、联网搜图直发、统一图片生成
 - **并行研究**：复杂查询和生图准备时并发聚合联网、Wiki、图片、视觉资料，最多 6 个子 Agent
 - **长期记忆**：用户画像、记忆衰减、记忆宫殿、群聊风格学习、话题摘要、上下文压缩
 - **主动行为**：主动私聊、群空闲主动发话、Qzone 说说、远程 skill 审批
 - **多模态**：贴图库自动标注、语义选图、视觉分析、GIF 动态表情理解、视频理解、可选 LLM 决策的 TTS 语音回复
 - **拟人发送层**：打字延迟、碎片化回复、跨楼引用、多人混聊 @、沉默贴表情、戳一戳回拍、私聊输入状态
-- **WebUI 运维**：内置管理后台、设备审批、功能体检、真实交互测试、运行日志、回复链路 trace、配置热更新
+- **WebUI 运维**：内置管理后台、设备审批、功能体检、真实交互测试、消息 Trace 独立页、Agent 过程摘要、配置热更新、插件更新管理
+- **人设模板构建**：WebUI / QQ 命令共用构建链路，支持阶段进度、历史、导出和一键应用
 - **可扩展**：内置 skillpack 体系，支持本地 / 远程 skill 加载，可对接 MCP 桥
 - **插件调用器**：可选让 Agent 代执行同 bot 其它插件命令并转述结果，默认关闭，支持 allowlist / blocklist
 - **多 Provider 路由**：主模型 + 轻量模型 + 画像模型 + 风格模型 + 回退模型独立配置
@@ -381,10 +382,18 @@ system: |
 
 ## 更新日志
 
+### 0.6.2
+
+- **全量同步源仓库 `f6c1427` 更新**：迁移 0.6.1 之后的 Agent runner 拆分、自适应预算 shadow/adaptive 模式、最终回复质量闭环、短期话题状态、ACG 指代查证、联网搜图直发和统一 `generate_image` 绘图工具。
+- **补齐 WebUI 与运维能力**：同步消息 Trace 独立页、Agent 过程摘要、配置中心 provider 模型探测下拉、仪表盘明细、插件知识库全量源码覆盖统计、工具健康巡检、WebUI 插件更新管理和人设模板构建历史/导出/一键应用。
+- **迁移 QQ 与社交功能增量**：同步 QQ 表情发送工具、群成员外号/QQ 资料快照、插件内好感度、QZone 好友动态转发与额度记录、群作息可编辑生成、GIF 表情包打标和贴图库研究复核。
+- **更新发布仓库链接**：`pyproject.toml`、`PluginMetadata.homepage`、README 里的项目主页/issue/repository 统一指向 `https://github.com/luojisama/nonebot-plugin-shiro-personification`。
+- **保留发布包适配并扩展测试**：继续保留包名兼容命名空间、`web_console_api.py`、`plugin_data.py`、`data/meme_seeds.json` 与 localstore/htmlrender 降级加载；同步新增回放样本和 7 月以来的 Agent/WebUI/QZone/工具测试。
+
 ### 0.6.1
 
 - **同步本地 `personification` 最新开发版**：迁移 0.6.0 后的 WebUI 体检、GIF 理解、基础三观提示词、Agent 查证约束、轻量路由与耗时追踪等更新。
-- **修复插件元数据 homepage**：`PluginMetadata.homepage` 改为当前发布仓库 `https://github.com/luojisama/nonebot-plugin-personification`，避免插件校验报告项目主页无法访问。
+- **修复插件元数据 homepage**：`PluginMetadata.homepage` 改为发布仓库主页，避免插件校验报告项目主页无法访问；当前链接统一指向 `https://github.com/luojisama/nonebot-plugin-shiro-personification`。
 - **补齐发布仓库测试套件**：迁移本地测试与回放样本到发布仓库根目录，并增加测试命名空间适配，便于在包仓库布局下验证 `plugin.personification` 兼容入口。
 - **补全文档与架构说明**：README 对齐当前运行时代码、WebUI、体检日志、GIF 理解、插件调用器和拟人发送层；CONFIG.md 补齐 0.6.1 新增配置字段。
 - **保留发布版专属适配**：继续保留 `web_console_api` 桥接、`nonebot_plugin_personification` 到 `plugin.personification` 的兼容命名空间，以及 localstore/htmlrender 的加载顺序保护。

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import html
 import json
 import re
 from dataclasses import dataclass
@@ -27,6 +28,10 @@ _SEARCH_ENGINES = [
         "snippet_pattern": r'<p[^>]*class="[^"]*b_caption[^"]*"[^>]*><span>(.*?)</span>',
     },
 ]
+_IMAGE_SEARCH_ENGINE = {
+    "name": "Bing Images",
+    "url": "https://www.bing.com/images/search?q={query}&form=HDRSC2&setlang=zh-CN",
+}
 
 _HEADERS = {
     "User-Agent": (
@@ -308,6 +313,194 @@ def _prioritize_web_results(
         results,
         key=lambda item: _score_web_result(item, query, search_kind, resource_type),
         reverse=True,
+    )
+
+
+def _safe_int(value: Any, default: int = 0) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _decode_jsonish_attr(value: str) -> dict[str, Any] | None:
+    raw = html.unescape(str(value or "").strip())
+    if not raw:
+        return None
+    try:
+        data = json.loads(raw)
+    except Exception:
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _extract_bing_image_items(html_text: str) -> list[dict[str, Any]]:
+    text = str(html_text or "")
+    items: list[dict[str, Any]] = []
+    for match in re.finditer(r"\bm=(['\"])(.*?)\1", text, flags=re.DOTALL):
+        data = _decode_jsonish_attr(match.group(2))
+        if isinstance(data, dict):
+            items.append(data)
+    if items:
+        return items
+
+    # Some Bing image responses inline the metadata as raw escaped JSON instead
+    # of an m="..." attribute. Keep this as a conservative fallback.
+    for match in re.finditer(r'"murl"\s*:\s*"((?:\\.|[^"\\])*)"', text):
+        try:
+            image_url = json.loads(f'"{match.group(1)}"')
+        except Exception:
+            image_url = html.unescape(match.group(1)).replace("\\/", "/")
+        if image_url:
+            items.append({"murl": image_url})
+    return items
+
+
+def _image_direct_url_from_item(item: dict[str, Any]) -> str:
+    for key in ("murl", "mediaurl", "imgurl", "url"):
+        value = str(item.get(key, "") or "").strip()
+        if _is_valid_url(value):
+            return value
+    return ""
+
+
+def _image_page_url_from_item(item: dict[str, Any]) -> str:
+    for key in ("purl", "p", "hostPageUrl", "page_url"):
+        value = str(item.get(key, "") or "").strip()
+        if _is_valid_url(value):
+            return value
+    return ""
+
+
+def _image_thumbnail_url_from_item(item: dict[str, Any]) -> str:
+    for key in ("turl", "thumbnailUrl", "thumb", "thumbnail_url"):
+        value = str(item.get(key, "") or "").strip()
+        if _is_valid_url(value):
+            return value
+    return ""
+
+
+def _score_image_result(item: dict[str, Any], query: str) -> tuple[int, int, int, int]:
+    image_url = str(item.get("image_url", "") or item.get("url", "") or "")
+    page_url = str(item.get("page_url", "") or "")
+    title = str(item.get("title", "") or "")
+    combined = f"{title} {image_url} {page_url}".lower()
+    try:
+        image_domain = urlparse(image_url).netloc.lower()
+        page_domain = urlparse(page_url).netloc.lower()
+    except Exception:
+        image_domain = ""
+        page_domain = ""
+
+    dimension_score = 0
+    width = _safe_int(item.get("width"))
+    height = _safe_int(item.get("height"))
+    if width and height:
+        long_edge = max(width, height)
+        short_edge = min(width, height)
+        if long_edge >= 1600 and short_edge >= 800:
+            dimension_score = 4
+        elif long_edge >= 1000 and short_edge >= 600:
+            dimension_score = 3
+        elif long_edge >= 700 and short_edge >= 400:
+            dimension_score = 2
+        elif long_edge >= 400:
+            dimension_score = 1
+
+    domain_score = 0
+    preferred_domains = (
+        "pixiv.net",
+        "wallhaven.cc",
+        "zerochan.net",
+        "konachan.com",
+        "yande.re",
+        "artstation.com",
+        "deviantart.com",
+        "static.zerochan.net",
+        "images.",
+        "img.",
+        "cdn.",
+    )
+    if any(domain in image_domain or domain in page_domain for domain in preferred_domains):
+        domain_score = 3
+
+    direct_score = 1
+    path = urlparse(image_url).path.lower()
+    if path.endswith((".jpg", ".jpeg", ".png", ".webp")):
+        direct_score = 3
+    elif path.endswith((".gif", ".bmp")):
+        direct_score = 1
+
+    token_score = 0
+    for token in [t.lower() for t in re.split(r"\s+", _extract_search_core(query)) if len(t.strip()) >= 2][:6]:
+        if token in combined:
+            token_score += 1
+    return (dimension_score, domain_score, direct_score, token_score)
+
+
+def _normalize_image_search_results(raw_items: list[dict[str, Any]], query: str, limit: int) -> list[dict[str, Any]]:
+    seen: set[str] = set()
+    results: list[dict[str, Any]] = []
+    for raw in raw_items:
+        if not isinstance(raw, dict):
+            continue
+        image_url = _image_direct_url_from_item(raw)
+        if not image_url or image_url in seen:
+            continue
+        seen.add(image_url)
+        title = (
+            str(raw.get("t", "") or raw.get("title", "") or raw.get("desc", "") or "").strip()
+            or _extract_search_core(query)
+            or "图片结果"
+        )
+        page_url = _image_page_url_from_item(raw)
+        result = {
+            "type": "image",
+            "title": title[:120],
+            "url": image_url,
+            "image_url": image_url,
+            "thumbnail_url": _image_thumbnail_url_from_item(raw),
+            "page_url": page_url,
+            "source": _get_domain_label(page_url or image_url),
+            "width": _safe_int(raw.get("ow") or raw.get("width")),
+            "height": _safe_int(raw.get("oh") or raw.get("height")),
+            "engine": _IMAGE_SEARCH_ENGINE["name"],
+        }
+        results.append(result)
+    return sorted(results, key=lambda item: _score_image_result(item, query), reverse=True)[:limit]
+
+
+async def _search_image_payload(
+    *,
+    query: str,
+    limit: int,
+    http_client: httpx.AsyncClient,
+    logger: Any,
+) -> dict[str, Any]:
+    search_query = str(query or "").strip()
+    if not search_query:
+        return _build_payload(
+            ok=False,
+            query="",
+            source_type="image",
+            results=[],
+            error="missing_query",
+        )
+    limit = _normalize_limit(limit)
+    url = _IMAGE_SEARCH_ENGINE["url"].format(query=quote_plus(_extract_search_core(search_query) or search_query))
+    try:
+        response = await http_client.get(url, headers=_HEADERS, timeout=_FETCH_TIMEOUT)
+        raw_items = _extract_bing_image_items(response.text)
+    except Exception as exc:
+        logger.debug(f"[resource_collector] image search failed engine={_IMAGE_SEARCH_ENGINE['name']}: {exc}")
+        raw_items = []
+    results = _normalize_image_search_results(raw_items, search_query, limit)
+    return _build_payload(
+        ok=bool(results),
+        query=search_query,
+        source_type="image",
+        results=results,
+        error="" if results else "no_results",
     )
 
 
@@ -779,14 +972,21 @@ async def _execute_resource_plan(
                 resource_type=resource_type,
             )
         elif task.kind == "image":
-            payload = await _search_web_payload(
+            payload = await _search_image_payload(
                 query=task.query,
                 limit=task.limit,
                 http_client=http_client,
                 logger=logger,
-                search_kind="image",
-                resource_type=resource_type,
             )
+            if not payload.get("results"):
+                payload = await _search_web_payload(
+                    query=task.query,
+                    limit=task.limit,
+                    http_client=http_client,
+                    logger=logger,
+                    search_kind="image",
+                    resource_type=resource_type,
+                )
         else:
             payload = await _search_web_payload(
                 query=task.query,
@@ -870,14 +1070,21 @@ async def search_images(
     http_client: httpx.AsyncClient,
     logger: Any,
 ) -> str:
-    payload = await _search_web_payload(
+    payload = await _search_image_payload(
         query=query,
         limit=limit,
         http_client=http_client,
         logger=logger,
-        search_kind="image",
-        resource_type="图片/壁纸",
     )
+    if not payload.get("results"):
+        payload = await _search_web_payload(
+            query=query,
+            limit=limit,
+            http_client=http_client,
+            logger=logger,
+            search_kind="image",
+            resource_type="图片/壁纸",
+        )
     return dumps_json_payload(payload)
 
 

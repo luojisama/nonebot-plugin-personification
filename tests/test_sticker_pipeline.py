@@ -98,6 +98,58 @@ def test_rank_sticker_candidates_uses_feedback_score(monkeypatch) -> None:  # no
         shutil.rmtree(temp_dir, ignore_errors=True)
 
 
+def test_select_sticker_can_filter_gif_media_type() -> None:
+    temp_dir = _make_workspace_temp_dir("stickers-gif-")
+    try:
+        (temp_dir / "static.png").write_bytes(b"png")
+        (temp_dir / "animated.gif").write_bytes(b"gif")
+
+        selected = sticker_impl.select_sticker(
+            temp_dir,
+            mood="淡定|表达疑惑",
+            context="随手发个动图",
+            proactive=False,
+            plugin_config=SimpleNamespace(personification_sticker_semantic=True),
+            media_type="gif",
+        )
+
+        assert selected.endswith("animated.gif")
+    finally:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+
+
+def test_send_sticker_tool_queues_gif_action() -> None:
+    temp_dir = _make_workspace_temp_dir("stickers-send-gif-")
+    try:
+        (temp_dir / "animated.gif").write_bytes(b"gif")
+        queued: list[dict] = []
+
+        class _Executor:
+            def queue_action(self, action, params):  # noqa: ANN001
+                queued.append({"type": action, "params": params})
+
+        tool = sticker_impl.build_send_sticker_tool(
+            temp_dir,
+            SimpleNamespace(personification_sticker_semantic=True),
+            _Executor(),
+        )
+
+        result = asyncio.run(
+            tool.handler(
+                mood="淡定|表达疑惑",
+                context="用户想看一个动图表情",
+                media_type="gif",
+            )
+        )
+
+        assert '"queued": true' in result
+        assert queued[0]["type"] == "send_sticker"
+        assert queued[0]["params"]["path"].endswith("animated.gif")
+        assert queued[0]["params"]["history_text"] == "[GIF表情包:animated]"
+    finally:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+
+
 class _FakeStore:
     def __init__(self) -> None:
         self.payloads: dict[str, dict] = {}

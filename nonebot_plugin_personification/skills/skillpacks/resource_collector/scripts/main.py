@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import json
 import os
+import re
 
 import httpx
 
@@ -60,6 +62,79 @@ def _compact_visual_search_context(raw: str) -> str:
     return "；".join(parts)[:300]
 
 
+def _queue_action(executor, action_type: str, params: dict) -> bool:  # noqa: ANN001
+    queue = getattr(executor, "queue_action", None)
+    if callable(queue):
+        queue(action_type, params)
+        return True
+    actions = getattr(executor, "pending_actions", None)
+    if isinstance(actions, list):
+        actions.append({"type": action_type, "params": dict(params or {})})
+        return True
+    return False
+
+
+def _compact_text(value, *, limit: int = 80) -> str:  # noqa: ANN001
+    text = re.sub(r"\s+", " ", str(value or "").strip())
+    return text[: max(0, int(limit))]
+
+
+def _extract_image_candidates(raw: str) -> list[dict[str, str]]:
+    try:
+        payload = json.loads(str(raw or "").strip())
+    except Exception:
+        return []
+    if not isinstance(payload, dict):
+        return []
+    candidates: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for item in list(payload.get("results") or []):
+        if not isinstance(item, dict):
+            continue
+        url = str(item.get("image_url") or item.get("url") or "").strip()
+        if not url.startswith(("http://", "https://")) or url in seen:
+            continue
+        seen.add(url)
+        candidates.append(
+            {
+                "url": url,
+                "title": _compact_text(item.get("title") or item.get("source") or "", limit=80),
+                "source": _compact_text(item.get("source") or "", limit=40),
+                "page_url": str(item.get("page_url") or "").strip(),
+            }
+        )
+    return candidates
+
+
+def _send_image_action_result(*, ok: bool, queued: bool = False, reason: str = "", **extra) -> str:  # noqa: ANN003
+    payload = {"ok": bool(ok), "queued": bool(queued), "kind": "web_image"}
+    if reason:
+        payload["reason"] = str(reason)
+    payload.update(extra)
+    if queued:
+        payload["final_reply_instruction"] = "图片已经安排发送；最终回复请只输出 [SILENCE]，不要再解释搜索或重复说已发送。"
+    return json.dumps(payload, ensure_ascii=False)
+
+
+async def _augment_query_with_images(runtime, logger, query: str, images=None, image_urls=None) -> str:  # noqa: ANN001
+    refs = _merge_image_refs(images, image_urls)
+    if not refs:
+        return str(query or "").strip()
+    try:
+        visual_raw = await vision_impl.analyze_images(
+            runtime=runtime,
+            query="为资源/网页搜索提取图片中的主体、文字、人物、作品名和关键视觉线索。",
+            images=refs,
+        )
+    except Exception as exc:
+        logger.debug(f"[resource_collector] visual query augmentation skipped: {exc}")
+        return str(query or "").strip()
+    visual_context = _compact_visual_search_context(visual_raw)
+    if not visual_context:
+        return str(query or "").strip()
+    return f"{str(query or '').strip()} 图像线索：{visual_context}".strip()
+
+
 def build_tools(runtime):
     logger = getattr(runtime, "logger", None) or _SilentLogger()
     shared_client = getattr(runtime, "http_client", None)
@@ -71,24 +146,6 @@ def build_tools(runtime):
             return await callback(shared_client)
         async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as http_client:
             return await callback(http_client)
-
-    async def _augment_query_with_images(query: str, images=None, image_urls=None) -> str:  # noqa: ANN001
-        refs = _merge_image_refs(images, image_urls)
-        if not refs:
-            return str(query or "").strip()
-        try:
-            visual_raw = await vision_impl.analyze_images(
-                runtime=runtime,
-                query="为资源/网页搜索提取图片中的主体、文字、人物、作品名和关键视觉线索。",
-                images=refs,
-            )
-        except Exception as exc:
-            logger.debug(f"[resource_collector] visual query augmentation skipped: {exc}")
-            return str(query or "").strip()
-        visual_context = _compact_visual_search_context(visual_raw)
-        if not visual_context:
-            return str(query or "").strip()
-        return f"{str(query or '').strip()} 图像线索：{visual_context}".strip()
 
     async def _confirm_handler(raw_query: str = "", context_hint: str = "") -> str:
         result = await impl.confirm_resource_request(
@@ -106,7 +163,7 @@ def build_tools(runtime):
         images: list[str] | None = None,
         image_urls: list[str] | None = None,
     ) -> str:
-        augmented_query = await _augment_query_with_images(query, images, image_urls)
+        augmented_query = await _augment_query_with_images(runtime, logger, query, images, image_urls)
 
         async def _call(http_client: httpx.AsyncClient) -> str:
             return await impl.collect_resources(
@@ -127,7 +184,7 @@ def build_tools(runtime):
         images: list[str] | None = None,
         image_urls: list[str] | None = None,
     ) -> str:
-        augmented_query = await _augment_query_with_images(query, images, image_urls)
+        augmented_query = await _augment_query_with_images(runtime, logger, query, images, image_urls)
 
         async def _call(http_client: httpx.AsyncClient) -> str:
             return await impl.search_web(
@@ -156,7 +213,7 @@ def build_tools(runtime):
         images: list[str] | None = None,
         image_urls: list[str] | None = None,
     ) -> str:
-        augmented_query = await _augment_query_with_images(query, images, image_urls)
+        augmented_query = await _augment_query_with_images(runtime, logger, query, images, image_urls)
 
         async def _call(http_client: httpx.AsyncClient) -> str:
             return await impl.search_images(
@@ -273,6 +330,110 @@ def build_tools(runtime):
             },
             handler=_collect_handler,
         ),
+    ]
+
+
+def build_send_image_tools(runtime, executor):  # noqa: ANN001
+    logger = getattr(runtime, "logger", None) or _SilentLogger()
+    shared_client = getattr(runtime, "http_client", None)
+
+    async def _with_client(callback):
+        if shared_client is not None:
+            return await callback(shared_client)
+        async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as http_client:
+            return await callback(http_client)
+
+    async def _search_and_send_images(
+        query: str,
+        count: int = 1,
+        images: list[str] | None = None,
+        image_urls: list[str] | None = None,
+        text: str = "",
+    ) -> str:
+        raw_query = str(query or "").strip()
+        if not raw_query:
+            return _send_image_action_result(ok=False, reason="需要提供图片搜索主题")
+        try:
+            wanted = max(1, min(3, int(count or 1)))
+        except Exception:
+            wanted = 1
+        augmented_query = await _augment_query_with_images(runtime, logger, raw_query, images, image_urls)
+
+        async def _call(http_client: httpx.AsyncClient) -> str:
+            return await impl.search_images(
+                augmented_query,
+                limit=max(5, wanted * 2),
+                http_client=http_client,
+                logger=logger,
+            )
+
+        result_text = await _with_client(_call)
+        candidates = _extract_image_candidates(result_text)
+        if not candidates:
+            return _send_image_action_result(ok=False, reason="没有找到可直接发送的图片", query=raw_query)
+        picked = candidates[:wanted]
+        queued = 0
+        for index, item in enumerate(picked, 1):
+            title = item.get("title", "") or raw_query
+            if _queue_action(
+                executor,
+                "send_image_url",
+                {
+                    "url": item["url"],
+                    "text": _compact_text(text, limit=40) if index == 1 else "",
+                    "summary": title,
+                    "source": item.get("source", ""),
+                    "page_url": item.get("page_url", ""),
+                    "history_text": f"[联网图片:{title}]" if title else "[联网图片]",
+                },
+            ):
+                queued += 1
+        if queued <= 0:
+            return _send_image_action_result(ok=False, reason="当前发送上下文不可用", query=raw_query)
+        return _send_image_action_result(
+            ok=True,
+            queued=True,
+            query=raw_query,
+            queued_count=queued,
+            candidates_found=len(candidates),
+            images=[
+                {
+                    "title": item.get("title", ""),
+                    "source": item.get("source", ""),
+                    "page_url": item.get("page_url", ""),
+                }
+                for item in picked
+            ],
+        )
+
+    return [
+        AgentTool(
+            name="search_and_send_images",
+            description=(
+                "联网搜索已有图片、壁纸、插画、参考图并把最合适的图片直接发送到当前聊天。"
+                "当用户明确让你搜图、找图、发壁纸、来几张参考图或找某个角色/作品图片时调用；"
+                "这不是生成图片，不要把它和 generate_image 混用。调用成功后不要再用文字解释已发送。"
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "要搜索的图片主题、角色、作品、风格或关键词"},
+                    "count": {"type": "integer", "description": "发送数量，1 到 3，默认 1", "default": 1},
+                    "images": {"type": "array", "items": {"type": "string"}, "description": "可选图片引用；用于先提取视觉线索再搜图"},
+                    "image_urls": {"type": "array", "items": {"type": "string"}, "description": "可选图片 URL；等同 images"},
+                    "text": {"type": "string", "description": "可选，和第一张图同条发送的极短文字；通常留空"},
+                },
+                "required": ["query"],
+            },
+            handler=_search_and_send_images,
+            metadata={
+                "intent_tags": ["lookup", "image_generation"],
+                "evidence_kind": "action",
+                "requires_network": True,
+                "latency_class": "normal",
+                "risk_level": "low",
+            },
+        )
     ]
 
 

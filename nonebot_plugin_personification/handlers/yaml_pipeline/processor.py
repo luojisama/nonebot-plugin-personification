@@ -7,13 +7,11 @@ from typing import Any, Awaitable, Callable, Dict, List
 
 from ...agent.inner_state import DEFAULT_STATE as DEFAULT_INNER_STATE, get_personification_data_dir, load_inner_state
 from ...agent.runtime.planner import (
-    plan_turn_with_llm,
     turn_plan_from_semantic_frame,
     turn_plan_to_semantic_frame,
 )
 from ...agent.runtime.tool_catalog import registry_planner_metadata
 from ...core.chat_intent import (
-    infer_turn_semantic_frame_with_llm,
     looks_like_explanatory_output,
 )
 from ...core.emotion_state import (
@@ -23,7 +21,11 @@ from ...core.emotion_state import (
     render_inner_state_hint,
     update_emotion_state_after_turn,
 )
-from ...core.group_context import build_group_conversation_context, render_group_conversation_context
+from ...core.group_context import (
+    build_group_conversation_context,
+    render_group_conversation_context,
+    render_topic_state_trace_detail,
+)
 from ...core.metrics import record_counter, record_timing
 from ...core.message_relations import extract_event_message_id, extract_reply_message_id, extract_send_message_id
 from ...core.image_input import (
@@ -49,6 +51,7 @@ from ...core.repeat_follow import maybe_follow_repeat_cluster
 from ...core.reply_style_policy import (
     build_direct_visual_identity_guard,
     build_reply_style_policy_prompt,
+    build_speech_act_policy_prompt,
 )
 from ...core.response_review import (
     ReplyArbitrationIntent,
@@ -59,8 +62,18 @@ from ...core.response_review import (
     rewrite_agent_reply_ooc,
     review_response_text,
 )
+from ...core.target_inference import normalize_message_target_for_plan, normalize_message_target_for_review
 from ...core.reply_text_policy import normalize_visible_reply_text
 from ...core.prompt_loader import pick_ack_phrase
+from ...core.qq_expression_library import (
+    build_qq_expression_prompt,
+    contains_qq_expression_marker,
+    history_text_for_qq_expression,
+    maybe_choose_auto_qq_expression_marker,
+    qq_expression_enabled,
+    render_qq_expression_message,
+)
+from ...core.qq_expression_tools import qq_action_history_text, register_send_qq_expression_tools
 from ...core.sticker_feedback import (
     build_sticker_feedback_scene_key,
     load_sticker_feedback,
@@ -70,16 +83,23 @@ from ...core.sticker_feedback import (
 from ...core.target_inference import TARGET_OTHERS
 from ...core.tts_service import extract_persona_tts_config
 from ...core.visual_capabilities import VISUAL_ROUTE_AGENT, VISUAL_ROUTE_REPLY_YAML
+from ...skill_runtime.runtime_api import SkillRuntime
 
 from ...agent.action_executor import ActionExecutor
 from ...agent.loop import run_agent
 from ...agent.query_rewriter import QueryRewriteContext
 from ..reply_pipeline.pipeline_emotion import (
+    attach_turn_plan_to_semantic_frame,
     compose_reply_emotion_block,
+    infer_turn_semantic_frame_with_timeout,
+    plan_turn_with_timeout,
     schedule_inner_state_update_after_reply,
+    semantic_frame_timeout_hint,
 )
+from ..reply_pipeline import humanize as _humanize
 from ..reply_pipeline.pipeline_context import (
     batch_has_newer_messages as _shared_batch_has_newer_messages,
+    clone_tool_registry as _clone_tool_registry,
     compute_agent_time_budget as _compute_agent_time_budget,
     primary_route_supports_vision as _runtime_primary_route_supports_vision,
     should_use_agent_for_reply as _should_use_agent_for_reply,
@@ -87,10 +107,12 @@ from ..reply_pipeline.pipeline_context import (
 )
 from ..reply_pipeline.pipeline_sticker import build_image_summary_suffix as _shared_build_image_summary_suffix
 from ...skills.skillpacks.sticker_tool.scripts.impl import (
+    build_send_sticker_tool,
     choose_sticker_for_context,
     reset_current_image_context,
     set_current_image_context,
 )
+from ...skills.skillpacks.resource_collector.scripts.main import build_send_image_tools
 from ...utils import build_group_context_window, get_group_topic_summary, get_recent_group_msgs
 
 
@@ -298,6 +320,16 @@ def _strip_control_markers(text: str) -> str:
     return cleaned.strip()
 
 
+def _consume_pending_action_history_text(event: Any) -> str:
+    text = str(getattr(event, "_personification_pending_action_history_text", "") or "").strip()
+    if text:
+        try:
+            setattr(event, "_personification_pending_action_history_text", "")
+        except Exception:
+            pass
+    return re.sub(r"\s+", " ", text).strip()
+
+
 def _normalize_parsed_message_texts(parsed: Dict[str, Any]) -> Dict[str, Any]:
     copied = dict(parsed or {})
     messages: list[dict[str, Any]] = []
@@ -442,6 +474,7 @@ async def process_yaml_response_logic(
     memory_curator: Any = None,
     knowledge_store: Any = None,
     inner_state_updater: Any = None,
+    favorability_service: Any = None,
     disable_network_hooks: bool = False,
     batched_events: List[Dict[str, Any]] | None = None,
     repeat_clusters: List[Dict[str, Any]] | None = None,
@@ -464,6 +497,8 @@ async def process_yaml_response_logic(
     lite_tool_caller = lite_tool_caller or agent_tool_caller
     lite_call_ai_api = lite_call_ai_api or call_ai_api
     review_call_ai_api = review_call_ai_api or lite_call_ai_api or call_ai_api
+    planner_message_target = normalize_message_target_for_plan(message_target)
+    review_message_target = normalize_message_target_for_review(message_target)
 
     def _has_newer_batch_now() -> bool:
         return bool(has_newer_batch or _batch_ref_has_newer_messages(batch_runtime_ref))
@@ -513,6 +548,13 @@ async def process_yaml_response_logic(
             detail={"reason": reason},
         )
 
+    _trace_stage(
+        key="incoming_message",
+        label="收到消息",
+        status="info",
+        detail=str(raw_message_text or "")[:500],
+    )
+
     now = get_current_time()
     week_days = ["星期一", "星期二", "星期三", "星期四", "星期五", "星期六", "星期日"]
     weekday_str = week_days[now.weekday()]
@@ -535,6 +577,46 @@ async def process_yaml_response_logic(
         detail=f"scene={'private' if is_private_session else 'group'} user={user_id} group={group_id or '-'}",
     )
     is_direct_mention = _event_mentions_bot(event, bot)
+
+    def _record_pending_action_history_if_any() -> bool:
+        action_history_text = _consume_pending_action_history_text(event)
+        if not action_history_text:
+            return False
+        assistant_history = sanitize_history_text(action_history_text)
+        if not assistant_history:
+            return False
+        session_id = build_private_session_id(user_id) if is_private_session else build_group_session_id(group_id)
+        legacy_session_id = None if is_private_session else group_id
+        bot_self_id = str(getattr(bot, "self_id", "") or "")
+        append_session_message(
+            session_id,
+            "assistant",
+            assistant_history,
+            legacy_session_id=legacy_session_id,
+            scene="reply",
+            sticker_sent=None,
+            speaker=bot_self_id or "bot",
+            user_id=bot_self_id or None,
+            source_kind="bot_reply",
+            group_id=None if is_private_session else group_id,
+            message_id=None,
+            reply_to_msg_id=str(getattr(event, "message_id", "") or "") or None,
+            reply_to_user_id=None if is_private_session else user_id,
+            mentioned_ids=[],
+            is_at_bot=False,
+        )
+        if not is_private_session and record_group_msg is not None:
+            record_group_msg(
+                group_id,
+                bot_self_id or "bot",
+                assistant_history,
+                is_bot=True,
+                user_id=bot_self_id,
+                reply_to_msg_id=str(getattr(event, "message_id", "") or "") or None,
+                reply_to_user_id=user_id,
+                source_kind="bot_reply",
+            )
+        return True
 
     forward_content = ""
     if extract_forward_content is not None:
@@ -612,6 +694,15 @@ async def process_yaml_response_logic(
         )
         recent_context_hint = render_group_conversation_context(conversation_context)
         relationship_hint = relationship_hint or conversation_context.relationship_hint
+        topic_detail = render_topic_state_trace_detail(conversation_context.topic_state)
+        if topic_detail:
+            _trace_stage(
+                key="yaml_topic_state",
+                label="YAML 短期话题状态",
+                status="info",
+                detail=topic_detail,
+                hint="结构化线索用于判断当前消息接谁的话，不替代 LLM 语义判断",
+            )
     else:
         recent_window = []
     recent_bot_replies = extract_recent_bot_reply_texts(
@@ -645,21 +736,24 @@ async def process_yaml_response_logic(
                 planner_available_tools = []
         plan_source_text = raw_message_text or history_last_text or trigger_reason
         if planner_enabled:
-            started_at = time.monotonic()
-            turn_plan = await plan_turn_with_llm(
+            turn_plan, plan_elapsed_ms, plan_fallback_reason, plan_timeout_s, plan_source = await plan_turn_with_timeout(
                 plan_source_text,
+                plugin_config=plugin_config,
                 is_group=not is_private_session,
                 is_random_chat=is_random_chat,
                 is_direct_mention=is_direct_mention,
                 has_images=bool(last_images),
-                message_target=str(message_target or ""),
+                message_target=planner_message_target,
                 tool_caller=lite_tool_caller,
+                fallback_tool_caller=agent_tool_caller,
                 recent_context=recent_context_hint,
                 relationship_hint=relationship_hint,
                 repeat_clusters=repeat_clusters,
                 current_inner_state=render_inner_state_hint(inner_state),
                 current_emotion_state=emotion_memory_hint,
                 available_tools=planner_available_tools,
+                logger=logger,
+                metric_mode="yaml_enabled",
             )
             record_counter(
                 "turn_planner.plan_total",
@@ -667,59 +761,121 @@ async def process_yaml_response_logic(
                 action=turn_plan.reply_action,
                 output_mode=turn_plan.output_mode,
             )
-            record_timing("turn_planner.plan_ms", (time.monotonic() - started_at) * 1000.0, mode="yaml_enabled")
+            record_timing("turn_planner.plan_ms", plan_elapsed_ms, mode="yaml_enabled")
             semantic_frame = turn_plan_to_semantic_frame(turn_plan)
+            if plan_fallback_reason:
+                is_timeout = plan_fallback_reason.endswith("_timeout")
+                _trace_stage(
+                    key="yaml_turn_plan_timeout" if is_timeout else "yaml_turn_plan_fallback",
+                    label="YAML 回合规划超时" if is_timeout else "YAML 回合规划降级",
+                    status="warn",
+                    detail=(
+                        f"timeout_s={plan_timeout_s:g} "
+                        f"elapsed_ms={int(plan_elapsed_ms)} "
+                        f"reason={plan_fallback_reason} "
+                        f"fallback=metadata "
+                        f"source={plan_source} "
+                        f"action={getattr(turn_plan, 'reply_action', '')} "
+                        f"speech_act={getattr(turn_plan, 'speech_act', '')} "
+                        f"output={getattr(turn_plan, 'output_mode', '')}"
+                    ),
+                    hint=semantic_frame_timeout_hint(plan_timeout_s),
+                )
         else:
-            semantic_frame = await infer_turn_semantic_frame_with_llm(
-                plan_source_text,
-                is_group=not is_private_session,
-                is_random_chat=is_random_chat,
-                tool_caller=lite_tool_caller,
-                recent_context=recent_context_hint,
-                relationship_hint=relationship_hint,
-                repeat_clusters=repeat_clusters,
-                current_inner_state=render_inner_state_hint(inner_state),
-                current_emotion_state=emotion_memory_hint,
+            semantic_frame, semantic_elapsed_ms, semantic_fallback_reason, semantic_timeout_s, semantic_source = (
+                await infer_turn_semantic_frame_with_timeout(
+                    plan_source_text,
+                    plugin_config=plugin_config,
+                    is_group=not is_private_session,
+                    is_random_chat=is_random_chat,
+                    tool_caller=lite_tool_caller,
+                    fallback_tool_caller=agent_tool_caller,
+                    recent_context=recent_context_hint,
+                    relationship_hint=relationship_hint,
+                    repeat_clusters=repeat_clusters,
+                    current_inner_state=render_inner_state_hint(inner_state),
+                    current_emotion_state=emotion_memory_hint,
+                    logger=logger,
+                    metric_scene="yaml_private" if is_private_session else "yaml_group",
+                )
+            )
+            record_timing(
+                "reply.semantic_frame_ms",
+                semantic_elapsed_ms,
+                scene="yaml_private" if is_private_session else "yaml_group",
             )
             turn_plan = turn_plan_from_semantic_frame(
                 semantic_frame,
                 has_images=bool(last_images),
-                message_target=str(message_target or ""),
+                message_target=planner_message_target,
             )
-            try:
-                semantic_frame.turn_plan = turn_plan
-                semantic_frame.output_mode = turn_plan.output_mode
-                semantic_frame.session_goal = turn_plan.session_goal
-            except Exception:
-                pass
+            attach_turn_plan_to_semantic_frame(semantic_frame, turn_plan)
+            if semantic_fallback_reason:
+                is_timeout = semantic_fallback_reason.endswith("_timeout")
+                _trace_stage(
+                    key="yaml_semantic_frame_timeout" if is_timeout else "yaml_semantic_frame_fallback",
+                    label="YAML 语义帧超时" if is_timeout else "YAML 语义帧降级",
+                    status="warn",
+                    detail=(
+                        f"timeout_s={semantic_timeout_s:g} "
+                        f"elapsed_ms={int(semantic_elapsed_ms)} "
+                        f"reason={semantic_fallback_reason} "
+                        f"fallback=metadata "
+                        f"source={semantic_source} "
+                        f"intent={getattr(semantic_frame, 'chat_intent', '')} "
+                        f"speech_act={getattr(turn_plan, 'speech_act', '')} "
+                        f"ambiguity={getattr(semantic_frame, 'ambiguity_level', '')}"
+                    ),
+                    hint=semantic_frame_timeout_hint(semantic_timeout_s),
+                )
             if planner_shadow_enabled:
-                started_at = time.monotonic()
-                shadow_plan = await plan_turn_with_llm(
+                shadow_plan, shadow_elapsed_ms, shadow_fallback_reason, shadow_timeout_s, shadow_source = await plan_turn_with_timeout(
                     plan_source_text,
+                    plugin_config=plugin_config,
                     is_group=not is_private_session,
                     is_random_chat=is_random_chat,
                     is_direct_mention=is_direct_mention,
                     has_images=bool(last_images),
-                    message_target=str(message_target or ""),
+                    message_target=planner_message_target,
                     tool_caller=lite_tool_caller,
+                    fallback_tool_caller=agent_tool_caller,
                     recent_context=recent_context_hint,
                     relationship_hint=relationship_hint,
                     repeat_clusters=repeat_clusters,
                     current_inner_state=render_inner_state_hint(inner_state),
                     current_emotion_state=emotion_memory_hint,
                     available_tools=planner_available_tools,
+                    logger=logger,
+                    metric_mode="yaml_shadow",
                 )
-                record_counter(
-                    "turn_planner.plan_total",
-                    mode="yaml_shadow",
-                    action=shadow_plan.reply_action,
-                    output_mode=shadow_plan.output_mode,
-                )
-                if shadow_plan.reply_action != turn_plan.reply_action:
-                    record_counter("turn_planner.diff_total", field="yaml_reply_action")
-                if shadow_plan.output_mode != turn_plan.output_mode:
-                    record_counter("turn_planner.diff_total", field="yaml_output_mode")
-                record_timing("turn_planner.plan_ms", (time.monotonic() - started_at) * 1000.0, mode="yaml_shadow")
+                record_timing("turn_planner.plan_ms", shadow_elapsed_ms, mode="yaml_shadow")
+                if shadow_fallback_reason:
+                    is_timeout = shadow_fallback_reason.endswith("_timeout")
+                    _trace_stage(
+                        key="yaml_turn_plan_shadow_timeout" if is_timeout else "yaml_turn_plan_shadow_fallback",
+                        label="YAML TurnPlan 影子超时" if is_timeout else "YAML TurnPlan 影子降级",
+                        status="warn",
+                        detail=(
+                            f"timeout_s={shadow_timeout_s:g} "
+                            f"elapsed_ms={int(shadow_elapsed_ms)} "
+                            f"reason={shadow_fallback_reason} "
+                            f"fallback=metadata source={shadow_source}"
+                        ),
+                        hint=semantic_frame_timeout_hint(shadow_timeout_s),
+                    )
+                else:
+                    record_counter(
+                        "turn_planner.plan_total",
+                        mode="yaml_shadow",
+                        action=shadow_plan.reply_action,
+                        output_mode=shadow_plan.output_mode,
+                    )
+                    if shadow_plan.reply_action != turn_plan.reply_action:
+                        record_counter("turn_planner.diff_total", field="yaml_reply_action")
+                    if getattr(shadow_plan, "speech_act", "") != getattr(turn_plan, "speech_act", ""):
+                        record_counter("turn_planner.diff_total", field="yaml_speech_act")
+                    if shadow_plan.output_mode != turn_plan.output_mode:
+                        record_counter("turn_planner.diff_total", field="yaml_output_mode")
     intent_decision = semantic_frame.to_intent_decision()
     if not message_intent:
         message_intent = intent_decision.chat_intent
@@ -733,6 +889,7 @@ async def process_yaml_response_logic(
         status="info",
         detail=(
             f"intent={message_intent or '-'} "
+            f"speech_act={getattr(turn_plan, 'speech_act', getattr(semantic_frame, 'speech_act', '-')) or '-'} "
             f"ambiguity={intent_ambiguity_level or '-'} "
             f"recommend_silence={bool(intent_recommend_silence)}"
         ),
@@ -746,7 +903,7 @@ async def process_yaml_response_logic(
         is_private=is_private_session,
         is_direct_mention=is_direct_mention,
         is_random_chat=is_random_chat,
-        message_target=str(message_target or ""),
+        message_target=review_message_target,
         solo_speaker_follow=solo_speaker_follow,
     )
     if arbitration == "no_reply":
@@ -793,17 +950,27 @@ async def process_yaml_response_logic(
                 "如果上下文和现有证据不足，请优先承认不确定；群聊里若没人明确在 cue 你，且这轮明显会打断别人时，也可以保持沉默。"
             )
         if arbitration == "clarify":
-            system_prompt += "\n- 这轮高歧义但对方像是在直接问你，优先用一句短澄清问句确认对象。"
+            system_prompt += "\n- 这轮高歧义但对方像是在直接问你；群聊里不要用澄清问句追问，能判断就给保守短反应，不能判断就保持沉默。"
     system_prompt += (
         "\n\n## 基础输出规则\n"
         "- 输出纯文本，禁止使用 markdown 格式（不要用 **加粗**、*斜体*、# 标题、- 列表符号、`代码块`等）。\n"
-        "- 收到贴图/表情包时绝对不要对图片内容发表任何评论（包括“这图也太X了”“哈哈这个”等），当作没看见，按对话语境继续；收到真实照片时可以像群友看朋友圈一样自然回应。\n"
-        "- 表情包/梗图/截图可以当作语气线索理解，但没人问图里是什么时，不要主动做图片讲解。\n"
+        "- 收到贴图、表情包、GIF、截图或真实照片时，先把视觉信息当作内部语境理解；没人明确要求识别、翻译或说明时，不要主动评论、讲解、复述或总结图片/动图内容。\n"
+        "- 表情包/梗图/GIF 只当作语气线索；真实照片也只用于判断情绪、关系和意图，最终回复接人和话题，不写成图片说明。如果只看到图片占位或没有视觉摘要，不要假装看懂，也不要泛泛问对方看到什么。\n"
         "- 有人让你“写一段/来一段/AI 一段/帮我写”对白、剧本、小作文、段子、歌词或角色扮演内容时，不要切换成写作工具去交付任务：不写前言铺垫、不写“角色：台词”式多角色剧本、不写结尾点评总结、不堆营业腔和网络黑话。可以用人设口吻即兴接两三句、玩梗式带过，但绝不展开成长篇命题作文，也不要为此出戏或扮演成别的角色。"
     )
+    if qq_expression_enabled(plugin_config):
+        system_prompt += "\n\n" + build_qq_expression_prompt()
     system_prompt += "\n\n" + build_reply_style_policy_prompt(
         has_visual_context=bool(last_images),
         photo_like=photo_like,
+        is_group=not is_private_session,
+    )
+    turn_plan_for_prompt = getattr(semantic_frame, "turn_plan", turn_plan)
+    system_prompt += "\n\n" + build_speech_act_policy_prompt(
+        speech_act=str(getattr(turn_plan_for_prompt, "speech_act", getattr(semantic_frame, "speech_act", "")) or ""),
+        output_mode=str(getattr(turn_plan_for_prompt, "output_mode", getattr(semantic_frame, "output_mode", "")) or ""),
+        session_goal=str(getattr(turn_plan_for_prompt, "session_goal", getattr(semantic_frame, "session_goal", "")) or ""),
+        is_group=not is_private_session,
     )
     primary_api_type, primary_model = primary_route_signature(
         plugin_config,
@@ -846,8 +1013,12 @@ async def process_yaml_response_logic(
     system_schedule_instruction = ""
 
     if schedule_active:
-        system_schedule_instruction = get_schedule_prompt_injection()
-        schedule_instruction = "2. **时间锚定**：参考【当前时间】判断作息状态。**作息状态仅作为回复的背景设定（占比约20%），主要精力应放在回应对方的内容上。**如果当前是上课或深夜（非休息时间），你回复了消息说明你正在“偷偷玩手机”或“熬夜”，请表现出这种紧张感或困意。"
+        schedule_prompt_text = str(group_config.get("schedule_prompt", "") or "").strip()
+        system_schedule_instruction = get_schedule_prompt_injection(schedule_prompt_text)
+        if schedule_prompt_text:
+            schedule_instruction = "2. **时间锚定**：参考【当前时间】和本群自定义作息表判断轻量状态。作息只占背景，不要压过正在聊的内容。"
+        else:
+            schedule_instruction = "2. **时间锚定**：参考【当前时间】保持时间语义正确；当前未配置具体作息表，不要自动推断上课/上班/睡觉等状态。"
     else:
         system_prompt = f"{schedule_disabled_override_prompt()}\n\n{system_prompt}"
         system_schedule_instruction = (
@@ -955,6 +1126,10 @@ async def process_yaml_response_logic(
         "[图片·表情包]" in input_text
         or "[表情id:" in input_text
         or "[表情:" in input_text
+        or "[QQ表情" in input_text
+        or "[QQ超级表情" in input_text
+        or "[QQ收藏表情" in input_text
+        or "[QQ推荐表情" in input_text
         or "[表情包]" in input_text
         or "[多张表情]" in input_text
     )
@@ -1012,8 +1187,8 @@ async def process_yaml_response_logic(
             agent_input_text = f"{agent_input_text} {image_summary_suffix}".strip()
     if photo_like:
         system_prompt += (
-            "\n[系统提示] 当前消息包含真实照片，可以像群友看到朋友圈一样自然回应图片内容，"
-            "不需要等对方先提问。"
+            "\n[系统提示] 当前消息包含真实照片。照片只作为内部语境帮助你理解对方的情绪、关系和意图；"
+            "除非对方明确要求说明/识别/翻译图片，最终回复不要讲解、复述或总结画面细节。"
         )
 
     image_guard_prompt = build_direct_visual_identity_guard()
@@ -1096,6 +1271,37 @@ async def process_yaml_response_logic(
         has_image_input=bool(tool_image_urls),
     ):
         executor = ActionExecutor(bot, event, plugin_config, logger)
+        agent_tool_registry = _clone_tool_registry(tool_registry)
+        register_send_qq_expression_tools(
+            agent_tool_registry,
+            executor=executor,
+            bot=bot,
+            plugin_config=plugin_config,
+        )
+        try:
+            skill_runtime_for_images = SkillRuntime(
+                plugin_config=plugin_config,
+                logger=logger,
+                get_now=lambda: int(time.time()),
+                vision_caller=vision_caller,
+                tool_caller=agent_tool_caller,
+            )
+            for tool in build_send_image_tools(skill_runtime_for_images, executor):
+                agent_tool_registry.register(tool)
+        except Exception as exc:
+            logger.debug(f"拟人插件 (YAML)：注册联网搜图发送工具失败: {exc}")
+        try:
+            sticker_dir = resolve_sticker_dir(getattr(plugin_config, "personification_sticker_path", None))
+            if sticker_dir.exists() and sticker_dir.is_dir():
+                agent_tool_registry.register(
+                    build_send_sticker_tool(
+                        sticker_dir,
+                        plugin_config,
+                        executor,
+                    )
+                )
+        except Exception as exc:
+            logger.debug(f"拟人插件 (YAML)：注册本地表情包发送工具失败: {exc}")
         image_ctx_token = set_current_image_context(tool_image_urls, input_text)
         ack_phrase = ""
         if is_direct_mention:
@@ -1120,7 +1326,7 @@ async def process_yaml_response_logic(
             try:
                 agent_result = await run_agent(
                     messages=agent_messages,
-                    registry=tool_registry,
+                    registry=agent_tool_registry,
                     tool_caller=agent_tool_caller,
                     executor=executor,
                     plugin_config=plugin_config,
@@ -1187,8 +1393,14 @@ async def process_yaml_response_logic(
                 logger.info(f"拟人插件 (YAML)：会话 {group_id} 已出现更新批次，本轮旧回复丢弃。")
                 _trace_no_reply("stale_reply", diagnosis_code="stale_reply", detail="Agent 结果生成后出现更新批次")
                 return
+            action_history_parts: list[str] = []
             for action in agent_result.pending_actions:
                 await executor.execute(action["type"], action["params"])
+                history_text = qq_action_history_text(action)
+                if history_text:
+                    action_history_parts.append(history_text)
+            if action_history_parts:
+                setattr(event, "_personification_pending_action_history_text", " ".join(action_history_parts))
             if agent_result.direct_output:
                 raw_direct_output = str(reply_content or "").strip()
                 if _looks_like_translation_result(raw_direct_output):
@@ -1208,7 +1420,7 @@ async def process_yaml_response_logic(
                             return
                     except Exception as e:
                         logger.warning(f"拟人插件: 翻译结果转发发送失败，回退到普通消息: {e}")
-                raw_direct_output = normalize_visible_reply_text(raw_direct_output)
+                raw_direct_output = normalize_visible_reply_text(strip_response_control_markers(raw_direct_output))
                 direct_segments_sent = 0
                 for seg in re.split(r"(?:\r?\n){2,}", raw_direct_output):
                     text = seg.strip()
@@ -1289,7 +1501,9 @@ async def process_yaml_response_logic(
             asyncio.create_task(_notify_superusers())
         _trace_no_reply("block_marker", diagnosis_code="blocked", detail="模型返回 BLOCK 控制标记")
         return
-    if "[SILENCE]" in reply_content or "<SILENCE>" in reply_content:
+    if has_silence_control_marker(reply_content):
+        if _record_pending_action_history_if_any():
+            logger.info("拟人插件 (YAML)：Agent 静默动作已写入会话历史。")
         logger.info("AI (YAML) 决定保持沉默 (SILENCE)")
         _trace_no_reply("silence_marker", detail="模型返回 SILENCE 控制标记")
         return
@@ -1337,7 +1551,8 @@ async def process_yaml_response_logic(
     assistant_text = re.sub(r"^(如果你需要|如果需要的话)[，,:：\s]*", "", assistant_text).strip()
     assistant_text = re.sub(r"(?:如果你需要|需要的话).*?$", "", assistant_text).strip()
     if (
-        message_intent == "banter"
+        not used_agent
+        and message_intent == "banter"
         and looks_like_explanatory_output(assistant_text)
     ):
         try:
@@ -1364,7 +1579,7 @@ async def process_yaml_response_logic(
         except Exception as e:
             logger.debug(f"[yaml_response_handler] banter regenerate skipped: {e}")
 
-    if not is_private_session and message_intent == "banter":
+    if not used_agent and not is_private_session and message_intent == "banter":
         async def _rewrite_for_repeat(cluster_text: str, original_reply: str) -> str:
             return str(
                 await call_ai_api(
@@ -1457,17 +1672,41 @@ async def process_yaml_response_logic(
     elif cleaned_assistant_text != assistant_text:
         parsed = {"messages": [{"text": cleaned_assistant_text, "sticker": ""}], "think": "", "status": "", "action": ""}
     assistant_text = cleaned_assistant_text
+    qq_auto_marker = maybe_choose_auto_qq_expression_marker(
+        plugin_config=plugin_config,
+        semantic_frame=semantic_frame,
+        reply_text=assistant_text,
+        raw_message_text=raw_message_text or history_last_text or trigger_reason,
+        message_intent=message_intent,
+        group_id=group_id,
+        user_id=user_id,
+        is_private=is_private_session,
+        is_random_chat=is_random_chat,
+        has_rich_sticker=bool(stickers_sent),
+    )
+    if qq_auto_marker:
+        if message_intent == "expression" and not contains_qq_expression_marker(assistant_text):
+            assistant_text = qq_auto_marker
+            parsed = {"messages": [{"text": qq_auto_marker, "sticker": ""}], "think": "", "status": "", "action": ""}
+        elif parsed.get("messages"):
+            parsed["messages"][-1]["text"] = f"{str(parsed['messages'][-1].get('text', '') or '').strip()}{qq_auto_marker}"
+            assistant_text = f"{assistant_text}{qq_auto_marker}".strip()
+        else:
+            assistant_text = f"{assistant_text}{qq_auto_marker}".strip()
+            parsed = {"messages": [{"text": assistant_text, "sticker": ""}], "think": "", "status": "", "action": ""}
 
     assistant_text, history_image_payloads = _extract_image_b64_markers(assistant_text)
     has_generated_image = bool(history_image_payloads)
-    if history_image_payloads and not assistant_text:
-        assistant_text = "[发送了一张图片]"
+    assistant_history_text = history_text_for_qq_expression(assistant_text)
+    if history_image_payloads and not assistant_history_text:
+        assistant_history_text = "[发送了一张图片]"
 
     sticker_dir = resolve_sticker_dir(getattr(plugin_config, "personification_sticker_path", None))
     chosen_sticker_paths: list[Path | None] = []
     if (
         parsed["messages"]
         and bool(getattr(semantic_frame, "sticker_appropriate", True))
+        and not contains_qq_expression_marker(assistant_text)
         and group_config.get("sticker_enabled", True)
         and sticker_dir.exists()
         and sticker_dir.is_dir()
@@ -1506,10 +1745,34 @@ async def process_yaml_response_logic(
 
     sent_as_tts = False
     sent_message_id = ""
+    address_plan = _humanize.decide_addressing(
+        plugin_config=plugin_config,
+        state={"batched_events": list(batched_events or [])},
+        event=event,
+        group_id=group_id,
+        user_id=user_id,
+        is_private=is_private_session,
+        has_newer_batch=_has_newer_batch_now(),
+        address_mode=getattr(semantic_frame, "address_mode", "auto"),
+    )
+    quote_message_id = address_plan.get("quote_message_id")
+    at_target = address_plan.get("at_target")
+    _trace_stage(
+        key="addressing_plan",
+        label="发送指向",
+        status="info",
+        detail=(
+            f"address_mode={address_plan.get('mode') or 'none'} "
+            f"source={address_plan.get('source') or '-'} "
+            f"quote={bool(quote_message_id)} at={bool(at_target)} "
+            f"target={str(at_target or '-')}"
+        ),
+    )
     if (
         assistant_text
         and not has_generated_image
         and not stickers_sent
+        and not contains_qq_expression_marker(assistant_text)
         and tts_service is not None
     ):
         try:
@@ -1569,13 +1832,33 @@ async def process_yaml_response_logic(
                     if not merged_segments and text.strip():
                         merged_segments = [text]
 
-                    for seg in merged_segments:
+                    for seg_index, seg in enumerate(merged_segments):
                         if seg.strip():
                             if _has_newer_batch_now():
                                 logger.info(f"拟人插件 (YAML)：会话 {group_id} 已出现更新批次，本轮旧回复丢弃。")
                                 _trace_no_reply("stale_reply", diagnosis_code="stale_reply", detail="分段文本发送前出现更新批次")
                                 return
-                            send_result = await bot.send(event, seg)
+                            rendered_seg = await render_qq_expression_message(
+                                seg,
+                                message_segment_cls=message_segment_cls,
+                                bot=bot,
+                                plugin_config=plugin_config,
+                                logger=logger,
+                            )
+                            if not rendered_seg.message:
+                                continue
+                            outgoing = rendered_seg.message
+                            if not sent_message_id and seg_index == 0:
+                                try:
+                                    outgoing = _humanize.prepend_addressing_segments(
+                                        message_segment_cls=message_segment_cls,
+                                        outgoing=outgoing,
+                                        quote_message_id=quote_message_id,
+                                        at_target=at_target,
+                                    )
+                                except Exception:
+                                    outgoing = rendered_seg.message
+                            send_result = await bot.send(event, outgoing)
                             if not sent_message_id:
                                 sent_message_id = extract_send_message_id(send_result)
                             await asyncio.sleep(random.uniform(0.4, 1.0))
@@ -1623,8 +1906,28 @@ async def process_yaml_response_logic(
                     logger.info(f"拟人插件 (YAML)：会话 {group_id} 已出现更新批次，本轮旧回复丢弃。")
                     _trace_no_reply("stale_reply", diagnosis_code="stale_reply", detail="普通文本发送前出现更新批次")
                     return
-                send_result = await bot.send(event, clean_reply)
-                if not sent_message_id:
+                rendered_reply = await render_qq_expression_message(
+                    clean_reply,
+                    message_segment_cls=message_segment_cls,
+                    bot=bot,
+                    plugin_config=plugin_config,
+                    logger=logger,
+                )
+                if rendered_reply.message:
+                    outgoing = rendered_reply.message
+                    try:
+                        outgoing = _humanize.prepend_addressing_segments(
+                            message_segment_cls=message_segment_cls,
+                            outgoing=outgoing,
+                            quote_message_id=quote_message_id,
+                            at_target=at_target,
+                        )
+                    except Exception:
+                        outgoing = rendered_reply.message
+                    send_result = await bot.send(event, outgoing)
+                else:
+                    send_result = None
+                if send_result is not None and not sent_message_id:
                     sent_message_id = extract_send_message_id(send_result)
             for image_b64 in image_b64_payloads:
                 if _has_newer_batch_now():
@@ -1641,7 +1944,7 @@ async def process_yaml_response_logic(
     append_session_message(
         session_id,
         "assistant",
-        assistant_text,
+        assistant_history_text,
         legacy_session_id=legacy_session_id,
         scene="reply",
         sticker_sent=", ".join(stickers_sent) if stickers_sent else None,
@@ -1652,7 +1955,7 @@ async def process_yaml_response_logic(
         message_id=sent_message_id or None,
         reply_to_msg_id=str(getattr(event, "message_id", "") or "") or None,
         reply_to_user_id=None if is_private_session else user_id,
-        mentioned_ids=[],
+        mentioned_ids=[str(at_target)] if at_target else [],
         is_at_bot=False,
     )
     try:
@@ -1661,16 +1964,34 @@ async def process_yaml_response_logic(
             user_id=user_id,
             group_id="" if is_private_session else group_id,
             semantic_frame=semantic_frame,
-            assistant_text=assistant_text,
+            assistant_text=assistant_history_text,
             is_private=is_private_session,
         )
     except Exception as e:
         logger.debug(f"[emotion] YAML update after reply failed: {e}")
+    try:
+        if favorability_service is not None and hasattr(favorability_service, "apply_user_reply_interaction"):
+            result = favorability_service.apply_user_reply_interaction(
+                user_id,
+                now=get_current_time(),
+                group_id="" if is_private_session else group_id,
+                is_direct=bool(is_direct_mention or not is_random_chat),
+                is_random_chat=bool(is_random_chat),
+            )
+            delta = float(result.get("delta", 0.0) or 0.0)
+            if delta > 0:
+                logger.debug(
+                    f"拟人插件 (YAML)：记录与 {user_name}({user_id}) 的成功回复互动，好感度 +{delta:.2f} "
+                    f"(今日已加: {float(result.get('daily_used', 0.0) or 0.0):.2f}/"
+                    f"{float(result.get('daily_cap', 0.0) or 0.0):.2f})"
+                )
+    except Exception as exc:
+        logger.debug(f"拟人插件 (YAML)：记录成功回复互动好感事件失败: {exc}")
     schedule_inner_state_update_after_reply(
         inner_state_updater=inner_state_updater,
         logger=logger,
         user_text=raw_message_text or history_last_text or trigger_reason,
-        assistant_text=assistant_text,
+        assistant_text=assistant_history_text,
         user_id=user_id,
         group_id=group_id,
         is_private=is_private_session,
@@ -1681,7 +2002,7 @@ async def process_yaml_response_logic(
         if hasattr(memory_curator, "schedule_turn_capture"):
             memory_curator.schedule_turn_capture(
                 user_utterance=raw_message_text or history_last_text or trigger_reason,
-                bot_response=assistant_text,
+                bot_response=assistant_history_text,
                 user_id=user_id,
                 group_id=memory_group_id,
                 vision_summary=image_summary_suffix,
@@ -1690,7 +2011,7 @@ async def process_yaml_response_logic(
             )
         else:
             memory_curator.schedule_capture(
-                summary=assistant_text,
+                summary=assistant_history_text,
                 user_id=user_id,
                 group_id=memory_group_id,
                 topic_tags=[group_id] if not is_private_session else [],
@@ -1699,12 +2020,13 @@ async def process_yaml_response_logic(
         record_group_msg(
             group_id,
             str(getattr(bot, "self_id", "") or "bot"),
-            assistant_text,
+            assistant_history_text,
             is_bot=True,
             user_id=str(getattr(bot, "self_id", "") or ""),
             message_id=sent_message_id or None,
             reply_to_msg_id=str(getattr(event, "message_id", "") or "") or None,
             reply_to_user_id=user_id,
+            mentioned_ids=[str(at_target)] if at_target else [],
             source_kind="bot_reply",
         )
     record_counter(
@@ -1719,18 +2041,26 @@ async def process_yaml_response_logic(
         scene="private" if is_private_session else "group",
     )
     _trace_stage(
+        key="outgoing_message",
+        label="发送消息",
+        status="ok",
+        detail=str(assistant_history_text or "")[:500],
+    )
+    _trace_stage(
         key="yaml_reply_success",
         label="YAML 回复完成",
         status="ok",
-        detail=f"chars={len(assistant_text)} tts={bool(sent_as_tts)} sticker={bool(stickers_sent)}",
+        detail=f"chars={len(assistant_history_text)} tts={bool(sent_as_tts)} sticker={bool(stickers_sent)}",
     )
     _trace_finish(
         outcome="ok",
         diagnosis_code="ok",
         detail={
-            "reply_chars": len(assistant_text),
+            "reply_chars": len(assistant_history_text),
             "tts": bool(sent_as_tts),
             "sticker": bool(stickers_sent),
+            "incoming_text": str(raw_message_text or history_last_text or trigger_reason or "")[:500],
+            "outgoing_text": str(assistant_history_text or "")[:500],
         },
     )
 
@@ -1769,6 +2099,7 @@ def build_yaml_response_processor(
     memory_curator: Any = None,
     knowledge_store: Any = None,
     inner_state_updater: Any = None,
+    favorability_service: Any = None,
 ) -> Callable[..., Awaitable[None]]:
     async def _processor(
         bot: Any,
@@ -1839,6 +2170,7 @@ def build_yaml_response_processor(
             memory_curator=runtime_overrides.get("memory_curator", memory_curator),
             knowledge_store=runtime_overrides.get("knowledge_store", knowledge_store),
             inner_state_updater=runtime_overrides.get("inner_state_updater", inner_state_updater),
+            favorability_service=runtime_overrides.get("favorability_service", favorability_service),
             disable_network_hooks=bool(runtime_overrides.get("disable_network_hooks", False)),
             batched_events=list(runtime_overrides.get("batched_events") or []),
             repeat_clusters=list(runtime_overrides.get("repeat_clusters") or []),

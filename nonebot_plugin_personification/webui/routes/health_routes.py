@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import random
+import re
 import time
 from typing import Any
 
@@ -43,6 +44,65 @@ def _first_bot(runtime) -> Any | None:
     except Exception:
         return None
     return next(iter(bots.values()), None) if bots else None
+
+
+def _bundle_attr(runtime, name: str) -> Any:
+    bundle = getattr(runtime, "runtime_bundle", None)
+    return getattr(bundle, name, None) if bundle is not None else None
+
+
+def _extract_qzone_target_user_id(value: Any) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    at_match = re.search(r"\[CQ:at,qq=(\d{5,20})[^\]]*\]", text)
+    if at_match:
+        return at_match.group(1)
+    plain_match = re.search(r"\d{5,20}", text)
+    return plain_match.group(0) if plain_match else ""
+
+
+def _qzone_feed_summary(feed: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "feed_id": str(feed.get("feed_id", "") or ""),
+        "owner_uin": str(feed.get("owner_uin", "") or ""),
+        "nickname": str(feed.get("nickname", "") or feed.get("owner_nickname", "") or ""),
+        "content": str(feed.get("content", "") or "")[:500],
+        "created_at": feed.get("created_at", 0),
+        "images": list(feed.get("images", []) or [])[:6] if isinstance(feed.get("images"), list) else [],
+        "unikey": str(feed.get("unikey", "") or ""),
+        "curkey": str(feed.get("curkey", "") or ""),
+    }
+
+
+def _format_qzone_forward_health_record(feed: dict[str, Any], forward_text: str) -> str:
+    summary = _qzone_feed_summary(feed)
+    author = summary.get("nickname") or summary.get("owner_uin") or "未知用户"
+    content = str(summary.get("content") or "").strip() or "（无文字内容）"
+    suffix = f" | 附言：{str(forward_text or '').strip()}" if str(forward_text or "").strip() else ""
+    return f"转发 {author} 的空间：{content[:120]}{suffix}"
+
+
+def _record_qzone_forward_test_audit(
+    *,
+    admin: AdminIdentity,
+    target_user_id: str,
+    outcome: str,
+    detail: dict[str, Any] | None = None,
+) -> None:
+    try:
+        from ...core import webui_audit_log
+
+        webui_audit_log.record(
+            action="qzone_forward_test",
+            qq=admin.qq,
+            device_id=admin.device_id,
+            target=str(target_user_id or ""),
+            detail=detail or {},
+            outcome=outcome,
+        )
+    except Exception:
+        pass
 
 
 # 这些 OneBot 动作都是"对外发消息"，交互测试需要全部捕获，
@@ -833,5 +893,197 @@ def build_health_router(*, runtime) -> APIRouter:
             duration_ms=ms,
             target_detail=target_detail,
         )
+
+    @router.post("/qzone-forward-test")
+    async def qzone_forward_test(
+        body: dict = Body(default_factory=dict),
+        admin: AdminIdentity = Depends(require_admin),
+    ) -> dict:
+        """真实转发指定用户第一条 QZone 动态，用于功能体检。
+
+        这是管理员显式触发的外部写操作：会真的转发到 bot 的 QQ 空间，并消耗
+        ``qzone_post_state`` 的月度额度。
+        """
+        from ...core.data_store import get_data_store
+        from ...core.time_ctx import get_configured_now
+        from ...jobs.periodic_jobs import build_qzone_quota, record_qzone_post
+
+        cfg = getattr(runtime, "plugin_config", None)
+        logger = getattr(runtime, "logger", None)
+        target_user_id = _extract_qzone_target_user_id(
+            body.get("target_user_id") or body.get("target_uin") or body.get("target") or ""
+        )
+        forward_text = str(body.get("forward_text", "") or "").strip()[:120]
+        if not target_user_id:
+            _record_qzone_forward_test_audit(
+                admin=admin,
+                target_user_id="",
+                outcome="bad_request",
+                detail={"error": "missing_target_user_id"},
+            )
+            raise HTTPException(status_code=400, detail="请填写要转发的目标 QQ 号")
+
+        qzone_service = _bundle_attr(runtime, "qzone_social_service")
+        forward_method = getattr(qzone_service, "forward_feed", None)
+        fetch_method = getattr(qzone_service, "fetch_user_feeds", None)
+        if not callable(fetch_method) or not callable(forward_method):
+            _record_qzone_forward_test_audit(
+                admin=admin,
+                target_user_id=target_user_id,
+                outcome="unavailable",
+                detail={"error": "qzone_social_service_unavailable"},
+            )
+            raise HTTPException(status_code=503, detail="QZone 转发能力未就绪（运行时未初始化或 qzone 未启用）")
+
+        bot = _first_bot(runtime)
+        if bot is None:
+            _record_qzone_forward_test_audit(
+                admin=admin,
+                target_user_id=target_user_id,
+                outcome="unavailable",
+                detail={"error": "bot_not_connected"},
+            )
+            raise HTTPException(status_code=503, detail="Bot 未连接")
+
+        now = get_configured_now()
+        state = get_data_store().load_sync("qzone_post_state")
+        if not isinstance(state, dict):
+            state = {}
+        monthly_limit = int(getattr(cfg, "personification_qzone_monthly_limit", 30) or 30)
+        min_interval_hours = float(getattr(cfg, "personification_qzone_min_interval_hours", 12.0) or 0)
+        quota_before = build_qzone_quota(
+            state=state,
+            now=now,
+            monthly_limit=monthly_limit,
+            min_interval_hours=min_interval_hours,
+        )
+        if int(quota_before.get("limit", 0) or 0) > 0 and int(quota_before.get("remaining", 0) or 0) <= 0:
+            _record_qzone_forward_test_audit(
+                admin=admin,
+                target_user_id=target_user_id,
+                outcome="quota_blocked",
+                detail={"quota": quota_before},
+            )
+            raise HTTPException(status_code=409, detail="本月 QQ 空间额度已用完，不能继续转发测试")
+
+        update_cookie = _bundle_attr(runtime, "update_qzone_cookie")
+        cookie_result: dict[str, Any] = {"attempted": False}
+        if callable(update_cookie):
+            cookie_result["attempted"] = True
+            try:
+                cookie_ok, cookie_msg = await update_cookie(bot)
+            except Exception as exc:
+                cookie_ok, cookie_msg = False, str(exc)
+            cookie_result.update({"ok": bool(cookie_ok), "message": str(cookie_msg or "")[:300]})
+            if not cookie_ok and logger is not None:
+                logger.warning(f"[webui] QZone 转发体检刷新 Cookie 失败：{cookie_msg}")
+
+        bot_id = str(getattr(bot, "self_id", "") or "")
+        try:
+            fetch_ok, fetch_msg, feeds = await fetch_method(
+                target_uin=target_user_id,
+                bot_id=bot_id,
+                count=1,
+                include_comments=False,
+            )
+        except Exception as exc:
+            _record_qzone_forward_test_audit(
+                admin=admin,
+                target_user_id=target_user_id,
+                outcome="fetch_error",
+                detail={"error": str(exc)[:500], "cookie": cookie_result},
+            )
+            raise HTTPException(status_code=500, detail=f"读取目标空间失败：{exc}") from exc
+        if not fetch_ok:
+            _record_qzone_forward_test_audit(
+                admin=admin,
+                target_user_id=target_user_id,
+                outcome="fetch_failed",
+                detail={"message": str(fetch_msg or "")[:500], "cookie": cookie_result},
+            )
+            return {
+                "ok": False,
+                "stage": "fetch",
+                "target_user_id": target_user_id,
+                "error": str(fetch_msg or "读取目标空间失败"),
+                "cookie": cookie_result,
+                "quota": quota_before,
+            }
+        if not feeds:
+            _record_qzone_forward_test_audit(
+                admin=admin,
+                target_user_id=target_user_id,
+                outcome="no_feed",
+                detail={"cookie": cookie_result},
+            )
+            return {
+                "ok": False,
+                "stage": "fetch",
+                "target_user_id": target_user_id,
+                "error": "目标用户空间没有可转发的动态",
+                "cookie": cookie_result,
+                "quota": quota_before,
+            }
+
+        feed = feeds[0]
+        try:
+            forward_ok, forward_msg = await forward_method(
+                feed=feed,
+                bot_id=bot_id,
+                content=forward_text,
+            )
+        except Exception as exc:
+            _record_qzone_forward_test_audit(
+                admin=admin,
+                target_user_id=target_user_id,
+                outcome="forward_error",
+                detail={"error": str(exc)[:500], "feed": _qzone_feed_summary(feed), "cookie": cookie_result},
+            )
+            raise HTTPException(status_code=500, detail=f"转发失败：{exc}") from exc
+        if not forward_ok:
+            _record_qzone_forward_test_audit(
+                admin=admin,
+                target_user_id=target_user_id,
+                outcome="forward_failed",
+                detail={"message": str(forward_msg or "")[:500], "feed": _qzone_feed_summary(feed), "cookie": cookie_result},
+            )
+            return {
+                "ok": False,
+                "stage": "forward",
+                "target_user_id": target_user_id,
+                "error": str(forward_msg or "转发失败"),
+                "feed": _qzone_feed_summary(feed),
+                "cookie": cookie_result,
+                "quota": quota_before,
+            }
+
+        post_state = record_qzone_post(
+            _format_qzone_forward_health_record(feed, forward_text),
+            now=get_configured_now(),
+            kind="forward",
+        )
+        quota_after = build_qzone_quota(
+            state=post_state,
+            now=get_configured_now(),
+            monthly_limit=monthly_limit,
+            min_interval_hours=min_interval_hours,
+        )
+        if logger is not None:
+            logger.info(f"[webui] 管理员 {admin.qq} 转发体检：target={target_user_id}")
+        _record_qzone_forward_test_audit(
+            admin=admin,
+            target_user_id=target_user_id,
+            outcome="ok",
+            detail={"feed": _qzone_feed_summary(feed), "forward_text": forward_text, "quota": quota_after},
+        )
+        return {
+            "ok": True,
+            "target_user_id": target_user_id,
+            "forward_text": forward_text,
+            "message": str(forward_msg or "ok"),
+            "feed": _qzone_feed_summary(feed),
+            "cookie": cookie_result,
+            "quota": quota_after,
+        }
 
     return router

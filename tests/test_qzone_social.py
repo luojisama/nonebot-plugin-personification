@@ -213,6 +213,58 @@ def test_qzone_comment_feed_falls_back_to_top_level_rich_mention(monkeypatch) ->
     assert calls[1]["data"]["content"] == "@{uin:20001,nick:白咲零,who:1} 测试收到"
 
 
+def test_qzone_forward_feed_uses_forward_endpoint(monkeypatch) -> None:  # noqa: ANN001
+    calls: list[dict[str, object]] = []
+
+    class _Response:
+        status_code = 200
+        text = '{"code":0}'
+
+    class _Client:
+        def __init__(self, **_kwargs) -> None:  # noqa: ANN003
+            return None
+
+        async def __aenter__(self):  # noqa: ANN201
+            return self
+
+        async def __aexit__(self, *_args) -> None:  # noqa: ANN003
+            return None
+
+        async def post(self, url, *, params=None, data=None, headers=None):  # noqa: ANN001, ANN201
+            calls.append({"url": url, "params": params, "data": data, "headers": headers})
+            return _Response()
+
+    monkeypatch.setattr(qzone_service.httpx, "AsyncClient", _Client)
+    service = qzone_service.QzoneSocialService(
+        SimpleNamespace(
+            personification_qzone_enabled=True,
+            personification_qzone_cookie="uin=o99999; skey=sk; p_uin=o99999; p_skey=ps;",
+        ),
+        _Logger(),
+    )
+
+    ok, msg = asyncio.run(
+        service.forward_feed(
+            feed={
+                "feed_key": "20001:feed1",
+                "feed_id": "feed1",
+                "owner_uin": "20001",
+                "topic_id": "20001_feed1__1",
+                "appid": "311",
+                "unikey": "http://user.qzone.qq.com/20001/mood/feed1",
+            },
+            bot_id="99999",
+            content="这句有点东西",
+        )
+    )
+
+    assert ok is True and msg == "ok"
+    assert calls[0]["url"].endswith("emotion_cgi_forward_v6")
+    assert calls[0]["data"]["t1_tid"] == "feed1"
+    assert calls[0]["data"]["owneruin"] == "20001"
+    assert calls[0]["data"]["con"] == "这句有点东西"
+
+
 def test_proactive_candidates_require_profile_and_not_favorability_threshold() -> None:
     candidates = proactive_flow._build_candidates(
         all_user_data={
@@ -449,7 +501,7 @@ def test_qzone_profile_evidence_records_once_with_source_label() -> None:
     assert len(store.records) == 1
     assert store.records[0][0] == "20001"
     assert "[QQ空间动态]" in store.records[0][1]
-    assert "图片摘要：一张饮料和便当的照片" in store.records[0][1]
+    assert "图片内部摘要（仅供理解）：一张饮料和便当的照片" in store.records[0][1]
     assert result["profile_records"] == 1
 
 
@@ -746,6 +798,136 @@ def test_qzone_social_limits_use_zero_as_unlimited() -> None:
     assert qzone_flow._limit_reached(0, 9999) is False
     assert qzone_flow._limit_reached(2, 2) is True
     assert qzone_flow._limit_reached(2, 1) is False
+
+
+def test_qzone_feed_action_can_choose_forward() -> None:
+    captured: dict[str, str] = {}
+
+    async def _call_ai(messages):  # noqa: ANN001
+        captured["prompt"] = str(messages[-1]["content"])
+        return '{"action":"forward","comment":"","forward_text":"这句有点东西","reason":"文案有趣"}'
+
+    decision = asyncio.run(
+        qzone_flow._decide_feed_action(
+            feed={
+                "feed_key": "20001:feed1",
+                "owner_uin": "20001",
+                "nickname": "白咲零",
+                "content": "把烦恼切成薯条就好入口了",
+                "created_at": 1710000000,
+            },
+            candidate={"user_id": "20001", "nickname": "白咲零", "persona_snippet": "熟人", "last_interaction": 0},
+            system_prompt="你是绪山真寻。",
+            call_ai_api=_call_ai,
+            image_summary="",
+            inner_state={},
+            emotion_memory="",
+        )
+    )
+
+    assert decision["action"] == "forward"
+    assert decision["forward_text"] == "这句有点东西"
+    assert "禁止转发这些内容" in captured["prompt"]
+    assert "瓜条" in captured["prompt"] and "黄赌毒暴" in captured["prompt"]
+
+
+def test_qzone_forward_limits_can_block_monthly_quota() -> None:
+    decision = qzone_flow._apply_action_limits(
+        decision={"action": "forward", "forward_text": "转一下", "comment": ""},
+        state={"forward_count": 0},
+        friend_state={"action_count": 0},
+        like_limit=0,
+        comment_limit=0,
+        per_friend_limit=0,
+        forward_limit=0,
+        forward_block_reason="qzone_monthly_limit_reached",
+    )
+
+    assert decision["action"] == "ignore"
+    assert decision["reason"] == "qzone_monthly_limit_reached"
+
+
+def test_qzone_social_scan_forwards_and_consumes_monthly_quota(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    data_store_mod = load_personification_module("plugin.personification.core.data_store")
+    paths_mod = load_personification_module("plugin.personification.core.paths")
+    monkeypatch.setattr(paths_mod, "get_data_dir", lambda _cfg=None: tmp_path)
+    data_store_mod.init_data_store(SimpleNamespace(personification_data_dir=str(tmp_path)))
+    data_store_mod.get_data_store().save_sync(
+        "qzone_post_state",
+        {"period": "2026-06", "count": 0, "last_post_at": 0, "recent_contents": []},
+    )
+
+    class _FriendBot:
+        self_id = "99999"
+
+        async def get_friend_list(self):  # noqa: ANN201
+            return [{"user_id": "20001", "nickname": "白咲零"}]
+
+    class _ForwardService:
+        def __init__(self) -> None:
+            self.forwarded: list[str] = []
+
+        async def fetch_user_feeds(self, **_kwargs):  # noqa: ANN003
+            return True, "ok", [
+                {
+                    "feed_key": "20001:feed1",
+                    "feed_id": "feed1",
+                    "owner_uin": "20001",
+                    "nickname": "白咲零",
+                    "topic_id": "20001_feed1__1",
+                    "content": "把烦恼切成薯条就好入口了",
+                    "created_at": 1710000000,
+                    "raw": {},
+                }
+            ]
+
+        async def forward_feed(self, *, content: str, **_kwargs):  # noqa: ANN003
+            self.forwarded.append(str(content))
+            return True, "ok"
+
+        async def like_feed(self, **_kwargs):  # noqa: ANN003
+            raise AssertionError("forward action should not like")
+
+        async def comment_feed(self, **_kwargs):  # noqa: ANN003
+            raise AssertionError("forward action should not comment")
+
+    service = _ForwardService()
+
+    async def _call_ai(_messages):  # noqa: ANN001
+        return '{"action":"forward","forward_text":"这句有点东西","reason":"文案有趣"}'
+
+    result = asyncio.run(
+        qzone_flow.scan_qzone_social_feeds(
+            bot=_FriendBot(),
+            plugin_config=SimpleNamespace(
+                personification_qzone_social_max_feeds_per_scan=5,
+                personification_qzone_social_like_limit=0,
+                personification_qzone_social_comment_limit=0,
+                personification_qzone_social_per_friend_limit=0,
+                personification_qzone_forward_enabled=True,
+                personification_qzone_forward_limit=1,
+                personification_qzone_forward_max_per_scan=1,
+                personification_qzone_monthly_limit=30,
+                personification_qzone_min_interval_hours=0,
+                personification_persona_snippet_max_chars=80,
+                personification_qzone_third_party_chime_in_enabled=True,
+            ),
+            qzone_social_service=service,
+            load_prompt=lambda: "你是绪山真寻。",
+            call_ai_api=_call_ai,
+            load_proactive_state=lambda: {"20001": {"last_interaction": 1710000000}},
+            get_now=lambda: datetime(2026, 6, 18, 14, 0),
+            logger=_Logger(),
+            target_user_id="20001",
+        )
+    )
+
+    assert result["forwarded"] == 1
+    assert service.forwarded == ["这句有点东西"]
+    state = data_store_mod.get_data_store().load_sync("qzone_post_state")
+    assert state["count"] == 1
+    assert state["forward_count"] == 1
+    assert "转发QQ空间" in state["last_content"]
 
 
 def test_qzone_admin_target_accepts_at_and_plain_qq() -> None:

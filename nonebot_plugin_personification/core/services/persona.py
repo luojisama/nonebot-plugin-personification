@@ -4,7 +4,21 @@ from typing import Any, Callable
 def build_custom_title_getter(
     *,
     logger: Any = None,
+    get_user_data: Callable[[str], dict[str, Any]] | None = None,
 ) -> Callable[[str], str]:
+    if get_user_data is not None:
+        def _get_internal_custom_title(user_id: str) -> str:
+            try:
+                user_data = get_user_data(str(user_id))
+                custom_title = user_data.get("custom_title")
+                if custom_title:
+                    return str(custom_title)
+            except Exception:
+                pass
+            return ""
+
+        return _get_internal_custom_title
+
     try:
         try:
             from plugin.sign_in.utils import get_user_data  # type: ignore
