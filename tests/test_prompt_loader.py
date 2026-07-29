@@ -7,6 +7,7 @@ from types import SimpleNamespace
 from ._loader import load_personification_module
 
 prompt_loader = load_personification_module("plugin.personification.core.prompt_loader")
+context_policy = load_personification_module("plugin.personification.core.context_policy")
 
 
 class _FakeLogger:
@@ -63,7 +64,8 @@ def test_load_prompt_reuses_yaml_cache_and_pick_ack_phrase(monkeypatch) -> None:
 
     assert first == second
     assert isinstance(first, dict)
-    assert first["system"] == "你是群友"
+    assert first["system"].startswith("你是群友")
+    assert first["system"].count(context_policy.PROMPT_INJECTION_GUARD_MARKER) == 1
     assert ack_phrase == "查下~"
     assert len(logger.info_messages) == 1
     yaml_path.unlink(missing_ok=True)
@@ -105,6 +107,7 @@ def test_core_values_are_appended_to_yaml_system_without_duplicate() -> None:
     system_prompt = first["system"]
     assert system_prompt.count(prompt_loader.CORE_VALUES_MARKER) == 1
     assert system_prompt.count(prompt_loader.AGENT_GUIDANCE_MARKER) == 1
+    assert system_prompt.count(context_policy.PROMPT_INJECTION_GUARD_MARKER) == 1
     assert "你是群友" in system_prompt
     yaml_path.unlink(missing_ok=True)
 
@@ -115,4 +118,6 @@ def test_core_values_can_be_disabled() -> None:
 
     loaded = prompt_loader.load_prompt(plugin_config, lambda _gid: {}, logger)
 
-    assert loaded == "你是群友"
+    assert isinstance(loaded, str)
+    assert loaded.startswith("你是群友")
+    assert loaded.count(context_policy.PROMPT_INJECTION_GUARD_MARKER) == 1

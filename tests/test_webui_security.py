@@ -29,13 +29,13 @@ def _runtime(tmp_path: Path, monkeypatch):
     return SimpleNamespace(plugin_config=cfg, app_module=app_module)
 
 
-def _client(rt):
+def _client(rt, *, base_url: str = "http://testserver"):
     from fastapi import FastAPI
     from fastapi.testclient import TestClient
 
     app = FastAPI()
     app.include_router(rt.app_module.build_router())
-    return TestClient(app)
+    return TestClient(app, base_url=base_url)
 
 
 def _login(rt, client) -> str:
@@ -98,27 +98,13 @@ def test_get_does_not_require_csrf(_runtime) -> None:
 
 
 def test_verify_code_invalidated_after_5_bad_attempts(_runtime) -> None:
-    client = _client(_runtime)
-    sent: list = []
-
-    class _Bot:
-        async def call_api(self, _n: str, **kwargs):
-            sent.append(kwargs)
-            return {}
-
-    _runtime.app_module.get_runtime_context().get_bots = lambda: {"1": _Bot()}
-    client.post("/personification/api/auth/login", json={"qq": "10001"})
-    correct_code = re.search(r"\b(\d{6})\b", str(sent[-1]["message"])).group(1)
-
-    # 连错 5 次
+    auth_store = load_personification_module("plugin.personification.core.webui_auth_store")
+    challenge = "browser-challenge"
+    correct_code = auth_store.create_verify_code("10001", challenge)
     for _ in range(5):
-        r = client.post("/personification/api/auth/verify", json={"qq": "10001", "code": "000000", "device_label": ""})
-        # 5 次内仍返回 403（验证码错），但第 5 次后验证码就废了
-        assert r.status_code in (403, 429)
+        assert auth_store.consume_verify_code("10001", "000000", challenge) is False
 
-    # 第 6 次：即使是正确的 code，验证码也已被废弃
-    r = client.post("/personification/api/auth/verify", json={"qq": "10001", "code": correct_code, "device_label": ""})
-    assert r.status_code in (403, 429), f"正确验证码不应在 5 次失败后还能使用，得到 {r.status_code}"
+    assert auth_store.consume_verify_code("10001", correct_code, challenge) is False
 
 
 def test_verify_code_uses_constant_time_compare(_runtime, monkeypatch) -> None:
@@ -132,13 +118,24 @@ def test_verify_code_uses_constant_time_compare(_runtime, monkeypatch) -> None:
 
     monkeypatch.setattr(auth_store.secrets, "compare_digest", compare_spy)
 
-    code = auth_store.create_verify_code("10001")
-    assert auth_store.consume_verify_code("10001", code) is True
-    assert calls == [(code, code)]
+    challenge = "constant-time-challenge"
+    code = auth_store.create_verify_code("10001", challenge)
+    assert auth_store.consume_verify_code("10001", code, challenge) is True
+    assert calls[-1] == (code, code)
+
+
+def test_wrong_browser_challenge_does_not_consume_verify_attempts(_runtime) -> None:
+    auth_store = load_personification_module("plugin.personification.core.webui_auth_store")
+    code = auth_store.create_verify_code("10001", "right-browser")
+
+    for _ in range(8):
+        assert auth_store.consume_verify_code("10001", code, "wrong-browser") is False
+
+    assert auth_store.consume_verify_code("10001", code, "right-browser") is True
 
 
 def test_https_login_cookies_are_marked_secure(_runtime) -> None:
-    client = _client(_runtime)
+    client = _client(_runtime, base_url="https://testserver")
     sent: list = []
 
     class _Bot:
@@ -205,6 +202,7 @@ def test_prune_expired_devices_cleans_up(_runtime) -> None:
             "created_at": time.time(),
             "last_seen": time.time(),
             "expires_at": time.time() + 86400,
+            "status": "pending",
         },
     }
     data_store.get_data_store().save_sync("webui_devices", devices)
@@ -212,34 +210,135 @@ def test_prune_expired_devices_cleans_up(_runtime) -> None:
     assert pruned == 1
     remaining = data_store.get_data_store().load_sync("webui_devices")
     assert set(remaining.keys()) == {"fresh_hash"}
+    assert remaining["fresh_hash"]["status"] == "approved"
 
 
-# ---- eligible-admins 接口（不需要鉴权，但默认不暴露 QQ） ----
-
-
-def test_eligible_admins_hidden_by_default(_runtime) -> None:
+def test_repeated_code_send_is_throttled_without_replacing_code(_runtime) -> None:
     client = _client(_runtime)
-    res = client.get("/personification/api/auth/eligible-admins")
-    assert res.status_code == 200
-    body = res.json()
-    assert body["admins"] == []
-    assert body["manual_entry"] is True
-    assert body["source_hidden"] is True
+    sent: list[dict] = []
+
+    class _Bot:
+        async def call_api(self, _n: str, **kwargs):
+            sent.append(kwargs)
+            return {}
+
+    _runtime.app_module.get_runtime_context().get_bots = lambda: {"1": _Bot()}
+    first = client.post("/personification/api/auth/login", json={"qq": "10001"})
+    assert first.status_code == 200
+    original_code = re.search(r"\b(\d{6})\b", str(sent[-1]["message"])).group(1)
+
+    for _ in range(4):
+        second = client.post("/personification/api/auth/login", json={"qq": "10001"})
+        assert second.status_code == 429
+    assert len(sent) == 1
+
+    verified = client.post(
+        "/personification/api/auth/verify",
+        json={"qq": "10001", "code": original_code, "device_label": "throttled"},
+    )
+    assert verified.status_code == 200
 
 
-def test_eligible_admins_lists_superusers_when_explicitly_enabled(_runtime) -> None:
-    _runtime.plugin_config.personification_webui_expose_admin_list = True
+def test_parallel_browser_challenges_do_not_block_existing_verification(_runtime) -> None:
+    sent: list[dict] = []
+
+    class _Bot:
+        async def call_api(self, _n: str, **kwargs):
+            sent.append(kwargs)
+            return {}
+
+    _runtime.app_module.get_runtime_context().get_bots = lambda: {"1": _Bot()}
+    clients = []
+    for index in range(5):
+        client = _client(_runtime)
+        response = client.post(
+            "/personification/api/auth/login",
+            json={"qq": "10001"},
+            headers={"X-Forwarded-For": f"198.51.100.{index + 1}"},
+        )
+        assert response.status_code == 200
+        clients.append(client)
+
+    blocked = _client(_runtime).post(
+        "/personification/api/auth/login",
+        json={"qq": "10001"},
+        headers={"X-Forwarded-For": "203.0.113.8"},
+    )
+    assert blocked.status_code == 429
+
+    first_code = re.search(r"\b(\d{6})\b", str(sent[0]["message"])).group(1)
+    verified = clients[0].post(
+        "/personification/api/auth/verify",
+        json={"qq": "10001", "code": first_code, "device_label": "first"},
+    )
+    assert verified.status_code == 200
+
+
+def test_revoked_admin_session_is_invalidated(_runtime) -> None:
+    client = _client(_runtime)
+    _login(_runtime, client)
+    _runtime.app_module.get_runtime_context().superusers.clear()
+
+    res = client.get("/personification/api/auth/me")
+
+    assert res.status_code == 401
+    assert "管理员权限已撤销" in res.json()["detail"]
+    auth_store = load_personification_module("plugin.personification.core.webui_auth_store")
+    assert auth_store.list_devices("10001") == []
+
+
+def test_revoked_admin_cannot_finish_code_verification(_runtime) -> None:
+    client = _client(_runtime)
+    sent: list[dict] = []
+
+    class _Bot:
+        async def call_api(self, _n: str, **kwargs):
+            sent.append(kwargs)
+            return {}
+
+    _runtime.app_module.get_runtime_context().get_bots = lambda: {"1": _Bot()}
+    assert client.post("/personification/api/auth/login", json={"qq": "10001"}).status_code == 200
+    code = re.search(r"\b(\d{6})\b", str(sent[-1]["message"])).group(1)
+    _runtime.app_module.get_runtime_context().superusers.clear()
+
+    res = client.post(
+        "/personification/api/auth/verify",
+        json={"qq": "10001", "code": code, "device_label": "revoked"},
+    )
+
+    assert res.status_code == 403
+    assert not client.cookies.get("personification_webui_token")
+
+
+# ---- eligible-admins 接口（不需要鉴权，固定用于登录选择） ----
+
+
+def test_eligible_admins_lists_superusers_by_default(_runtime) -> None:
+    admin_acl = load_personification_module("plugin.personification.core.admin_acl")
+    admin_acl.add_plugin_admin("30003")
     client = _client(_runtime)
     res = client.get("/personification/api/auth/eligible-admins")
     assert res.status_code == 200
     body = res.json()
     assert body["manual_entry"] is False
+    assert body["source_hidden"] is False
     qqs = {item["qq"] for item in body["admins"]}
-    assert {"10001", "20002"} <= qqs
+    assert {"10001", "20002", "30003"} <= qqs
     # 来源标记
     for item in body["admins"]:
         if item["qq"] == "10001":
             assert "SUPERUSERS" in item["source"]
+        if item["qq"] == "30003":
+            assert item["source"] == "plugin_admins"
+
+
+def test_eligible_admins_never_falls_back_to_manual_entry(_runtime) -> None:
+    _runtime.app_module.get_runtime_context().superusers.clear()
+    client = _client(_runtime)
+
+    body = client.get("/personification/api/auth/eligible-admins").json()
+
+    assert body == {"admins": [], "manual_entry": False, "source_hidden": False}
 
 
 # ---- Audit log ----

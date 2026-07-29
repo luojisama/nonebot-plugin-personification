@@ -7,8 +7,9 @@ import re
 import httpx
 
 from plugin.personification.agent.tool_registry import AgentTool
+from plugin.personification.skills.skillpacks.vision_analyze.scripts import impl as vision_impl
+
 from . import impl
-from ...vision_analyze.scripts import impl as vision_impl
 
 
 def _resolve_github_token(runtime) -> str:

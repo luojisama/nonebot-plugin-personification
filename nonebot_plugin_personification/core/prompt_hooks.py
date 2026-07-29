@@ -50,6 +50,7 @@ class HookContext:
     batch_event_count: int = 1
     disable_network_hooks: bool = False
     semantic_frame: Any = None
+    user_profile_block: str = ""
 
 
 PromptHook = Callable[[HookContext], Awaitable[Optional[str]]]

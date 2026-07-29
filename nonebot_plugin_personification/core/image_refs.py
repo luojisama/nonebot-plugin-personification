@@ -1,20 +1,6 @@
 from __future__ import annotations
 
-import base64
-import mimetypes
-from pathlib import Path
 from typing import Iterable
-from urllib.parse import unquote, urlparse
-
-
-def _file_uri_to_path(value: str) -> str:
-    parsed = urlparse(value)
-    if parsed.scheme != "file":
-        return value
-    path = unquote(parsed.path or "")
-    if path.startswith("/") and len(path) >= 3 and path[2] == ":":
-        path = path[1:]
-    return path
 
 
 def is_supported_image_ref(value: str) -> bool:
@@ -30,19 +16,7 @@ def normalize_image_ref(value: str) -> tuple[str | None, str | None]:
         return raw, None
     if raw.startswith(("http://", "https://")):
         return raw, None
-    if raw.startswith("file://"):
-        raw = _file_uri_to_path(raw)
-
-    candidate = Path(raw)
-    if not candidate.is_absolute():
-        return None, "non_absolute_local_path"
-    try:
-        resolved = candidate.resolve(strict=True)
-    except Exception:
-        return None, "missing_local_file"
-    if not resolved.is_file():
-        return None, "not_a_file"
-    return _path_to_data_url(resolved), None
+    return None, "local_path_not_allowed"
 
 
 def normalize_image_refs(values: Iterable[str], *, limit: int = 3) -> tuple[list[str], list[str]]:
@@ -59,10 +33,3 @@ def normalize_image_refs(values: Iterable[str], *, limit: int = 3) -> tuple[list
         if problem:
             problems.append(problem)
     return normalized, problems
-
-
-def _path_to_data_url(path: Path) -> str:
-    mime_type, _ = mimetypes.guess_type(str(path))
-    resolved_mime = mime_type or "application/octet-stream"
-    payload = base64.b64encode(path.read_bytes()).decode("ascii")
-    return f"data:{resolved_mime};base64,{payload}"

@@ -1,10 +1,19 @@
 from __future__ import annotations
 
 import time
-from typing import Any
+import uuid
+from typing import Any, NoReturn
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 
+from ...core.operation_diagnostics import (
+    OperationDetail,
+    OperationStep,
+    detail as operation_detail,
+    diagnostic as operation_diagnostic,
+    exception_diagnostic,
+    step as operation_step,
+)
 from ..deps import AdminIdentity, require_admin
 
 
@@ -128,6 +137,94 @@ def _memory_store(runtime) -> Any | None:
     return getattr(bundle, "memory_store", None)
 
 
+def _operation_result(report: dict[str, Any], **fields: Any) -> dict[str, Any]:
+    result = dict(report)
+    result.update(fields)
+    result["diagnostic"] = dict(report)
+    return result
+
+
+def _raise_operation(status_code: int, report: dict[str, Any]) -> NoReturn:
+    raise HTTPException(status_code=status_code, detail=report)
+
+
+def _exception_report(
+    exc: BaseException,
+    *,
+    runtime: Any,
+    code: str,
+    phase: str,
+    title: str,
+    message: str,
+    suggestion: str,
+    operation_id: str = "",
+    details: tuple[OperationDetail, ...] = (),
+    steps: tuple[OperationStep, ...] = (),
+    retryable: bool | None = None,
+    partial: bool = False,
+    outcome_unknown: bool = False,
+) -> dict[str, Any]:
+    report = exception_diagnostic(
+        exc,
+        phase=phase,
+        title=title,
+        message=message,
+        suggestion=suggestion,
+        operation_id=operation_id,
+        retryable=retryable,
+    )
+    report["code"] = code
+    report["partial"] = bool(partial)
+    report["outcome_unknown"] = bool(outcome_unknown)
+    report["details"] = [item.to_dict() for item in details] + report.get("details", [])
+    report["steps"] = [item.to_dict() for item in steps]
+    logger = getattr(runtime, "logger", None)
+    if logger is not None:
+        logger.warning(
+            f"[webui] memory operation failed: code={code} "
+            f"exception={type(exc).__name__} trace={report.get('trace_id', '')}"
+        )
+    return report
+
+
+def _store_unavailable_report(*, operation_id: str = "", mutation: bool = False) -> dict[str, Any]:
+    return operation_diagnostic(
+        ok=False,
+        code="memory_store_unavailable",
+        phase="dependency",
+        title="MemoryStore 未就绪",
+        message="当前 runtime 没有可用的 MemoryStore。",
+        details=(operation_detail("MemoryStore", "unavailable", "error"),),
+        steps=(operation_step("store", "连接 MemoryStore", "error", "未取得记忆存储实例。"),),
+        suggestion=(
+            "确认 memory palace 已启用且 runtime 初始化完成；核对当前状态后再重试写操作。"
+            if mutation
+            else "确认 memory palace 已启用且 runtime 初始化完成后刷新页面。"
+        ),
+        retryable=True,
+        partial=False,
+        outcome_unknown=False,
+        operation_id=operation_id,
+    )
+
+
+def _private_api_unavailable_report(*, operation_id: str = "", purpose: str) -> dict[str, Any]:
+    return operation_diagnostic(
+        ok=False,
+        code="memory_private_store_api_unavailable",
+        phase="dependency",
+        title="MemoryStore 私有接口不可用",
+        message="当前版本无法安全访问该记忆存储能力。",
+        details=(operation_detail("用途", purpose, "error"),),
+        steps=(operation_step("private_api", "加载 MemoryStore 私有接口", "error", "依赖接口不可用。"),),
+        suggestion="确认插件文件版本一致并重启 runtime；不要绕过接口直接修改数据库。",
+        retryable=False,
+        partial=False,
+        outcome_unknown=False,
+        operation_id=operation_id,
+    )
+
+
 def _looks_like_bot_self_entry(item: dict[str, Any]) -> bool:
     source_kind = str(item.get("source_kind", "") or "").lower()
     memory_type = str(item.get("memory_type", "") or "").lower()
@@ -148,20 +245,72 @@ def build_memory_router(*, runtime) -> APIRouter:
         try:
             return {"available": True, **dict(store.get_vector_index_status())}
         except Exception as exc:
-            raise HTTPException(status_code=500, detail=str(exc))
+            report = _exception_report(
+                exc,
+                runtime=runtime,
+                code="memory_vector_status_failed",
+                phase="status_read",
+                title="无法读取记忆向量索引状态",
+                message="服务器读取索引统计时发生内部异常。",
+                suggestion="根据 Trace ID 检查脱敏日志；存储恢复后刷新页面。",
+                steps=(operation_step("status", "读取向量索引状态", "error", "未取得可靠统计。"),),
+            )
+            _raise_operation(500, report)
 
     @router.post("/vector-index/rebuild")
     async def rebuild_vector_index(
         limit: int = Query(default=0, ge=0, le=10000),
         _: AdminIdentity = Depends(require_admin),
     ) -> dict:
+        operation_id = uuid.uuid4().hex
         store = _memory_store(runtime)
         if store is None:
-            raise HTTPException(status_code=503, detail="memory_store 未就绪")
+            _raise_operation(503, _store_unavailable_report(operation_id=operation_id, mutation=True))
         try:
-            return dict(store.rebuild_vector_index(limit=int(limit or 0)))
+            result = dict(store.rebuild_vector_index(limit=int(limit or 0)))
+            verified_index = dict(store.get_vector_index_status())
         except Exception as exc:
-            raise HTTPException(status_code=500, detail=str(exc))
+            report = _exception_report(
+                exc,
+                runtime=runtime,
+                code="memory_vector_rebuild_unconfirmed",
+                phase="persistence_verification",
+                title="向量索引重建结果未确认",
+                message="索引重建或重建后的状态核验未明确完成。",
+                suggestion="刷新索引状态并核对待补建数量；确认状态后再决定是否重试。",
+                operation_id=operation_id,
+                details=(operation_detail("重建上限", int(limit or 0), "info"),),
+                steps=(
+                    operation_step("rebuild", "批量重建向量索引", "unknown", "批量写入可能已部分或全部提交。"),
+                    operation_step("verify", "读取索引状态核验", "unknown", "未取得可靠的持久化状态。"),
+                ),
+                retryable=False,
+                partial=True,
+                outcome_unknown=True,
+            )
+            _raise_operation(500, report)
+        result["index"] = verified_index
+        rebuilt = int(result.get("rebuilt", 0) or 0)
+        disabled = str(result.get("status", "") or "").lower() == "disabled"
+        report = operation_diagnostic(
+            ok=True,
+            code="memory_vector_rebuild_disabled" if disabled else "memory_vector_rebuilt",
+            phase="operation_complete",
+            title="向量索引未启用" if disabled else "向量索引已重建",
+            message="当前向量索引未启用，没有写入索引。" if disabled else f"已重建 {rebuilt} 条记忆索引并核验当前状态。",
+            details=(
+                operation_detail("重建条数", rebuilt, "info" if disabled else "ok"),
+                operation_detail("待补建", int(verified_index.get("stale_count", 0) or 0), "info"),
+            ),
+            steps=(
+                operation_step("rebuild", "批量重建向量索引", "skipped" if disabled else "ok", "索引未启用。" if disabled else "批量写入已完成。"),
+                operation_step("verify", "读取索引状态核验", "ok", "已取得持久化后的索引统计。"),
+            ),
+            warnings=("personification_memory_rag_enabled 或向量 backend 当前未启用。",) if disabled else (),
+            suggestion="启用 RAG 后再重建。" if disabled else "无需立即重复重建。",
+            operation_id=operation_id,
+        )
+        return _operation_result(report, **result)
 
     @router.get("/search-test")
     async def search_test(
@@ -174,7 +323,7 @@ def build_memory_router(*, runtime) -> APIRouter:
     ) -> dict:
         store = _memory_store(runtime)
         if store is None:
-            raise HTTPException(status_code=503, detail="memory_store 未就绪")
+            _raise_operation(503, _store_unavailable_report(mutation=True))
         try:
             items = list(
                 store.recall_memories(
@@ -186,7 +335,27 @@ def build_memory_router(*, runtime) -> APIRouter:
                 )
             )
         except Exception as exc:
-            raise HTTPException(status_code=500, detail=str(exc))
+            report = _exception_report(
+                exc,
+                runtime=runtime,
+                code="memory_recall_test_unconfirmed",
+                phase="recall_persistence",
+                title="记忆召回测试结果未确认",
+                message="召回过程可能已更新访问计数或搜索统计，但未返回完整结果。",
+                suggestion="不要立即重复测试；先根据 Trace ID 检查脱敏日志并刷新记忆详情。",
+                details=(
+                    operation_detail("group_id", str(group_id or "").strip() or "-", "info"),
+                    operation_detail("user_id", str(user_id or "").strip() or "-", "info"),
+                ),
+                steps=(
+                    operation_step("recall", "执行记忆召回", "unknown", "召回未完整返回。"),
+                    operation_step("stats", "更新访问与搜索统计", "unknown", "统计写入结果无法确认。"),
+                ),
+                retryable=False,
+                partial=True,
+                outcome_unknown=True,
+            )
+            _raise_operation(500, report)
         rendered = []
         for item in items:
             rendered.append(
@@ -205,7 +374,20 @@ def build_memory_router(*, runtime) -> APIRouter:
                     "user_id": str(item.get("user_id", "") or ""),
                 }
             )
-        return {"items": rendered, "query": query, "count": len(rendered)}
+        report = operation_diagnostic(
+            ok=True,
+            code="memory_recall_test_completed",
+            phase="operation_complete",
+            title="记忆召回测试已完成",
+            message=f"召回返回 {len(rendered)} 条结果，并完成本次访问/搜索统计。",
+            details=(operation_detail("结果数", len(rendered), "ok"),),
+            steps=(
+                operation_step("recall", "执行记忆召回", "ok", "召回结果已返回。"),
+                operation_step("stats", "更新访问与搜索统计", "ok", "MemoryStore 未报告统计写入异常。"),
+            ),
+            suggestion="可在下方结果中核对相关性和检索来源。",
+        )
+        return _operation_result(report, items=rendered, query=query, count=len(rendered))
 
     @router.get("/recent")
     async def recent(
@@ -239,7 +421,17 @@ def build_memory_router(*, runtime) -> APIRouter:
                 source_kind=str(source_kind or "").strip(),
             ))
         except Exception as exc:
-            raise HTTPException(status_code=500, detail=str(exc))
+            report = _exception_report(
+                exc,
+                runtime=runtime,
+                code="memory_recent_read_failed",
+                phase="memory_read",
+                title="无法读取近期记忆",
+                message="服务器查询近期记忆时发生内部异常。",
+                suggestion="根据 Trace ID 检查脱敏日志并刷新页面。",
+                steps=(operation_step("read", "查询近期记忆", "error", "未取得可靠列表。"),),
+            )
+            _raise_operation(500, report)
         rendered = []
         hidden = 0
         for item in items:
@@ -281,15 +473,36 @@ def build_memory_router(*, runtime) -> APIRouter:
             return {"messages": [], "available": False}
         gid = str(group_id or "").strip()
         if not gid:
-            raise HTTPException(status_code=400, detail="group_id 必填")
+            report = operation_diagnostic(
+                ok=False,
+                code="memory_raw_chat_group_required",
+                phase="validation",
+                title="缺少群 ID",
+                message="读取群对话原文必须提供 group_id。",
+                steps=(operation_step("validate", "校验 group_id", "error", "group_id 为空。"),),
+                suggestion="选择一个群后重新打开对话原文。",
+                retryable=True,
+            )
+            _raise_operation(400, report)
         try:
             from ...core.memory_store import _connect, _json_loads
-        except Exception as exc:
-            raise HTTPException(status_code=500, detail=f"memory_store 私有接口不可用：{exc}")
+        except Exception:
+            _raise_operation(503, _private_api_unavailable_report(purpose="读取群对话原文"))
         try:
             group_dir = store.ensure_group_space(gid)
         except Exception as exc:
-            raise HTTPException(status_code=500, detail=str(exc))
+            report = _exception_report(
+                exc,
+                runtime=runtime,
+                code="memory_raw_chat_space_failed",
+                phase="group_space",
+                title="无法访问群记忆目录",
+                message="服务器无法确认群对话数据库路径。",
+                suggestion="根据 Trace ID 检查脱敏日志和数据目录权限。",
+                details=(operation_detail("group_id", gid, "info"),),
+                steps=(operation_step("group_space", "解析群记忆目录", "error", "未取得可用路径。"),),
+            )
+            _raise_operation(500, report)
         db_path = group_dir / "chat_history.db"
         if not db_path.exists():
             return {"messages": [], "available": True, "group_id": gid}
@@ -307,7 +520,18 @@ def build_memory_router(*, runtime) -> APIRouter:
                     (cutoff, int(limit)),
                 ).fetchall()
         except Exception as exc:
-            raise HTTPException(status_code=500, detail=str(exc))
+            report = _exception_report(
+                exc,
+                runtime=runtime,
+                code="memory_raw_chat_read_failed",
+                phase="database_read",
+                title="无法读取群对话原文",
+                message="服务器查询 chat_history.db 时发生内部异常。",
+                suggestion="根据 Trace ID 检查脱敏日志和数据库完整性。",
+                details=(operation_detail("group_id", gid, "info"),),
+                steps=(operation_step("read", "查询群对话原文", "error", "数据库查询未完成。"),),
+            )
+            _raise_operation(500, report)
         messages: list[dict[str, Any]] = []
         for row in rows:
             content = _json_loads(row["content"], row["content"])
@@ -344,19 +568,51 @@ def build_memory_router(*, runtime) -> APIRouter:
             data = await load_inner_state(data_dir)
             return {"available": True, "state": data}
         except Exception as exc:
-            raise HTTPException(status_code=500, detail=str(exc))
+            report = _exception_report(
+                exc,
+                runtime=runtime,
+                code="memory_inner_state_read_failed",
+                phase="state_read",
+                title="无法读取 Inner State",
+                message="服务器读取持久化 Inner State 时发生内部异常。",
+                suggestion="根据 Trace ID 检查脱敏日志和状态文件。",
+                steps=(operation_step("read", "读取 Inner State", "error", "未取得可靠状态。"),),
+            )
+            _raise_operation(500, report)
 
     @router.get("/detail/{memory_id}")
     async def detail(memory_id: str, _: AdminIdentity = Depends(require_admin)) -> dict:
         store = _memory_store(runtime)
         if store is None:
-            raise HTTPException(status_code=503, detail="memory_store 未就绪")
+            _raise_operation(503, _store_unavailable_report())
         try:
             item = store.get_memory_item(memory_id)
         except Exception as exc:
-            raise HTTPException(status_code=500, detail=str(exc))
+            report = _exception_report(
+                exc,
+                runtime=runtime,
+                code="memory_detail_read_failed",
+                phase="memory_read",
+                title="无法读取记忆详情",
+                message="服务器读取目标记忆时发生内部异常。",
+                suggestion="根据 Trace ID 检查脱敏日志并刷新列表。",
+                details=(operation_detail("记忆 ID", memory_id, "info"),),
+                steps=(operation_step("read", "读取记忆详情", "error", "未取得可靠内容。"),),
+            )
+            _raise_operation(500, report)
         if not isinstance(item, dict) or not item:
-            raise HTTPException(status_code=404, detail=f"找不到记忆 {memory_id}")
+            report = operation_diagnostic(
+                ok=False,
+                code="memory_not_found",
+                phase="memory_read",
+                title="找不到记忆",
+                message="目标记忆不存在或已被删除。",
+                details=(operation_detail("记忆 ID", memory_id, "error"),),
+                steps=(operation_step("read", "读取记忆详情", "error", "目标不存在。"),),
+                suggestion="返回列表并刷新当前记忆数据。",
+                retryable=False,
+            )
+            _raise_operation(404, report)
         related: list[dict[str, Any]] = []
         try:
             related = list(store.list_related_memory_candidates(memory_id=memory_id, limit=8))
@@ -384,7 +640,10 @@ def build_memory_router(*, runtime) -> APIRouter:
         if not palace_on:
             return {"nodes": [], "edges": [], "available": False, "reason": "palace_disabled"}
 
-        from ...core.memory_store import _connect
+        try:
+            from ...core.memory_store import _connect
+        except Exception:
+            _raise_operation(503, _private_api_unavailable_report(purpose="读取记忆宫殿图谱"))
 
         nodes: dict[str, dict[str, Any]] = {}
         edges: list[dict[str, Any]] = []
@@ -511,7 +770,18 @@ def build_memory_router(*, runtime) -> APIRouter:
                             }
                         )
         except Exception as exc:
-            raise HTTPException(status_code=500, detail=str(exc))
+            report = _exception_report(
+                exc,
+                runtime=runtime,
+                code="memory_graph_read_failed",
+                phase="database_read",
+                title="无法读取记忆宫殿图谱",
+                message="服务器查询记忆节点或关系时发生内部异常。",
+                suggestion="根据 Trace ID 检查脱敏日志和 memory_palace.db。",
+                details=(operation_detail("group_id", str(group_id or "").strip() or "-", "info"),),
+                steps=(operation_step("read", "查询记忆节点与关系", "error", "图谱数据未完整返回。"),),
+            )
+            _raise_operation(500, report)
 
         # ---- 4) 群关系图：user-user 边（只在 group_id 明确时才加）
         if group_id.strip():
@@ -580,7 +850,7 @@ def build_memory_router(*, runtime) -> APIRouter:
 
             db_path = store.memory_palace_dir / "memory_palace.db"
         except Exception:
-            return {"zones": [], "available": False}
+            _raise_operation(503, _private_api_unavailable_report(purpose="读取记忆分区"))
         if not db_path.exists():
             return {"zones": [], "available": True}
         try:
@@ -589,7 +859,17 @@ def build_memory_router(*, runtime) -> APIRouter:
                     "SELECT DISTINCT palace_zone FROM memory_items WHERE palace_zone IS NOT NULL AND palace_zone != '' ORDER BY palace_zone"
                 ).fetchall()
         except Exception as exc:
-            raise HTTPException(status_code=500, detail=str(exc))
+            report = _exception_report(
+                exc,
+                runtime=runtime,
+                code="memory_zones_read_failed",
+                phase="database_read",
+                title="无法读取记忆分区",
+                message="服务器查询 palace_zone 时发生内部异常。",
+                suggestion="根据 Trace ID 检查脱敏日志和 memory_palace.db。",
+                steps=(operation_step("read", "查询记忆分区", "error", "未取得可靠分区列表。"),),
+            )
+            _raise_operation(500, report)
         zones = [str(row[0]) for row in rows if row and row[0]]
         return {"zones": zones, "available": True}
 

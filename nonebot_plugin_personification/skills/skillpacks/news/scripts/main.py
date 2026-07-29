@@ -13,64 +13,52 @@ async def _daily_news() -> str:
     tip = str(data.get("tip", "")).strip()
     lines = [f"【今日早报 {date}】"]
     if isinstance(items, list):
-        for idx, item in enumerate(items[:8], 1):
-            lines.append(f"{idx}. {str(item)}")
+        for item in items[:8]:
+            text = str(item or "").strip()
+            if text:
+                lines.append(f"{len(lines)}. {text}")
     if tip:
         lines.append(f"💬 每日一句：{tip}")
-    return "\n".join(lines)
+    return "\n".join(lines) if len(lines) > 1 else impl._canonical_failure("no_results")
 
 
 async def _ai_news() -> str:
-    data = await impl._fetch_v2_data(
+    data = await impl._fetch_latest_ai_news(
         impl.BASE_URL_DEFAULT,
-        "/v2/ai-news",
         local_base_url=impl.LOCAL_BASE_URL_DEFAULT,
     )
-    date = str(data.get("date", "今日")).strip() or "今日"
-    items = impl._extract_items(data, "news", "items", "list")
-    lines = [f"【AI 资讯 {date}】"]
-    for idx, item in enumerate(items[:8], 1):
-        if not isinstance(item, dict):
-            continue
-        title = impl._extract_text(item, "title", "name")
-        detail = impl._extract_text(item, "summary", "description", "detail", "content")
-        source = impl._extract_text(item, "source")
-        if not title:
-            continue
-        line = f"{idx}. {title}"
-        if source:
-            line += f" [{source}]"
-        lines.append(line)
-        if detail:
-            lines.append(detail[:80])
-    return "\n".join(lines) if len(lines) > 1 else "AI 资讯暂时获取失败，稍后再试。"
+    return impl._format_ai_news(data)
+
+
+async def _tech_news(source: str = "IT之家") -> str:
+    resolved = impl._resolve_tech_news_source(source)
+    if resolved is None:
+        return impl._canonical_failure("invalid_source")
+    endpoint, source_name = resolved
+    data = await impl._fetch_v2_data(
+        impl.BASE_URL_DEFAULT,
+        f"/v2/{endpoint}",
+        local_base_url=impl.LOCAL_BASE_URL_DEFAULT,
+    )
+    return impl._format_tech_news(data, source_name)
 
 
 async def _trending(platform: str) -> str:
     platform = str(platform or "").strip()
     mapped = impl.PLATFORM_MAP.get(platform)
     if not mapped:
-        return "不支持该平台，可选：微博、知乎、抖音、B站"
+        return impl._canonical_failure("invalid_platform")
     data = await impl._fetch_v2_data(
         impl.BASE_URL_DEFAULT,
         f"/v2/{mapped}",
         local_base_url=impl.LOCAL_BASE_URL_DEFAULT,
     )
-    items = impl._extract_items(data, "list", "items")
-    lines = [f"【{platform} 热搜 Top10】"]
-    for idx, item in enumerate(items[:10], 1):
-        if isinstance(item, dict):
-            title = impl._extract_text(item, "title", "name", "word", "hotword", "keyword")
-        else:
-            title = str(item or "").strip()
-        if title:
-            lines.append(f"{idx}. {title}")
-    return "\n".join(lines)
+    return impl._format_trending(data, platform)
 
 
 async def _joke() -> str:
     data = await impl._fetch_v2_data(impl.BASE_URL_DEFAULT, "/v2/duanzi", local_base_url=impl.LOCAL_BASE_URL_DEFAULT)
-    return impl._extract_text(data, "duanzi", "content", "text") or "段子暂时获取失败，等会再讲一个。"
+    return impl._extract_text(data, "duanzi", "content", "text") or impl._canonical_failure("no_results")
 
 
 async def _history() -> str:
@@ -88,7 +76,7 @@ async def _history() -> str:
         title = str(item.get("title", "")).strip()
         if year and title:
             lines.append(f"{year}年：{title}")
-    return "\n".join(lines)
+    return "\n".join(lines) if len(lines) > 1 else impl._canonical_failure("no_results")
 
 
 async def _epic() -> str:
@@ -99,7 +87,7 @@ async def _epic() -> str:
         if not isinstance(game, dict):
             continue
         lines.extend(impl._format_epic_game_line(game))
-    return "\n".join(lines) if len(lines) > 1 else "Epic 本周暂无免费游戏信息。"
+    return "\n".join(lines) if len(lines) > 1 else impl._canonical_failure("no_results")
 
 
 async def _gold() -> str:
@@ -107,13 +95,13 @@ async def _gold() -> str:
     lines = ["【黄金价格】"]
     for row in list(impl._iter_gold_rows(data))[:5]:
         lines.append(impl._format_gold_row(row))
-    return "\n".join(lines) if len(lines) > 1 else "黄金价格暂时获取失败，稍后再试。"
+    return "\n".join(lines) if len(lines) > 1 else impl._canonical_failure("no_results")
 
 
 async def _baike(word: str) -> str:
     word = str(word or "").strip()
     if not word:
-        return "请告诉我想查的百科词条。"
+        return impl._canonical_failure("invalid_word")
     data = await impl._fetch_v2_data(
         impl.BASE_URL_DEFAULT,
         "/v2/baike",
@@ -128,7 +116,7 @@ async def _baike(word: str) -> str:
         lines.append(summary)
     if url:
         lines.append(url)
-    return "\n".join(lines) if len(lines) > 1 else f"没有查到“{word}”的百科摘要。"
+    return "\n".join(lines) if len(lines) > 1 else impl._canonical_failure("no_results")
 
 
 async def _exchange(base_currency: str = "", quote_currency: str = "") -> str:
@@ -137,11 +125,21 @@ async def _exchange(base_currency: str = "", quote_currency: str = "") -> str:
         "/v2/exchange-rate",
         local_base_url=impl.LOCAL_BASE_URL_DEFAULT,
     )
+    _reference_code, rates = impl._coerce_rate_lookup(data)
+    if not rates:
+        return impl._canonical_failure("no_results")
     lines = impl._build_exchange_lines(data, base_currency=base_currency, quote_currency=quote_currency)
     return "\n".join(lines)
 
 
-async def run(topic: str = "daily", platform: str = "微博", keyword: str = "", base_currency: str = "", quote_currency: str = "") -> str:
+async def run(
+    topic: str = "daily",
+    platform: str = "微博",
+    source: str = "IT之家",
+    keyword: str = "",
+    base_currency: str = "",
+    quote_currency: str = "",
+) -> str:
     topic_key = str(topic or "daily").strip().lower()
     handlers: dict[str, Callable[[], object]] = {
         "daily": _daily_news,
@@ -149,6 +147,9 @@ async def run(topic: str = "daily", platform: str = "微博", keyword: str = "",
         "ai_news": _ai_news,
         "ai-news": _ai_news,
         "ai": _ai_news,
+        "tech": lambda: _tech_news(source),
+        "tech_news": lambda: _tech_news(source),
+        "tech-news": lambda: _tech_news(source),
         "trending": lambda: _trending(platform),
         "joke": _joke,
         "history": _history,
@@ -159,11 +160,11 @@ async def run(topic: str = "daily", platform: str = "微博", keyword: str = "",
     }
     target = handlers.get(topic_key)
     if target is None:
-        return "topic 可选: daily, trending, joke, history, epic, gold, baike, exchange"
+        return "topic 可选: daily, ai_news, tech_news, trending, joke, history, epic, gold, baike, exchange"
     try:
         return str(await target())
-    except Exception as e:
-        return f"新闻能力调用失败: {e}"
+    except Exception:
+        return impl._canonical_failure("fetch_failed")
 
 
 def build_tools(runtime: SkillRuntime):
@@ -179,6 +180,7 @@ def build_tools(runtime: SkillRuntime):
     return [
         impl.build_daily_news_tool(base, logger, local_base),
         impl.build_ai_news_tool(base, logger, local_base),
+        impl.build_tech_news_tool(base, logger, local_base),
         impl.build_trending_tool(base, logger, local_base),
         impl.build_joke_tool(base, logger, local_base),
         impl.build_history_today_tool(base, logger, local_base),

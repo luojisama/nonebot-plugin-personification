@@ -53,6 +53,23 @@ def test_group_routing() -> None:
     assert entries["global_enabled"].group == "核心开关"
     assert entries["response_review_enabled"].group == "回复审阅"
     assert entries["turn_planner_enabled"].group == "意图规划"
+    assert entries["meme_reply_probability"].group == "原生 MCP"
+
+
+def test_social_slang_learning_defaults_and_safety_floors() -> None:
+    cfg = config_mod.Config()
+    entries = {entry.key: entry for entry in config_registry.get_config_entries()}
+
+    assert cfg.personification_probability == 0.30
+    assert cfg.personification_meme_reply_probability == 0.18
+    assert cfg.personification_slang_max_claims == 20
+    assert entries["meme_reply_probability"].min_value == 0.0
+    assert entries["meme_reply_probability"].max_value == 1.0
+    assert entries["slang_max_claims"].min_value == 1
+    assert entries["slang_max_claims"].max_value == 50
+    assert entries["auto_understand_min_sources"].min_value == 2
+    assert entries["auto_use_min_sources"].min_value == 2
+    assert entries["auto_use_min_platforms"].min_value == 2
 
 
 def test_advanced_inference_from_field_name() -> None:

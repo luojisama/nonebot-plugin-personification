@@ -3,9 +3,10 @@ import random
 import re
 import time
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Awaitable, Callable, Dict, List
 
-from ...agent.inner_state import DEFAULT_STATE as DEFAULT_INNER_STATE, get_personification_data_dir, load_inner_state
+from ...agent.inner_state import get_personification_data_dir
 from ...agent.runtime.planner import (
     turn_plan_from_semantic_frame,
     turn_plan_to_semantic_frame,
@@ -14,19 +15,28 @@ from ...agent.runtime.tool_catalog import registry_planner_metadata
 from ...core.chat_intent import (
     looks_like_explanatory_output,
 )
+from ...core.current_group_context_tool import register_current_group_context_tool
+from ...core.group_member_avatar_insight import register_group_member_avatar_insight_tool
 from ...core.emotion_state import (
     build_turn_emotion_prompt_block,
-    load_emotion_state,
     render_emotion_memory_hint,
     render_inner_state_hint,
     update_emotion_state_after_turn,
 )
+from ...core.favorability_turn import (
+    build_favorability_turn_id,
+    commit_favorability_turn,
+    extract_legacy_favorability_markers,
+    signals_from_semantic_frame,
+)
 from ...core.group_context import (
     build_group_conversation_context,
     render_group_conversation_context,
+    render_plugin_episode_trace_detail,
     render_topic_state_trace_detail,
 )
 from ...core.metrics import record_counter, record_timing
+from ...core.meme_reply_policy import format_meme_turn_prompt, prepare_meme_turn_context
 from ...core.message_relations import extract_event_message_id, extract_reply_message_id, extract_send_message_id
 from ...core.image_input import (
     is_image_input_unsupported_error,
@@ -38,7 +48,7 @@ from ...core.sticker_library import (
 )
 from ...core.message_parts import build_user_message_content, clone_messages_with_text_suffix
 from ...core.context_policy import (
-    build_prompt_injection_guard,
+    ensure_prompt_injection_guard,
     has_silence_control_marker,
     strip_response_control_markers,
 )
@@ -50,21 +60,32 @@ from ...core.gemini_profile import (
 from ...core.repeat_follow import maybe_follow_repeat_cluster
 from ...core.reply_style_policy import (
     build_direct_visual_identity_guard,
+    build_directed_exchange_policy_prompt,
+    build_plugin_interaction_policy_prompt,
     build_reply_style_policy_prompt,
     build_speech_act_policy_prompt,
 )
+from ...core.role_integrity import detect_persona_identity_leak
 from ...core.response_review import (
     ReplyArbitrationIntent,
     arbitrate_reply_mode,
     extract_recent_bot_reply_texts,
     is_agent_reply_ooc,
     make_passthrough_review_decision,
+    needs_uncertain_visible_reply_review,
+    required_reply_fallback_text,
+    required_reply_needs_recovery,
+    resolve_uncertain_visible_reply,
     rewrite_agent_reply_ooc,
     review_response_text,
 )
+from ...core.send_outcome import is_likely_delivered_send_timeout
 from ...core.target_inference import normalize_message_target_for_plan, normalize_message_target_for_review
 from ...core.reply_text_policy import normalize_visible_reply_text
+from ...core.reply_completion_contract import resolve_sent_reply_completion
 from ...core.prompt_loader import pick_ack_phrase
+from ...core.qq_outbound import QQOutboundLedger, SendReceipt, build_outbound_context
+from ...core.qq_recall import register_qq_recall_tool
 from ...core.qq_expression_library import (
     build_qq_expression_prompt,
     contains_qq_expression_marker,
@@ -73,7 +94,7 @@ from ...core.qq_expression_library import (
     qq_expression_enabled,
     render_qq_expression_message,
 )
-from ...core.qq_expression_tools import qq_action_history_text, register_send_qq_expression_tools
+from ...core.qq_expression_tools import register_send_qq_expression_tools
 from ...core.sticker_feedback import (
     build_sticker_feedback_scene_key,
     load_sticker_feedback,
@@ -82,7 +103,26 @@ from ...core.sticker_feedback import (
 )
 from ...core.target_inference import TARGET_OTHERS
 from ...core.tts_service import extract_persona_tts_config
+from ...core.visible_output import guard_visible_text
+from ...core.turn_media import (
+    attach_safe_visual_summary,
+    coerce_turn_media,
+    extract_media_from_message,
+    extract_turn_media_from_event,
+    media_summary_timeout_seconds,
+    normalize_safe_visual_summary,
+    render_turn_media_grounding,
+)
 from ...core.visual_capabilities import VISUAL_ROUTE_AGENT, VISUAL_ROUTE_REPLY_YAML
+from ...core.user_avatar_insight import (
+    add_current_user_avatar_planner_metadata,
+    register_current_user_avatar_tool,
+)
+from ...core.user_avatar_pair_insight import (
+    build_avatar_pair_candidates,
+    filter_avatar_candidates_by_policy,
+    register_group_user_avatar_pair_insight_tool,
+)
 from ...skill_runtime.runtime_api import SkillRuntime
 
 from ...agent.action_executor import ActionExecutor
@@ -92,15 +132,29 @@ from ..reply_pipeline.pipeline_emotion import (
     attach_turn_plan_to_semantic_frame,
     compose_reply_emotion_block,
     infer_turn_semantic_frame_with_timeout,
+    load_reply_states_with_timeout,
     plan_turn_with_timeout,
     schedule_inner_state_update_after_reply,
     semantic_frame_timeout_hint,
 )
 from ..reply_pipeline import humanize as _humanize
+from ..reply_commit import (
+    acquire_reply_commit,
+    begin_reply_lifecycle,
+    execute_pending_actions,
+    mark_reply_phase,
+    mark_reply_delivery_complete,
+    mark_reply_delivery_confirmed,
+    mark_reply_delivery_started,
+    release_reply_commit,
+)
 from ..reply_pipeline.pipeline_context import (
     batch_has_newer_messages as _shared_batch_has_newer_messages,
     clone_tool_registry as _clone_tool_registry,
     compute_agent_time_budget as _compute_agent_time_budget,
+    dispatch_reply_part as _dispatch_reply_part,
+    guard_reply_ack_text as _guard_reply_ack_text,
+    build_reply_operation_id as _build_reply_operation_id,
     primary_route_supports_vision as _runtime_primary_route_supports_vision,
     should_use_agent_for_reply as _should_use_agent_for_reply,
     strip_injected_visual_summary as _strip_injected_visual_summary,
@@ -271,8 +325,27 @@ def _group_translation_result(text: str) -> List[str]:
     return [raw]
 
 
-async def _send_translation_forward(bot: Any, event: Any, text: str) -> bool:
-    grouped = _group_translation_result(text)
+async def _send_translation_forward(
+    bot: Any,
+    event: Any,
+    text: str,
+    *,
+    qq_outbound_ledger: QQOutboundLedger | None = None,
+    operation_id: str = "",
+    user_target: str = "",
+    logger: Any = None,
+) -> bool | SendReceipt:
+    guarded_text = guard_visible_text(
+        text,
+        logger=logger,
+        surface="reply_translation_forward",
+        allow_direct_media=False,
+        allow_control=False,
+    )
+    visible_text = normalize_visible_reply_text(strip_response_control_markers(guarded_text))
+    if not visible_text:
+        return False
+    grouped = _group_translation_result(visible_text)
     if not grouped:
         return False
 
@@ -299,10 +372,29 @@ async def _send_translation_forward(bot: Any, event: Any, text: str) -> bool:
             }
         )
 
-    if hasattr(event, "group_id"):
-        await bot.call_api("send_group_forward_msg", group_id=event.group_id, messages=nodes)
-    else:
-        await bot.call_api("send_private_forward_msg", user_id=event.user_id, messages=nodes)
+    async def _send() -> Any:
+        if hasattr(event, "group_id"):
+            return await bot.call_api(
+                "send_group_forward_msg",
+                group_id=event.group_id,
+                messages=nodes,
+            )
+        return await bot.call_api(
+            "send_private_forward_msg",
+            user_id=event.user_id,
+            messages=nodes,
+        )
+
+    if qq_outbound_ledger is not None:
+        outbound_context = build_outbound_context(
+            bot=bot,
+            event=event,
+            surface="reply_translation_forward",
+            operation_id=operation_id,
+            user_target=user_target,
+        )
+        return await qq_outbound_ledger.dispatch(outbound_context, nodes, _send)
+    await _send()
     return True
 
 
@@ -487,18 +579,46 @@ async def process_yaml_response_logic(
     intent_recommend_silence: bool | None = None,
     recent_context_hint: str = "",
     relationship_hint: str = "",
+    plugin_episode: Any = None,
     semantic_frame: Any = None,
     has_newer_batch: bool = False,
     batch_runtime_ref: Dict[str, Any] | None = None,
+    reply_commit_state: Dict[str, Any] | None = None,
     solo_speaker_follow: bool = False,
+    reply_required: bool = False,
+    response_deadline: float | None = None,
+    prepared_inner_state: dict[str, Any] | None = None,
+    prepared_emotion_state: dict[str, Any] | None = None,
+    turn_media_context: List[Dict[str, Any]] | None = None,
+    media_grounding: str = "",
+    precomputed_image_summary_suffix: str = "",
+    user_profile_block: str = "",
+    profile_service: Any = None,
+    favorability_context_block: str = "",
+    favorability_turn_id: str = "",
+    avatar_pair_candidates: List[Dict[str, str]] | None = None,
+    avatar_pair_runtime: Any = None,
+    user_policy_gate: Any = None,
+    qq_outbound_ledger: QQOutboundLedger | None = None,
+    reply_trace_id: str = "",
 ) -> None:
     """处理基于 YAML 模板的新版响应逻辑。"""
+    if user_policy_gate is not None and not await user_policy_gate.allows_current(event):
+        return
+    reply_commit_state = reply_commit_state if isinstance(reply_commit_state, dict) else {}
+    outbound_reply_trace_id = str(
+        reply_trace_id or reply_commit_state.get("reply_trace_id", "") or ""
+    ).strip()
     started_at = time.monotonic()
+    begin_reply_lifecycle(reply_commit_state, "yaml_pipeline")
     lite_tool_caller = lite_tool_caller or agent_tool_caller
     lite_call_ai_api = lite_call_ai_api or call_ai_api
     review_call_ai_api = review_call_ai_api or lite_call_ai_api or call_ai_api
     planner_message_target = normalize_message_target_for_plan(message_target)
     review_message_target = normalize_message_target_for_review(message_target)
+    turn_media_refs = coerce_turn_media(turn_media_context or [])
+    if not turn_media_refs:
+        turn_media_refs = extract_turn_media_from_event(event, current_origin="current")
 
     def _has_newer_batch_now() -> bool:
         return bool(has_newer_batch or _batch_ref_has_newer_messages(batch_runtime_ref))
@@ -509,6 +629,7 @@ async def process_yaml_response_logic(
         status: str,
         detail: str = "",
         hint: str = "",
+        elapsed_ms: int | None = None,
     ) -> None:
         try:
             from ...core import reply_turn_trace
@@ -519,6 +640,7 @@ async def process_yaml_response_logic(
                 status=status,
                 detail=detail,
                 hint=hint,
+                elapsed_ms=elapsed_ms,
             )
         except Exception:
             pass
@@ -565,6 +687,15 @@ async def process_yaml_response_logic(
     )
 
     is_private_session = str(group_id).startswith(private_session_prefix)
+    favorability_signals = signals_from_semantic_frame(
+        semantic_frame,
+        is_private=is_private_session,
+    )
+    resolved_favorability_turn_id = str(favorability_turn_id or "").strip() or build_favorability_turn_id(
+        message_id=getattr(event, "message_id", ""),
+        group_id=group_id,
+        user_id=user_id,
+    )
     record_counter(
         "yaml_reply.requests_total",
         scene="private" if is_private_session else "group",
@@ -574,9 +705,84 @@ async def process_yaml_response_logic(
         key="yaml_start",
         label="YAML 回复开始",
         status="info",
-        detail=f"scene={'private' if is_private_session else 'group'} user={user_id} group={group_id or '-'}",
+        detail=(
+            f"scene={'private' if is_private_session else 'group'} "
+            f"user={user_id} group={group_id or '-'} elapsed_ms=0"
+        ),
     )
     is_direct_mention = _event_mentions_bot(event, bot)
+    pending_action_executor: Any = None
+    pending_actions: list[dict[str, Any]] = []
+    favorability_committed = False
+
+    def _commit_favorability_if_confirmed() -> None:
+        nonlocal favorability_committed
+        if favorability_committed or not bool(reply_commit_state.get("reply_delivery_confirmed", False)):
+            return
+        favorability_committed = True
+        try:
+            commit_favorability_turn(
+                service=favorability_service,
+                user_id=user_id,
+                group_id=group_id,
+                is_private=is_private_session,
+                is_direct=bool(is_direct_mention or not is_random_chat),
+                is_random_chat=bool(is_random_chat),
+                signals=favorability_signals,
+                turn_id=resolved_favorability_turn_id,
+                now=get_current_time(),
+            )
+        except Exception as exc:
+            logger.debug(f"拟人插件 (YAML)：提交回复好感事件失败: {exc}")
+
+    def _confirm_reply_delivery() -> None:
+        mark_reply_delivery_confirmed(reply_commit_state)
+        _commit_favorability_if_confirmed()
+
+    async def _send_reply(payload: Any, *, surface: str = "yaml_reply") -> Any:
+        if user_policy_gate is not None:
+            await user_policy_gate.ensure_current(event)
+        mark_reply_delivery_started(reply_commit_state)
+        result = await _dispatch_reply_part(
+            bot=bot,
+            event=event,
+            payload=payload,
+            ledger=qq_outbound_ledger,
+            surface=surface,
+            reply_trace_id=outbound_reply_trace_id,
+        )
+        if not isinstance(result, SendReceipt) or result.status == "sent":
+            _confirm_reply_delivery()
+        return result
+
+    def _message_id_from_send_result(send_result: Any) -> str:
+        if isinstance(send_result, SendReceipt):
+            return str(send_result.message_id or "")
+        return extract_send_message_id(send_result)
+
+    async def _commit_pending_actions() -> None:
+        if not pending_actions:
+            return
+        if user_policy_gate is not None:
+            await user_policy_gate.ensure_current(event)
+        mark_reply_phase(reply_commit_state, "delivery_commit_wait")
+        await acquire_reply_commit(reply_commit_state)
+        mark_reply_phase(reply_commit_state, "delivery")
+        if _has_newer_batch_now():
+            pending_actions.clear()
+            return
+        history_parts = await execute_pending_actions(
+            pending_action_executor,
+            pending_actions,
+            state=reply_commit_state,
+        )
+        _commit_favorability_if_confirmed()
+        if history_parts:
+            setattr(
+                event,
+                "_personification_pending_action_history_text",
+                " ".join(history_parts),
+            )
 
     def _record_pending_action_history_if_any() -> bool:
         action_history_text = _consume_pending_action_history_text(event)
@@ -677,23 +883,82 @@ async def process_yaml_response_logic(
                         last_images.append(url)
                 elif isinstance(img_url_obj, str) and img_url_obj not in last_images:
                     last_images.append(img_url_obj)
+    if not turn_media_refs and last_images:
+        turn_media_refs = extract_media_from_message(
+            [
+                {"type": "image", "data": {"url": image_ref}}
+                for image_ref in last_images
+            ],
+            origin="current",
+            owner_user_id=user_id,
+            message_id=str(getattr(event, "message_id", "") or ""),
+        )
+    image_input_mode = normalize_image_input_mode(
+        getattr(plugin_config, "personification_image_input_mode", "auto")
+    )
+    image_summary_suffix = str(precomputed_image_summary_suffix or "").strip()
+    if not image_summary_suffix and last_images and image_input_mode != "disabled":
+        summary_timeout = media_summary_timeout_seconds(
+            response_deadline if isinstance(response_deadline, (int, float)) else None,
+            now=time.monotonic(),
+        )
+        if summary_timeout > 0.05:
+            try:
+                image_summary_suffix = await asyncio.wait_for(
+                    _build_image_summary_suffix(
+                        plugin_config=plugin_config,
+                        agent_tool_caller=agent_tool_caller,
+                        get_configured_api_providers=get_configured_api_providers,
+                        vision_caller=vision_caller,
+                        image_urls=last_images,
+                        sticker_like=False,
+                        logger=logger,
+                    ),
+                    timeout=summary_timeout,
+                )
+            except asyncio.TimeoutError:
+                logger.warning(
+                    f"拟人插件 (YAML)：视觉摘要超过本轮前置预算 {summary_timeout:.1f}s，继续使用 provenance 进入语义判断。"
+                )
+    safe_visual_summary = normalize_safe_visual_summary(image_summary_suffix)
+    turn_media_refs = attach_safe_visual_summary(
+        turn_media_refs,
+        safe_visual_summary,
+        confidence=0.65,
+    )
+    media_grounding = render_turn_media_grounding(
+        turn_media_refs,
+        summary=safe_visual_summary,
+    ) or str(media_grounding or "").strip()
     photo_like = "[图片·照片]" in (history_last_text or raw_message_text or trigger_reason)
 
+    conversation_context = None
+    resolved_plugin_episode = plugin_episode
     if not is_private_session and not recent_context_hint:
         recent_window = build_group_context_window(
             group_id,
             limit=8,
             include_message_ids=[extract_reply_message_id(event)],
         )
+        excluded_context_user_ids: set[str] = set()
+        if user_policy_gate is not None:
+            recent_window, excluded_context_user_ids = (
+                await user_policy_gate.filter_context_messages(
+                    recent_window,
+                    bot_self_id=str(getattr(bot, "self_id", "") or ""),
+                )
+            )
         conversation_context = build_group_conversation_context(
             recent_messages=recent_window,
             trigger_msg_id=extract_event_message_id(event),
             trigger_user_id=user_id,
             bot_self_id=str(getattr(bot, "self_id", "") or ""),
             repeat_clusters=list(repeat_clusters or []),
+            excluded_user_ids=excluded_context_user_ids,
         )
         recent_context_hint = render_group_conversation_context(conversation_context)
         relationship_hint = relationship_hint or conversation_context.relationship_hint
+        resolved_plugin_episode = conversation_context.plugin_episode
         topic_detail = render_topic_state_trace_detail(conversation_context.topic_state)
         if topic_detail:
             _trace_stage(
@@ -703,28 +968,65 @@ async def process_yaml_response_logic(
                 detail=topic_detail,
                 hint="结构化线索用于判断当前消息接谁的话，不替代 LLM 语义判断",
             )
+        plugin_detail = render_plugin_episode_trace_detail(conversation_context.plugin_episode)
+        if plugin_detail:
+            _trace_stage(
+                key="yaml_plugin_episode",
+                label="YAML 其它插件交互",
+                status="info",
+                detail=plugin_detail,
+                hint="其它插件输出仅作为带来源的群聊上下文，不等同于人格回复",
+            )
     else:
         recent_window = []
-    recent_bot_replies = extract_recent_bot_reply_texts(
-        recent_window if recent_window else get_recent_group_msgs(group_id, limit=8, expire_hours=0) if not is_private_session else []
+    avatar_pair_recent_messages = (
+        recent_window
+        if recent_window
+        else get_recent_group_msgs(group_id, limit=8, expire_hours=0)
+        if not is_private_session
+        else []
+    )
+    recent_bot_replies = extract_recent_bot_reply_texts(avatar_pair_recent_messages)
+    resolved_avatar_pair_candidates = list(avatar_pair_candidates or []) or build_avatar_pair_candidates(
+        event=event,
+        current_user_id=user_id,
+        current_user_label=user_name,
+        bot_self_id=getattr(bot, "self_id", ""),
+        batched_events=list(batched_events or []),
+        recent_messages=avatar_pair_recent_messages,
+    )
+    resolved_avatar_pair_candidates = await filter_avatar_candidates_by_policy(
+        resolved_avatar_pair_candidates,
+        (
+            user_policy_gate.current_authorization
+            if user_policy_gate is not None
+            else None
+        ),
     )
     data_dir = get_personification_data_dir(plugin_config)
-    inner_state = dict(DEFAULT_INNER_STATE)
-    try:
-        inner_state.update(await load_inner_state(data_dir))
-    except Exception as e:
-        logger.debug(f"[emotion] YAML load inner_state failed: {e}")
-    emotion_state = {}
-    try:
-        emotion_state = await load_emotion_state(data_dir)
-    except Exception as e:
-        logger.debug(f"[emotion] YAML load emotion_state failed: {e}")
+    if isinstance(prepared_inner_state, dict) and isinstance(prepared_emotion_state, dict):
+        inner_state = dict(prepared_inner_state)
+        emotion_state = dict(prepared_emotion_state)
+        _trace_stage(
+            key="yaml_state_reuse",
+            label="YAML 复用回复状态",
+            status="ok",
+            detail="source=prepared_semantics elapsed_ms=0",
+        )
+    else:
+        inner_state, emotion_state = await load_reply_states_with_timeout(
+            data_dir,
+            logger,
+            trace_key="yaml_state_load",
+            trace_label="YAML 状态加载",
+        )
     emotion_memory_hint = render_emotion_memory_hint(
         emotion_state,
         user_id=user_id,
         group_id="" if is_private_session else group_id,
     )
 
+    turn_plan = getattr(semantic_frame, "turn_plan", None)
     if semantic_frame is None:
         planner_enabled = bool(getattr(plugin_config, "personification_turn_planner_enabled", False))
         planner_shadow_enabled = bool(getattr(plugin_config, "personification_turn_planner_shadow_enabled", False))
@@ -732,6 +1034,11 @@ async def process_yaml_response_logic(
         if planner_enabled or planner_shadow_enabled:
             try:
                 planner_available_tools = registry_planner_metadata(tool_registry)
+                planner_available_tools = add_current_user_avatar_planner_metadata(
+                    planner_available_tools,
+                    profile_service,
+                    user_id,
+                )
             except Exception:
                 planner_available_tools = []
         plan_source_text = raw_message_text or history_last_text or trigger_reason
@@ -752,6 +1059,7 @@ async def process_yaml_response_logic(
                 current_inner_state=render_inner_state_hint(inner_state),
                 current_emotion_state=emotion_memory_hint,
                 available_tools=planner_available_tools,
+                media_grounding=media_grounding,
                 logger=logger,
                 metric_mode="yaml_enabled",
             )
@@ -788,6 +1096,8 @@ async def process_yaml_response_logic(
                     plugin_config=plugin_config,
                     is_group=not is_private_session,
                     is_random_chat=is_random_chat,
+                    is_direct_mention=is_direct_mention,
+                    message_target=planner_message_target,
                     tool_caller=lite_tool_caller,
                     fallback_tool_caller=agent_tool_caller,
                     recent_context=recent_context_hint,
@@ -795,6 +1105,7 @@ async def process_yaml_response_logic(
                     repeat_clusters=repeat_clusters,
                     current_inner_state=render_inner_state_hint(inner_state),
                     current_emotion_state=emotion_memory_hint,
+                    media_grounding=media_grounding,
                     logger=logger,
                     metric_scene="yaml_private" if is_private_session else "yaml_group",
                 )
@@ -845,6 +1156,7 @@ async def process_yaml_response_logic(
                     current_inner_state=render_inner_state_hint(inner_state),
                     current_emotion_state=emotion_memory_hint,
                     available_tools=planner_available_tools,
+                    media_grounding=media_grounding,
                     logger=logger,
                     metric_mode="yaml_shadow",
                 )
@@ -876,6 +1188,13 @@ async def process_yaml_response_logic(
                         record_counter("turn_planner.diff_total", field="yaml_speech_act")
                     if shadow_plan.output_mode != turn_plan.output_mode:
                         record_counter("turn_planner.diff_total", field="yaml_output_mode")
+    if turn_plan is None:
+        turn_plan = turn_plan_from_semantic_frame(
+            semantic_frame,
+            has_images=bool(last_images),
+            message_target=planner_message_target,
+        )
+        attach_turn_plan_to_semantic_frame(semantic_frame, turn_plan)
     intent_decision = semantic_frame.to_intent_decision()
     if not message_intent:
         message_intent = intent_decision.chat_intent
@@ -883,6 +1202,12 @@ async def process_yaml_response_logic(
         intent_ambiguity_level = intent_decision.ambiguity_level
     if intent_recommend_silence is None:
         intent_recommend_silence = intent_decision.recommend_silence
+    favorability_signals.merge(
+        signals_from_semantic_frame(
+            semantic_frame,
+            is_private=is_private_session,
+        )
+    )
     _trace_stage(
         key="yaml_semantic_frame",
         label="YAML 语义帧",
@@ -920,7 +1245,32 @@ async def process_yaml_response_logic(
         _trace_no_reply("stale_random_chat", diagnosis_code="stale_reply", detail="随机插话期间出现更新批次")
         return
 
+    meme_turn_prompt = ""
+    try:
+        meme_turn_context = prepare_meme_turn_context(
+            group_id="" if is_private_session else str(group_id),
+            message_text=plan_source_text,
+            recent_context=recent_context_hint,
+            probability=float(getattr(plugin_config, "personification_meme_reply_probability", 0.18) or 0.0),
+            semantic_frame=semantic_frame,
+            rng=random.random,
+        )
+        meme_turn_prompt = format_meme_turn_prompt(meme_turn_context)
+        record_counter(
+            "reply.meme_turn_total",
+            allowed=str(bool(meme_turn_context.get("active_use_allowed"))).lower(),
+            understood=len(meme_turn_context.get("understanding_senses") or []),
+        )
+    except Exception as exc:
+        logger.debug(f"拟人插件 (YAML)：本轮黑话上下文不可用，按无词典提示继续: {type(exc).__name__}")
+
     system_prompt = prompt_config.get("system", "")
+    if user_profile_block:
+        system_prompt += f"\n\n{user_profile_block}"
+    if favorability_context_block:
+        system_prompt += f"\n\n{favorability_context_block}"
+    if meme_turn_prompt:
+        system_prompt += f"\n\n{meme_turn_prompt}"
     if is_private_session:
         system_prompt += (
             "\n\n## 私聊称呼规则（高优先级）\n"
@@ -947,7 +1297,8 @@ async def process_yaml_response_logic(
         if str(intent_ambiguity_level or "").strip().lower() == "high":
             system_prompt += (
                 "\n- 当前最新名词/对象存在较高歧义。"
-                "如果上下文和现有证据不足，请优先承认不确定；群聊里若没人明确在 cue 你，且这轮明显会打断别人时，也可以保持沉默。"
+                "如果上下文和现有证据不足，非强交互直接保持沉默；"
+                "强交互只索取一个明确且对方能提供的必要条件，不要播报无法确认或查证无结果。"
             )
         if arbitration == "clarify":
             system_prompt += "\n- 这轮高歧义但对方像是在直接问你；群聊里不要用澄清问句追问，能判断就给保守短反应，不能判断就保持沉默。"
@@ -958,6 +1309,8 @@ async def process_yaml_response_logic(
         "- 表情包/梗图/GIF 只当作语气线索；真实照片也只用于判断情绪、关系和意图，最终回复接人和话题，不写成图片说明。如果只看到图片占位或没有视觉摘要，不要假装看懂，也不要泛泛问对方看到什么。\n"
         "- 有人让你“写一段/来一段/AI 一段/帮我写”对白、剧本、小作文、段子、歌词或角色扮演内容时，不要切换成写作工具去交付任务：不写前言铺垫、不写“角色：台词”式多角色剧本、不写结尾点评总结、不堆营业腔和网络黑话。可以用人设口吻即兴接两三句、玩梗式带过，但绝不展开成长篇命题作文，也不要为此出戏或扮演成别的角色。"
     )
+    if media_grounding:
+        system_prompt += f"\n\n{media_grounding}"
     if qq_expression_enabled(plugin_config):
         system_prompt += "\n\n" + build_qq_expression_prompt()
     system_prompt += "\n\n" + build_reply_style_policy_prompt(
@@ -965,13 +1318,25 @@ async def process_yaml_response_logic(
         photo_like=photo_like,
         is_group=not is_private_session,
     )
-    turn_plan_for_prompt = getattr(semantic_frame, "turn_plan", turn_plan)
+    turn_plan_for_prompt = turn_plan
     system_prompt += "\n\n" + build_speech_act_policy_prompt(
         speech_act=str(getattr(turn_plan_for_prompt, "speech_act", getattr(semantic_frame, "speech_act", "")) or ""),
         output_mode=str(getattr(turn_plan_for_prompt, "output_mode", getattr(semantic_frame, "output_mode", "")) or ""),
         session_goal=str(getattr(turn_plan_for_prompt, "session_goal", getattr(semantic_frame, "session_goal", "")) or ""),
         is_group=not is_private_session,
     )
+    directed_exchange_prompt = build_directed_exchange_policy_prompt(
+        is_direct_mention=is_direct_mention,
+        is_group=not is_private_session,
+        speech_act=str(getattr(turn_plan_for_prompt, "speech_act", getattr(semantic_frame, "speech_act", "")) or ""),
+        output_mode=str(getattr(turn_plan_for_prompt, "output_mode", getattr(semantic_frame, "output_mode", "")) or ""),
+    )
+    if directed_exchange_prompt:
+        system_prompt += "\n\n" + directed_exchange_prompt
+    if resolved_plugin_episode is not None:
+        system_prompt += "\n\n" + build_plugin_interaction_policy_prompt(
+            is_direct_mention=is_direct_mention,
+        )
     primary_api_type, primary_model = primary_route_signature(
         plugin_config,
         get_configured_api_providers=get_configured_api_providers,
@@ -995,7 +1360,7 @@ async def process_yaml_response_logic(
             plugin_summary = ""
         if plugin_summary:
             system_prompt += f"\n\n[已安装插件摘要（仅供参考）]\n{plugin_summary}"
-    system_prompt += f"\n\n{build_prompt_injection_guard()}"
+    system_prompt = ensure_prompt_injection_guard(system_prompt)
 
     group_config = get_group_config(group_id)
     schedule_enabled = group_config.get("schedule_enabled", False)
@@ -1116,9 +1481,6 @@ async def process_yaml_response_logic(
 
     user_content: Any = input_text
     tool_image_urls = list(last_images)
-    image_input_mode = normalize_image_input_mode(
-        getattr(plugin_config, "personification_image_input_mode", "auto")
-    )
     image_detail = normalize_image_detail(
         getattr(plugin_config, "personification_image_detail", "auto")
     )
@@ -1150,7 +1512,6 @@ async def process_yaml_response_logic(
             route_name=VISUAL_ROUTE_AGENT,
         )
     )
-    image_summary_suffix = ""
     text_model_images = list(last_images)
     if last_images:
         _trace_stage(
@@ -1159,22 +1520,13 @@ async def process_yaml_response_logic(
             status="info",
             detail=(
                 f"images={len(last_images)} mode={image_input_mode} "
-                f"text_direct={bool(direct_image_input)} agent_direct={bool(agent_direct_image_input)}"
+                f"text_direct={bool(direct_image_input)} "
+                f"agent_direct={bool(agent_direct_image_input)} elapsed_ms=0"
             ),
         )
         if image_input_mode == "disabled":
             text_model_images = []
         else:
-            if image_input_mode in {"auto", "summary"} and (not direct_image_input or not agent_direct_image_input):
-                image_summary_suffix = await _build_image_summary_suffix(
-                    plugin_config=plugin_config,
-                    agent_tool_caller=agent_tool_caller,
-                    get_configured_api_providers=get_configured_api_providers,
-                    vision_caller=vision_caller,
-                    image_urls=tool_image_urls,
-                    sticker_like=sticker_like,
-                    logger=logger,
-                )
             if not direct_image_input:
                 text_model_images = []
 
@@ -1222,7 +1574,24 @@ async def process_yaml_response_logic(
         {"role": "user", "content": agent_user_content},
     ]
     used_agent = False
+    agent_result: Any = None
     reply_content = ""
+    uncertain_reply_suppress_recovery = False
+
+    def _trace_suppressed_agent_reply(background_detail: str, evidence_detail: str) -> None:
+        if str(getattr(agent_result, "quality_context", "") or "") == "evidence_unavailable":
+            _trace_no_reply(
+                "evidence_unavailable",
+                diagnosis_code="evidence_unavailable",
+                detail=evidence_detail,
+            )
+            return
+        _trace_no_reply(
+            "background_action_pending",
+            diagnosis_code="background_action_pending",
+            detail=background_detail,
+        )
+
     async def _call_text_model_with_retry(messages_to_use: List[Dict[str, Any]]) -> str:
         try:
             result = await call_ai_api(messages_to_use)
@@ -1270,8 +1639,77 @@ async def process_yaml_response_logic(
         is_direct_mention=is_direct_mention,
         has_image_input=bool(tool_image_urls),
     ):
-        executor = ActionExecutor(bot, event, plugin_config, logger)
+        executor = ActionExecutor(
+            bot,
+            event,
+            plugin_config,
+            logger,
+            qq_outbound_ledger=qq_outbound_ledger,
+            operation_id=_build_reply_operation_id(
+                bot=bot,
+                event=event,
+                reply_trace_id=outbound_reply_trace_id,
+            ),
+            user_target=user_id,
+            recall_cutoff=float(
+                reply_commit_state.get("received_wall_at", 0.0) or time.time()
+            ),
+        )
         agent_tool_registry = _clone_tool_registry(tool_registry)
+        register_qq_recall_tool(
+            agent_tool_registry,
+            executor=executor,
+            bot=bot,
+            event=event,
+            cutoff=float(
+                reply_commit_state.get("received_wall_at", 0.0) or time.time()
+            ),
+        )
+        register_current_user_avatar_tool(agent_tool_registry, profile_service, user_id)
+        register_current_group_context_tool(
+            agent_tool_registry,
+            bot=bot,
+            event=event,
+            plugin_config=plugin_config,
+            logger=logger,
+            policy_authorizer=(
+                user_policy_gate.current_authorization
+                if user_policy_gate is not None
+                else None
+            ),
+        )
+        register_group_user_avatar_pair_insight_tool(
+            agent_tool_registry,
+            runtime=avatar_pair_runtime
+            or SimpleNamespace(
+                plugin_config=plugin_config,
+                get_configured_api_providers=get_configured_api_providers,
+            ),
+            bot=bot,
+            event=event,
+            candidates=resolved_avatar_pair_candidates,
+            policy_authorizer=(
+                user_policy_gate.current_authorization
+                if user_policy_gate is not None
+                else None
+            ),
+        )
+        register_group_member_avatar_insight_tool(
+            agent_tool_registry,
+            runtime=avatar_pair_runtime
+            or SimpleNamespace(
+                plugin_config=plugin_config,
+                get_configured_api_providers=get_configured_api_providers,
+            ),
+            bot=bot,
+            event=event,
+            candidates=resolved_avatar_pair_candidates,
+            policy_authorizer=(
+                user_policy_gate.current_authorization
+                if user_policy_gate is not None
+                else None
+            ),
+        )
         register_send_qq_expression_tools(
             agent_tool_registry,
             executor=executor,
@@ -1314,13 +1752,36 @@ async def process_yaml_response_logic(
         ack_sender = None
         if ack_phrase:
             async def _ack_sender(text: str, *, _phrase: str = ack_phrase) -> None:
-                await bot.send(event, str(text or "").strip() or _phrase)
+                visible_ack = _guard_reply_ack_text(
+                    text,
+                    fallback=_phrase,
+                    logger=logger,
+                )
+                if not visible_ack:
+                    return
+                mark_reply_phase(reply_commit_state, "delivery_commit_wait")
+                await acquire_reply_commit(reply_commit_state)
+                mark_reply_phase(reply_commit_state, "delivery")
+                try:
+                    # _send_reply keeps the legacy await bot.send(...) fallback without a ledger.
+                    if user_policy_gate is not None:
+                        await user_policy_gate.ensure_current(event)
+                    await _send_reply(
+                        visible_ack,
+                        surface="reply_ack",
+                    )
+                finally:
+                    release_reply_commit(reply_commit_state)
+                    mark_reply_phase(reply_commit_state, "yaml_agent_after_ack")
             ack_sender = _ack_sender
         _trace_stage(
             key="yaml_agent_start",
             label="YAML Agent 开始",
             status="info",
-            detail=f"images={len(tool_image_urls)} direct_image={bool(agent_direct_image_input)}",
+            detail=(
+                f"images={len(tool_image_urls)} direct_image={bool(agent_direct_image_input)} "
+                "elapsed_ms=0"
+            ),
         )
         try:
             try:
@@ -1344,14 +1805,19 @@ async def process_yaml_response_logic(
                     relationship_hint=relationship_hint,
                     recent_bot_replies=recent_bot_replies,
                     precomputed_intent=intent_decision,
-                    turn_plan=getattr(semantic_frame, "turn_plan", None),
+                    turn_plan=turn_plan,
                     time_budget_seconds=_compute_agent_time_budget(
                         started_at=started_at,
                         total_timeout_seconds=float(
                             getattr(plugin_config, "personification_response_timeout", 180) or 180
                         ),
+                        response_deadline=response_deadline,
                     ),
                     ack_sender=ack_sender,
+                    is_group=not is_private_session,
+                    is_direct_mention=is_direct_mention,
+                    reply_required=reply_required,
+                    turn_media_context=turn_media_refs,
                 )
             except Exception as exc:
                 if not (
@@ -1366,6 +1832,60 @@ async def process_yaml_response_logic(
         finally:
             reset_current_image_context(image_ctx_token)
         if agent_result is not None:
+            social_coverage = dict(getattr(agent_result, "social_coverage", {}) or {})
+            reply_commit_state["agent_evidence_delivery_required"] = bool(
+                getattr(agent_result, "evidence_delivery_required", False)
+            )
+            reply_commit_state["agent_evidence_delivery_status"] = str(
+                getattr(agent_result, "evidence_delivery_status", "not_required") or "not_required"
+            )
+            reply_commit_state["agent_evidence_recovered"] = bool(
+                getattr(agent_result, "evidence_recovered", False)
+            )
+            reply_commit_state["agent_social_coverage_status"] = str(
+                social_coverage.get("coverage_status", "") or ""
+            )
+            reply_commit_state["agent_social_tool_execution"] = (
+                "partial" if bool(social_coverage.get("partial", False)) else "ok"
+                if bool(getattr(agent_result, "social_evidence", None))
+                else "not_used"
+            )
+            agent_failure_code = str(getattr(agent_result, "failure_code", "") or "").strip()
+            if agent_failure_code:
+                delivery_started = bool(reply_commit_state.get("reply_delivery_started", False))
+                delivery_confirmed = bool(reply_commit_state.get("reply_delivery_confirmed", False))
+                if delivery_confirmed:
+                    delivery_state = "partial"
+                    trace_outcome = "partial"
+                    diagnosis_code = f"partial_{agent_failure_code}"
+                elif delivery_started:
+                    delivery_state = "dispatching"
+                    trace_outcome = "failed"
+                    diagnosis_code = "outbound_send_failed"
+                else:
+                    delivery_state = "not_started"
+                    trace_outcome = "failed"
+                    diagnosis_code = agent_failure_code
+                logger.warning(
+                    f"拟人插件 (YAML)：Agent 基础设施失败，保持静默: code={agent_failure_code} "
+                    f"delivery_state={delivery_state}"
+                )
+                _trace_stage(
+                    key="yaml_agent_operational_failure",
+                    label="YAML Agent 基础设施失败",
+                    status="warn" if delivery_confirmed else "error",
+                    detail=f"code={agent_failure_code} delivery_state={delivery_state} silent=true",
+                )
+                _trace_finish(
+                    outcome=trace_outcome,
+                    diagnosis_code=diagnosis_code,
+                    detail={
+                        "silent": True,
+                        "delivery_state": delivery_state,
+                        "failure_code": agent_failure_code,
+                    },
+                )
+                return
             reply_content = agent_result.text
             used_agent = True
             _trace_stage(
@@ -1377,13 +1897,34 @@ async def process_yaml_response_logic(
                     f"direct_output={bool(getattr(agent_result, 'direct_output', False))} "
                     f"actions={len(getattr(agent_result, 'pending_actions', []) or [])}"
                 ),
-            )
+                )
+            if required_reply_needs_recovery(
+                reply_content,
+                reply_required=reply_required,
+                pending_actions=list(getattr(agent_result, "pending_actions", []) or []),
+                direct_output=bool(
+                    getattr(agent_result, "direct_output", False)
+                    or getattr(agent_result, "suppress_reply_recovery", False)
+                ),
+            ):
+                logger.warning("拟人插件 (YAML)：强交互 Agent 返回静默，改走基础模型恢复。")
+                reply_content = ""
+                used_agent = False
+                agent_result = None
+        if agent_result is not None:
+            reply_content, legacy_favorability_signals = extract_legacy_favorability_markers(reply_content)
+            favorability_signals.merge(legacy_favorability_signals)
             if not agent_result.direct_output and is_agent_reply_ooc(reply_content):
                 rewritten_ooc = await rewrite_agent_reply_ooc(
                     tool_caller=lite_tool_caller or agent_tool_caller,
                     original_text=reply_content,
                     persona_system=system_prompt,
                     output_mode=str(getattr(semantic_frame, "output_mode", "chat_short") or "chat_short"),
+                    avoid_questions=not is_private_session,
+                    allow_rhetorical_banter=bool(
+                        is_direct_mention
+                        and str(getattr(turn_plan_for_prompt, "speech_act", "") or "") in {"", "participate", "tease"}
+                    ),
                 )
                 if rewritten_ooc:
                     reply_content = rewritten_ooc
@@ -1393,19 +1934,50 @@ async def process_yaml_response_logic(
                 logger.info(f"拟人插件 (YAML)：会话 {group_id} 已出现更新批次，本轮旧回复丢弃。")
                 _trace_no_reply("stale_reply", diagnosis_code="stale_reply", detail="Agent 结果生成后出现更新批次")
                 return
-            action_history_parts: list[str] = []
-            for action in agent_result.pending_actions:
-                await executor.execute(action["type"], action["params"])
-                history_text = qq_action_history_text(action)
-                if history_text:
-                    action_history_parts.append(history_text)
-            if action_history_parts:
-                setattr(event, "_personification_pending_action_history_text", " ".join(action_history_parts))
+            pending_action_executor = executor
+            pending_actions = list(agent_result.pending_actions)
             if agent_result.direct_output:
+                mark_reply_phase(reply_commit_state, "delivery_commit_wait")
+                await acquire_reply_commit(reply_commit_state)
+                if user_policy_gate is not None:
+                    await user_policy_gate.ensure_current(event)
+                mark_reply_phase(reply_commit_state, "delivery")
+                if _has_newer_batch_now():
+                    logger.info(f"拟人插件 (YAML)：会话 {group_id} 已出现更新批次，本轮旧回复丢弃。")
+                    _trace_no_reply("stale_reply", diagnosis_code="stale_reply", detail="直出消息提交前出现更新批次")
+                    return
+                await _commit_pending_actions()
                 raw_direct_output = str(reply_content or "").strip()
                 if _looks_like_translation_result(raw_direct_output):
                     try:
-                        if await _send_translation_forward(bot, event, raw_direct_output):
+                        mark_reply_delivery_started(reply_commit_state)
+                        translation_result = await _send_translation_forward(
+                            bot,
+                            event,
+                            raw_direct_output,
+                            qq_outbound_ledger=qq_outbound_ledger,
+                            operation_id=outbound_reply_trace_id,
+                            user_target=user_id,
+                            logger=logger,
+                        )
+                        if translation_result is False:
+                            release_reply_commit(reply_commit_state)
+                            mark_reply_phase(reply_commit_state, "reply_complete")
+                            _trace_no_reply(
+                                "unsafe_visible_output",
+                                diagnosis_code="blocked",
+                                detail="翻译转发内容被安全门拦截",
+                            )
+                            return
+                        translation_confirmed = (
+                            not isinstance(translation_result, SendReceipt)
+                            or translation_result.status == "sent"
+                        )
+                        if translation_confirmed:
+                            _confirm_reply_delivery()
+                            mark_reply_delivery_complete(reply_commit_state)
+                            release_reply_commit(reply_commit_state)
+                            mark_reply_phase(reply_commit_state, "reply_complete")
                             _trace_stage(
                                 key="yaml_direct_output_success",
                                 label="YAML 直出完成",
@@ -1418,9 +1990,65 @@ async def process_yaml_response_logic(
                                 detail={"direct_output": True, "kind": "translation_forward"},
                             )
                             return
+                        delivery_unknown = True
+                        release_reply_commit(reply_commit_state)
+                        mark_reply_phase(reply_commit_state, "reply_complete")
+                        _trace_finish(
+                            outcome="failed",
+                            diagnosis_code="outbound_send_failed",
+                            detail={"direct_output": True, "kind": "translation_forward"},
+                        )
+                        return
                     except Exception as e:
+                        if qq_outbound_ledger is not None:
+                            delivery_partial = bool(
+                                reply_commit_state.get("reply_delivery_confirmed", False)
+                            )
+                            delivery_unknown = not delivery_partial
+                            logger.warning(
+                                f"拟人插件: 翻译结果转发发送结果未知，禁止自动回退重发: {e}"
+                            )
+                            release_reply_commit(reply_commit_state)
+                            mark_reply_phase(reply_commit_state, "reply_complete")
+                            _trace_finish(
+                                outcome="partial" if delivery_partial else "failed",
+                                diagnosis_code=(
+                                    "partial_reply_timeout"
+                                    if delivery_partial
+                                    else "outbound_send_failed"
+                                ),
+                                detail={"direct_output": True, "kind": "translation_forward"},
+                            )
+                            return
                         logger.warning(f"拟人插件: 翻译结果转发发送失败，回退到普通消息: {e}")
                 raw_direct_output = normalize_visible_reply_text(strip_response_control_markers(raw_direct_output))
+                if raw_direct_output:
+                    raw_direct_output = guard_visible_text(
+                        raw_direct_output,
+                        logger=logger,
+                        surface="yaml_direct_output",
+                        allow_direct_media=False,
+                        allow_control=False,
+                    )
+                if not raw_direct_output:
+                    action_confirmed = bool(reply_commit_state.get("reply_delivery_confirmed", False))
+                    if action_confirmed:
+                        mark_reply_delivery_complete(reply_commit_state)
+                    release_reply_commit(reply_commit_state)
+                    mark_reply_phase(reply_commit_state, "reply_complete")
+                    if action_confirmed:
+                        _trace_finish(
+                            outcome="ok",
+                            diagnosis_code="blocked",
+                            detail={"direct_output": True, "visible_text_blocked": True, "actions_sent": True},
+                        )
+                    else:
+                        _trace_no_reply(
+                            "unsafe_visible_output",
+                            diagnosis_code="blocked",
+                            detail="YAML 直出内容为空或被安全门拦截",
+                        )
+                    return
                 direct_segments_sent = 0
                 for seg in re.split(r"(?:\r?\n){2,}", raw_direct_output):
                     text = seg.strip()
@@ -1429,7 +2057,7 @@ async def process_yaml_response_logic(
                             logger.info(f"拟人插件 (YAML)：会话 {group_id} 已出现更新批次，本轮旧回复丢弃。")
                             _trace_no_reply("stale_reply", diagnosis_code="stale_reply", detail="直出消息发送前出现更新批次")
                             return
-                        await bot.send(event, text)
+                        await _send_reply(text)
                         direct_segments_sent += 1
                         await asyncio.sleep(random.uniform(0.5, 1.2))
                 _trace_stage(
@@ -1438,6 +2066,9 @@ async def process_yaml_response_logic(
                     status="ok",
                     detail=f"segments={direct_segments_sent}",
                 )
+                mark_reply_delivery_complete(reply_commit_state)
+                release_reply_commit(reply_commit_state)
+                mark_reply_phase(reply_commit_state, "reply_complete")
                 _trace_finish(
                     outcome="ok",
                     diagnosis_code="ok",
@@ -1454,17 +2085,79 @@ async def process_yaml_response_logic(
         )
     if not reply_content:
         logger.warning("拟人插件 (YAML): 未能获取到 AI 回复内容")
-        _trace_no_reply("empty_model_reply", diagnosis_code="model_empty", detail="模型返回空内容")
-        return
+        if reply_required:
+            reply_content = required_reply_fallback_text(has_images=bool(tool_image_urls))
+        else:
+            _trace_no_reply("empty_model_reply", diagnosis_code="model_empty", detail="模型返回空内容")
+            return
+    if not used_agent and needs_uncertain_visible_reply_review(
+        ambiguity_level=intent_ambiguity_level,
+        persona_response_info_added=getattr(
+            semantic_frame,
+            "persona_response_info_added",
+            "",
+        ),
+    ):
+        uncertain_started_at = time.monotonic()
+        uncertain_timeout = 8.0
+        if isinstance(response_deadline, (int, float)):
+            uncertain_timeout = min(
+                uncertain_timeout,
+                max(0.0, float(response_deadline) - time.monotonic()),
+            )
+        uncertain_decision = await resolve_uncertain_visible_reply(
+            review_call_ai_api or call_ai_api,
+            candidate_text=reply_content,
+            raw_message_text=raw_message_text or history_last_text or trigger_reason,
+            persona_system=system_prompt,
+            turn_plan=turn_plan,
+            reply_required=reply_required,
+            is_private=is_private_session,
+            evidence_unavailable=False,
+            timeout=uncertain_timeout,
+        )
+        if uncertain_decision.action == "request_context" and uncertain_decision.text:
+            reply_content = uncertain_decision.text.strip()
+        elif uncertain_decision.action == "silence":
+            reply_content = "[SILENCE]"
+            uncertain_reply_suppress_recovery = True
+        _trace_stage(
+            key="yaml_uncertain_reply_review",
+            label="YAML 高歧义回复收口",
+            status="ok" if uncertain_decision.action in {"accept", "request_context"} else "warn",
+            detail=(
+                f"action={uncertain_decision.action} "
+                f"flags={','.join(uncertain_decision.flags) or '-'} "
+                f"elapsed_ms={int((time.monotonic() - uncertain_started_at) * 1000)}"
+            ),
+        )
     if _has_newer_batch_now():
         logger.info(f"拟人插件 (YAML)：会话 {group_id} 已出现更新批次，本轮旧回复丢弃。")
         _trace_no_reply("stale_reply", diagnosis_code="stale_reply", detail="模型回复生成后出现更新批次")
         return
+    if required_reply_needs_recovery(
+        reply_content,
+        reply_required=reply_required,
+        pending_actions=pending_actions,
+        direct_output=bool(
+            uncertain_reply_suppress_recovery
+            or (
+                agent_result is not None
+                and (
+                    getattr(agent_result, "direct_output", False)
+                    or getattr(agent_result, "suppress_reply_recovery", False)
+                )
+            )
+        ),
+    ):
+        reply_content = required_reply_fallback_text(has_images=bool(tool_image_urls))
     if used_agent and reply_content in ("[NO_REPLY]", "<NO_REPLY>"):
         logger.info("拟人插件 (YAML)：Agent 返回 NO_REPLY，保持沉默。")
         _trace_no_reply("agent_no_reply", detail="Agent 返回 NO_REPLY")
         return
 
+    reply_content, legacy_favorability_signals = extract_legacy_favorability_markers(reply_content)
+    favorability_signals.merge(legacy_favorability_signals)
     parsed = parse_yaml_response(reply_content)
     has_block_marker = "[BLOCK]" in reply_content or "<BLOCK>" in reply_content
     frame_domain_focus = str(getattr(semantic_frame, "domain_focus", "") or "").strip().lower()
@@ -1499,17 +2192,63 @@ async def process_yaml_response_logic(
                         logger.warning(f"[BLOCK] 通知管理员 {_su} 失败: {_e}")
 
             asyncio.create_task(_notify_superusers())
-        _trace_no_reply("block_marker", diagnosis_code="blocked", detail="模型返回 BLOCK 控制标记")
-        return
+        if reply_required:
+            reply_content = "这个我不能接。"
+            parsed = parse_yaml_response(reply_content)
+        else:
+            _trace_no_reply("block_marker", diagnosis_code="blocked", detail="模型返回 BLOCK 控制标记")
+            return
     if has_silence_control_marker(reply_content):
+        await _commit_pending_actions()
         if _record_pending_action_history_if_any():
             logger.info("拟人插件 (YAML)：Agent 静默动作已写入会话历史。")
         logger.info("AI (YAML) 决定保持沉默 (SILENCE)")
-        _trace_no_reply("silence_marker", detail="模型返回 SILENCE 控制标记")
-        return
+        if bool(reply_commit_state.get("reply_delivery_confirmed", False)):
+            mark_reply_delivery_complete(reply_commit_state)
+            release_reply_commit(reply_commit_state)
+            mark_reply_phase(reply_commit_state, "reply_complete")
+            _trace_finish(outcome="ok", diagnosis_code="ok", detail={"action_only": True})
+            return
+        if uncertain_reply_suppress_recovery:
+            _trace_no_reply(
+                "uncertain_reply_silenced",
+                diagnosis_code="uncertain_reply_silenced",
+                detail="高歧义候选没有实质内容或具体补充请求",
+            )
+            return
+        if bool(getattr(agent_result, "suppress_reply_recovery", False)):
+            _trace_suppressed_agent_reply(
+                "后台动作已启动，状态回复保持静默",
+                "当前没有足够可用证据，状态回复保持静默",
+            )
+            return
+        if reply_required:
+            reply_content = required_reply_fallback_text(has_images=bool(tool_image_urls))
+            parsed = parse_yaml_response(reply_content)
+        else:
+            _trace_no_reply("silence_marker", detail="模型返回 SILENCE 控制标记")
+            return
 
     status_text = str(parsed.get("status") or "").strip()
     action_text = str(parsed.get("action") or "").strip()
+    pending_yaml_poke = bool(schedule_active and "戳一戳" in action_text)
+
+    async def _commit_yaml_poke() -> bool:
+        nonlocal pending_yaml_poke
+        if not pending_yaml_poke:
+            return True
+        await acquire_reply_commit(reply_commit_state)
+        if user_policy_gate is not None:
+            await user_policy_gate.ensure_current(event)
+        if _has_newer_batch_now():
+            _trace_no_reply("stale_reply", diagnosis_code="stale_reply", detail="YAML 动作提交前出现更新批次")
+            return False
+        try:
+            await _send_reply(message_segment_cls.poke(int(user_id)))
+            pending_yaml_poke = False
+        except Exception as exc:
+            logger.warning(f"拟人插件: 发送戳一戳失败: {exc}")
+        return True
 
     if schedule_active and status_text:
         bot_statuses[group_id] = {
@@ -1525,11 +2264,6 @@ async def process_yaml_response_logic(
 
     if schedule_active and action_text:
         logger.info(f"拟人插件: 执行动作: {action_text}")
-        if "戳一戳" in action_text:
-            try:
-                await bot.send(event, message_segment_cls.poke(int(user_id)))
-            except Exception as e:
-                logger.warning(f"拟人插件: 发送戳一戳失败: {e}")
     elif not schedule_active:
         action_text = ""
 
@@ -1579,7 +2313,7 @@ async def process_yaml_response_logic(
         except Exception as e:
             logger.debug(f"[yaml_response_handler] banter regenerate skipped: {e}")
 
-    if not used_agent and not is_private_session and message_intent == "banter":
+    if not is_private_session and message_intent == "banter":
         async def _rewrite_for_repeat(cluster_text: str, original_reply: str) -> str:
             return str(
                 await call_ai_api(
@@ -1613,7 +2347,7 @@ async def process_yaml_response_logic(
             raw_message_text=raw_message_text or history_last_text,
             message_intent=message_intent,
             is_private_session=is_private_session,
-            is_random_chat=False,
+            is_random_chat=is_random_chat,
             is_direct_mention=is_direct_mention,
             has_newer_batch=_has_newer_batch_now(),
             rewrite_reply=_rewrite_for_repeat,
@@ -1621,13 +2355,27 @@ async def process_yaml_response_logic(
         if assistant_text:
             parsed = {"messages": [{"text": assistant_text, "sticker": ""}], "think": "", "status": "", "action": ""}
 
-    should_review_agent_reply = bool(used_agent and tool_image_urls and not _IMAGE_B64_RE.search(assistant_text or ""))
-    if used_agent and not should_review_agent_reply:
+    care_review_required = bool(
+        getattr(semantic_frame, "requires_emotional_care", False)
+        or getattr(getattr(semantic_frame, "emotional_support", None), "needed", False)
+    )
+    should_review_visual_reply = bool(turn_media_refs and not _IMAGE_B64_RE.search(assistant_text or ""))
+    should_review_agent_reply = bool(used_agent and should_review_visual_reply)
+    protected_review_required = bool(
+        resolved_plugin_episode is not None
+        or detect_persona_identity_leak(assistant_text)
+    )
+    if used_agent and not should_review_agent_reply and not care_review_required and not protected_review_required:
         review_decision = make_passthrough_review_decision(
             assistant_text,
             reason="agent_passthrough",
         )
-    elif not bool(getattr(plugin_config, "personification_response_review_enabled", False)):
+    elif (
+        not care_review_required
+        and not should_review_visual_reply
+        and not protected_review_required
+        and not bool(getattr(plugin_config, "personification_response_review_enabled", False))
+    ):
         review_decision = make_passthrough_review_decision(
             assistant_text,
             reason="review_disabled",
@@ -1645,7 +2393,10 @@ async def process_yaml_response_logic(
             is_private=is_private_session,
             is_random_chat=is_random_chat,
             is_direct_mention=is_direct_mention,
+            reply_required=reply_required,
             semantic_frame=semantic_frame,
+            turn_media_context=turn_media_refs,
+            plugin_episode=resolved_plugin_episode,
         )
     if review_decision.action == "no_reply":
         logger.info(f"拟人插件 (YAML)：回复审阅后选择沉默，group={group_id} user={user_id}")
@@ -1655,16 +2406,64 @@ async def process_yaml_response_logic(
         assistant_text = sanitize_history_text(review_decision.text.strip())
         parsed = {"messages": [{"text": assistant_text, "sticker": ""}], "think": "", "status": "", "action": ""}
 
+    assistant_text, reviewed_favorability_signals = extract_legacy_favorability_markers(assistant_text)
+    favorability_signals.merge(reviewed_favorability_signals)
+
+    suppress_reply_recovery = bool(
+        agent_result is not None and getattr(agent_result, "suppress_reply_recovery", False)
+    ) or uncertain_reply_suppress_recovery
+    if (
+        has_silence_control_marker(assistant_text)
+        and reply_required
+        and not pending_actions
+        and not suppress_reply_recovery
+    ):
+        assistant_text = required_reply_fallback_text(has_images=bool(tool_image_urls))
+        parsed = {"messages": [{"text": assistant_text, "sticker": ""}], "think": "", "status": "", "action": ""}
     if has_silence_control_marker(assistant_text):
         logger.info(f"拟人插件 (YAML)：最终回复含沉默控制标记，group={group_id} user={user_id}")
-        _trace_no_reply("final_silence_marker", detail="最终回复含沉默控制标记")
-        return
+        await _commit_pending_actions()
+        if bool(reply_commit_state.get("reply_delivery_confirmed", False)):
+            mark_reply_delivery_complete(reply_commit_state)
+            release_reply_commit(reply_commit_state)
+            mark_reply_phase(reply_commit_state, "reply_complete")
+            _trace_finish(outcome="ok", diagnosis_code="ok", detail={"action_only": True})
+            return
+        if suppress_reply_recovery:
+            _trace_suppressed_agent_reply(
+                "后台动作已启动，最终状态回复保持静默",
+                "当前没有足够可用证据，最终回复保持静默",
+            )
+            return
+        if reply_required:
+            assistant_text = required_reply_fallback_text(has_images=bool(tool_image_urls))
+            parsed = {"messages": [{"text": assistant_text, "sticker": ""}], "think": "", "status": "", "action": ""}
+        else:
+            _trace_no_reply("final_silence_marker", detail="最终回复含沉默控制标记")
+            return
 
     cleaned_assistant_text = strip_response_control_markers(assistant_text)
     cleaned_assistant_text = normalize_visible_reply_text(cleaned_assistant_text)
     if not cleaned_assistant_text:
-        _trace_no_reply("empty_visible_reply", diagnosis_code="model_empty", detail="清理控制标记后没有可见文本")
-        return
+        if suppress_reply_recovery:
+            _trace_suppressed_agent_reply(
+                "后台动作已启动，清理后状态回复保持静默",
+                "当前没有足够可用证据，清理后保持静默",
+            )
+            return
+        if reply_required:
+            cleaned_assistant_text = required_reply_fallback_text(has_images=bool(tool_image_urls))
+            parsed = {
+                "messages": [{"text": cleaned_assistant_text, "sticker": ""}],
+                "think": "",
+                "status": "",
+                "action": "",
+            }
+        else:
+            if not await _commit_yaml_poke():
+                return
+            _trace_no_reply("empty_visible_reply", diagnosis_code="model_empty", detail="清理控制标记后没有可见文本")
+            return
     if parsed.get("messages"):
         parsed = _normalize_parsed_message_texts(parsed)
         if not any(str(item.get("text", "") or "").strip() for item in parsed.get("messages", [])):
@@ -1672,6 +2471,10 @@ async def process_yaml_response_logic(
     elif cleaned_assistant_text != assistant_text:
         parsed = {"messages": [{"text": cleaned_assistant_text, "sticker": ""}], "think": "", "status": "", "action": ""}
     assistant_text = cleaned_assistant_text
+    assistant_text = guard_visible_text(assistant_text, logger=logger, surface="yaml_reply")
+    if not assistant_text:
+        _trace_no_reply("unsafe_visible_output", diagnosis_code="blocked", detail="最终可见输出被安全门拦截")
+        return
     qq_auto_marker = maybe_choose_auto_qq_expression_marker(
         plugin_config=plugin_config,
         semantic_frame=semantic_frame,
@@ -1737,13 +2540,33 @@ async def process_yaml_response_logic(
         stickers_sent = [path.stem for path in chosen_sticker_paths if path is not None]
     elif parsed["messages"]:
         chosen_sticker_paths = [None for _ in parsed["messages"]]
+    delivered_sticker_names: list[str] = []
 
     if _has_newer_batch_now():
         logger.info(f"拟人插件 (YAML)：会话 {group_id} 已出现更新批次，本轮旧回复丢弃。")
         _trace_no_reply("stale_reply", diagnosis_code="stale_reply", detail="发送前出现更新批次")
         return
+    mark_reply_phase(reply_commit_state, "delivery_commit_wait")
+    await acquire_reply_commit(reply_commit_state)
+    if user_policy_gate is not None:
+        await user_policy_gate.ensure_current(event)
+    delivery_started_at = time.monotonic()
+    mark_reply_phase(reply_commit_state, "delivery")
+    if _has_newer_batch_now():
+        logger.info(f"拟人插件 (YAML)：会话 {group_id} 已出现更新批次，本轮旧回复丢弃。")
+        _trace_no_reply("stale_reply", diagnosis_code="stale_reply", detail="获得提交锁后出现更新批次")
+        return
+    await _commit_pending_actions()
+    if not await _commit_yaml_poke():
+        return
 
     sent_as_tts = False
+    delivery_partial = False
+    delivery_unknown = False
+
+    def _mark_tts_delivery_unknown() -> None:
+        nonlocal delivery_unknown
+        delivery_unknown = True
     sent_message_id = ""
     address_plan = _humanize.decide_addressing(
         plugin_config=plugin_config,
@@ -1765,7 +2588,7 @@ async def process_yaml_response_logic(
             f"address_mode={address_plan.get('mode') or 'none'} "
             f"source={address_plan.get('source') or '-'} "
             f"quote={bool(quote_message_id)} at={bool(at_target)} "
-            f"target={str(at_target or '-')}"
+            f"target={str(at_target or '-')} elapsed_ms=0"
         ),
     )
     if (
@@ -1802,9 +2625,21 @@ async def process_yaml_response_logic(
                     is_private=is_private_session,
                     persona_tts=persona_tts,
                     pause_range=(0.8, 1.5),
+                    on_delivery_started=lambda: mark_reply_delivery_started(reply_commit_state),
+                    on_delivery_confirmed=_confirm_reply_delivery,
+                    on_delivery_unknown=_mark_tts_delivery_unknown,
+                    operation_id=outbound_reply_trace_id,
+                    user_target=user_id,
                 )
         except Exception as e:
-            logger.warning(f"[tts] YAML 自动语音发送失败，回退文字: {e}")
+            likely_delivered = is_likely_delivered_send_timeout(e)
+            if bool(reply_commit_state.get("reply_delivery_confirmed", False)) or likely_delivered:
+                sent_as_tts = True
+                delivery_unknown = likely_delivered
+                delivery_partial = not likely_delivered
+                logger.warning(f"[tts] YAML 自动语音发送结果不完整，不重复发送完整文字: {e}")
+            else:
+                logger.warning(f"[tts] YAML 自动语音发送失败，回退文字: {e}")
 
     if not sent_as_tts:
         clean_reply = ""
@@ -1858,9 +2693,9 @@ async def process_yaml_response_logic(
                                     )
                                 except Exception:
                                     outgoing = rendered_seg.message
-                            send_result = await bot.send(event, outgoing)
+                            send_result = await _send_reply(outgoing)
                             if not sent_message_id:
-                                sent_message_id = extract_send_message_id(send_result)
+                                sent_message_id = _message_id_from_send_result(send_result)
                             await asyncio.sleep(random.uniform(0.4, 1.0))
 
                 for image_b64 in image_b64_payloads:
@@ -1868,9 +2703,9 @@ async def process_yaml_response_logic(
                         logger.info(f"拟人插件 (YAML)：会话 {group_id} 已出现更新批次，本轮旧回复丢弃。")
                         _trace_no_reply("stale_reply", diagnosis_code="stale_reply", detail="图片发送前出现更新批次")
                         return
-                    send_result = await bot.send(event, message_segment_cls.image(f"base64://{image_b64}"))
+                    send_result = await _send_reply(message_segment_cls.image(f"base64://{image_b64}"))
                     if not sent_message_id:
-                        sent_message_id = extract_send_message_id(send_result)
+                        sent_message_id = _message_id_from_send_result(send_result)
                     await asyncio.sleep(random.uniform(0.4, 1.0))
 
                 chosen_sticker_path = chosen_sticker_paths.pop(0) if chosen_sticker_paths else None
@@ -1880,10 +2715,12 @@ async def process_yaml_response_logic(
                             logger.info(f"拟人插件 (YAML)：会话 {group_id} 已出现更新批次，本轮旧回复丢弃。")
                             _trace_no_reply("stale_reply", diagnosis_code="stale_reply", detail="表情发送前出现更新批次")
                             return
-                        send_result = await bot.send(event, message_segment_cls.image(f"file:///{chosen_sticker_path.absolute()}"))
+                        send_result = await _send_reply(
+                            message_segment_cls.image(f"file:///{chosen_sticker_path.absolute()}")
+                        )
                         if not sent_message_id:
-                            sent_message_id = extract_send_message_id(send_result)
-                        await record_sticker_sent(chosen_sticker_path.stem)
+                            sent_message_id = _message_id_from_send_result(send_result)
+                        delivered_sticker_names.append(chosen_sticker_path.stem)
                         mark_pending_sticker_reaction(
                             build_sticker_feedback_scene_key(
                                 group_id=group_id,
@@ -1924,23 +2761,28 @@ async def process_yaml_response_logic(
                         )
                     except Exception:
                         outgoing = rendered_reply.message
-                    send_result = await bot.send(event, outgoing)
+                    send_result = await _send_reply(outgoing)
                 else:
                     send_result = None
                 if send_result is not None and not sent_message_id:
-                    sent_message_id = extract_send_message_id(send_result)
+                    sent_message_id = _message_id_from_send_result(send_result)
             for image_b64 in image_b64_payloads:
                 if _has_newer_batch_now():
                     logger.info(f"拟人插件 (YAML)：会话 {group_id} 已出现更新批次，本轮旧回复丢弃。")
                     _trace_no_reply("stale_reply", diagnosis_code="stale_reply", detail="生成图片发送前出现更新批次")
                     return
-                send_result = await bot.send(event, message_segment_cls.image(f"base64://{image_b64}"))
+                send_result = await _send_reply(message_segment_cls.image(f"base64://{image_b64}"))
                 if not sent_message_id:
-                    sent_message_id = extract_send_message_id(send_result)
+                    sent_message_id = _message_id_from_send_result(send_result)
 
+    if not delivery_partial and not delivery_unknown:
+        mark_reply_delivery_complete(reply_commit_state)
+    if user_policy_gate is not None:
+        await user_policy_gate.ensure_current(event)
+    mark_reply_phase(reply_commit_state, "delivery_history_commit")
     session_id = build_private_session_id(user_id) if is_private_session else build_group_session_id(group_id)
     legacy_session_id = None if is_private_session else group_id
-    # YAML 模式同样只写回最终用户可见文本，避免 session 中保留未发送的原始模板输出。
+    # 可见发送与有序历史投影共用同一个提交门，避免并发直达轮次写回顺序反转。
     append_session_message(
         session_id,
         "assistant",
@@ -1958,6 +2800,45 @@ async def process_yaml_response_logic(
         mentioned_ids=[str(at_target)] if at_target else [],
         is_at_bot=False,
     )
+    if not is_private_session and record_group_msg is not None:
+        record_group_msg(
+            group_id,
+            str(getattr(bot, "self_id", "") or "bot"),
+            assistant_history_text,
+            is_bot=True,
+            user_id=str(getattr(bot, "self_id", "") or ""),
+            message_id=sent_message_id or None,
+            reply_to_msg_id=str(getattr(event, "message_id", "") or "") or None,
+            reply_to_user_id=user_id,
+            mentioned_ids=[str(at_target)] if at_target else [],
+            source_kind="bot_reply",
+        )
+    release_reply_commit(reply_commit_state)
+    delivery_elapsed_ms = int((time.monotonic() - delivery_started_at) * 1000)
+    mark_reply_phase(reply_commit_state, "post_send_bookkeeping")
+    bookkeeping_started_at = time.monotonic()
+    _trace_stage(
+        key="delivery_complete",
+        label="交付完成",
+        status="warn" if delivery_partial or delivery_unknown else "ok",
+        detail=(
+            f"elapsed_ms={delivery_elapsed_ms} "
+            f"confirmed={bool(reply_commit_state.get('reply_delivery_confirmed', False))} "
+            f"complete={bool(reply_commit_state.get('reply_delivery_complete', False))}"
+        ),
+    )
+    _trace_stage(
+        key="outgoing_message",
+        label="发送消息",
+        status="ok",
+        detail=str(assistant_history_text or "")[:500],
+        elapsed_ms=0,
+    )
+    for sticker_name in delivered_sticker_names:
+        try:
+            await record_sticker_sent(sticker_name)
+        except Exception as e:
+            logger.debug(f"[sticker] YAML sent feedback update failed: {e}")
     try:
         await update_emotion_state_after_turn(
             data_dir,
@@ -1969,24 +2850,6 @@ async def process_yaml_response_logic(
         )
     except Exception as e:
         logger.debug(f"[emotion] YAML update after reply failed: {e}")
-    try:
-        if favorability_service is not None and hasattr(favorability_service, "apply_user_reply_interaction"):
-            result = favorability_service.apply_user_reply_interaction(
-                user_id,
-                now=get_current_time(),
-                group_id="" if is_private_session else group_id,
-                is_direct=bool(is_direct_mention or not is_random_chat),
-                is_random_chat=bool(is_random_chat),
-            )
-            delta = float(result.get("delta", 0.0) or 0.0)
-            if delta > 0:
-                logger.debug(
-                    f"拟人插件 (YAML)：记录与 {user_name}({user_id}) 的成功回复互动，好感度 +{delta:.2f} "
-                    f"(今日已加: {float(result.get('daily_used', 0.0) or 0.0):.2f}/"
-                    f"{float(result.get('daily_cap', 0.0) or 0.0):.2f})"
-                )
-    except Exception as exc:
-        logger.debug(f"拟人插件 (YAML)：记录成功回复互动好感事件失败: {exc}")
     schedule_inner_state_update_after_reply(
         inner_state_updater=inner_state_updater,
         logger=logger,
@@ -2016,49 +2879,56 @@ async def process_yaml_response_logic(
                 group_id=memory_group_id,
                 topic_tags=[group_id] if not is_private_session else [],
             )
-    if not is_private_session and record_group_msg is not None:
-        record_group_msg(
-            group_id,
-            str(getattr(bot, "self_id", "") or "bot"),
-            assistant_history_text,
-            is_bot=True,
-            user_id=str(getattr(bot, "self_id", "") or ""),
-            message_id=sent_message_id or None,
-            reply_to_msg_id=str(getattr(event, "message_id", "") or "") or None,
-            reply_to_user_id=user_id,
-            mentioned_ids=[str(at_target)] if at_target else [],
-            source_kind="bot_reply",
-        )
     record_counter(
         "yaml_reply.success_total",
         scene="private" if is_private_session else "group",
         via="tts" if sent_as_tts else "text",
         sticker=bool(stickers_sent),
     )
+    bookkeeping_elapsed_ms = int((time.monotonic() - bookkeeping_started_at) * 1000)
+    mark_reply_phase(reply_commit_state, "reply_complete")
     record_timing(
         "yaml_reply.total_ms",
         (time.monotonic() - started_at) * 1000.0,
         scene="private" if is_private_session else "group",
     )
     _trace_stage(
-        key="outgoing_message",
-        label="发送消息",
+        key="post_send_bookkeeping",
+        label="发送后状态写入",
         status="ok",
-        detail=str(assistant_history_text or "")[:500],
+        detail=f"elapsed_ms={bookkeeping_elapsed_ms}",
+    )
+    completion = resolve_sent_reply_completion(
+        state=reply_commit_state,
+        visible_text=assistant_history_text,
+        delivery_partial=delivery_partial,
+        delivery_unknown=delivery_unknown,
     )
     _trace_stage(
         key="yaml_reply_success",
         label="YAML 回复完成",
-        status="ok",
-        detail=f"chars={len(assistant_history_text)} tts={bool(sent_as_tts)} sticker={bool(stickers_sent)}",
+        status="ok" if completion["outcome"] == "ok" else "warn",
+        detail=(
+            f"chars={len(assistant_history_text)} tts={bool(sent_as_tts)} "
+            f"sticker={bool(stickers_sent)} tool_execution={completion['tool_execution']} "
+            f"evidence_delivery={completion['evidence_delivery']} "
+            f"outbound_delivery={completion['outbound_delivery']}"
+        ),
     )
     _trace_finish(
-        outcome="ok",
-        diagnosis_code="ok",
+        outcome=completion["outcome"],
+        diagnosis_code=completion["diagnosis_code"],
         detail={
             "reply_chars": len(assistant_history_text),
             "tts": bool(sent_as_tts),
             "sticker": bool(stickers_sent),
+            "delivery_partial": delivery_partial,
+            "delivery_unknown": delivery_unknown,
+            "tool_execution": completion["tool_execution"],
+            "evidence_delivery": completion["evidence_delivery"],
+            "outbound_delivery": completion["outbound_delivery"],
+            "social_coverage_status": completion["coverage_status"],
+            "evidence_recovered": completion["evidence_recovered"],
             "incoming_text": str(raw_message_text or history_last_text or trigger_reason or "")[:500],
             "outgoing_text": str(assistant_history_text or "")[:500],
         },
@@ -2100,6 +2970,8 @@ def build_yaml_response_processor(
     knowledge_store: Any = None,
     inner_state_updater: Any = None,
     favorability_service: Any = None,
+    user_policy_gate: Any = None,
+    qq_outbound_ledger: QQOutboundLedger | None = None,
 ) -> Callable[..., Awaitable[None]]:
     async def _processor(
         bot: Any,
@@ -2183,9 +3055,34 @@ def build_yaml_response_processor(
             intent_recommend_silence=runtime_overrides.get("intent_recommend_silence"),
             recent_context_hint=str(runtime_overrides.get("recent_context_hint", "") or ""),
             relationship_hint=str(runtime_overrides.get("relationship_hint", "") or ""),
+            semantic_frame=runtime_overrides.get("semantic_frame"),
             has_newer_batch=bool(runtime_overrides.get("has_newer_batch", False)),
             batch_runtime_ref=runtime_overrides.get("batch_runtime_ref"),
+            reply_commit_state=runtime_overrides.get("reply_commit_state"),
             solo_speaker_follow=bool(runtime_overrides.get("solo_speaker_follow", False)),
+            reply_required=bool(runtime_overrides.get("reply_required", False)),
+            response_deadline=runtime_overrides.get("response_deadline"),
+            prepared_inner_state=runtime_overrides.get("prepared_inner_state"),
+            prepared_emotion_state=runtime_overrides.get("prepared_emotion_state"),
+            turn_media_context=list(runtime_overrides.get("turn_media_context") or []),
+            media_grounding=str(runtime_overrides.get("media_grounding", "") or ""),
+            precomputed_image_summary_suffix=str(
+                runtime_overrides.get("precomputed_image_summary_suffix", "") or ""
+            ),
+            user_profile_block=str(runtime_overrides.get("user_profile_block", "") or ""),
+            profile_service=runtime_overrides.get("profile_service"),
+            favorability_context_block=str(
+                runtime_overrides.get("favorability_context_block", "") or ""
+            ),
+            favorability_turn_id=str(runtime_overrides.get("favorability_turn_id", "") or ""),
+            avatar_pair_candidates=list(runtime_overrides.get("avatar_pair_candidates") or []),
+            avatar_pair_runtime=runtime_overrides.get("avatar_pair_runtime"),
+            user_policy_gate=runtime_overrides.get("user_policy_gate", user_policy_gate),
+            qq_outbound_ledger=runtime_overrides.get(
+                "qq_outbound_ledger",
+                qq_outbound_ledger,
+            ),
+            reply_trace_id=str(runtime_overrides.get("reply_trace_id", "") or ""),
         )
 
     return _processor

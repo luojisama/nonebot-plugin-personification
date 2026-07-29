@@ -197,37 +197,38 @@ async def update_emotion_state_after_turn(
 ) -> dict[str, Any]:
     _ = data_dir
     store = get_data_store()
-    async with store._alock(_STORE_NAME):
-        loaded = await store.load(_STORE_NAME)
-        state = _normalize_state(loaded)
-        now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        frame = semantic_frame
+    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    frame = semantic_frame
+    user_entry = {
+        "user_attitude": _trim_text(getattr(frame, "user_attitude", ""), limit=80),
+        "bot_emotion": _trim_text(getattr(frame, "bot_emotion", ""), limit=80),
+        "emotion_intensity": _trim_text(getattr(frame, "emotion_intensity", ""), limit=16),
+        "expression_style": _trim_text(getattr(frame, "expression_style", ""), limit=80),
+        "tts_style_hint": _trim_text(getattr(frame, "tts_style_hint", ""), limit=60),
+        "sticker_mood_hint": _trim_text(getattr(frame, "sticker_mood_hint", ""), limit=60),
+        "last_group_id": "" if is_private else str(group_id or ""),
+        "last_reply": _trim_text(assistant_text, limit=120),
+        "updated_at": now_str,
+    }
+    group_entry = {
+        "group_climate": _trim_text(getattr(frame, "user_attitude", ""), limit=80),
+        "bot_social_posture": _trim_text(getattr(frame, "expression_style", ""), limit=80),
+        "bot_emotion": _trim_text(getattr(frame, "bot_emotion", ""), limit=80),
+        "emotion_intensity": _trim_text(getattr(frame, "emotion_intensity", ""), limit=16),
+        "last_user_id": str(user_id or ""),
+        "updated_at": now_str,
+    }
 
+    def _mutate(loaded: Any) -> dict[str, Any]:
+        state = _normalize_state(loaded)
         per_user = dict(state.get("per_user", {}) or {})
         if user_id:
-            per_user[str(user_id)] = {
-                "user_attitude": _trim_text(getattr(frame, "user_attitude", ""), limit=80),
-                "bot_emotion": _trim_text(getattr(frame, "bot_emotion", ""), limit=80),
-                "emotion_intensity": _trim_text(getattr(frame, "emotion_intensity", ""), limit=16),
-                "expression_style": _trim_text(getattr(frame, "expression_style", ""), limit=80),
-                "tts_style_hint": _trim_text(getattr(frame, "tts_style_hint", ""), limit=60),
-                "sticker_mood_hint": _trim_text(getattr(frame, "sticker_mood_hint", ""), limit=60),
-                "last_group_id": "" if is_private else str(group_id or ""),
-                "last_reply": _trim_text(assistant_text, limit=120),
-                "updated_at": now_str,
-            }
+            per_user[str(user_id)] = dict(user_entry)
         state["per_user"] = per_user
 
         per_group = dict(state.get("per_group", {}) or {})
         if group_id and not is_private:
-            per_group[str(group_id)] = {
-                "group_climate": _trim_text(getattr(frame, "user_attitude", ""), limit=80),
-                "bot_social_posture": _trim_text(getattr(frame, "expression_style", ""), limit=80),
-                "bot_emotion": _trim_text(getattr(frame, "bot_emotion", ""), limit=80),
-                "emotion_intensity": _trim_text(getattr(frame, "emotion_intensity", ""), limit=16),
-                "last_user_id": str(user_id or ""),
-                "updated_at": now_str,
-            }
+            per_group[str(group_id)] = dict(group_entry)
         state["per_user"] = _prune_bucket(
             per_user,
             max_entries=_MAX_USER_EMOTION_ENTRIES,
@@ -239,8 +240,10 @@ async def update_emotion_state_after_turn(
             ttl_days=_EMOTION_STATE_TTL_DAYS,
         )
         state["updated_at"] = now_str
-        await store.save(_STORE_NAME, state)
         return state
+
+    updated = await store.mutate(_STORE_NAME, _mutate)
+    return _normalize_state(updated)
 
 
 __all__ = [

@@ -377,9 +377,29 @@ async def _tts_checks(cfg: Any) -> list[dict[str, Any]]:
     if not url or not _truthy_str(cfg, "personification_tts_api_key"):
         return [_check("tts", "TTS 语音", _ERROR, detail="已启用但缺少 api_url / api_key")]
     ok, info = await _http_reachable(url)
-    return [_check("tts", "TTS 语音", _OK if ok else _ERROR,
-                   detail=f"接口连通（{info}）" if ok else f"接口不通：{info}",
-                   hint="" if ok else "检查 tts_api_url 与网络/代理")]
+    if not ok:
+        return [_check(
+            "tts",
+            "TTS 语音",
+            _ERROR,
+            detail=f"接口不通：{info}",
+            hint="检查 tts_api_url 与网络/代理",
+        )]
+    if info.startswith("HTTP 4") or info.startswith("HTTP 5"):
+        return [_check(
+            "tts",
+            "TTS 语音",
+            _WARN,
+            detail=f"服务可达，但探测地址返回 {info}；尚未验证语音合成",
+            hint="核对 tts_api_url、鉴权与模型；实际合成会调用 /chat/completions",
+        )]
+    return [_check(
+        "tts",
+        "TTS 语音",
+        _OK,
+        detail=f"服务可达（{info}）；本项仅验证传输连通性",
+        hint="完整功能仍需执行一次实际语音合成",
+    )]
 
 
 async def _qzone_checks(cfg: Any) -> list[dict[str, Any]]:
@@ -429,22 +449,36 @@ async def _search_checks(cfg: Any) -> list[dict[str, Any]]:
 def _skill_checks(cfg: Any, bundle: Any) -> list[dict[str, Any]]:
     checks: list[dict[str, Any]] = []
     registry = getattr(bundle, "tool_registry", None) if bundle is not None else None
+    registry_tools: list[Any] = []
     if registry is None:
         checks.append(_check("tools", "已加载工具", _WARN, detail="工具注册表未就绪"))
     else:
         try:
-            n = len(list(registry.all()))
+            registry_tools = list(registry.all())
+            n = len(registry_tools)
         except Exception:
             n = 0
         checks.append(_check("tools", "已加载工具", _OK if n else _WARN, detail=f"{n} 个工具已注册就绪"))
-    # MCP（仅 stdio）
+    # MCP 有 Legacy Skill stdio、managed 和原生 builtin 三条接入路径；服务进程
+    # 存活不代表工具已授权注册，因此体检只把当前 registry 中的工具算作生效。
     try:
         from ..skill_runtime.mcp_compat import _REGISTERED_MCP_TOOLS
 
-        mcp_n = len(_REGISTERED_MCP_TOOLS)
-        checks.append(_check("mcp", "MCP 工具", _OK if mcp_n else _INFO,
-                             detail=(f"已接入 {mcp_n} 个 MCP 工具（stdio）" if mcp_n
-                                     else "未接入 MCP 工具；当前仅支持 stdio transport")))
+        source_counts = {"mcp": 0, "mcp_managed": 0, "mcp_builtin": 0}
+        for tool in registry_tools:
+            metadata = getattr(tool, "metadata", None) or {}
+            source_kind = str(metadata.get("source_kind") or "").strip()
+            if source_kind in source_counts:
+                source_counts[source_kind] += 1
+        source_counts["mcp"] = max(source_counts["mcp"], len(_REGISTERED_MCP_TOOLS))
+        mcp_n = sum(source_counts.values())
+        detail = (
+            f"已生效 {mcp_n} 个 MCP 工具（原生 {source_counts['mcp_builtin']}，"
+            f"managed {source_counts['mcp_managed']}，Legacy stdio {source_counts['mcp']}）"
+            if mcp_n
+            else "当前没有已授权并注册的 MCP 工具；服务运行不等于工具已对 Agent 生效，请在「MCP 管理」核对逐工具授权"
+        )
+        checks.append(_check("mcp", "MCP 工具", _OK if mcp_n else _INFO, detail=detail))
     except Exception as exc:
         checks.append(_check("mcp", "MCP 工具", _INFO, detail=f"MCP 模块不可用：{str(exc)[:80]}"))
     # 远程 skill
@@ -507,9 +541,12 @@ async def _protocol_checks(get_bots: Any, cfg: Any, logger: Any) -> list[dict[st
 
 
 def _webui_checks(cfg: Any) -> list[dict[str, Any]]:
-    approval = bool(_get(cfg, "personification_webui_require_device_approval", True))
-    return [_check("device_approval", "新设备审批", _OK if approval else _WARN,
-                   detail="已开启" if approval else "已关闭：新设备直接放行")]
+    return [_check(
+        "device_approval",
+        "WebUI 登录授权",
+        _OK,
+        detail="管理员验证码通过后直接批准设备；有效 Session 内无需重复验证",
+    )]
 
 
 async def _run_category(name: str, *, cfg, bundle, su, get_bots, logger) -> list[dict[str, Any]]:

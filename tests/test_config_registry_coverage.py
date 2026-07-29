@@ -56,6 +56,7 @@ def test_extra_entries_normalize_roundtrip() -> None:
     assert entries["tts_enabled"].normalize_value("开") is True
     assert entries["group_idle_minutes"].normalize_value("45") == 45
     assert entries["qzone_probability"].normalize_value("0.5") == 0.5
+    assert entries["qzone_semantic_review_timeout"].normalize_value("180") == 180.0
     assert entries["image_detail"].normalize_value("LOW") == "low"
     assert entries["whitelist"].normalize_value('["123"]') == ["123"]
     assert entries["favorability_enabled"].normalize_value("开") is True
@@ -73,6 +74,22 @@ def test_extra_entries_normalize_roundtrip() -> None:
     assert entries["favorability_decay_enabled"].normalize_value("关") is False
     assert entries["favorability_decay_idle_days"].normalize_value("21") == 21
     assert entries["favorability_decay_delta"].normalize_value("-0.1") == -0.1
+
+
+def test_favorability_registry_defaults_match_runtime_defaults() -> None:
+    config_module = load_personification_module("plugin.personification.config")
+    entries = {entry.key: entry for entry in config_registry.get_config_entries()}
+
+    assert entries["favorability_group_default_score"].default == 35.0
+    assert config_module.Config().personification_favorability_group_default_score == 35.0
+    assert (
+        entries["favorability_attitudes"].default
+        == config_module.Config().personification_favorability_attitudes
+    )
+    assert (
+        config_module.Config(personification_favorability_attitudes={}).personification_favorability_attitudes
+        == config_module.DEFAULT_FAVORABILITY_ATTITUDES
+    )
 
 
 def test_normalize_value_accepts_parsed_list_and_dict() -> None:

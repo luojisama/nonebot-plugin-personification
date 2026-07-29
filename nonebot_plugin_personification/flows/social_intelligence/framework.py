@@ -7,6 +7,7 @@ SocialTrigger 把"什么时候触发"（cron / interval / event）与"触发后�
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from types import SimpleNamespace
 from typing import Any, Awaitable, Callable
 
 
@@ -22,8 +23,46 @@ class SocialContext:
     persona_store: Any
     data_dir: Any
     get_now: Callable[[], Any]
+    load_prompt: Callable[[str | None], Any] | None = None
     tool_registry: Any = None
     agent_max_steps: int = 4
+    qq_outbound_ledger: Any = None
+
+
+async def dispatch_social_outbound(
+    ctx: SocialContext,
+    *,
+    bot: Any,
+    conversation_kind: str,
+    conversation_id: str,
+    surface: str,
+    content: Any,
+    user_target: str = "",
+) -> bool:
+    """Dispatch one social message and report only strict OneBot confirmation."""
+    target = str(conversation_id or "").strip()
+    if conversation_kind not in {"group", "private"}:
+        raise ValueError("conversation_kind must be group or private")
+    if conversation_kind == "group":
+        send = lambda: bot.send_group_msg(group_id=int(target), message=content)
+        event = SimpleNamespace(group_id=target, user_id=user_target)
+    else:
+        send = lambda: bot.send_private_msg(user_id=int(target), message=content)
+        event = SimpleNamespace(user_id=target)
+    if ctx.qq_outbound_ledger is None:
+        await send()
+        return True
+
+    from ...core.qq_outbound import build_outbound_context
+
+    outbound_context = build_outbound_context(
+        bot=bot,
+        event=event,
+        surface=surface,
+        user_target=user_target or (target if conversation_kind == "private" else ""),
+    )
+    receipt = await ctx.qq_outbound_ledger.dispatch(outbound_context, content, send)
+    return receipt.status == "sent"
 
 
 async def run_social_text_agent(
@@ -38,6 +77,31 @@ async def run_social_text_agent(
     if ctx.tool_caller is None or ctx.tool_registry is None:
         return ""
     from ...core.agent_bridge import run_text_agent
+    from ...core.social_surface_renderer import (
+        OutputKind,
+        SocialSurfaceRenderer,
+        resolve_surface_spec,
+    )
+
+    surface, spec = resolve_surface_spec(trigger_reason)
+    if not callable(ctx.load_prompt):
+        ctx.logger.warning(f"[social] persona loader unavailable surface={surface}")
+        return ""
+    try:
+        prompt_data = ctx.load_prompt(None)
+    except Exception as exc:
+        ctx.logger.warning(f"[social] load persona failed surface={surface}: {exc}")
+        return ""
+    renderer = SocialSurfaceRenderer(spec)
+    projected_persona = renderer.project_persona(prompt_data)
+    if not projected_persona:
+        ctx.logger.warning(f"[social] empty persona projection surface={surface}")
+        return ""
+    messages = renderer.prepare_messages(
+        messages,
+        prompt_data=prompt_data,
+        output_kind=OutputKind.PERSONA_TEXT,
+    )
 
     return await run_text_agent(
         messages=messages,
@@ -49,6 +113,8 @@ async def run_social_text_agent(
         use_builtin_search_hint=use_builtin_search_hint,
         trigger_reason=trigger_reason,
         chat_intent_hint=chat_intent_hint or trigger_reason,
+        surface=surface,
+        output_kind=OutputKind.PERSONA_TEXT,
     )
 
 
@@ -89,6 +155,7 @@ def clear_social_triggers_for_testing() -> None:
 __all__ = [
     "SocialContext",
     "SocialTrigger",
+    "dispatch_social_outbound",
     "run_social_text_agent",
     "register_social_trigger",
     "list_social_triggers",

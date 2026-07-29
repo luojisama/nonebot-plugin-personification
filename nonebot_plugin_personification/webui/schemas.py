@@ -95,3 +95,20 @@ class AdminIdentity(BaseModel):
     qq: str
     device_id: str
     label: str
+
+
+class DataExportRequest(BaseModel):
+    bot_id: str = Field(..., min_length=1, max_length=64)
+    group_id: str = Field(..., min_length=1, max_length=64)
+    datasets: list[str] | None = None
+
+
+class DataImportPlanRequest(BaseModel):
+    target_bot_id: str = Field(..., min_length=1, max_length=64)
+    target_group_id: str = Field(..., min_length=1, max_length=64)
+    mode: str = Field(default="merge", pattern="^(merge|scope-replace)$")
+    allow_same_identity: bool = False
+
+
+class DataImportApplyRequest(DataImportPlanRequest):
+    plan_token: str = Field(..., min_length=32, max_length=4096)

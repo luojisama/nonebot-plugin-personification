@@ -9,16 +9,29 @@ caps = load_personification_module("plugin.personification.core.protocol_capabil
 
 
 class FakeBot:
-    def __init__(self, app_name: str = "NapCat.Onebot", fail_apis: set[str] | None = None) -> None:
+    def __init__(
+        self,
+        app_name: str = "NapCat.Onebot",
+        fail_apis: set[str] | None = None,
+        *,
+        app_version: str = "",
+        protocol_version: str = "v11",
+    ) -> None:
         self.self_id = "12345"
         self.app_name = app_name
+        self.app_version = app_version
+        self.protocol_version = protocol_version
         self.fail_apis = fail_apis or set()
         self.calls: list[tuple[str, dict]] = []
 
     async def call_api(self, api: str, **kwargs):
         self.calls.append((api, kwargs))
         if api == "get_version_info":
-            return {"app_name": self.app_name}
+            return {
+                "app_name": self.app_name,
+                "app_version": self.app_version,
+                "protocol_version": self.protocol_version,
+            }
         if api in self.fail_apis:
             raise RuntimeError(f"{api} not supported")
         return {"result": True}
@@ -36,6 +49,8 @@ def test_flavor_detection_from_app_name() -> None:
     assert asyncio.run(caps.detect_flavor(FakeBot("NapCat.Onebot"))) == "napcat"
     caps.reset_capability_cache()
     assert asyncio.run(caps.detect_flavor(FakeBot("Lagrange.OneBot"))) == "lagrange"
+    caps.reset_capability_cache()
+    assert asyncio.run(caps.detect_flavor(FakeBot("LLOneBot"))) == "llonebot"
     caps.reset_capability_cache()
     assert asyncio.run(caps.detect_flavor(FakeBot("go-cqhttp"))) == "gocq"
     caps.reset_capability_cache()
@@ -68,13 +83,29 @@ def test_emoji_react_gocq_and_none_mode_disabled() -> None:
     assert bot2.calls == []
 
 
-def test_failed_api_cached_as_unsupported() -> None:
+def test_unavailable_api_is_cooled_down() -> None:
     bot = FakeBot("NapCat.Onebot", fail_apis={"set_msg_emoji_like"})
     assert asyncio.run(caps.emoji_react(bot, _config(), message_id=1, face_id=76)) is False
     calls_after_first = len(bot.calls)
     assert asyncio.run(caps.emoji_react(bot, _config(), message_id=2, face_id=76)) is False
     # 第二次不再发起 set_msg_emoji_like 请求
     assert len(bot.calls) == calls_after_first
+
+
+def test_unknown_implementation_does_not_probe_extensions() -> None:
+    bot = FakeBot("Whatever")
+    assert asyncio.run(caps.emoji_react(bot, _config(), message_id=1, face_id=76)) is False
+    assert [name for name, _params in bot.calls] == ["get_version_info"]
+
+
+def test_llonebot_version_gates_typing() -> None:
+    old = FakeBot("LLOneBot", app_version="7.10.0")
+    assert asyncio.run(caps.set_typing(old, _config(), user_id="10001")) is False
+    assert [name for name, _params in old.calls] == ["get_version_info"]
+    caps.reset_capability_cache()
+    current = FakeBot("LLOneBot", app_version="7.12.3")
+    assert asyncio.run(caps.set_typing(current, _config(), user_id="10001")) is True
+    assert current.calls[-1] == ("set_input_status", {"user_id": 10001, "event_type": 1})
 
 
 def test_poke_fallback_chain() -> None:

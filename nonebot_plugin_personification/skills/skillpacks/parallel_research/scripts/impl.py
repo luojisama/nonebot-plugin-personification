@@ -11,6 +11,10 @@ from typing import Any
 import httpx
 
 from plugin.personification.agent.tool_registry import AgentTool, ToolRegistry
+from plugin.personification.agent.runtime.tool_loop import (
+    append_assistant_tool_calls_message,
+    append_tool_result_messages,
+)
 from plugin.personification.core.web_grounding import do_web_search
 from plugin.personification.skills.skillpacks.acg_resolver.scripts import impl as acg_impl
 from plugin.personification.skills.skillpacks.resource_collector.scripts import impl as resource_impl
@@ -632,21 +636,6 @@ async def _plan_workers(
     return _normalize_worker_plans(data, query=query, purpose=purpose, focus=focus, max_workers=max_workers)
 
 
-def _build_tool_result_message(tool_caller: Any, tool_call_id: str, tool_name: str, result: str) -> dict[str, Any]:
-    builder = getattr(tool_caller, "build_tool_result_message", None)
-    if callable(builder):
-        try:
-            return builder(tool_call_id, tool_name, result)
-        except Exception:
-            pass
-    return {
-        "role": "tool",
-        "tool_call_id": tool_call_id,
-        "name": tool_name,
-        "content": str(result or ""),
-    }
-
-
 async def _execute_tool_call(
     *,
     registry: ToolRegistry,
@@ -757,22 +746,10 @@ async def _run_worker(
             }
         if _round >= max_tool_rounds:
             break
-        messages.append(
-            {
-                "role": "assistant",
-                "content": content,
-                "tool_calls": [
-                    {
-                        "id": str(getattr(call, "id", "") or ""),
-                        "type": "function",
-                        "function": {
-                            "name": str(getattr(call, "name", "") or ""),
-                            "arguments": _json_dumps(dict(getattr(call, "arguments", {}) or {})),
-                        },
-                    }
-                    for call in tool_calls
-                ],
-            }
+        append_assistant_tool_calls_message(
+            messages=messages,
+            response=response,
+            tool_caller=tool_caller,
         )
         executed = await asyncio.gather(
             *[
@@ -785,20 +762,20 @@ async def _run_worker(
             ],
             return_exceptions=True,
         )
-        for item in executed:
+        turn_results: list[tuple[Any, str]] = []
+        for tool_call, item in zip(tool_calls, executed):
             if isinstance(item, Exception):
-                messages.append(
-                    {
-                        "role": "tool",
-                        "tool_call_id": "failed-tool-call",
-                        "name": "unknown",
-                        "content": f"工具调用失败：{item}",
-                    }
-                )
+                turn_results.append((tool_call, f"工具调用失败：{type(item).__name__}"))
                 continue
-            tool_id, tool_name, result = item
+            _tool_id, _tool_name, result = item
             last_content = result
-            messages.append(_build_tool_result_message(tool_caller, tool_id, tool_name, result[:4000]))
+            turn_results.append((tool_call, result[:4000]))
+        append_tool_result_messages(
+            messages=messages,
+            tool_caller=tool_caller,
+            response=response,
+            results=turn_results,
+        )
     return {
         "role": plan.role,
         "goal": plan.goal,

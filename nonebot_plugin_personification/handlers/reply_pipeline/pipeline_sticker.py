@@ -312,7 +312,11 @@ async def build_image_summary_suffix(
         prompt = (
             UNDERSTAND_STICKER_PROMPT
             if sticker_like
-            else "请用一句中文概括图片的主体、动作/表情、图中文字和当前语境里最相关的线索；控制在80字内，直接输出。"
+            else (
+                "请用一句中文概括图片中客观可见的主体、动作/表情、图中文字和构图线索，控制在80字内，直接输出。"
+                "只描述媒体内容，不推断画中人物是发送者、群友或 bot；"
+                "多人、视线、站位或拥挤感不得解释成现实群友围观、施压或参与。"
+            )
         )
         try:
             summary_text, _route = await analyze_images_with_route_or_fallback(

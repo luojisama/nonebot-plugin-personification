@@ -22,6 +22,11 @@ def test_webui_plugin_logs_query_and_clear(_runtime_context) -> None:
     body = res.json()
     assert body["entries"]
     assert body["entries"][0]["trace_id"] == "trace-webui"
+    assert body["has_more"] is False
+    assert body["next_cursor"] == 0
+    assert body["limit"] == 200
+    assert body["filters"]["q"] == "trace-webui"
+    assert body["writer"]["alive"] is True
 
     csrf = client.cookies.get("personification_webui_csrf", "")
     client.headers["X-Personification-CSRF"] = csrf

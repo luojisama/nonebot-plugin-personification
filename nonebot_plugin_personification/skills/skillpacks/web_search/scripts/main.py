@@ -5,8 +5,9 @@ from pathlib import Path
 
 from plugin.personification.core.web_grounding import do_web_search
 from plugin.personification.skill_runtime.runtime_api import SkillRuntime
+from plugin.personification.skills.skillpacks.vision_analyze.scripts import impl as vision_impl
+
 from . import impl
-from ...vision_analyze.scripts import impl as vision_impl
 
 
 SKILL_ROOT = Path(__file__).resolve().parents[2]

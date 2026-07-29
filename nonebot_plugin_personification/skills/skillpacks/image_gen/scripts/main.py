@@ -29,10 +29,15 @@ def _image_route_available(runtime: Any) -> bool:
     main_url = str(getattr(plugin_config, "personification_api_url", "") or "").strip()
     api_type = str(getattr(plugin_config, "personification_image_gen_api_type", "auto") or "auto").strip().lower()
     main_type = str(getattr(plugin_config, "personification_api_type", "") or "").strip().lower()
-    if api_type in {"openai", "gemini"} and (api_key or main_key):
-        return True
-    if api_key and (api_url or main_url):
-        return True
+    dedicated = api_type not in {"", "auto", "default"} or bool(api_key or api_url)
+    if dedicated:
+        return api_type in {"openai", "gemini"} and bool(api_key and api_url)
+    pools = getattr(plugin_config, "personification_api_pools", None)
+    if pools:
+        from .impl import _pool_image_route
+
+        if _pool_image_route(plugin_config) is not None:
+            return True
     return bool(main_key and main_type in {"openai", "gemini", "gemini_official"})
 
 
@@ -91,7 +96,7 @@ def build_image_gen_tool(runtime: Any) -> AgentTool | None:
                 "images": {
                     "type": "array",
                     "items": {"type": "string"},
-                    "description": "可选参考图片引用，支持 URL、data URL 或绝对本地路径",
+                    "description": "可选参考图片引用，仅支持 HTTP(S) URL 或 data URL",
                 },
                 "image_urls": {
                     "type": "array",

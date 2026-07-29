@@ -4,6 +4,7 @@ from collections import defaultdict
 from typing import Any
 
 from .context_policy import stringify_history_content
+from .avatar_relation_evidence import render_avatar_relation_hypotheses
 from .group_relation_edges import summarize_relation_edges
 
 
@@ -13,7 +14,19 @@ def summarize_group_relationships(
     trigger_msg_id: str = "",
     trigger_user_id: str = "",
     bot_self_id: str = "",
+    excluded_user_ids: set[str] | None = None,
 ) -> str:
+    excluded = {
+        str(value or "").strip()
+        for value in set(excluded_user_ids or set())
+        if str(value or "").strip()
+    }
+    messages = [
+        message
+        for message in list(messages or [])
+        if isinstance(message, dict)
+        and str(message.get("user_id", "") or "").strip() not in excluded
+    ]
     if not messages:
         return ""
 
@@ -69,11 +82,19 @@ def summarize_group_relationships(
                 if isinstance(referenced, dict):
                     reply_to_user = str(referenced.get("user_id", "") or "").strip()
         if reply_to_user and reply_to_user != src:
+            if reply_to_user in excluded:
+                reply_to_user = ""
+        if reply_to_user and reply_to_user != src:
             directed_edges[(src, reply_to_user)] += 2
             speaker_recent_targets[src][reply_to_user] += 2
         for uid in list(msg.get("mentioned_ids") or [])[:4]:
             target = str(uid or "").strip()
-            if target and target != src and target != str(bot_self_id or "").strip():
+            if (
+                target
+                and target not in excluded
+                and target != src
+                and target != str(bot_self_id or "").strip()
+            ):
                 directed_edges[(src, target)] += 1
                 speaker_recent_targets[src][target] += 1
 
@@ -96,8 +117,15 @@ def summarize_group_relationships(
     if isinstance(trigger_msg, dict):
         reply_to_user = str(trigger_msg.get("reply_to_user_id", "") or "").strip()
         if reply_to_user:
+            if reply_to_user in excluded:
+                reply_to_user = ""
+        if reply_to_user:
             current_target_parts.append(f"当前更像在接 {_resolve_name(reply_to_user)} 的话")
-        mentioned_ids = [str(uid or "").strip() for uid in list(trigger_msg.get("mentioned_ids") or []) if str(uid or "").strip()]
+        mentioned_ids = [
+            str(uid or "").strip()
+            for uid in list(trigger_msg.get("mentioned_ids") or [])
+            if str(uid or "").strip() and str(uid or "").strip() not in excluded
+        ]
         if mentioned_ids:
             current_target_parts.append(
                 "当前提及 " + " / ".join(_resolve_name(uid) for uid in mentioned_ids[:3])
@@ -155,15 +183,29 @@ def summarize_group_relationships(
             messages[-1].get("group_id", "") if messages else "",
             trigger_user_id=trigger_user_id,
             bot_self_id=bot_self_id,
+            excluded_user_ids=excluded,
         )
-        return persistent or ""
+        visual = render_avatar_relation_hypotheses(
+            messages[-1].get("group_id", "") if messages else "",
+            recent_messages=messages,
+            excluded_user_ids=excluded,
+        )
+        return "\n".join(item for item in (persistent, visual) if item) or ""
     persistent = summarize_relation_edges(
         messages[-1].get("group_id", "") if messages else "",
         trigger_user_id=trigger_user_id,
         bot_self_id=bot_self_id,
+        excluded_user_ids=excluded,
     )
     if persistent:
         lines.append(persistent)
+    visual = render_avatar_relation_hypotheses(
+        messages[-1].get("group_id", "") if messages else "",
+        recent_messages=messages,
+        excluded_user_ids=excluded,
+    )
+    if visual:
+        lines.append(visual)
     lines.append("理解规则：先判断谁在接谁、谁在 cue 谁，再决定要不要插话；不要把插件播报误当成真人态度。")
     return "\n".join(lines)
 

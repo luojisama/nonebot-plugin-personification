@@ -6,6 +6,7 @@ from nonebot import on_message, on_notice
 from nonebot.rule import Rule
 
 from ..core.group_mute import update_group_mute_from_notice
+from .reply_buffer import ReplyConcurrencyController
 
 try:
     from nonebot.typing import T_State
@@ -24,7 +25,10 @@ _RULE_EVAL_CACHE_MAX_SIZE = 128
 def _build_rule_cache_key(event: Event) -> str:
     message_id = str(getattr(event, "message_id", "") or "").strip()
     if message_id:
-        return f"{event.__class__.__name__}:{message_id}"
+        bot_self_id = str(getattr(event, "self_id", "") or "").strip()
+        group_id = str(getattr(event, "group_id", "") or "").strip()
+        user_id = str(getattr(event, "user_id", "") or "").strip()
+        return f"{event.__class__.__name__}:{bot_self_id}:{group_id}:{user_id}:{message_id}"
 
     user_id = str(getattr(event, "user_id", "") or "").strip()
     group_id = str(getattr(event, "group_id", "") or "").strip()
@@ -109,10 +113,15 @@ def register_reply_matchers(
     logger: Any,
     plugin_config: Any,
     finished_exception_cls: Any = None,
+    user_policy_gate: Any = None,
 ) -> Dict[str, Any]:
     response_timeout_seconds = max(
         30.0,
         float(getattr(plugin_config, "personification_response_timeout", 180) or 180),
+    )
+    concurrency_controller = ReplyConcurrencyController(
+        session_limit=int(getattr(plugin_config, "personification_reply_session_concurrency", 3) or 3),
+        global_limit=int(getattr(plugin_config, "personification_reply_global_concurrency", 12) or 12),
     )
 
     async def _direct_reply_rule(event: Event, state: T_State) -> bool:
@@ -161,6 +170,8 @@ def register_reply_matchers(
             finished_exception_cls=finished_exception_cls,
             delay=wait_seconds,
             response_timeout_seconds=response_timeout_seconds,
+            concurrency_controller=concurrency_controller,
+            user_policy_gate=user_policy_gate,
         )
 
     @direct_reply_matcher.handle()
@@ -180,6 +191,10 @@ def register_reply_matchers(
                 _buffer_timer(key, _bot, wait_seconds)
             ),
             logger=logger,
+            concurrency_controller=concurrency_controller,
+            response_timeout_seconds=response_timeout_seconds,
+            finished_exception_cls=finished_exception_cls,
+            user_policy_gate=user_policy_gate,
         )
 
     return {
@@ -189,4 +204,3 @@ def register_reply_matchers(
         "group_mute_notice_matcher": group_mute_notice_matcher,
         "handle_reply": _handle_reply,
     }
-

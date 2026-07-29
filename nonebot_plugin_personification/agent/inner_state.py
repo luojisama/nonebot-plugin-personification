@@ -230,69 +230,70 @@ async def update_inner_state_after_chat(
     # thinking_mode 参数保留以备将来直接在 tool_caller 层控制推理档位
     # 当前由 build_inner_state_updater 构建 state_tool_caller 时应用
     store = _get_data_store()
-    async with store._alock(_STORE_NAME):
-        fresh_state = await asyncio.to_thread(store._read, _STORE_NAME)
-        if not isinstance(fresh_state, dict):
-            fresh_state = copy.deepcopy(DEFAULT_STATE)
-        else:
-            fresh_state = normalize_inner_state(fresh_state)
+    fresh_state = await store.load(_STORE_NAME)
+    if not isinstance(fresh_state, dict):
+        fresh_state = copy.deepcopy(DEFAULT_STATE)
+    else:
+        fresh_state = normalize_inner_state(fresh_state)
 
-        persona_context = ""
-        if persona_snippet:
-            persona_context = (
-                "\n对话用户画像参考（用于更新 relation_warmth，不必照搬）：\n"
-                f"{persona_snippet}\n"
-            )
-        from ..schedule import format_time_context, get_activity_status, get_current_local_time
-
-        datetime_now = get_current_local_time()
-        prompt = _load_prompt_text("inner_state_update").replace(
-            "{current_time}",
-            f"{datetime_now.strftime('%Y-%m-%d %H:%M:%S')} [{format_time_context(datetime_now)}]",
-        ).replace(
-            "{time_period}",
-            get_activity_status(),
-        ).replace(
-            "{current_state_json}",
-            json.dumps(fresh_state, ensure_ascii=False, indent=2),
-        ).replace(
-            "{conversation_summary}",
-            f"{recent_summary}{persona_context}",
+    persona_context = ""
+    if persona_snippet:
+        persona_context = (
+            "\n对话用户画像参考（用于更新 relation_warmth，不必照搬）：\n"
+            f"{persona_snippet}\n"
         )
-        token = None
-        try:
-            from ..core.llm_context import reset_llm_context, set_llm_context
+    from ..schedule import format_time_context, get_activity_status, get_current_local_time
 
-            token = set_llm_context(purpose="inner_state_chat")
-        except Exception:
-            token = None
+    datetime_now = get_current_local_time()
+    prompt = _load_prompt_text("inner_state_update").replace(
+        "{current_time}",
+        f"{datetime_now.strftime('%Y-%m-%d %H:%M:%S')} [{format_time_context(datetime_now)}]",
+    ).replace(
+        "{time_period}",
+        get_activity_status(),
+    ).replace(
+        "{current_state_json}",
+        json.dumps(fresh_state, ensure_ascii=False, indent=2),
+    ).replace(
+        "{conversation_summary}",
+        f"{recent_summary}{persona_context}",
+    )
+    token = None
+    try:
+        from ..core.llm_context import reset_llm_context, set_llm_context
+
+        token = set_llm_context(purpose="inner_state_chat")
+    except Exception:
+        token = None
+    try:
+        response = await tool_caller.chat_with_tools(
+            messages=[{"role": "user", "content": prompt}],
+            tools=[],
+            use_builtin_search=False,
+        )
         try:
-            response = await tool_caller.chat_with_tools(
-                messages=[{"role": "user", "content": prompt}],
-                tools=[],
-                use_builtin_search=False,
-            )
+            from ..core.token_ledger import record_response_usage
+            record_response_usage(response)
+        except Exception:
+            pass
+        updated_fields = json.loads(response.content or "{}")
+        if not isinstance(updated_fields, dict):
+            raise ValueError("inner state update is not a JSON object")
+        await store.mutate(
+            _STORE_NAME,
+            lambda current: _merge_state(
+                current if isinstance(current, dict) else copy.deepcopy(DEFAULT_STATE),
+                updated_fields,
+            ),
+        )
+    except Exception as e:
+        logger.warning(f"[inner_state] update failed: {e}")
+    finally:
+        if token is not None:
             try:
-                from ..core.token_ledger import record_response_usage
-                record_response_usage(response)
+                reset_llm_context(token)
             except Exception:
                 pass
-            updated_fields = json.loads(response.content or "{}")
-            if not isinstance(updated_fields, dict):
-                raise ValueError("inner state update is not a JSON object")
-            await asyncio.to_thread(
-                store._write,
-                _STORE_NAME,
-                _merge_state(fresh_state, updated_fields),
-            )
-        except Exception as e:
-            logger.warning(f"[inner_state] update failed: {e}")
-        finally:
-            if token is not None:
-                try:
-                    reset_llm_context(token)
-                except Exception:
-                    pass
 
 
 async def update_state_from_diary(
@@ -303,51 +304,52 @@ async def update_state_from_diary(
 ) -> None:
     _ = data_dir
     store = _get_data_store()
-    async with store._alock(_STORE_NAME):
-        fresh_state = await asyncio.to_thread(store._read, _STORE_NAME)
-        if not isinstance(fresh_state, dict):
-            fresh_state = copy.deepcopy(DEFAULT_STATE)
-        else:
-            fresh_state = normalize_inner_state(fresh_state)
+    fresh_state = await store.load(_STORE_NAME)
+    if not isinstance(fresh_state, dict):
+        fresh_state = copy.deepcopy(DEFAULT_STATE)
+    else:
+        fresh_state = normalize_inner_state(fresh_state)
 
-        prompt = _load_prompt_text("diary_state_update").replace(
-            "{diary_text}",
-            diary_text,
-        ).replace(
-            "{today}",
-            datetime.now().strftime("%Y-%m-%d"),
-        )
+    prompt = _load_prompt_text("diary_state_update").replace(
+        "{diary_text}",
+        diary_text,
+    ).replace(
+        "{today}",
+        datetime.now().strftime("%Y-%m-%d"),
+    )
+    token = None
+    try:
+        from ..core.llm_context import reset_llm_context, set_llm_context
+
+        token = set_llm_context(purpose="inner_state_diary")
+    except Exception:
         token = None
+    try:
+        response = await tool_caller.chat_with_tools(
+            messages=[{"role": "user", "content": prompt}],
+            tools=[],
+            use_builtin_search=False,
+        )
         try:
-            from ..core.llm_context import reset_llm_context, set_llm_context
-
-            token = set_llm_context(purpose="inner_state_diary")
+            from ..core.token_ledger import record_response_usage
+            record_response_usage(response)
         except Exception:
-            token = None
-        try:
-            response = await tool_caller.chat_with_tools(
-                messages=[{"role": "user", "content": prompt}],
-                tools=[],
-                use_builtin_search=False,
-            )
+            pass
+        updated_fields = json.loads(response.content or "{}")
+        if not isinstance(updated_fields, dict):
+            raise ValueError("diary state update is not a JSON object")
+        await store.mutate(
+            _STORE_NAME,
+            lambda current: _merge_state(
+                current if isinstance(current, dict) else copy.deepcopy(DEFAULT_STATE),
+                updated_fields,
+            ),
+        )
+    except Exception as e:
+        logger.warning(f"[inner_state] diary update failed: {e}")
+    finally:
+        if token is not None:
             try:
-                from ..core.token_ledger import record_response_usage
-                record_response_usage(response)
+                reset_llm_context(token)
             except Exception:
                 pass
-            updated_fields = json.loads(response.content or "{}")
-            if not isinstance(updated_fields, dict):
-                raise ValueError("diary state update is not a JSON object")
-            await asyncio.to_thread(
-                store._write,
-                _STORE_NAME,
-                _merge_state(fresh_state, updated_fields),
-            )
-        except Exception as e:
-            logger.warning(f"[inner_state] diary update failed: {e}")
-        finally:
-            if token is not None:
-                try:
-                    reset_llm_context(token)
-                except Exception:
-                    pass

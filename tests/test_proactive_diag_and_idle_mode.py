@@ -153,3 +153,29 @@ def test_decide_idle_mode_llm_exception_returns_text() -> None:
     ))
     assert mode == "text"
     assert mood == ""
+
+
+def test_decide_idle_mode_agent_requests_structured_output(monkeypatch) -> None:  # noqa: ANN001
+    pf = load_personification_module("plugin.personification.flows.proactive_flow")
+    captured: dict = {}
+
+    async def _agent(**kwargs):  # noqa: ANN003, ANN202
+        captured.update(kwargs)
+        return '{"mode":"text","mood":"日常"}'
+
+    monkeypatch.setattr(pf, "run_text_agent", _agent)
+    mode, mood = asyncio.run(
+        pf._decide_idle_output_mode(
+            call_ai_api=_make_fake_call_ai_api(""),
+            plugin_config=SimpleNamespace(personification_agent_enabled=True),
+            agent_tool_caller=object(),
+            agent_tool_registry=object(),
+            topic="周末干嘛",
+            group_style="轻松",
+            logger=SimpleNamespace(debug=lambda *_: None, info=lambda *_: None, warning=lambda *_: None),
+            group_id="g1",
+        )
+    )
+
+    assert (mode, mood) == ("text", "日常")
+    assert captured["structured_output"] is True

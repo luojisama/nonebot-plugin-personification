@@ -48,4 +48,7 @@ def test_persona_responder_instruction_is_inserted_into_system_message() -> None
     assert "直呼/提及时禁止输出 [NO_REPLY]" in updated[0]["content"]
     assert "帮用户找资料" in updated[0]["content"]
     assert "最近经常一起聊游戏" in updated[0]["content"]
+    assert "不要把失败或不确定状态写成 reply_text" in updated[0]["content"]
+    assert "空证据可见输出纪律" in updated[0]["content"]
+    assert "info_added 设为 'redirect'" in updated[0]["content"]
     assert messages[0]["content"] == "base"

@@ -5,12 +5,9 @@ from typing import Any
 
 from ..query_rewriter import ContextualQueryRewrite
 from ..tool_registry import ToolRegistry
-from .constants import MAX_LOOKUP_QUERY_VARIANTS
 from .intent import compact_lookup_query
 
-_RETRYABLE_LOOKUP_TOOLS = frozenset(
-    {"web_search", "search_web", "wiki_lookup", "resolve_acg_entity", "collect_resources", "search_images", "search_and_send_images"}
-)
+
 def _parse_json_tool_result(text: str) -> dict[str, Any] | None:
     raw = str(text or "").strip()
     if not raw or not raw.startswith("{"):
@@ -60,23 +57,30 @@ def query_variants_for_tool(
     rewritten_query: ContextualQueryRewrite | None,
     previous_tool_name: str = "",
     previous_tool_result_text: str = "",
+    max_variants: int = 1,
 ) -> list[str]:
     candidates: list[str] = []
     if rewritten_query is not None:
-        for query in [rewritten_query.primary_query, *(rewritten_query.query_candidates or [])]:
-            cleaned = compact_lookup_query(query)
-            if cleaned and cleaned not in candidates:
-                candidates.append(cleaned)
+        primary_query = compact_lookup_query(rewritten_query.primary_query)
+        if primary_query:
+            candidates.append(primary_query)
     provided_query = compact_lookup_query(str((tool_args or {}).get("query", "") or ""))
     if provided_query and provided_query not in candidates:
         candidates.append(provided_query)
+    if rewritten_query is not None:
+        for query in rewritten_query.query_candidates or []:
+            cleaned = compact_lookup_query(query)
+            if cleaned and cleaned not in candidates:
+                candidates.append(cleaned)
     if previous_tool_name and previous_tool_result_text:
         refined = compact_lookup_query(previous_tool_result_text)
         if refined and refined not in candidates:
             candidates.append(refined)
-    if tool_name not in _RETRYABLE_LOOKUP_TOOLS:
-        return candidates[:1]
-    return candidates[:MAX_LOOKUP_QUERY_VARIANTS]
+    try:
+        limit = max(1, int(max_variants))
+    except (TypeError, ValueError):
+        limit = 1
+    return candidates[:limit]
 
 
 def rewrite_tool_args(

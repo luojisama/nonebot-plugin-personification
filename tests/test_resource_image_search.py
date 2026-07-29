@@ -21,8 +21,10 @@ class _Logger:
 
 
 class _Response:
-    def __init__(self, text: str) -> None:
+    def __init__(self, text: str, *, status_code: int = 200, content_type: str = "text/html") -> None:
         self.text = text
+        self.status_code = status_code
+        self.headers = {"content-type": content_type}
 
 
 class _HttpClient:
@@ -73,7 +75,45 @@ def test_search_images_returns_direct_image_urls() -> None:
     assert payload["results"][0]["image_url"] == "https://img.example/a.jpg"
     assert payload["results"][0]["page_url"] == "https://page.example/a"
     assert payload["results"][0]["width"] == 1920
+    assert payload["image_search_diagnostics"]["http_status"] == 200
+    assert payload["image_search_diagnostics"]["raw_item_count"] == 2
+    assert payload["image_search_diagnostics"]["direct_image_count"] == 2
     assert client.urls and "bing.com/images/search" in client.urls[0]
+
+
+def test_search_images_keeps_empty_parse_diagnostics_after_web_fallback() -> None:
+    payload = json.loads(asyncio.run(resource_impl.search_images(
+        "测试角色头像",
+        http_client=_HttpClient("<html>challenge</html>"),
+        logger=_Logger(),
+    )))
+
+    diagnostics = payload["image_search_diagnostics"]
+    assert diagnostics["http_status"] == 200
+    assert diagnostics["response_bytes"] > 0
+    assert diagnostics["raw_item_count"] == 0
+    assert diagnostics["direct_image_count"] == 0
+
+
+def test_search_images_records_http_error_and_timeout_types() -> None:
+    class ErrorClient:
+        def __init__(self, error=None):
+            self.error = error
+
+        async def get(self, _url, **_kwargs):
+            if self.error is not None:
+                raise self.error
+            return _Response("forbidden", status_code=403)
+
+    forbidden = json.loads(asyncio.run(resource_impl.search_images(
+        "测试角色头像", http_client=ErrorClient(), logger=_Logger(),
+    )))
+    timed_out = json.loads(asyncio.run(resource_impl.search_images(
+        "测试角色头像", http_client=ErrorClient(asyncio.TimeoutError()), logger=_Logger(),
+    )))
+
+    assert forbidden["image_search_diagnostics"]["http_status"] == 403
+    assert timed_out["image_search_diagnostics"]["error_type"] == "TimeoutError"
 
 
 def test_search_and_send_images_queues_real_image_message() -> None:

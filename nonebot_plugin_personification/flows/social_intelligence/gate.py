@@ -1,10 +1,7 @@
 """主动社交闸门：在 scenario 决定 draft 之后，再让 Agent 二次判断
 "现在发这条合不合适"。避免 bot 显得唐突或在用户不想被打扰时推送。
 
-返回 (allow, message)：
-- (False, None) 拒绝发送
-- (True, draft) 允许且不改文案
-- (True, modified) 允许但 LLM 改了文案
+返回 (allow, None, reason)：闸门只决定是否允许发送，不改写 scenario 生成的正文。
 """
 from __future__ import annotations
 
@@ -34,8 +31,7 @@ _GATE_PROMPT = """你是一个主动社交闸门，负责判断 bot 是否应该
 严格输出 JSON：
 {{
   "allow": true 或 false,
-  "reason": "一句话说明",
-  "rewritten": "如果需要小改，把改后的文案放这（不改就给空串）"
+  "reason": "一句话说明"
 }}
 """
 
@@ -53,7 +49,7 @@ async def gate_should_send(
     persona_snippet: str = "",
     now_str: str = "",
 ) -> tuple[bool, str | None, str]:
-    """二次判断；失败默认 allow（不阻塞正常发送）。返回 (allow, rewritten or None, reason)。"""
+    """二次判断；失败默认 allow。兼容返回三元组，但第二项始终为 None。"""
     if not tool_caller:
         return True, None, "no tool_caller, skip gate"
     prompt = _GATE_PROMPT.format(
@@ -77,6 +73,7 @@ async def gate_should_send(
                 max_steps=agent_max_steps,
                 trigger_reason=f"social_gate_{scenario}",
                 chat_intent_hint="social_gate",
+                structured_output=True,
             )
         else:
             response = await tool_caller.chat_with_tools(
@@ -94,9 +91,8 @@ async def gate_should_send(
     if parsed is None:
         return True, None, f"gate non-json, default allow; raw={text[:80]}"
     allow = bool(parsed.get("allow", True))
-    rewritten = str(parsed.get("rewritten", "") or "").strip() or None
     reason = str(parsed.get("reason", "") or "").strip()
-    return allow, rewritten, reason
+    return allow, None, reason
 
 
 def _parse_gate_json(text: str) -> dict | None:

@@ -135,6 +135,10 @@ def build_user_profile_meta(
             extra_keys.append(key)
     if extra_keys:
         out["extra_fields"] = extra_keys[:12]
+    for key in ("avatar_analysis", "avatar_insight"):
+        value = old.get(key)
+        if isinstance(value, dict):
+            out[key] = dict(value)
     return out
 
 
@@ -186,8 +190,19 @@ def render_user_profile_meta(meta: dict[str, Any] | None) -> str:
         lines.append("[群内身份] " + "；".join(parts))
     if data.get("signature"):
         lines.append(f"[个性签名] {data['signature']}")
-    if data.get("avatar_url"):
-        lines.append(f"[头像URL] {data['avatar_url']}")
+    avatar_insight = data.get("avatar_insight") if isinstance(data.get("avatar_insight"), dict) else {}
+    if avatar_insight:
+        avatar_parts = []
+        if avatar_insight.get("asset_kind"):
+            avatar_parts.append(f"类型：{avatar_insight['asset_kind']}")
+        if avatar_insight.get("neutral_summary"):
+            avatar_parts.append(f"中性摘要：{avatar_insight['neutral_summary']}")
+        candidates = avatar_insight.get("acg_candidates")
+        if isinstance(candidates, list) and candidates:
+            avatar_parts.append("ACG候选：" + "、".join(str(item) for item in candidates[:5]))
+        if avatar_parts:
+            lines.append("[头像视觉（长期弱证据）] " + "；".join(avatar_parts))
+            lines.append("[头像视觉边界] 不用于推断真实身份、性别、年龄、性格、精神状态、职业或现实关系。")
     if data.get("homepage_url"):
         lines.append(f"[主页] {data['homepage_url']}")
     return "\n".join(lines)

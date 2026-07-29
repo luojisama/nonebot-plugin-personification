@@ -84,6 +84,50 @@ def test_append_single_tool_call_exchange_adds_assistant_and_tool_result() -> No
     }
 
 
+def test_response_aware_builders_keep_parallel_results_in_one_turn() -> None:
+    messages: list[dict] = []
+    calls = [
+        SimpleNamespace(id="call-1", name="first", arguments={}),
+        SimpleNamespace(id="call-2", name="second", arguments={}),
+    ]
+    response = SimpleNamespace(content="", tool_calls=calls)
+
+    class _TurnCaller(_ToolCaller):
+        def build_assistant_tool_calls_message(self, _response):  # noqa: ANN001, ANN201
+            return {"role": "model", "parts": [{"functionCall": {"name": "first"}}]}
+
+        def build_tool_result_messages(self, _response, results):  # noqa: ANN001, ANN201
+            return [
+                {
+                    "role": "user",
+                    "parts": [
+                        {"functionResponse": {"name": call.name, "response": {"result": result}}}
+                        for call, result in results
+                    ],
+                }
+            ]
+
+    caller = _TurnCaller()
+    tool_loop.append_assistant_tool_calls_message(
+        messages=messages,
+        response=response,
+        tool_caller=caller,
+    )
+    tool_loop.append_tool_result_messages(
+        messages=messages,
+        tool_caller=caller,
+        response=response,
+        results=[(calls[0], "one"), (calls[1], "two")],
+    )
+
+    assert len(messages) == 2
+    assert messages[0]["role"] == "model"
+    assert [part["functionResponse"]["name"] for part in messages[1]["parts"]] == [
+        "first",
+        "second",
+    ]
+
+
 def test_observe_model_step_records_trace_and_warns_empty_stop() -> None:
     traces: list[dict] = []
     logger = _Logger()

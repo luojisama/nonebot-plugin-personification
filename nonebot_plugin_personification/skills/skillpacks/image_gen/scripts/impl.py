@@ -1,13 +1,24 @@
 from __future__ import annotations
 
 import base64
+import binascii
+import io
 import json
 import re
+import struct
+import zlib
 from typing import Any
-from urllib.parse import quote, urljoin
+from urllib.parse import quote, urljoin, urlsplit
 
 import httpx
+from plugin.personification.core.gemini_transport import (
+    is_google_gemini_endpoint,
+    raise_for_gemini_status,
+    request_with_gemini_auth,
+)
 from plugin.personification.core.image_refs import normalize_image_refs
+from plugin.personification.core.llm_context import use_single_attempt_retry_policy
+from plugin.personification.core.safe_image_download import download_public_image
 
 
 _IMAGE_SIZE_ALIASES = {
@@ -38,7 +49,9 @@ _IMAGE_SIZE_ALIASES = {
     "4:3": "1536x1024",
     "3:2": "1536x1024",
 }
-_DEDICATED_CODEX_CALLERS: dict[tuple[type, str, str, float], Any] = {}
+_DEDICATED_CODEX_CALLERS: dict[tuple[type, str, str, float, str], Any] = {}
+_MAX_IMAGE_BYTES = 20 * 1024 * 1024
+_ALLOWED_IMAGE_MIMES = {"image/png", "image/jpeg", "image/webp", "image/gif"}
 
 
 def normalize_image_generation_size(size: str) -> str:
@@ -96,16 +109,81 @@ def _configured_image_route(plugin_config: Any) -> dict[str, str]:
     explicit_type = _normalize_api_type(getattr(plugin_config, "personification_image_gen_api_type", "auto"))
     explicit_url = str(getattr(plugin_config, "personification_image_gen_api_url", "") or "").strip()
     explicit_key = str(getattr(plugin_config, "personification_image_gen_api_key", "") or "").strip()
+    auth_mode = str(getattr(plugin_config, "personification_gemini_auth_mode", "auto") or "auto").strip()
     main_type = _normalize_api_type(getattr(plugin_config, "personification_api_type", "openai"))
     main_url = str(getattr(plugin_config, "personification_api_url", "") or "").strip()
     main_key = str(getattr(plugin_config, "personification_api_key", "") or "").strip()
-    route_type = explicit_type
+    dedicated = any((explicit_type != "auto", explicit_url, explicit_key))
     return {
-        "api_type": route_type,
+        "api_type": explicit_type,
         "main_api_type": main_type,
-        "api_url": explicit_url or main_url,
-        "api_key": explicit_key or main_key,
+        "api_url": explicit_url if dedicated else main_url,
+        "api_key": explicit_key if dedicated else main_key,
+        "gemini_auth_mode": auth_mode,
+        "dedicated": "1" if dedicated else "",
     }
+
+
+def _pool_image_routes(plugin_config: Any) -> list[dict[str, Any]]:
+    raw = getattr(plugin_config, "personification_api_pools", None)
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except (TypeError, json.JSONDecodeError):
+            return []
+    if not isinstance(raw, list):
+        return []
+    candidates: list[dict[str, Any]] = []
+    for index, item in enumerate(raw):
+        if not isinstance(item, dict) or item.get("enabled", True) is False:
+            continue
+        api_type = _normalize_api_type(item.get("api_type"))
+        api_url = str(item.get("api_url", "") or "").strip()
+        api_key = str(item.get("api_key", "") or "").strip()
+        if api_type not in {"openai", "gemini"} or not api_url or not api_key:
+            continue
+        try:
+            priority = int(item.get("priority", index) or 0)
+        except (TypeError, ValueError):
+            priority = index
+        candidates.append({
+            "name": str(item.get("name") or f"pool_{index + 1}"),
+            "api_type": api_type,
+            "api_url": api_url,
+            "api_key": api_key,
+            "model": str(item.get("image_model") or item.get("model") or "").strip(),
+            "priority": priority,
+            "proxy": str(item.get("proxy", "") or "").strip(),
+            "gemini_auth_mode": str(item.get("gemini_auth_mode", "auto") or "auto").strip(),
+        })
+    if not candidates:
+        return []
+    dynamic = bool(getattr(plugin_config, "personification_provider_dynamic_priority_enabled", False))
+    if dynamic:
+        try:
+            from plugin.personification.core import provider_health
+
+            stats = provider_health.get_all_stats()
+            min_samples = int(getattr(plugin_config, "personification_provider_health_min_samples", 3) or 3)
+            candidates.sort(key=lambda provider: (
+                provider_health.compute_effective_priority(
+                    provider,
+                    stats.get(provider["name"]),
+                    min_samples=min_samples,
+                    enabled=True,
+                ),
+                provider["name"],
+            ))
+        except Exception:
+            candidates.sort(key=lambda provider: (provider["priority"], provider["name"]))
+    else:
+        candidates.sort(key=lambda provider: (provider["priority"], provider["name"]))
+    return candidates
+
+
+def _pool_image_route(plugin_config: Any) -> dict[str, Any] | None:
+    routes = _pool_image_routes(plugin_config)
+    return routes[0] if routes else None
 
 
 def _gemini_image_model(plugin_config: Any, image_model: str) -> str:
@@ -151,14 +229,7 @@ def _gemini_generate_endpoint(api_url: str, model: str, api_key: str) -> tuple[s
     if not re.search(r"/v\d+(?:beta)?$", cleaned, flags=re.I):
         cleaned = cleaned.rstrip("/") + "/v1beta"
     endpoint = f"{cleaned}/models/{quote(str(model or '').strip(), safe='')}:generateContent"
-    headers = {"Content-Type": "application/json"}
-    params: dict[str, str] = {}
-    if "generativelanguage.googleapis.com" in endpoint:
-        if api_key:
-            params["key"] = api_key
-    elif api_key:
-        headers["Authorization"] = f"Bearer {api_key}"
-    return endpoint, headers, params
+    return endpoint, {"Content-Type": "application/json"}, {}
 
 
 def _split_data_url(data_url: str) -> tuple[str, str] | None:
@@ -172,6 +243,88 @@ def _split_data_url(data_url: str) -> tuple[str, str] | None:
     if encoding != "base64":
         return None
     return (mime_type or "image/png", body)
+
+
+def _validated_b64(value: Any, mime_type: str = "") -> tuple[str, str] | None:
+    text = str(value or "").strip()
+    try:
+        payload = base64.b64decode(text, validate=True)
+    except (ValueError, binascii.Error):
+        return None
+    if not payload or len(payload) > _MAX_IMAGE_BYTES:
+        return None
+    claimed = str(mime_type or "").split(";", 1)[0].strip().lower()
+    if claimed and claimed not in _ALLOWED_IMAGE_MIMES:
+        return None
+    try:
+        from PIL import Image, UnidentifiedImageError
+    except ImportError:
+        detected = "image/png" if _validate_png_without_pillow(payload) else ""
+    else:
+        try:
+            with Image.open(io.BytesIO(payload)) as image:
+                image.verify()
+            with Image.open(io.BytesIO(payload)) as image:
+                image.load()
+                detected = str(Image.MIME.get(image.format, "") or "").lower()
+        except (UnidentifiedImageError, OSError, ValueError):
+            return None
+    if detected not in _ALLOWED_IMAGE_MIMES or (claimed and claimed != detected):
+        return None
+    return text, detected
+
+
+def _validate_png_without_pillow(payload: bytes) -> bool:
+    if not payload.startswith(b"\x89PNG\r\n\x1a\n"):
+        return False
+    offset = 8
+    width = height = bit_depth = color_type = 0
+    idat = bytearray()
+    saw_iend = False
+    try:
+        while offset + 12 <= len(payload):
+            length = struct.unpack(">I", payload[offset:offset + 4])[0]
+            chunk_type = payload[offset + 4:offset + 8]
+            end = offset + 12 + length
+            if length > _MAX_IMAGE_BYTES or end > len(payload):
+                return False
+            data = payload[offset + 8:offset + 8 + length]
+            crc = struct.unpack(">I", payload[offset + 8 + length:end])[0]
+            if zlib.crc32(chunk_type + data) & 0xFFFFFFFF != crc:
+                return False
+            if chunk_type == b"IHDR":
+                if length != 13 or width or height:
+                    return False
+                width, height, bit_depth, color_type, compression, filtering, interlace = struct.unpack(">IIBBBBB", data)
+                if not width or not height or compression or filtering or interlace:
+                    return False
+            elif chunk_type == b"IDAT":
+                idat.extend(data)
+            elif chunk_type == b"IEND":
+                saw_iend = length == 0 and end == len(payload)
+                break
+            offset = end
+        channels = {0: 1, 2: 3, 3: 1, 4: 2, 6: 4}.get(color_type, 0)
+        if not saw_iend or not idat or bit_depth not in {1, 2, 4, 8, 16} or not channels:
+            return False
+        row_bytes = (width * channels * bit_depth + 7) // 8
+        expected = height * (row_bytes + 1)
+        if expected > _MAX_IMAGE_BYTES * 8:
+            return False
+        decompressor = zlib.decompressobj()
+        decoded = decompressor.decompress(bytes(idat), expected + 1)
+        decoded += decompressor.flush()
+        return decompressor.eof and not decompressor.unused_data and len(decoded) == expected
+    except (ValueError, struct.error, zlib.error):
+        return False
+
+
+def _ok_image(value: Any, mime_type: str = "") -> dict[str, str]:
+    validated = _validated_b64(value, mime_type)
+    if validated is None:
+        return {"error": "provider returned invalid image data"}
+    b64, detected = validated
+    return {"b64_json": b64, "mime_type": detected}
 
 
 def _extract_openai_image(data: Any) -> tuple[str, str]:
@@ -217,24 +370,39 @@ def _extract_gemini_image(data: Any) -> tuple[str, str]:
     return "", ""
 
 
-async def _download_image_as_b64(url: str, *, api_key: str = "", timeout: float = 180.0) -> str:
+def _origin(url: str) -> tuple[str, str, int]:
+    parsed = urlsplit(url)
+    return parsed.scheme.lower(), (parsed.hostname or "").lower().rstrip("."), parsed.port or (443 if parsed.scheme == "https" else 80)
+
+
+async def _download_image_as_b64(
+    url: str,
+    *,
+    api_key: str = "",
+    auth_origin: str = "",
+    timeout: float = 180.0,
+    proxy: str = "",
+) -> str:
     headers = {"Accept": "image/*,*/*"}
-    if api_key:
+    if api_key and auth_origin and _origin(url) == _origin(auth_origin):
         headers["Authorization"] = f"Bearer {api_key}"
-    async with httpx.AsyncClient(timeout=httpx.Timeout(float(timeout or 180.0), connect=15.0)) as client:
-        response = await client.get(url, headers=headers)
-        response.raise_for_status()
-    payload = bytes(response.content or b"")
-    return base64.b64encode(payload).decode("ascii") if payload else ""
+    result = await download_public_image(
+        url,
+        headers=headers,
+        timeout=float(timeout or 180.0),
+        connect_timeout=15.0,
+        max_bytes=_MAX_IMAGE_BYTES,
+        allowed_mimes=_ALLOWED_IMAGE_MIMES,
+        max_redirects=5,
+        proxy=proxy,
+        sensitive_headers_origin=auth_origin,
+    )
+    encoded = base64.b64encode(result.content).decode("ascii")
+    return encoded if _validated_b64(encoded, result.content_type) else ""
 
 
 def _error_from_http(exc: httpx.HTTPStatusError) -> str:
-    body = ""
-    try:
-        body = exc.response.text[:360]
-    except Exception:
-        pass
-    return f"HTTP {exc.response.status_code}: {body}"
+    return f"image provider HTTP {exc.response.status_code}"
 
 
 async def _generate_image_openai_http(
@@ -245,6 +413,9 @@ async def _generate_image_openai_http(
     image_model: str,
     size: str,
     timeout: float,
+    proxy: str = "",
+    reference_mode: str = "auto",
+    has_references: bool = False,
 ) -> dict[str, str]:
     if not api_key:
         return {"error": "missing image generation api key"}
@@ -261,21 +432,29 @@ async def _generate_image_openai_http(
         "Content-Type": "application/json",
     }
     try:
-        async with httpx.AsyncClient(timeout=httpx.Timeout(float(timeout or 180.0), connect=15.0)) as client:
+        client_kwargs: dict[str, Any] = {"timeout": httpx.Timeout(float(timeout or 180.0), connect=15.0)}
+        if proxy:
+            client_kwargs["proxy"] = proxy
+        async with httpx.AsyncClient(**client_kwargs) as client:
             response = await client.post(endpoint, json=payload, headers=headers)
             response.raise_for_status()
             data = response.json()
     except httpx.HTTPStatusError as exc:
         return {"error": _error_from_http(exc)}
-    except Exception as exc:
-        return {"error": f"request failed: {exc}"}
+    except Exception:
+        return {"error": "image provider request failed"}
     b64, url = _extract_openai_image(data)
     if not b64 and url:
         try:
-            b64 = await _download_image_as_b64(url, api_key=api_key, timeout=timeout)
-        except Exception as exc:
-            return {"error": f"image download failed: {exc}"}
-    return {"b64_json": b64} if b64 else {"error": f"empty image response: {json.dumps(data, ensure_ascii=False)[:360]}"}
+            b64 = await _download_image_as_b64(
+                url, api_key=api_key, auth_origin=endpoint, timeout=timeout, proxy=proxy
+            )
+        except Exception:
+            return {"error": "image download failed"}
+    result = _ok_image(b64)
+    if "error" not in result and has_references and reference_mode not in {"off", "vision_prompt"}:
+        result["warning"] = "reference images are not supported by this provider"
+    return result
 
 
 async def _generate_image_gemini_http(
@@ -288,10 +467,13 @@ async def _generate_image_gemini_http(
     timeout: float,
     images: list[str] | None = None,
     image_urls: list[str] | None = None,
+    proxy: str = "",
+    reference_mode: str = "auto",
+    auth_mode: str = "auto",
 ) -> dict[str, str]:
     model = str(image_model or "gemini-3-pro-image-preview").strip() or "gemini-3-pro-image-preview"
     endpoint, headers, params = _gemini_generate_endpoint(api_url, model, api_key)
-    raw_refs = list(images or []) + list(image_urls or [])
+    raw_refs = [] if reference_mode in {"off", "vision_prompt"} else list(images or []) + list(image_urls or [])
     reference_images, reference_problems = normalize_image_refs(raw_refs, limit=3)
     parts: list[dict[str, Any]] = [
         {
@@ -313,17 +495,42 @@ async def _generate_image_gemini_http(
         "generationConfig": {"responseModalities": ["IMAGE"]},
     }
     try:
-        async with httpx.AsyncClient(timeout=httpx.Timeout(float(timeout or 180.0), connect=15.0)) as client:
-            response = await client.post(endpoint, json=payload, headers=headers, params=params)
-            response.raise_for_status()
+        client_kwargs: dict[str, Any] = {
+            "timeout": httpx.Timeout(float(timeout or 180.0), connect=15.0),
+            "follow_redirects": False,
+        }
+        if proxy:
+            client_kwargs["proxy"] = proxy
+        async with httpx.AsyncClient(**client_kwargs) as client:
+            async def _send(auth):  # noqa: ANN001, ANN202
+                return await client.post(
+                    endpoint,
+                    json=payload,
+                    headers={**headers, **auth.headers},
+                    params={**params, **auth.params},
+                )
+
+            auth_result = await request_with_gemini_auth(
+                endpoint=endpoint.rsplit("/models/", 1)[0],
+                api_key=api_key,
+                auth_mode=auth_mode,
+                send=_send,
+                allow_negotiation=not use_single_attempt_retry_policy(),
+            )
+            response = auth_result.response
+            raise_for_gemini_status(
+                response,
+                auth_mode=auth_result.mode,
+                request_count=auth_result.request_count,
+            )
             data = response.json()
     except httpx.HTTPStatusError as exc:
         return {"error": _error_from_http(exc)}
-    except Exception as exc:
-        return {"error": f"request failed: {exc}"}
+    except Exception:
+        return {"error": "image provider request failed"}
     b64, _mime = _extract_gemini_image(data)
-    result = {"b64_json": b64} if b64 else {"error": f"empty image response: {json.dumps(data, ensure_ascii=False)[:360]}"}
-    if b64 and reference_problems:
+    result = _ok_image(b64, _mime)
+    if "error" not in result and reference_problems:
         result["warning"] = "some reference images were ignored: " + ", ".join(reference_problems[:3])
     return result
 
@@ -351,6 +558,13 @@ async def generate_image(
     plugin_config = plugin_config or object()
     route = _configured_image_route(plugin_config)
     route_type = route.get("api_type") or "auto"
+    reference_mode = str(reference_mode or "auto").strip().lower() or "auto"
+    has_references = bool(list(images or []) + list(image_urls or []))
+
+    if route.get("dedicated") and (
+        route_type not in {"openai", "gemini"} or not route.get("api_url") or not route.get("api_key")
+    ):
+        return {"error": "dedicated image route requires api_type, api_url and api_key"}
 
     if route_type == "openai":
         return await _generate_image_openai_http(
@@ -360,6 +574,8 @@ async def generate_image(
             image_model=image_model,
             size=size,
             timeout=float(timeout or 180.0),
+            reference_mode=reference_mode,
+            has_references=has_references,
         )
     if route_type == "gemini":
         return await _generate_image_gemini_http(
@@ -371,6 +587,8 @@ async def generate_image(
             timeout=float(timeout or 180.0),
             images=images,
             image_urls=image_urls,
+            reference_mode=reference_mode,
+            auth_mode=str(route.get("gemini_auth_mode", "auto") or "auto"),
         )
 
     caller = _first_codex_caller(tool_caller)
@@ -392,29 +610,43 @@ async def generate_image(
                 timeout=timeout,
                 images=images,
                 image_urls=image_urls,
+                reference_mode=reference_mode,
             )
-        if route.get("api_key"):
-            guessed_type = route_type if route_type in {"openai", "gemini"} else route.get("main_api_type") or "openai"
-            if guessed_type == "gemini" or "generativelanguage.googleapis.com" in route.get("api_url", ""):
-                return await _generate_image_gemini_http(
+        pool_routes = _pool_image_routes(plugin_config) if not route.get("dedicated") else []
+        routes = pool_routes or ([route] if route.get("api_key") else [])
+        last_result: dict[str, str] = {"error": "image generation route is not configured"}
+        for route in routes:
+            guessed_type = route.get("api_type") if route.get("api_type") in {"openai", "gemini"} else route.get("main_api_type") or "openai"
+            candidate_model = str(route.get("model") or image_model).strip() or image_model
+            if guessed_type == "gemini" or is_google_gemini_endpoint(str(route.get("api_url", "") or "")):
+                last_result = await _generate_image_gemini_http(
                     prompt_text,
                     api_url=route.get("api_url", ""),
                     api_key=route.get("api_key", ""),
-                    image_model=_gemini_image_model(plugin_config, image_model),
+                    image_model=_gemini_image_model(plugin_config, candidate_model),
                     size=size,
                     timeout=float(timeout or 180.0),
                     images=images,
                     image_urls=image_urls,
+                    proxy=str(route.get("proxy", "") or ""),
+                    reference_mode=reference_mode,
+                    auth_mode=str(route.get("gemini_auth_mode", "auto") or "auto"),
                 )
-            return await _generate_image_openai_http(
-                prompt_text,
-                api_url=route.get("api_url", ""),
-                api_key=route.get("api_key", ""),
-                image_model=image_model,
-                size=size,
-                timeout=float(timeout or 180.0),
-            )
-        return {"error": "image generation route is not configured"}
+            else:
+                last_result = await _generate_image_openai_http(
+                    prompt_text,
+                    api_url=route.get("api_url", ""),
+                    api_key=route.get("api_key", ""),
+                    image_model=candidate_model,
+                    size=size,
+                    timeout=float(timeout or 180.0),
+                    proxy=str(route.get("proxy", "") or ""),
+                    reference_mode=reference_mode,
+                    has_references=has_references,
+                )
+            if "error" not in last_result:
+                return last_result
+        return last_result
     if timeout is not None:
         try:
             timeout_value = float(timeout)
@@ -433,6 +665,7 @@ async def generate_image(
                 str(getattr(caller, "model", "") or ""),
                 str(getattr(caller, "auth_path_override", "") or ""),
                 timeout_value,
+                str(getattr(caller, "proxy", "") or ""),
             )
             dedicated = _DEDICATED_CODEX_CALLERS.get(key)
             if dedicated is None:
@@ -440,29 +673,36 @@ async def generate_image(
                     model=key[1],
                     auth_path=key[2],
                     timeout=timeout_value,
+                    proxy=key[4],
                 )
                 _DEDICATED_CODEX_CALLERS[key] = dedicated
             caller = dedicated
-    raw_refs = list(images or []) + list(image_urls or [])
+    raw_refs = [] if reference_mode in {"off", "vision_prompt"} else list(images or []) + list(image_urls or [])
     reference_images, reference_problems = normalize_image_refs(raw_refs, limit=3)
     result = await caller.generate_image(
         prompt_text,
         size=normalize_image_generation_size(str(size or "1024x1024")),
         image_model=str(image_model or "gpt-image-2").strip() or "gpt-image-2",
         images=reference_images,
-        reference_mode=str(reference_mode or "auto").strip() or "auto",
+        reference_mode=reference_mode,
     )
     if not isinstance(result, dict):
         return {"error": "invalid image response"}
+    normalized = _ok_image(result.get("b64_json"), result.get("mime_type", ""))
+    if "error" in normalized:
+        return normalized
     if reference_problems and "warning" not in result:
         result = dict(result)
         result["warning"] = "some reference images were ignored: " + ", ".join(reference_problems[:3])
-    return result
+    if result.get("warning"):
+        normalized["warning"] = str(result["warning"])
+    return normalized
 
 
 __all__ = [
     "_first_gemini_cli_caller",
     "_first_codex_caller",
+    "_pool_image_route",
     "generate_image",
     "normalize_image_generation_size",
 ]

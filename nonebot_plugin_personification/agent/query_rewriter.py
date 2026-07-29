@@ -51,6 +51,8 @@ class ContextualQueryRewrite:
     need_image_understanding: bool
     recommended_tools: list[str]
     search_plan: list[str] = field(default_factory=list)
+    source: str = "model"
+    fallback_reason: str = ""
 
 
 def _normalize_text(text: Any) -> str:
@@ -343,6 +345,8 @@ def _fallback_rewrite(
         need_image_understanding=need_image_understanding,
         recommended_tools=recommended_tools,
         search_plan=search_plan,
+        source="structural",
+        fallback_reason="structural_fallback",
     )
 
 
@@ -355,6 +359,7 @@ def _coerce_rewrite_payload(
     images: list[str] | None = None,
     quoted_message: str = "",
     topic_hint: str = "",
+    fallback_reason: str = "",
 ) -> ContextualQueryRewrite:
     fallback = _fallback_rewrite(
         history_new=history_new,
@@ -365,6 +370,15 @@ def _coerce_rewrite_payload(
         topic_hint=topic_hint,
     )
     if not isinstance(payload, dict):
+        if fallback_reason:
+            fallback.fallback_reason = fallback_reason
+        return fallback
+    has_model_query = bool(
+        _normalize_text(payload.get("primary_query", ""))
+        or _normalize_str_list(payload.get("query_candidates", []), limit=1)
+    )
+    if not has_model_query:
+        fallback.fallback_reason = "empty_payload"
         return fallback
 
     primary_query = _normalize_text(payload.get("primary_query", "")) or fallback.primary_query
@@ -386,6 +400,8 @@ def _coerce_rewrite_payload(
         need_image_understanding=need_image_understanding,
         recommended_tools=recommended_tools,
         search_plan=search_plan,
+        source="model",
+        fallback_reason="",
     )
 
 
@@ -450,6 +466,7 @@ async def contextual_query_rewriter(
     except Exception:
         response = None
     payload = _parse_json_object(getattr(response, "content", "") if response is not None else "")
+    fallback_reason = "provider_error" if response is None else "invalid_payload" if payload is None else ""
     return _coerce_rewrite_payload(
         payload,
         history_new=history_new,
@@ -458,4 +475,5 @@ async def contextual_query_rewriter(
         images=images,
         quoted_message=quoted_message,
         topic_hint=topic_hint,
+        fallback_reason=fallback_reason,
     )

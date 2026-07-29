@@ -37,3 +37,24 @@ def test_image_only_followup_placeholder_uses_topic_without_claiming_vision() ->
     assert "没有清楚的视觉摘要" in text
     assert "不要评价图片内容" in text
     assert "短句回应" in text
+
+
+def test_multi_user_batch_sticker_collection_does_not_use_selected_user_as_owner() -> None:
+    batched_events = [
+        {
+            "user_id": "user_a",
+            "media": [
+                {
+                    "media_id": "media-a",
+                    "owner_user_id": "user_a",
+                    "message_id": "message-a",
+                    "origin": "batch",
+                    "kind": "image",
+                }
+            ],
+        },
+        {"user_id": "user_b", "media": []},
+    ]
+
+    assert not processor._batch_media_owner_matches_selected_user(batched_events, "user_b")
+    assert processor._batch_media_owner_matches_selected_user(batched_events, "user_a")

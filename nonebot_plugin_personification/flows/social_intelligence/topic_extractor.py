@@ -1,39 +1,21 @@
 """从用户消息中提取"未完成的事"（pending topic）。
 
 两段式：
-1. pre_filter(text)：纯正则关键短语筛，快、零 LLM 成本。不匹配就直接跳。
-2. extract_pending_topic(text, now_ts, tool_caller)：匹配的消息优先走完整 Agent
-   抽 (topic, time_hint_ts, confidence)，confidence < 0.5 丢弃。
-
-设计上让 hook 把热路径开销控到极低（正则 → 99% 早退），只对真正的
-"承诺/计划/未来事件"才花 LLM 一次调用。
+1. pre_filter(text)：只做长度等结构成本边界，不参与对话语义判断。
+2. extract_pending_topic(text, now_ts, tool_caller)：候选消息优先走完整 Agent
+抽 (topic, time_hint_ts, confidence)，confidence < 0.5 丢弃。
 """
 from __future__ import annotations
 
 import json
-import re
 import time
 from datetime import datetime, timedelta
 from typing import Any
 
-# pre-filter 关键词：覆盖中文里"将要做某事"的常见说法
-_PREFILTER_PATTERNS = [
-    re.compile(r"我(要|想|打算|准备|计划|打算去|得去|要去)"),
-    re.compile(r"(明天|后天|大后天|下周|下个?月|周末|周[一二三四五六日天])"),
-    re.compile(r"(几天后|几小时后|过几天|过两天|等会|晚点|稍后)"),
-    re.compile(r"(出差|考试|面试|搬家|约|约好|约了|开会)"),
-    re.compile(r"(\d+\s*(天|小时|周|月))[内后]"),
-]
-
-
 def pre_filter(text: str) -> bool:
-    """快速判断这条消息是否"看起来含未完成的事"。误报可以，漏报最小化。"""
-    if not text or len(text) < 4:
-        return False
-    if len(text) > 400:
-        # 太长的消息（图片描述、转发等）误判率太高，直接跳
-        return False
-    return any(p.search(text) for p in _PREFILTER_PATTERNS)
+    """Only apply structural cost bounds; semantic classification belongs to the LLM."""
+    length = len(str(text or "").strip())
+    return 4 <= length <= 400
 
 
 _EXTRACT_PROMPT = """从用户的下面这句话里提取"未完成的承诺/计划/未来事件"，方便我之后主动关心他。
@@ -88,7 +70,7 @@ async def extract_pending_topic(
     messages = [{"role": "user", "content": prompt}]
     try:
         if tool_registry is not None:
-            from ...core.agent_bridge import run_text_agent
+            from ...core.agent_bridge import TEXT_AGENT_TOOL_PROFILE_NONE, run_text_agent
 
             content = await run_text_agent(
                 messages=messages,
@@ -99,6 +81,8 @@ async def extract_pending_topic(
                 max_steps=agent_max_steps,
                 trigger_reason="social_topic_extract",
                 chat_intent_hint="social_topic_extract",
+                structured_output=True,
+                tool_profile=TEXT_AGENT_TOOL_PROFILE_NONE,
             )
         else:
             response = await tool_caller.chat_with_tools(

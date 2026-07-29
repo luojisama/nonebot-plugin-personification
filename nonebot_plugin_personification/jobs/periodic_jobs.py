@@ -1,106 +1,27 @@
-import calendar
+import asyncio
 import random
-import re
-import time
+import uuid
 from typing import Any, Callable, Dict, Iterable
 
 from ..core.data_store import get_data_store
+from ..core.qzone_publish import (
+    build_qzone_quota,
+    coordinated_qzone_publish,
+    finalize_qzone_publish,
+    record_qzone_post,
+    reserve_qzone_publish,
+)
 
 
-_IMAGE_B64_RE = re.compile(r"\[IMAGE_B64\][A-Za-z0-9+/=\r\n]+\[/IMAGE_B64\]")
+_QZONE_SOCIAL_SCAN_TIMEOUT_SECONDS = 180.0
+_QZONE_INBOUND_TIMEOUT_SECONDS = 90.0
 
 
-def build_qzone_quota(
-    *,
-    state: Any,
-    now: Any,
-    monthly_limit: int,
-    min_interval_hours: float,
-) -> Dict[str, Any]:
-    """计算发空间的月度额度快照，供 agent 自我节奏控制与 WebUI 展示共用。
-
-    state 为 data_store 的 qzone_post_state；若其 period 不是当前月（或缺失），
-    本月已发计 0（与 run_proactive 的按月重置一致）。
-    """
-    period = now.strftime("%Y-%m")
-    same_period = isinstance(state, dict) and state.get("period") == period
-    used = int((state or {}).get("count", 0) or 0) if same_period else 0
-    limit = max(0, int(monthly_limit or 0))
-    remaining = max(0, limit - used)
-    days_in_month = calendar.monthrange(now.year, now.month)[1]
-    day_of_month = int(getattr(now, "day", 1) or 1)
-    days_left = max(1, days_in_month - day_of_month + 1)
-    last_post_at = float((state or {}).get("last_post_at", 0) or 0)
-    min_interval_seconds = max(0.0, float(min_interval_hours or 0)) * 3600
-    next_eligible_at = (
-        last_post_at + min_interval_seconds if (last_post_at and min_interval_seconds) else 0.0
-    )
-    return {
-        "month": period,
-        "used": used,
-        "limit": limit,
-        "remaining": remaining,
-        "days_in_month": days_in_month,
-        "day_of_month": day_of_month,
-        "days_left": days_left,
-        "min_interval_hours": float(min_interval_hours or 0),
-        "last_post_at": last_post_at,
-        "next_eligible_at": next_eligible_at,
-    }
-
-
-def _compact_qzone_state_content(content: str) -> str:
-    return _IMAGE_B64_RE.sub("[配图]", str(content or "")).strip()[:200]
-
-
-def _remember_qzone_post(state: dict[str, Any], content: str, *, max_items: int = 12) -> None:
-    compact = _compact_qzone_state_content(content)
-    if not compact:
-        return
-    recent_raw = state.get("recent_contents")
-    recent = list(recent_raw) if isinstance(recent_raw, list) else []
-    normalized: list[str] = []
-    seen: set[str] = set()
-    for item in recent + [compact]:
-        text = str(item.get("content") if isinstance(item, dict) else item or "").strip()
-        if not text or text in seen:
-            continue
-        seen.add(text)
-        normalized.append(text)
-    state["recent_contents"] = normalized[-max(1, int(max_items)) :]
-    state["last_content"] = compact
-
-
-def record_qzone_post(content: str, *, now: Any, kind: str = "post") -> Dict[str, Any]:
-    """发布一条空间内容后更新 qzone_post_state（按月总数 +1、记录去重）。
-
-    供 WebUI 手动「立即发一条」和自动转发复用，保证所有外显空间发布都计入月度额度。
-    """
-    store = get_data_store()
-    state = store.load_sync("qzone_post_state")
-    if not isinstance(state, dict):
-        state = {}
-    period = now.strftime("%Y-%m")
-    if state.get("period") != period:
-        state = {
-            "period": period,
-            "count": 0,
-            "last_post_at": float(state.get("last_post_at", 0) or 0),
-            "last_content": str(state.get("last_content", "") or ""),
-            "recent_contents": list(state.get("recent_contents", []))
-            if isinstance(state.get("recent_contents"), list)
-            else [],
-        }
-    state["period"] = period
-    state["count"] = int(state.get("count", 0) or 0) + 1
-    kind_key = str(kind or "post").strip().lower()
-    if kind_key and kind_key != "post":
-        counter_key = f"{kind_key}_count"
-        state[counter_key] = int(state.get(counter_key, 0) or 0) + 1
-    state["last_post_at"] = time.time()
-    _remember_qzone_post(state, content)
-    store.save_sync("qzone_post_state", state)
-    return state
+def _qzone_runtime_ts(now: Any) -> float:
+    try:
+        return float(now.timestamp())
+    except Exception:
+        return 0.0
 
 
 async def run_daily_group_fav_report(
@@ -223,7 +144,7 @@ async def run_auto_post_diary(
 
     logger.info("拟人插件：正在自动更新 Qzone Cookie...")
     try:
-        cookie_ok, cookie_msg = await update_qzone_cookie(bot)
+        cookie_ok, cookie_msg = await update_qzone_cookie(bot, force=True)
     except Exception as e:
         logger.warning(f"拟人插件：Qzone Cookie 更新失败（{e}），将尝试使用旧 Cookie 继续发布。")
     else:
@@ -237,19 +158,27 @@ async def run_auto_post_diary(
         return False
 
     logger.info("拟人插件：正在自动发布空间说说...")
-    success, msg = await publish_qzone_shuo(diary_content, bot.self_id)
-    if success:
-        store = get_data_store()
-        state = store.load_sync("qzone_post_state")
-        if not isinstance(state, dict):
-            state = {}
-        _remember_qzone_post(state, diary_content)
-        state["last_post_at"] = time.time()
-        store.save_sync("qzone_post_state", state)
+    from ..core.time_ctx import get_configured_now
+
+    published = await coordinated_qzone_publish(
+        operation_id=f"auto-diary-{uuid.uuid4().hex}",
+        content=diary_content,
+        bot_id=str(bot.self_id),
+        now=get_configured_now(),
+        monthly_limit=0,
+        min_interval_hours=0,
+        kind="post",
+        publish=lambda: publish_qzone_shuo(diary_content, bot.self_id),
+        force=True,
+    )
+    if published.get("success"):
+        mark_published = getattr(generate_ai_diary, "mark_published", None)
+        if published.get("newly_committed") and callable(mark_published):
+            mark_published(diary_content)
         logger.info("拟人插件：空间说说发布成功！")
         return True
 
-    logger.error(f"拟人插件：空间说说发布失败：{msg}")
+    logger.error(f"拟人插件：空间说说发布失败：{published.get('message') or published.get('status')}")
     return False
 
 
@@ -303,31 +232,19 @@ async def run_proactive_qzone_post(
             f"[qzone] skip proactive post in quiet hour {quiet_hour_start}-{quiet_hour_end}"
         )
         return False
-    period = now.strftime("%Y-%m")
-    now_ts = time.time()
-
     store = get_data_store()
     state = store.load_sync("qzone_post_state")
     if not isinstance(state, dict):
         state = {}
-    # 按月计数：跨月（或旧的按天 state，缺少 period 字段）时 count 归零，
-    # last_post_at / recent_contents 照旧 carry over 喂去重。
-    if state.get("period") != period:
-        state = {
-            "period": period,
-            "count": 0,
-            "last_post_at": float(state.get("last_post_at", 0) or 0),
-            "last_content": str(state.get("last_content", "") or ""),
-            "recent_contents": list(state.get("recent_contents", []))
-            if isinstance(state.get("recent_contents"), list)
-            else [],
-        }
-
-    if int(state.get("count", 0) or 0) >= max(1, int(qzone_monthly_limit)):
+    quota = build_qzone_quota(
+        state=state,
+        now=now,
+        monthly_limit=qzone_monthly_limit,
+        min_interval_hours=qzone_min_interval_hours,
+    )
+    if int(quota.get("available", 0) or 0) <= 0:
         return False
-    min_interval_seconds = max(0.0, float(qzone_min_interval_hours)) * 3600
-    last_post_at = float(state.get("last_post_at", 0) or 0)
-    if min_interval_seconds and last_post_at and now_ts - last_post_at < min_interval_seconds:
+    if float(quota.get("next_eligible_at", 0) or 0) > _qzone_runtime_ts(now):
         return False
 
     try:
@@ -341,15 +258,8 @@ async def run_proactive_qzone_post(
         return False
 
     # 把月度额度快照交给 agent，让它自己把控发不发、发的节奏（硬上限仍由上面的 gate 兜底）。
-    quota = build_qzone_quota(
-        state=state,
-        now=now,
-        monthly_limit=qzone_monthly_limit,
-        min_interval_hours=qzone_min_interval_hours,
-    )
-
     try:
-        cookie_ok, cookie_msg = await update_qzone_cookie(bot)
+        cookie_ok, cookie_msg = await update_qzone_cookie(bot, force=True)
     except Exception as e:
         logger.warning(f"拟人插件：主动说说刷新 Cookie 失败（{e}），尝试使用旧 Cookie。")
     else:
@@ -360,16 +270,23 @@ async def run_proactive_qzone_post(
     if not content:
         return False
 
-    success, msg = await publish_qzone_shuo(content, bot.self_id)
-    if not success:
-        logger.error(f"拟人插件：主动说说发布失败：{msg}")
+    published = await coordinated_qzone_publish(
+        operation_id=f"proactive-{uuid.uuid4().hex}",
+        content=content,
+        bot_id=str(bot.self_id),
+        now=now,
+        monthly_limit=qzone_monthly_limit,
+        min_interval_hours=qzone_min_interval_hours,
+        kind="post",
+        publish=lambda: publish_qzone_shuo(content, bot.self_id),
+    )
+    if not published.get("success"):
+        logger.error(f"拟人插件：主动说说发布失败：{published.get('message') or published.get('status')}")
         return False
 
-    state["period"] = period
-    state["count"] = int(state.get("count", 0) or 0) + 1
-    state["last_post_at"] = now_ts
-    _remember_qzone_post(state, content)
-    store.save_sync("qzone_post_state", state)
+    mark_published = getattr(maybe_generate_qzone_post, "mark_published", None)
+    if published.get("newly_committed") and callable(mark_published):
+        mark_published(content)
     logger.info("拟人插件：已根据当前状态主动发布一条空间说说。")
     return True
 
@@ -399,12 +316,24 @@ async def run_qzone_social_scan(
     else:
         if not cookie_ok:
             logger.warning(f"拟人插件：空间互动刷新 Cookie 失败（{cookie_msg}），尝试使用旧 Cookie。")
-    result = await scan_qzone_social_feeds(
-        bot,
-        target_user_id=str(target_user_id or ""),
-        allow_open_user=bool(force),
-    )
-    if result.get("ok"):
+    try:
+        result = await asyncio.wait_for(
+            scan_qzone_social_feeds(
+                bot,
+                target_user_id=str(target_user_id or ""),
+                allow_open_user=bool(force),
+            ),
+            timeout=_QZONE_SOCIAL_SCAN_TIMEOUT_SECONDS,
+        )
+    except asyncio.TimeoutError:
+        result = {"ok": False, "status": "timed_out", "last_error": "qzone_social_scan_timed_out"}
+    if result.get("skipped"):
+        log = logger.warning if int(result.get("running_seconds", 0) or 0) > _QZONE_SOCIAL_SCAN_TIMEOUT_SECONDS else logger.info
+        log(
+            "拟人插件：空间互动扫描忙碌跳过，"
+            f"当前任务 {result.get('busy_by', '')}，已运行 {result.get('running_seconds', 0)} 秒。"
+        )
+    elif result.get("ok"):
         logger.info(
             "拟人插件：空间互动扫描完成，"
             f"用户 {result.get('scanned_users', 0)}，动态 {result.get('feeds_seen', 0)}，"
@@ -440,8 +369,20 @@ async def run_qzone_inbound_poll(
     else:
         if not cookie_ok:
             logger.warning(f"拟人插件：空间消息轮询刷新 Cookie 失败（{cookie_msg}），尝试使用旧 Cookie。")
-    result = await poll_qzone_inbound_messages(bot)
-    if result.get("ok"):
+    try:
+        result = await asyncio.wait_for(
+            poll_qzone_inbound_messages(bot),
+            timeout=_QZONE_INBOUND_TIMEOUT_SECONDS,
+        )
+    except asyncio.TimeoutError:
+        result = {"ok": False, "status": "timed_out", "last_error": "qzone_inbound_poll_timed_out"}
+    if result.get("skipped"):
+        log = logger.warning if int(result.get("running_seconds", 0) or 0) > _QZONE_SOCIAL_SCAN_TIMEOUT_SECONDS else logger.info
+        log(
+            "拟人插件：空间消息轮询忙碌跳过，"
+            f"当前任务 {result.get('busy_by', '')}，已运行 {result.get('running_seconds', 0)} 秒。"
+        )
+    elif result.get("ok"):
         logger.info(
             "拟人插件：空间消息轮询完成，"
             f"说说 {result.get('feeds_seen', 0)}，留言 {result.get('inbound_comments', 0)}，"

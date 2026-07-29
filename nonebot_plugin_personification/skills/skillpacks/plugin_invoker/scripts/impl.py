@@ -416,5 +416,8 @@ def build_invoke_plugin_tool(
             "requires_image": False,
             "latency_class": "slow",
             "risk_level": "medium",
+            "side_effect": "external",
+            "final_behavior": "continue",
+            "retryable": False,
         },
     )

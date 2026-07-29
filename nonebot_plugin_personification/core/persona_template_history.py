@@ -125,8 +125,69 @@ def get_latest_persona_template_record(work_title: str, character_name: str) -> 
     return records[0] if records else None
 
 
+def get_persona_template_record(record_id: str) -> dict[str, Any] | None:
+    wanted = str(record_id or "")
+    return next(
+        (record for record in list_persona_template_records(limit=100) if str(record.get("record_id") or "") == wanted),
+        None,
+    )
+
+
+def delete_persona_template_record(record_id: str) -> dict[str, Any] | None:
+    deleted: dict[str, Any] | None = None
+
+    def _mutate(current: Any) -> dict[str, Any]:
+        nonlocal deleted
+        payload = current if isinstance(current, dict) else {}
+        records = [item for item in payload.get("records", []) if isinstance(item, dict)]
+        kept: list[dict[str, Any]] = []
+        for record in records:
+            if deleted is None and str(record.get("record_id") or "") == str(record_id or ""):
+                deleted = record
+            else:
+                kept.append(record)
+        payload["records"] = kept
+        payload["updated_at"] = time.time()
+        return payload
+
+    get_data_store().mutate_sync(_NAMESPACE, _mutate)
+    return deleted
+
+
+def append_persona_template_apply_audit(record_id: str, event: dict[str, Any]) -> dict[str, Any] | None:
+    updated: dict[str, Any] | None = None
+
+    def _mutate(current: Any) -> dict[str, Any]:
+        nonlocal updated
+        payload = current if isinstance(current, dict) else {}
+        records = [item for item in payload.get("records", []) if isinstance(item, dict)]
+        for record in records:
+            if str(record.get("record_id") or "") != str(record_id or ""):
+                continue
+            audit = [item for item in record.get("profile_apply_audit", []) if isinstance(item, dict)]
+            audit.append({**event, "created_at": time.time()})
+            record["profile_apply_audit"] = audit[-50:]
+            updated = record
+            break
+        payload["records"] = records
+        payload["updated_at"] = time.time()
+        return payload
+
+    get_data_store().mutate_sync(_NAMESPACE, _mutate)
+    return updated
+
+
 def summarize_persona_template_record(record: dict[str, Any]) -> dict[str, Any]:
     result = record.get("result") if isinstance(record.get("result"), dict) else {}
+    avatar_review = result.get("avatar_review_summary") if isinstance(result.get("avatar_review_summary"), dict) else {}
+    verified_count = int(
+        avatar_review.get("verified_count")
+        or len([
+            item
+            for item in list(result.get("avatar_candidates") or [])
+            if isinstance(item, dict) and item.get("vision_status") == "verified"
+        ])
+    )
     return {
         "record_id": record.get("record_id", ""),
         "work_title": record.get("work_title", ""),
@@ -139,6 +200,12 @@ def summarize_persona_template_record(record: dict[str, Any]) -> dict[str, Any]:
         "source_count": int(record.get("source_count") or len(result.get("sources") or [])),
         "subagent_count": int(record.get("subagent_count") or len(result.get("subagents") or [])),
         "template_keys": list(result.get("template_keys") or [])[:32],
+        "revision": str(result.get("revision") or ""),
+        "avatar_candidate_count": verified_count,
+        "verified_avatar_count": verified_count,
+        "avatar_reviewed_count": int(avatar_review.get("reviewed_count") or 0),
+        "signature_candidate_count": len(result.get("signature_candidates") or []),
+        "profile_status": str(result.get("profile_status") or ""),
     }
 
 
@@ -205,8 +272,11 @@ def write_persona_template_export_file(record_or_result: dict[str, Any], *, plug
 
 
 __all__ = [
+    "append_persona_template_apply_audit",
     "build_persona_template_key",
+    "delete_persona_template_record",
     "get_latest_persona_template_record",
+    "get_persona_template_record",
     "list_persona_template_records",
     "record_persona_template_result",
     "render_persona_template_export",

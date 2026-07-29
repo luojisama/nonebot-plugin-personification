@@ -10,12 +10,12 @@ pending_actions / ActionExecutor、按 output_mode 截断等）。
 
 from __future__ import annotations
 
-import json
 from typing import Any
 
 from ..tool_registry import ToolRegistry
 from .executor import _execute_tool_with_retries
 from .tool_catalog import select_tool_schemas
+from .tool_loop import append_assistant_tool_calls_message, append_tool_result_messages
 
 
 async def run_tool_loop_text(
@@ -55,26 +55,13 @@ async def run_tool_loop_text(
         if not tool_calls:
             return content or last_content
 
-        # 回填 assistant tool_calls 消息：content 必须用空字符串而非 None，
-        # 部分严格 provider（Rust 反序列化）会把 null 当作缺失字段直接 400。
-        messages.append(
-            {
-                "role": "assistant",
-                "content": response.content if response.content else "",
-                "tool_calls": [
-                    {
-                        "id": tool_call.id,
-                        "type": "function",
-                        "function": {
-                            "name": tool_call.name,
-                            "arguments": json.dumps(tool_call.arguments, ensure_ascii=False),
-                        },
-                    }
-                    for tool_call in tool_calls
-                ],
-            }
+        append_assistant_tool_calls_message(
+            messages=messages,
+            response=response,
+            tool_caller=tool_caller,
         )
 
+        turn_results: list[tuple[Any, str]] = []
         for tool_call in tool_calls:
             logger.info(f"[qzone-tool] tool_call name={tool_call.name}")
             tool = registry.get(tool_call.name)
@@ -89,12 +76,12 @@ async def run_tool_loop_text(
                     user_images=[],
                     logger=logger,
                 )
-            messages.append(
-                tool_caller.build_tool_result_message(
-                    tool_call.id,
-                    tool_call.name,
-                    result,
-                )
-            )
+            turn_results.append((tool_call, str(result or "")))
+        append_tool_result_messages(
+            messages=messages,
+            tool_caller=tool_caller,
+            response=response,
+            results=turn_results,
+        )
 
     return last_content

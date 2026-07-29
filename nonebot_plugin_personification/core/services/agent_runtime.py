@@ -1,4 +1,5 @@
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Awaitable, Callable
 
 from ...agent.inner_state import (
@@ -12,18 +13,34 @@ from ...skill_runtime.loader import load_builtin_skillpacks_sync
 from ...skill_runtime.runtime_api import SkillRuntime
 from ..ai_routes import build_routed_tool_caller
 from ..file_sender import build_file_sender
+from ..generated_skills import register_generated_skills
 from ..llm_context import current_llm_context
 from ..model_router import (
     MODEL_ROLE_AGENT,
     MODEL_ROLE_INTENT,
     get_model_override_for_role,
 )
+from ..qq_outbound import build_outbound_context
 from ..session_store import init_session_store
 from ..tasks_service import make_cancel_task_tool, make_create_task_tool
+from ..visible_output import guard_visible_text
 from ..web_fetch import WebFetchError, fetch_web_page
 from ..web_grounding import do_web_search as do_web_search_core
 from ...utils import init_utils_config
 from ..sticker_library import resolve_sticker_dir
+
+
+def guard_scheduled_user_task_message(task: dict[str, Any], message: Any, *, logger: Any) -> str:
+    visible_message = guard_visible_text(
+        message,
+        logger=logger,
+        surface="scheduled_user_task",
+        allow_direct_media=False,
+        allow_control=False,
+    )
+    if not visible_message and isinstance(task, dict):
+        task["last_status"] = "safety_blocked"
+    return visible_message
 
 
 def build_agent_tool_registry(
@@ -42,6 +59,7 @@ def build_agent_tool_registry(
     profile_service: Any = None,
     memory_curator: Any = None,
     background_intelligence: Any = None,
+    qq_outbound_ledger: Any = None,
 ) -> ToolRegistry:
     registry = ToolRegistry()
     skills_root_raw = getattr(plugin_config, "personification_skills_path", None)
@@ -85,6 +103,7 @@ def build_agent_tool_registry(
         from ...skills.skillpacks.parallel_research.scripts.main import (
             build_tools as build_parallel_research_tools,
         )
+        from ...skills.skillpacks.game_info.scripts.main import build_tools as build_game_info_tools
         from ...skills.skillpacks.vision_analyze.scripts.main import (
             build_tools as build_vision_tools,
         )
@@ -134,6 +153,8 @@ def build_agent_tool_registry(
         for tool in build_acg_tools(legacy_runtime):
             registry.register(tool)
         for tool in build_parallel_research_tools(legacy_runtime):
+            registry.register(tool)
+        for tool in build_game_info_tools(legacy_runtime):
             registry.register(tool)
         for tool in build_memory_tools(legacy_runtime):
             registry.register(tool)
@@ -220,14 +241,39 @@ def build_agent_tool_registry(
                 message = params.get("message") or task.get("message", "")
                 if not user_id or not message:
                     return
+                message = guard_scheduled_user_task_message(task, message, logger=logger)
+                if not message:
+                    return
                 for bot in get_bots().values():
                     try:
-                        await bot.send_private_msg(
-                            user_id=int(user_id),
-                            message=str(message),
-                        )
+                        if qq_outbound_ledger is None:
+                            await bot.send_private_msg(
+                                user_id=int(user_id),
+                                message=str(message),
+                            )
+                        else:
+                            context = build_outbound_context(
+                                bot=bot,
+                                event=SimpleNamespace(user_id=user_id),
+                                surface="scheduled_user_task",
+                                user_target=str(user_id),
+                            )
+                            receipt = await qq_outbound_ledger.dispatch(
+                                context,
+                                str(message),
+                                lambda: bot.send_private_msg(
+                                    user_id=int(user_id),
+                                    message=str(message),
+                                ),
+                            )
+                            if receipt.status != "sent":
+                                logger.warning(
+                                    f"[user_tasks] 任务消息发送结果未知 user={user_id}，禁止自动重发"
+                                )
                         return
                     except Exception:
+                        if qq_outbound_ledger is not None:
+                            raise
                         continue
 
         registry.register(
@@ -277,6 +323,7 @@ def build_agent_tool_registry(
             build_gold_price_tool,
             build_history_today_tool,
             build_joke_tool,
+            build_tech_news_tool,
             build_trending_tool,
         )
 
@@ -288,6 +335,7 @@ def build_agent_tool_registry(
         ).strip().rstrip("/") or "http://127.0.0.1:4399"
         registry.register(build_daily_news_tool(_60s_base, logger, _60s_local_base))
         registry.register(build_ai_news_tool(_60s_base, logger, _60s_local_base))
+        registry.register(build_tech_news_tool(_60s_base, logger, _60s_local_base))
         registry.register(build_trending_tool(_60s_base, logger, _60s_local_base))
         registry.register(build_joke_tool(_60s_base, logger, _60s_local_base))
         registry.register(build_history_today_tool(_60s_base, logger, _60s_local_base))
@@ -295,6 +343,31 @@ def build_agent_tool_registry(
         registry.register(build_gold_price_tool(_60s_base, logger, _60s_local_base))
         registry.register(build_baike_tool(_60s_base, logger, _60s_local_base))
         registry.register(build_exchange_rate_tool(_60s_base, logger, _60s_local_base))
+    # First-party tools may come from the direct compatibility path or bundled
+    # skillpacks. Record authoritative provenance before extensions can replace
+    # a same-name tool during runtime loading.
+    for tool in registry.all():
+        metadata = dict(tool.metadata or {})
+        metadata["source_kind"] = "builtin"
+        tool.metadata = metadata
+
+    generated_runtime = SkillRuntime(
+        plugin_config=plugin_config,
+        logger=logger,
+        get_now=get_now,
+        scheduler=scheduler,
+        data_dir=data_dir,
+        persona_store=persona_store,
+        vision_caller=vision_caller,
+        get_bots=get_bots,
+        tool_caller=tool_caller,
+        knowledge_store=knowledge_store,
+        memory_store=memory_store,
+        profile_service=profile_service,
+        memory_curator=memory_curator,
+        background_intelligence=background_intelligence,
+    )
+    register_generated_skills(registry=registry, runtime=generated_runtime)
     apply_tool_metadata_defaults(registry)
     return registry
 
@@ -325,6 +398,11 @@ def _build_get_persona_tool(persona_store: Any, max_chars: int = 120) -> AgentTo
         },
         handler=_handler,
         local=True,
+        enabled=lambda: bool(
+            persona_store.is_enabled()
+            if callable(getattr(persona_store, "is_enabled", None))
+            else True
+        ),
     )
 
 
@@ -820,6 +898,7 @@ def build_agent_runtime_deps(
     profile_service: Any = None,
     memory_curator: Any = None,
     background_intelligence: Any = None,
+    qq_outbound_ledger: Any = None,
  ) -> tuple[Any, Any, Any, Any]:
     compress_tool_caller = _build_compress_tool_caller(plugin_config, logger)
     init_session_store(plugin_config, compress_tool_caller)
@@ -845,6 +924,7 @@ def build_agent_runtime_deps(
         profile_service=profile_service,
         memory_curator=memory_curator,
         background_intelligence=background_intelligence,
+        qq_outbound_ledger=qq_outbound_ledger,
     )
     inner_state_updater = build_inner_state_updater(
         plugin_config=plugin_config,

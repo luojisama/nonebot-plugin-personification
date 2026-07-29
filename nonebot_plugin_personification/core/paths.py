@@ -16,3 +16,7 @@ def get_data_dir(plugin_config: Any | None = None) -> Path:
         return Path(store.get_plugin_data_dir())
     except Exception:
         return Path("data") / "personification"
+
+
+def get_data_transfer_dir(plugin_config: Any | None = None) -> Path:
+    return get_data_dir(plugin_config) / "data_transfer"

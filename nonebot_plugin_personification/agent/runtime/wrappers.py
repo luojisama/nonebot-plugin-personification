@@ -6,34 +6,12 @@ import re
 from typing import Any, List
 
 from ...core.reply_text_policy import normalize_visible_reply_text
-from .fallbacks import _parse_json_tool_result
+from .fallbacks import TOOL_RESULT_USABLE_EVIDENCE, _parse_json_tool_result, _tool_result_outcome
 from .intent import _clean_user_query_text, _render_message_text
 
 
 _IMAGE_B64_TOOL_RESULT_RE = re.compile(r"\[IMAGE_B64\]([A-Za-z0-9+/=\r\n]+)\[/IMAGE_B64\]")
 _IMAGE_GENERATION_TOOL_NAME = "generate_image"
-_IMAGE_FAILURE_DIAGNOSTIC_HINTS = (
-    "empty image response",
-    "raw_keys=",
-    "output_items=",
-    "output_types=",
-    "content_types=",
-    "result_keys=",
-)
-
-
-def _looks_like_raw_tool_dump(text: str) -> bool:
-    raw = str(text or "").strip()
-    if not raw:
-        return False
-    if _parse_json_tool_result(raw) is not None:
-        return True
-    if re.search(r"https?://\S+", raw):
-        return True
-    lines = [line.strip() for line in raw.splitlines() if line.strip()]
-    if sum(1 for line in lines if re.match(r"^\d+[.)]\s+", line) or re.match(r"^[-*+]\s+", line)) >= 2:
-        return True
-    return False
 
 
 def _render_tool_result_for_user(tool_name: str, result_text: str, query: str) -> str:
@@ -48,8 +26,16 @@ def _render_tool_result_for_user(tool_name: str, result_text: str, query: str) -
     if not isinstance(payload, dict):
         return raw
 
+    if "results" not in payload:
+        if _tool_result_outcome(raw) == TOOL_RESULT_USABLE_EVIDENCE:
+            return raw
+        subject = _clean_user_query_text(query) or str(payload.get("query", "") or "这个主题").strip()
+        return json.dumps({"status": "no_result", "query": subject}, ensure_ascii=False)
     results = payload.get("results", [])
-    if not isinstance(results, list) or not results:
+    if not isinstance(results, list):
+        subject = _clean_user_query_text(query) or str(payload.get("query", "") or "这个主题").strip()
+        return json.dumps({"status": "no_result", "query": subject}, ensure_ascii=False)
+    if not results:
         subject = _clean_user_query_text(query) or str(payload.get("query", "") or "这个主题").strip()
         return json.dumps({"status": "no_result", "query": subject}, ensure_ascii=False)
 
@@ -80,31 +66,13 @@ def _is_direct_media_tool_result(tool_name: str, result_text: str) -> bool:
     )
 
 
-def _format_image_generation_failure(result_text: str) -> str:
-    text = str(result_text or "").strip()
-    if not text:
-        return "图片生成失败：工具没有返回图片数据"
-    detail = text
-    if detail.startswith("图片生成失败"):
-        detail = detail.removeprefix("图片生成失败").lstrip("：: \t\r\n")
-    detail = re.sub(r"\s+", " ", detail).strip()
-    lowered = detail.lower()
-    if not detail:
-        return "图片生成失败：工具没有返回图片数据"
-    if any(hint in lowered for hint in _IMAGE_FAILURE_DIAGNOSTIC_HINTS):
-        return "图片生成失败：图片服务没有返回图片数据"
-    if len(detail) > 80:
-        detail = detail[:77].rstrip() + "..."
-    return f"图片生成失败：{detail}"
-
-
 def _extract_persona_system_prompt(messages: List[dict]) -> str:
     for message in messages:
         if str(message.get("role", "") or "").strip() != "system":
             continue
         content = _render_message_text(message.get("content", ""))
         if len(content) >= 200:
-            return content[:1200]
+            return content
     return ""
 
 
@@ -115,6 +83,7 @@ async def _wrap_tool_result_in_persona(
     user_query_text: str,
     persona_system: str = "",
     turn_plan: Any = None,
+    evidence_unavailable: bool = False,
 ) -> str:
     fallback_text = str(rendered_tool_result or "").strip()
     if not fallback_text:
@@ -128,7 +97,7 @@ async def _wrap_tool_result_in_persona(
             pass
     wrap_messages: list[dict[str, Any]] = []
     if persona_system:
-        wrap_messages.append({"role": "system", "content": persona_system[:1200]})
+        wrap_messages.append({"role": "system", "content": persona_system})
     wrap_messages.append(
         {
             "role": "system",
@@ -136,6 +105,13 @@ async def _wrap_tool_result_in_persona(
                 "把下面的搜索/工具结果用你自己的口吻自然说给对方。"
                 "像群友顺手接话，不要暴露搜索、查询、工具、来源、链接这些中间过程。"
                 "不要列 URL，不要说“根据搜索结果”“我查了一下”。"
+                + (
+                    "当前结构化结果表示没有足够可用证据：保持这个事实边界，不要编造内容；"
+                    "仍要像当前角色和群友一样自然回应，没必要接话时可只输出 [SILENCE]，不要套客服或 AI 助手免责声明。"
+                    if evidence_unavailable
+                    else ""
+                )
+                + "头像视觉配套只能复述图像层结论，禁止改写成两位用户现实中的情侣、朋友、认识或同一人关系。"
                 "最终只输出纯文本，不要 markdown、标题、项目符号列表或编号列表。"
                 f"{length_hint}。"
             ),
@@ -147,34 +123,27 @@ async def _wrap_tool_result_in_persona(
             "content": f"查询：{str(user_query_text or '').strip()[:200]}\n工具结果：{fallback_text[:1000]}",
         }
     )
-    try:
-        response = await asyncio.wait_for(
-            tool_caller.chat_with_tools(
-                wrap_messages,
-                [],
-                False,
-            ),
-            timeout=10.0,
-        )
-    except Exception:
-        cleaned = normalize_visible_reply_text(fallback_text)
-        if _looks_like_raw_tool_dump(fallback_text):
-            return "这块我没拿到稳的结果，先别按我说死。"
-        return cleaned
+    response = await asyncio.wait_for(
+        tool_caller.chat_with_tools(
+            wrap_messages,
+            [],
+            False,
+        ),
+        timeout=10.0,
+    )
     wrapped_text = str(getattr(response, "content", "") or "").strip()
     if wrapped_text:
         return normalize_visible_reply_text(wrapped_text)
-    cleaned = normalize_visible_reply_text(fallback_text)
-    if _looks_like_raw_tool_dump(fallback_text):
-        return "这块我没拿到稳的结果，先别按我说死。"
-    return cleaned
+    error = RuntimeError("agent persona wrapper returned an empty response")
+    error.code = "provider_invalid_response"
+    error.retryable = True
+    raise error
 
 
 __all__ = [
     "_IMAGE_B64_TOOL_RESULT_RE",
     "_IMAGE_GENERATION_TOOL_NAME",
     "_extract_persona_system_prompt",
-    "_format_image_generation_failure",
     "_is_direct_media_tool_result",
     "_render_tool_result_for_user",
     "_wrap_tool_result_in_persona",

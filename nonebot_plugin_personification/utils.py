@@ -147,6 +147,7 @@ def record_group_msg(
             reply_to_msg_id=str(safe_metadata.get("reply_to_msg_id", "") or ""),
             reply_to_user_id=str(safe_metadata.get("reply_to_user_id", "") or ""),
             mentioned_ids=[str(item or "").strip() for item in mentioned_ids if str(item or "").strip()],
+            source_kind=str(safe_metadata.get("source_kind", "bot" if is_bot else "user") or "user"),
             timestamp=now_ts,
         )
         conn.execute(

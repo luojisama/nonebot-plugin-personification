@@ -2,10 +2,20 @@ from __future__ import annotations
 
 from typing import Any
 
+from ...core.meme_reply_policy import format_meme_turn_prompt
+from ...core.context_policy import (
+    PROMPT_INJECTION_GUARD_MARKER,
+    build_prompt_injection_guard,
+)
 from ...core.reply_style_policy import (
+    build_directed_exchange_policy_prompt,
+    build_domain_evidence_policy_prompt,
+    build_empty_evidence_output_policy_prompt,
+    build_emotional_support_policy_prompt,
     build_media_understanding_output_policy_prompt,
     build_speech_act_policy_prompt,
 )
+from ...core.turn_media import render_turn_media_grounding
 from .tool_selection import _semantic_tool_guidance
 
 
@@ -19,13 +29,71 @@ def append_agent_system_prompts(
     turn_plan: Any,
     user_images: list[str],
     direct_image_input: bool,
+    is_group: bool | None = None,
+    is_direct_mention: bool = False,
+    reply_required: bool = False,
+    surface: str = "",
+    turn_media_context: list[Any] | None = None,
 ) -> None:
+    if not any(
+        isinstance(message, dict)
+        and message.get("role") == "system"
+        and PROMPT_INJECTION_GUARD_MARKER in str(message.get("content", "") or "")
+        for message in messages
+    ):
+        messages.append({"role": "system", "content": build_prompt_injection_guard()})
+    group_context = bool(is_group) if is_group is not None else any(
+        isinstance(message, dict)
+        and message.get("role") == "system"
+        and any(marker in str(message.get("content", "") or "") for marker in ("群聊", "群里", "群友", "群成员"))
+        for message in list(messages or [])
+    )
     messages.append(
         {
             "role": "system",
             "content": _semantic_tool_guidance(),
         }
     )
+    if reply_required:
+        messages.append(
+            {
+                "role": "system",
+                "content": (
+                    "当前是结构上必须回应的强交互轮次（私聊、明确 @/回复 bot 或其它直接指向）。"
+                    "除非发送型工具已经成功排队、安全边界要求拒绝，或空证据且无法形成具体补充请求，"
+                    "否则禁止输出 [NO_REPLY] 或 [SILENCE]。"
+                    "如果只缺一个对方能提供的必要条件，就具体索取这一项；"
+                    "不要用无法确认、没有理解或查证无结果的状态播报顶替回答。"
+                ),
+            }
+        )
+    if surface:
+        messages.append(
+            {
+                "role": "system",
+                "content": (
+                    f"当前任务属于非聊天生成面：{surface}。"
+                    "严格遵守最新用户消息要求的输出格式；不要套用群聊接话、追问、@、引用、"
+                    "[NO_REPLY] 或聊天短句质量规则。需要事实查证时可以使用工具，"
+                    "但不得把工具过程写进最终结果。"
+                ),
+            }
+        )
+        if rewritten_query.primary_query:
+            messages.append(
+                {
+                    "role": "system",
+                    "content": (
+                        f"当前任务主查询：{rewritten_query.primary_query}\n"
+                        + (
+                            f"候选查询：{'；'.join(rewritten_query.query_candidates[:4])}\n"
+                            if rewritten_query.query_candidates else ""
+                        )
+                        + "仅在任务确实需要外部事实时使用这些查询；创作与审阅任务不要为了调用工具而调用。"
+                    ),
+                }
+            )
+        return
     messages.append(
         {
             "role": "system",
@@ -35,11 +103,12 @@ def append_agent_system_prompts(
                 "不要只附和、感叹，也不要把群友刚说过的内容换一种说法转述。"
                 "如果你只想说“先看看情况/等会再说/先围观一下”这类观察或等待宣告，直接输出 [NO_REPLY]。"
                 "不要暴露工具、检索、看图、回忆、审查清单或 Step 1/Step 2 这类中间步骤。"
-                "遇到不确定或有歧义时，如果有可用查证工具必须先查；工具不可用、查不到或时间预算不足时再承认不确定，不要硬猜。"
+                "遇到不确定或有歧义时，如果有可用查证工具必须先查；没有可用证据时不要硬猜，也不要把失败状态包装成回复。"
                 "遇到不认识的专有名词、外号、梗、游戏/动漫/卡牌术语或圈内说法，不要直接问群友那是什么，先用可用工具查证。"
                 "如果用户说“这个动画/这段动画/这个角色/这张图”是在接最近上下文里的 ACG 角色、抽卡、卡面、图片或视频，"
                 "先查清角色、作品、剧情/动画出处，再用一句具体评价参与讨论；不要泛泛附和“确实挺强”。"
-                "群聊里的可见回复不要用问句、反问句或澄清问句把问题丢回给群友；信息不足时给保守短反应或 [NO_REPLY]。"
+                "群聊里的可见回复不要用追问、澄清问句或征询式结尾把信息缺口丢回给群友；"
+                "轻松调侃时允许一句不索要信息的反击式反问。信息不足但能给具体态度时再短答，否则按空证据纪律收口。"
                 "涉及本地天气、出行、城市或附近状态时，如果用户没明说地点，先看已注入的用户档案；仍不确定可调用记忆工具确认，不能猜城市。"
                 "最终只输出纯文本，不要 markdown、标题、项目符号列表、编号列表、URL 列表，也不要说“我需要确认一下”“根据搜索结果”。"
             ),
@@ -53,9 +122,30 @@ def append_agent_system_prompts(
                     speech_act=str(getattr(turn_plan, "speech_act", "") or ""),
                     output_mode=str(getattr(turn_plan, "output_mode", "") or ""),
                     session_goal=str(getattr(turn_plan, "session_goal", "") or ""),
+                    is_group=group_context,
                 ),
             }
         )
+        domain_prompt = build_domain_evidence_policy_prompt(
+            domain_focus=str(getattr(turn_plan, "domain_focus", "general") or "general"),
+            evidence_policy=str(getattr(turn_plan, "evidence_policy", "none") or "none"),
+        )
+        if domain_prompt:
+            messages.append({"role": "system", "content": domain_prompt})
+        support_prompt = build_emotional_support_policy_prompt(getattr(turn_plan, "emotional_support", None))
+        if support_prompt:
+            messages.append({"role": "system", "content": support_prompt})
+        meme_prompt = format_meme_turn_prompt(getattr(turn_plan, "meme_turn_context", None))
+        if meme_prompt:
+            messages.append({"role": "system", "content": meme_prompt})
+    directed_exchange_prompt = build_directed_exchange_policy_prompt(
+        is_direct_mention=is_direct_mention,
+        is_group=group_context,
+        speech_act=str(getattr(turn_plan, "speech_act", "") or ""),
+        output_mode=str(getattr(turn_plan, "output_mode", "") or ""),
+    )
+    if directed_exchange_prompt:
+        messages.append({"role": "system", "content": directed_exchange_prompt})
     messages.append(
         {
             "role": "system",
@@ -68,7 +158,7 @@ def append_agent_system_prompts(
                 "比如 A 在说地震位置是「广西柳州」，同时 B 在说「我家在浙江」，"
                 "当 C 问「这次地震严重吗」时，你只能基于 A 的位置信息回答，绝不能说「浙江有震感」。\n"
                 "3. 引用某人状态前先问自己：这个状态是不是当前消息的语境？如果不是，就不要写进去。\n"
-                "4. 拿不准时宁可简短、含糊或承认不知道，也不要把无关上下文糊上去。"
+                "4. 拿不准时不要把无关上下文糊上去；没有具体内容可说就按空证据纪律收口。"
             ),
         }
     )
@@ -111,21 +201,30 @@ def append_agent_system_prompts(
             }
         )
     elif runtime_chat_intent == "plugin_question":
-        plugin_hint = (
-            "当前更像在问插件能力、命令、实现或配置。"
-            "如果需要工具，优先使用本地插件知识和源码工具，不要先联网。"
-            "优先考虑：search_plugin_source、search_plugin_knowledge、list_plugin_features、get_feature_detail、list_plugins。"
-        )
+        if plugin_query_intent == "runtime_capability":
+            plugin_hint = (
+                "当前是在问你是否具备读取或理解当前发送者头像可观察画面事实的运行时能力。"
+                "必须调用本轮可用的第一方只读 runtime capability 工具核实，不要调用插件清单、插件知识或源码工具猜测。"
+                "inspect_current_user_avatar 只提供受约束的头像画面事实，不能声称看到了 raw 头像；"
+                "available=false 时如实说明当前没有可用的头像画面事实。"
+            )
+        else:
+            plugin_hint = (
+                "当前更像在问插件静态能力、命令、实现或配置。"
+                "如果需要工具，优先使用本地插件知识和源码工具，不要先联网。"
+                "优先考虑：search_plugin_source、search_plugin_knowledge、list_plugin_features、get_feature_detail、list_plugins。"
+            )
         if plugin_query_intent == "latest":
             plugin_hint += (
                 "如果对方明确问官网、仓库、最新文档或版本，再考虑 web_search、search_official_site、search_github_repos。"
             )
-        plugin_hint += (
-            "如果对方不是在问插件原理，而是想直接用某个插件功能（查天气、签到、点歌、查询等），"
-            "先用 search_plugin_knowledge / list_plugin_features 定位插件和它的命令触发方式，"
-            "确认后用 invoke_plugin 传入完整命令文本（如 /天气 北京）代为执行，再用你自己的语气转述结果，"
-            "不要让用户自己去发命令。"
-        )
+        if plugin_query_intent != "runtime_capability":
+            plugin_hint += (
+                "如果对方不是在问插件原理，而是想直接用某个插件功能（查天气、签到、点歌、查询等），"
+                "先用 search_plugin_knowledge / list_plugin_features 定位插件和它的命令触发方式，"
+                "确认后用 invoke_plugin 传入完整命令文本（如 /天气 北京）代为执行，再用你自己的语气转述结果，"
+                "不要让用户自己去发命令。"
+            )
         messages.append(
             {
                 "role": "system",
@@ -138,14 +237,23 @@ def append_agent_system_prompts(
             "content": build_media_understanding_output_policy_prompt(),
         }
     )
+    messages.append(
+        {
+            "role": "system",
+            "content": build_empty_evidence_output_policy_prompt(),
+        }
+    )
+    media_grounding = render_turn_media_grounding(turn_media_context)
+    if media_grounding:
+        messages.append({"role": "system", "content": media_grounding})
     if getattr(intent_decision, "ambiguity_level", "") == "high":
         messages.append(
             {
                 "role": "system",
                 "content": (
                     "当前这句里有高歧义名词/对象，容易误解。"
-                    "如果有可用查证工具，先查证再说；上下文和工具证据仍不足时再承认不确定。"
-                    "群聊里若没人明确在 cue 你，也可以输出 [NO_REPLY]。"
+                    "如果有可用查证工具，先查证再说；上下文和工具证据仍不足时，"
+                    "非强交互直接 [NO_REPLY]，强交互只索取一个明确且对方能提供的必要条件。"
                 ),
             }
         )

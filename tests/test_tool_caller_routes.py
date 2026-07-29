@@ -7,12 +7,14 @@ import shutil
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Optional
 from uuid import uuid4
 
+import httpx
 import pytest
 
-from plugin.personification.core import ai_routes, provider_router
+from plugin.personification.core import ai_routes, gemini_transport, provider_router
 from plugin.personification.skills.skillpacks.tool_caller.scripts import impl as caller_impl
 from plugin.personification.skills.skillpacks.image_gen.scripts.main import (
     build_image_gen_nanobanan_tool,
@@ -33,6 +35,7 @@ class _DummyConfig:
     personification_antigravity_cli_auth_path: str = ""
     personification_antigravity_cli_project: str = ""
     personification_claude_code_auth_path: str = ""
+    personification_gemini_auth_mode: str = "auto"
     personification_api_pools: object = None
 
 
@@ -95,7 +98,7 @@ def test_openai_and_gemini_base_urls_fill_version_suffixes() -> None:
     )
 
 
-def test_custom_gemini_endpoint_uses_bearer_and_v1beta(monkeypatch) -> None:
+def test_custom_gemini_endpoint_uses_google_header_and_v1beta(monkeypatch) -> None:
     captured: dict = {}
 
     class _Response:
@@ -135,16 +138,419 @@ def test_custom_gemini_endpoint_uses_bearer_and_v1beta(monkeypatch) -> None:
         base_url="https://anti.zellon.me",
         model="gemini-3-flash-agent",
         thinking_mode="none",
+        timeout=77,
     )
 
     response = asyncio.run(caller.chat_with_tools([{"role": "user", "content": "hi"}], [], False))
 
     assert captured["url"] == "https://anti.zellon.me/v1beta/models/gemini-3-flash-agent:generateContent"
-    assert captured["headers"]["Authorization"] == "Bearer sk-test"
+    assert captured["headers"]["x-goog-api-key"] == "sk-test"
+    assert "Authorization" not in captured["headers"]
     assert captured["params"] == {}
+    assert captured["client_kwargs"]["timeout"].read == 77
+    assert captured["client_kwargs"]["follow_redirects"] is False
     assert "generationConfig" not in captured["json"]
     assert response.content == "ok"
     assert response.usage["total_tokens"] == 2
+
+
+def test_gemini_function_schema_uses_compatibility_subset(monkeypatch) -> None:  # noqa: ANN001
+    captured: dict = {}
+
+    class _Response:
+        status_code = 200
+
+        def json(self):  # noqa: ANN201
+            return {"candidates": [{"content": {"parts": [{"text": "ok"}]}}]}
+
+    class _Client:
+        def __init__(self, **_kwargs) -> None:
+            pass
+
+        async def __aenter__(self):  # noqa: ANN201
+            return self
+
+        async def __aexit__(self, *_args) -> None:
+            return None
+
+        async def post(self, _url, headers=None, params=None, json=None):  # noqa: ANN001, ANN201
+            captured["json"] = json or {}
+            return _Response()
+
+    monkeypatch.setattr(caller_impl.httpx, "AsyncClient", _Client)
+    caller = caller_impl.GeminiToolCaller(
+        api_key="sk-test",
+        base_url="https://anti.zellon.me",
+        model="gemini-3-flash-agent",
+    )
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "safe_lookup",
+                "description": "",
+                "parameters": {
+                    "type": "object",
+                    "title": "legacy title",
+                    "additionalProperties": False,
+                    "properties": {
+                        "query": {
+                            "type": ["string", "null"],
+                            "description": "query text",
+                            "default": "ignored",
+                            "examples": ["private example"],
+                        },
+                    },
+                    "required": ["query", "missing"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "optional_bad_schema",
+                "description": "must be skipped without dropping optional fields",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "mode": {
+                            "oneOf": [
+                                {"type": "string", "enum": ["fast", "deep"]},
+                                {"type": "integer", "minimum": 1, "maximum": 2},
+                            ]
+                        },
+                        "bad": {"type": "date", "description": "unsupported type"},
+                    },
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "required_bad_schema",
+                "description": "must be skipped without weakening required args",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"bad": {"type": "date"}},
+                    "required": ["bad"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "invalid tool name",
+                "description": "must be skipped",
+                "parameters": {"type": "object"},
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "invalid_root_schema",
+                "description": "must also be skipped",
+                "parameters": {"type": "string"},
+            },
+        },
+    ]
+
+    response = asyncio.run(caller.chat_with_tools([{"role": "user", "content": "hi"}], tools, False))
+
+    declarations = captured["json"]["tools"][0]["functionDeclarations"]
+    assert len(declarations) == 1
+    assert response.wire_tools_count == 1
+    declaration = declarations[0]
+    assert declaration["name"] == "safe_lookup"
+    assert declaration["description"] == "safe_lookup"
+    parameters = declaration["parameters"]
+    assert parameters["type"] == "OBJECT"
+    assert parameters["required"] == ["query"]
+    assert "title" not in parameters
+    assert "additionalProperties" not in parameters
+    query = parameters["properties"]["query"]
+    assert query == {"type": "STRING", "nullable": True, "description": "query text"}
+    assert "default" not in str(parameters)
+    assert "private example" not in str(parameters)
+
+
+def test_gemini_auth_auto_negotiates_only_on_401_and_caches() -> None:
+    gemini_transport.clear_gemini_auth_cache()
+    calls: list[str] = []
+
+    class _Response:
+        def __init__(self, status_code: int) -> None:
+            self.status_code = status_code
+
+    async def _send(auth):  # noqa: ANN001, ANN202
+        calls.append(auth.mode)
+        return _Response(401 if len(calls) == 1 else 200)
+
+    first = asyncio.run(gemini_transport.request_with_gemini_auth(
+        endpoint="https://gateway.example/v1beta",
+        api_key="secret-a",
+        auth_mode="auto",
+        send=_send,
+    ))
+    assert calls == ["x-goog-api-key", "bearer"]
+    assert first.mode == "bearer"
+    assert first.request_count == 2
+
+    cached_calls: list[str] = []
+
+    async def _send_cached(auth):  # noqa: ANN001, ANN202
+        cached_calls.append(auth.mode)
+        return _Response(200)
+
+    second = asyncio.run(gemini_transport.request_with_gemini_auth(
+        endpoint="https://gateway.example/v1beta",
+        api_key="secret-a",
+        auth_mode="auto",
+        send=_send_cached,
+    ))
+    assert cached_calls == ["bearer"]
+    assert second.request_count == 1
+
+
+def test_gemini_auth_cache_preserves_case_sensitive_endpoint_path() -> None:
+    gemini_transport.clear_gemini_auth_cache()
+
+    class _Response:
+        def __init__(self, status_code: int) -> None:
+            self.status_code = status_code
+
+    seed_calls: list[str] = []
+
+    async def _seed(auth):  # noqa: ANN001, ANN202
+        seed_calls.append(auth.mode)
+        return _Response(401 if len(seed_calls) == 1 else 200)
+
+    asyncio.run(gemini_transport.request_with_gemini_auth(
+        endpoint="https://Gateway.Example/TenantA/v1beta",
+        api_key="case-sensitive-secret",
+        auth_mode="auto",
+        send=_seed,
+    ))
+    calls: list[str] = []
+
+    async def _send(auth):  # noqa: ANN001, ANN202
+        calls.append(auth.mode)
+        return _Response(200)
+
+    asyncio.run(gemini_transport.request_with_gemini_auth(
+        endpoint="https://gateway.example/tenanta/v1beta",
+        api_key="case-sensitive-secret",
+        auth_mode="auto",
+        send=_send,
+        allow_negotiation=False,
+    ))
+
+    assert calls == ["x-goog-api-key"]
+
+
+def test_gemini_auth_does_not_retry_400_or_single_attempt_401() -> None:
+    gemini_transport.clear_gemini_auth_cache()
+
+    class _Response:
+        def __init__(self, status_code: int) -> None:
+            self.status_code = status_code
+
+    async def _run(status_code: int, *, allow_negotiation: bool) -> list[str]:
+        calls: list[str] = []
+
+        async def _send(auth):  # noqa: ANN001, ANN202
+            calls.append(auth.mode)
+            return _Response(status_code)
+
+        await gemini_transport.request_with_gemini_auth(
+            endpoint=f"https://gateway-{status_code}-{allow_negotiation}.example/v1beta",
+            api_key="secret-b",
+            auth_mode="auto",
+            send=_send,
+            allow_negotiation=allow_negotiation,
+        )
+        return calls
+
+    assert asyncio.run(_run(400, allow_negotiation=True)) == ["x-goog-api-key"]
+    assert asyncio.run(_run(401, allow_negotiation=False)) == ["x-goog-api-key"]
+
+
+def test_gemini_auth_uses_one_explicit_credential_carrier() -> None:
+    header = gemini_transport.gemini_auth_payload("secret", "x-goog-api-key")
+    bearer = gemini_transport.gemini_auth_payload("secret", "bearer")
+    query = gemini_transport.gemini_auth_payload("secret", "query_legacy")
+
+    assert header.headers == {"x-goog-api-key": "secret"}
+    assert header.params == {}
+    assert bearer.headers == {"Authorization": "Bearer secret"}
+    assert bearer.params == {}
+    assert query.headers == {}
+    assert query.params == {"key": "secret"}
+
+
+def test_gemini_status_error_redacts_legacy_query_key() -> None:
+    request = httpx.Request(
+        "POST",
+        "https://gateway.example/v1beta/models/gemini-test:generateContent?key=legacy-secret",
+    )
+    response = httpx.Response(
+        401,
+        headers={"Location": "https://gateway.example/retry?key=legacy-secret"},
+        request=request,
+    )
+
+    with pytest.raises(httpx.HTTPStatusError) as exc_info:
+        gemini_transport.raise_for_gemini_status(
+            response,
+            auth_mode="bearer",
+            request_count=2,
+        )
+
+    error = exc_info.value
+    assert "legacy-secret" not in str(error)
+    assert "legacy-secret" not in str(error.request.url)
+    assert "legacy-secret" not in str(error.response.request.url)
+    assert "legacy-secret" not in str(error.response.headers)
+    assert "location" not in error.response.headers
+    assert error.auth_mode == "bearer"
+    assert error.request_count == 2
+
+
+def test_single_provider_caller_receives_gemini_auth_mode_and_timeout() -> None:
+    caller = ai_routes.build_single_provider_caller(
+        _DummyConfig(personification_api_type="gemini"),
+        {
+            "api_type": "gemini",
+            "api_url": "https://gateway.example",
+            "api_key": "secret",
+            "model": "gemini-test",
+            "gemini_auth_mode": "bearer",
+            "timeout": 37,
+        },
+    )
+
+    assert isinstance(caller, caller_impl.GeminiToolCaller)
+    assert caller.auth_mode == "bearer"
+    assert caller.timeout == 37
+
+
+def test_provider_router_caller_receives_gemini_auth_mode_and_timeout() -> None:
+    caller = provider_router._build_provider_caller(
+        {
+            "api_type": "gemini",
+            "api_url": "https://gateway.example/v1beta",
+            "api_key": "secret",
+            "model": "gemini-test",
+            "gemini_auth_mode": "bearer",
+            "timeout": 41,
+        },
+        _DummyConfig(),
+    )
+
+    assert isinstance(caller, caller_impl.GeminiToolCaller)
+    assert caller.auth_mode == "bearer"
+    assert caller.timeout == 41
+
+
+def test_flat_global_fallback_preserves_gemini_auth_mode() -> None:
+    config = SimpleNamespace(
+        personification_fallback_enabled=True,
+        personification_fallback_api_type="gemini",
+        personification_fallback_api_url="https://fallback.example/v1beta",
+        personification_fallback_api_key="fallback-secret",
+        personification_fallback_model="gemini-fallback",
+        personification_fallback_auth_path="",
+        personification_gemini_auth_mode="bearer",
+        personification_api_type="openai",
+        personification_api_url="https://primary.example/v1",
+        personification_api_key="primary-secret",
+        personification_model="primary-model",
+        personification_api_pools=[],
+    )
+
+    fallback = ai_routes.resolve_global_fallback_provider(config)
+    video_fallback = ai_routes.resolve_video_fallback_provider(
+        SimpleNamespace(
+            **vars(config),
+            personification_video_fallback_enabled=True,
+            personification_video_fallback_provider="gemini",
+            personification_video_fallback_api_url="https://video.example/v1beta",
+            personification_video_fallback_api_key="video-secret",
+            personification_video_fallback_model="gemini-video",
+            personification_video_fallback_auth_path="",
+        )
+    )
+
+    assert fallback is not None
+    assert fallback.provider["gemini_auth_mode"] == "bearer"
+    assert video_fallback is not None
+    assert video_fallback.provider["gemini_auth_mode"] == "bearer"
+
+
+def test_non_gemini_route_signatures_ignore_gemini_auth_mode() -> None:
+    first = {
+        "api_type": "openai",
+        "api_url": "https://openai.example/v1",
+        "api_key": "secret",
+        "model": "model",
+        "auth_path": "",
+        "gemini_auth_mode": "auto",
+    }
+    second = {**first, "gemini_auth_mode": "bearer"}
+
+    assert ai_routes._provider_signature(first) == ai_routes._provider_signature(second)
+    assert provider_router._provider_signature(first) == provider_router._provider_signature(second)
+
+    gemini_first = {**first, "api_type": "gemini"}
+    gemini_second = {**second, "api_type": "gemini"}
+    assert ai_routes._provider_signature(gemini_first) != ai_routes._provider_signature(gemini_second)
+    assert provider_router._provider_signature(gemini_first) != provider_router._provider_signature(gemini_second)
+
+
+def test_google_gemini_rest_call_uses_configured_timeout(monkeypatch) -> None:
+    captured: dict = {}
+
+    class _Response:
+        status_code = 200
+
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self):  # noqa: ANN201
+            return {
+                "candidates": [{"content": {"parts": [{"text": "ok"}]}}],
+                "usageMetadata": {"totalTokenCount": 1},
+            }
+
+    class _Client:
+        def __init__(self, **kwargs) -> None:  # noqa: ANN001
+            captured["client_kwargs"] = kwargs
+
+        async def __aenter__(self):  # noqa: ANN201
+            return self
+
+        async def __aexit__(self, *_args) -> None:
+            return None
+
+        async def post(self, url, headers=None, params=None, json=None):  # noqa: ANN001, ANN201
+            captured.update(url=url, headers=headers or {}, params=params or {}, json=json or {})
+            return _Response()
+
+    monkeypatch.setattr(caller_impl.httpx, "AsyncClient", _Client)
+    caller = caller_impl.GeminiToolCaller(
+        api_key="secret",
+        base_url="",
+        model="gemini-test",
+        timeout=83,
+    )
+
+    response = asyncio.run(caller.chat_with_tools([{"role": "user", "content": "hi"}], [], False))
+
+    assert response.content == "ok"
+    assert captured["url"] == "https://generativelanguage.googleapis.com/v1beta/models/gemini-test:generateContent"
+    assert captured["headers"] == {"Content-Type": "application/json", "x-goog-api-key": "secret"}
+    assert captured["params"] == {}
+    assert captured["client_kwargs"]["timeout"].read == 83
+    assert captured["client_kwargs"]["follow_redirects"] is False
 
 
 def test_mimo_endpoint_detection_accepts_api_and_token_plan_urls() -> None:

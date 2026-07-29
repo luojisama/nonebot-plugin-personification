@@ -16,12 +16,19 @@ _NS_TRUSTED = "webui_trusted_devices"
 
 _VERIFY_TTL_SECONDS = 300
 _VERIFY_MAX_ATTEMPTS = 5  # 单个验证码最多输错 5 次后强制废弃，防止暴力枚举 6 位空间
+_VERIFY_RESEND_INTERVAL_SECONDS = 60
 _RATE_WINDOW_SECONDS = 3600
 _RATE_MAX_ATTEMPTS = 5
 # 设备 token 7 天过期；每次请求会刷新 last_seen 但不延长到期点（严格 7 天滚动）
 _DEVICE_TOKEN_TTL_SECONDS = 7 * 24 * 3600
 # 登录请求（QQ 私聊批准用）有效期
 _LOGIN_REQUEST_TTL_SECONDS = 300
+
+
+class VerifyCodeCooldownError(RuntimeError):
+    def __init__(self, retry_after: int) -> None:
+        self.retry_after = max(1, int(retry_after))
+        super().__init__(f"verify code cooldown: {self.retry_after}s")
 
 
 def _now() -> float:
@@ -36,63 +43,122 @@ def _hash_ip(ip: str) -> str:
     return hashlib.sha256(str(ip or "").encode("utf-8")).hexdigest()[:16]
 
 
-def create_verify_code(qq: str) -> str:
+def _verify_code_key(qq: str, challenge_token: str) -> str:
+    return f"{str(qq or '').strip()}:{_hash_token(challenge_token)}"
+
+
+def create_verify_code(qq: str, challenge_token: str) -> str:
     """生成 6 位数字验证码，写 KV，返回明文码（仅本次推送用）。
-    覆盖该 QQ 已有的验证码（重发即作废旧码）。
+    验证码绑定浏览器 challenge；其它浏览器不得覆盖未过期验证码。
     """
     qq_key = str(qq or "").strip()
-    if not qq_key:
-        raise ValueError("qq required")
+    challenge_hash = _hash_token(challenge_token)
+    if not qq_key or not challenge_token:
+        raise ValueError("qq and challenge required")
+    verify_key = _verify_code_key(qq_key, challenge_token)
     code = f"{secrets.randbelow(1_000_000):06d}"
+    now_ts = _now()
+    retry_after = 0
+    result_code = code
 
     def _mutate(current: object) -> dict[str, Any]:
+        nonlocal retry_after, result_code
         data = current if isinstance(current, dict) else {}
-        data[qq_key] = {
+        entry = data.get(verify_key)
+        if isinstance(entry, dict) and float(entry.get("expires_at", 0) or 0) > now_ts:
+            stored_challenge_hash = str(entry.get("challenge_hash", "") or "")
+            same_challenge = bool(stored_challenge_hash) and secrets.compare_digest(
+                stored_challenge_hash,
+                challenge_hash,
+            )
+            if same_challenge:
+                created_at = float(entry.get("created_at", 0) or 0)
+                remaining = created_at + _VERIFY_RESEND_INTERVAL_SECONDS - now_ts
+                if created_at > 0 and remaining > 0:
+                    retry_after = max(1, int(remaining + 0.999))
+                    return _prune_expired_codes(data)
+                result_code = str(entry.get("code", "") or code)
+                entry["created_at"] = now_ts
+                data[verify_key] = entry
+                return _prune_expired_codes(data)
+            data.pop(verify_key, None)
+        data[verify_key] = {
+            "qq": qq_key,
             "code": code,
-            "expires_at": _now() + _VERIFY_TTL_SECONDS,
+            "challenge_hash": challenge_hash,
+            "created_at": now_ts,
+            "expires_at": now_ts + _VERIFY_TTL_SECONDS,
             "fail_count": 0,
         }
         return _prune_expired_codes(data)
 
     get_data_store().mutate_sync(_NS_VERIFY_CODES, _mutate)
-    return code
+    if retry_after:
+        raise VerifyCodeCooldownError(retry_after)
+    return result_code
 
 
-def consume_verify_code(qq: str, code: str) -> bool:
+def consume_verify_code(qq: str, code: str, challenge_token: str) -> bool:
     """校验验证码。
     成功 → 销毁并返 True；
     失败 → fail_count+1；累计 5 次或验证码本身过期则直接废弃，下次必须重新发送。
     """
     qq_key = str(qq or "").strip()
     target = str(code or "").strip()
-    if not qq_key or not target:
+    challenge_hash = _hash_token(challenge_token)
+    if not qq_key or not target or not challenge_token:
         return False
+    verify_key = _verify_code_key(qq_key, challenge_token)
     matched = False
 
     def _mutate(current: object) -> dict[str, Any]:
         nonlocal matched
         data = current if isinstance(current, dict) else {}
-        entry = data.get(qq_key)
+        entry = data.get(verify_key)
         if not isinstance(entry, dict):
             return _prune_expired_codes(data)
         # 过期直接废弃
         if float(entry.get("expires_at", 0)) <= _now():
-            data.pop(qq_key, None)
+            data.pop(verify_key, None)
+            return _prune_expired_codes(data)
+        stored_challenge_hash = str(entry.get("challenge_hash", "") or "")
+        if not stored_challenge_hash or not secrets.compare_digest(stored_challenge_hash, challenge_hash):
             return _prune_expired_codes(data)
         if secrets.compare_digest(str(entry.get("code", "")), target):
             matched = True
-            data.pop(qq_key, None)
+            data.pop(verify_key, None)
         else:
             entry["fail_count"] = int(entry.get("fail_count", 0)) + 1
             if entry["fail_count"] >= _VERIFY_MAX_ATTEMPTS:
                 # 超过最大尝试次数，废弃验证码
-                data.pop(qq_key, None)
+                data.pop(verify_key, None)
             else:
-                data[qq_key] = entry
+                data[verify_key] = entry
         return _prune_expired_codes(data)
 
     get_data_store().mutate_sync(_NS_VERIFY_CODES, _mutate)
     return matched
+
+
+def discard_verify_code(qq: str, challenge_token: str) -> bool:
+    """仅删除与当前浏览器 challenge 匹配的验证码。"""
+    qq_key = str(qq or "").strip()
+    challenge_hash = _hash_token(challenge_token)
+    verify_key = _verify_code_key(qq_key, challenge_token)
+    removed = False
+
+    def _mutate(current: object) -> dict[str, Any]:
+        nonlocal removed
+        data = current if isinstance(current, dict) else {}
+        entry = data.get(verify_key)
+        stored_hash = str(entry.get("challenge_hash", "") or "") if isinstance(entry, dict) else ""
+        if stored_hash and secrets.compare_digest(stored_hash, challenge_hash):
+            data.pop(verify_key, None)
+            removed = True
+        return _prune_expired_codes(data)
+
+    get_data_store().mutate_sync(_NS_VERIFY_CODES, _mutate)
+    return removed
 
 
 def _prune_expired_codes(data: dict[str, Any]) -> dict[str, Any]:
@@ -226,6 +292,9 @@ def lookup_device(token: str, *, ua: str = "") -> dict[str, Any] | None:
             if ua and stored_ua and stored_ua != str(ua or "")[:512]:
                 # UA 不一致：怀疑 cookie 被换设备使用，拒绝
                 return data
+            if _device_status(entry) == "pending":
+                # 旧版本验证码后还要求设备二次审批；升级后验证码即完成授权。
+                entry["status"] = "approved"
             entry["last_seen"] = _now()
             matched = dict(entry)
             data[token_hash] = entry
@@ -271,13 +340,16 @@ def _prune_expired_devices(data: dict[str, Any]) -> dict[str, Any]:
 
 
 def prune_expired_devices() -> int:
-    """启动时调用：清理已过期的 device token；返回清理数量。"""
+    """启动时清理过期 token，并迁移旧版 pending 设备为 approved。"""
     pruned = [0]
 
     def _mutate(current: object) -> dict[str, Any]:
         data = current if isinstance(current, dict) else {}
         before = len(data)
         cleaned = _prune_expired_devices(data)
+        for entry in cleaned.values():
+            if isinstance(entry, dict) and _device_status(entry) == "pending":
+                entry["status"] = "approved"
         pruned[0] = before - len(cleaned)
         return cleaned
 
@@ -475,7 +547,7 @@ def take_approved_login_request(request_id: str) -> dict[str, Any] | None:
 # ──────────────────────── 免验证（信任）设备 ────────────────────────
 
 def add_trusted_device(qq: str, ua: str, label: str = "") -> str:
-    """登记一个免验证设备（按 UA 指纹）；该 QQ 从匹配 UA 登录时跳过验证码/批准。"""
+    """写入旧版 UA 信任记录；当前登录流程不再消费此记录。"""
     qq_key = str(qq or "").strip()
     if not qq_key:
         raise ValueError("qq required")
@@ -536,7 +608,7 @@ def remove_trusted_device(trust_id: str) -> bool:
 
 
 def match_trusted_device(qq: str, ua: str) -> dict[str, Any] | None:
-    """该 QQ 是否有匹配此 UA 的免验证设备。"""
+    """查询旧版 UA 信任记录；当前登录流程不再调用。"""
     qq_key = str(qq or "").strip()
     ua_hash = _hash_token(str(ua or "")[:512])
     data = get_data_store().load_sync(_NS_TRUSTED)
@@ -552,6 +624,8 @@ def match_trusted_device(qq: str, ua: str) -> dict[str, Any] | None:
 
 __all__ = [
     "create_verify_code",
+    "discard_verify_code",
+    "VerifyCodeCooldownError",
     "consume_verify_code",
     "issue_device_token",
     "lookup_device",

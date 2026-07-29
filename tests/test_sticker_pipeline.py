@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 import shutil
 from pathlib import Path
-from contextlib import asynccontextmanager
 from types import SimpleNamespace
 from uuid import uuid4
 
@@ -154,15 +153,14 @@ class _FakeStore:
     def __init__(self) -> None:
         self.payloads: dict[str, dict] = {}
 
-    @asynccontextmanager
-    async def _alock(self, _name: str):  # noqa: ANN001
-        yield
-
     async def load(self, name: str):  # noqa: ANN001
         return self.payloads.get(name, {})
 
-    async def save(self, name: str, data):  # noqa: ANN001
-        self.payloads[name] = data
+    async def mutate(self, name: str, mutator):  # noqa: ANN001
+        current = self.payloads.get(name, {})
+        updated = mutator(current)
+        self.payloads[name] = updated
+        return updated
 
 
 class _PositiveCaller:

@@ -63,12 +63,17 @@ def test_index_serves_static_frontend(_runtime_context) -> None:
     assert "拟人插件 控制台" in res.text
     assert re.search(r'<link rel="stylesheet" href="/personification/static/style\.css\?v=[^"]+">', res.text)
     assert re.search(r'<script src="/personification/static/app-core\.js\?v=[^"]+" defer></script>', res.text)
-    assert re.search(r'<script src="/personification/static/app-activity\.js\?v=[^"]+" defer></script>', res.text)
-    assert re.search(r'<script src="/personification/static/app-content\.js\?v=[^"]+" defer></script>', res.text)
-    assert re.search(r'<script src="/personification/static/app-admin\.js\?v=[^"]+" defer></script>', res.text)
-    assert re.search(r'<script src="/personification/static/app-tools\.js\?v=[^"]+" defer></script>', res.text)
-    assert re.search(r'<script src="/personification/static/app-config\.js\?v=[^"]+" defer></script>', res.text)
     assert re.search(r'<script src="/personification/static/app-auth\.js\?v=[^"]+" defer></script>', res.text)
+    assert "PERSONIFICATION_ASSET_VERSIONS" in res.text
+    instance = re.search(r"PERSONIFICATION_WEBUI_INSTANCE_ID=\"([^\"]+)\"", res.text)
+    assert instance is not None
+    assert len(instance.group(1)) >= 16
+    assert "__PERSONIFICATION_WEBUI_INSTANCE_ID__" not in res.text
+    second = client.get("/personification/")
+    assert f'PERSONIFICATION_WEBUI_INSTANCE_ID="{instance.group(1)}"' in second.text
+    for lazy_asset in ("app-activity.js", "app-content.js", "app-admin.js", "app-tools.js", "app-mcp.js", "app-config.js", "app-operations.js"):
+        assert lazy_asset in res.text
+        assert f'<script src="/personification/static/{lazy_asset}' not in res.text
     assert "no-store" in res.headers.get("cache-control", "")
 
 
@@ -91,15 +96,29 @@ def test_static_frontend_assets_are_served(_runtime_context) -> None:
     auth_js = client.get("/personification/static/app-auth.js")
     assert auth_js.status_code == 200
     assert "bootstrap();" in auth_js.text
+    assert 'select id="login-qq"' in auth_js.text
+    assert "输入管理员 QQ" not in auth_js.text
+    assert "未配置管理员" in auth_js.text
+    assert "await refreshEligibleAdmins()" in auth_js.text
+    assert "免验证设备" not in auth_js.text
+    assert "同意登录" not in auth_js.text
 
     admin_js = client.get("/personification/static/app-admin.js")
     assert admin_js.status_code == 200
     assert "renderHealth" in admin_js.text
     assert "runQzoneForwardTest" in admin_js.text
+    assert 'item.safety_status==="pass"&&item.vision_status==="verified"' in admin_js.text
+    assert "没有通过目标角色视觉审核的头像" in admin_js.text
+    assert "character_confidence" in admin_js.text
 
     tools_js = client.get("/personification/static/app-tools.js")
     assert tools_js.status_code == 200
     assert "renderPluginManager" in tools_js.text
+
+    mcp_js = client.get("/personification/static/app-mcp.js")
+    assert mcp_js.status_code == 200
+    assert "renderMcp" in mcp_js.text
+    assert "Registry discovery" in mcp_js.text
 
     css = client.get("/personification/static/style.css")
     assert css.status_code == 200

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional
@@ -348,8 +349,15 @@ def build_weather_tool(skills_root: Optional[Path], logger: Any) -> AgentTool:
         try:
             return await fetch_weather(resolved_city, forecast_days)
         except Exception as e:
-            logger.warning(f"[weather] query failed for {resolved_city}: {e}")
-            return f"{resolved_city} 天气查询失败"
+            logger.warning(
+                f"[weather] query failed for {resolved_city}: type={type(e).__name__}"
+            )
+            return json.dumps(
+                {"ok": False, "error": "fetch_failed"},
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
 
     return AgentTool(
         name="weather",

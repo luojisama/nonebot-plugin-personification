@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+from urllib.parse import urlparse
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
@@ -9,6 +10,33 @@ from .planner import TurnPlan, extract_json_payload, turn_plan_from_semantic_fra
 
 
 MemoryInjectStyle = Literal["factual", "softened", "drop_due_to_offense_risk", "drop_due_to_stale"]
+
+_SOCIAL_RESEARCH_TOOL_NAMES = frozenset(
+    {"social_content_search", "social_content_read", "research_game_slang"}
+)
+_SOCIAL_SEARCH_TOOL_NAMES = frozenset({"social_content_search", "research_game_slang"})
+_SOCIAL_SEARCH_EQUIVALENT_TOOL_NAMES = frozenset(
+    {"social_content_search", "research_game_slang", "web_search", "search_web"}
+)
+SOCIAL_SEARCH_EQUIVALENT_TOOL_NAMES = _SOCIAL_SEARCH_EQUIVALENT_TOOL_NAMES
+_SOCIAL_CONTENT_ROUTES: dict[str, tuple[frozenset[str], re.Pattern[str]]] = {
+    "bilibili": (
+        frozenset({"bilibili.com", "www.bilibili.com"}),
+        re.compile(r"^/video/(?:BV|av)[A-Za-z0-9_-]+(?:/|$)", re.IGNORECASE),
+    ),
+    "douyin": (
+        frozenset({"douyin.com", "www.douyin.com"}),
+        re.compile(r"^/(?:video|note)/[0-9]+(?:/|$)", re.IGNORECASE),
+    ),
+    "tieba": (
+        frozenset({"tieba.baidu.com"}),
+        re.compile(r"^/p/[0-9]+(?:/|$)", re.IGNORECASE),
+    ),
+    "xiaoheihe": (
+        frozenset({"xiaoheihe.cn", "www.xiaoheihe.cn"}),
+        re.compile(r"^/app/bbs/link/[0-9]+(?:/|$)", re.IGNORECASE),
+    ),
+}
 
 
 @dataclass
@@ -33,6 +61,13 @@ def _coerce_bool(value: Any, default: bool = False) -> bool:
     if value is None:
         return default
     return bool(value)
+
+
+def _coerce_nonnegative_int(value: Any, default: int = 0) -> int:
+    try:
+        return max(0, int(value))
+    except (TypeError, ValueError, OverflowError):
+        return max(0, int(default))
 
 
 def _coerce_text_list(value: Any, *, limit: int, item_chars: int) -> list[str]:
@@ -136,10 +171,202 @@ def build_tool_result_record(
     tool_args: dict[str, Any],
     result: Any,
 ) -> dict[str, Any]:
-    return {
+    record = {
         "tool_name": str(tool_name or "").strip(),
         "args": dict(tool_args or {}),
         "result": str(result or "").strip()[:2400],
+    }
+    social = social_evidence_metadata(tool_name=tool_name, result=result)
+    if social:
+        record["social_evidence"] = social
+    return record
+
+
+def _parse_social_packet(tool_name: str, result: Any) -> dict[str, Any] | None:
+    if str(tool_name or "").strip() not in _SOCIAL_RESEARCH_TOOL_NAMES:
+        return None
+    if isinstance(result, dict):
+        payload = result
+    else:
+        try:
+            payload = json.loads(str(result or ""))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _validated_social_url(platform: str, value: Any) -> str:
+    platform_name = str(platform or "").strip().lower()
+    route = _SOCIAL_CONTENT_ROUTES.get(platform_name)
+    if route is None:
+        return ""
+    candidate = str(value or "").strip()
+    try:
+        parsed = urlparse(candidate)
+    except ValueError:
+        return ""
+    hosts, path_pattern = route
+    host = str(parsed.hostname or "").lower()
+    try:
+        port = parsed.port
+    except ValueError:
+        return ""
+    if (
+        parsed.scheme != "https"
+        or host not in hosts
+        or port not in {None, 443}
+        or parsed.username is not None
+        or parsed.password is not None
+        or not path_pattern.search(parsed.path or "")
+    ):
+        return ""
+    canonical_host = "xiaoheihe.cn" if platform_name == "xiaoheihe" else host
+    canonical_path = (parsed.path or "").rstrip("/") if platform_name == "xiaoheihe" else parsed.path
+    parsed = parsed._replace(
+        netloc=canonical_host,
+        path=canonical_path,
+        query="",
+        fragment="",
+    )
+    return parsed.geturl()
+
+
+def social_evidence_metadata(*, tool_name: str, result: Any) -> dict[str, Any]:
+    """Keep compact, validated social evidence outside the truncated raw result.
+
+    Social MCP data is untrusted. Only additive aggregation fields and canonical
+    URLs which still satisfy a platform-specific public content route are
+    retained here; body text and discussions never become control input.
+    """
+
+    name = str(tool_name or "").strip()
+    packet = _parse_social_packet(name, result)
+    if packet is None:
+        return {}
+    aggregation = packet.get("aggregation") if isinstance(packet.get("aggregation"), dict) else {}
+    group_by_key: dict[tuple[str, str], str] = {}
+    for group in list(packet.get("source_groups") or []):
+        if not isinstance(group, dict):
+            continue
+        group_id = str(group.get("group_id") or "").strip()[:120]
+        for member in list(group.get("members") or []):
+            if not isinstance(member, dict):
+                continue
+            key = (
+                str(member.get("platform") or "").strip(),
+                str(member.get("content_id") or "").strip(),
+            )
+            if all(key) and group_id:
+                group_by_key[key] = group_id
+    sources: list[dict[str, Any]] = []
+    seen_urls: set[str] = set()
+    for item in list(packet.get("items") or []):
+        if not isinstance(item, dict):
+            continue
+        platform = str(item.get("platform") or "").strip().lower()
+        canonical_url = _validated_social_url(platform, item.get("canonical_url"))
+        if not canonical_url or canonical_url in seen_urls:
+            continue
+        seen_urls.add(canonical_url)
+        content_id = str(item.get("content_id") or "").strip()[:200]
+        group_id = str(item.get("source_group_id") or "").strip()[:120]
+        if not group_id:
+            group_id = group_by_key.get((platform, content_id), "")
+        sources.append(
+            {
+                "platform": platform,
+                "content_id": content_id,
+                "source_group_id": group_id,
+                "title": re.sub(r"\s+", " ", str(item.get("title") or "")).strip()[:180],
+                "canonical_url": canonical_url,
+            }
+        )
+        if len(sources) >= 10:
+            break
+    if not aggregation and not sources:
+        return {}
+    source_group_count = _coerce_nonnegative_int(aggregation.get("source_group_count", 0))
+    if source_group_count <= 0:
+        source_group_count = len(
+            {
+                str(item.get("source_group_id") or item.get("canonical_url") or "")
+                for item in sources
+            }
+        )
+    return {
+        "tool_name": name,
+        "aggregation": {
+            "requested_limit": _coerce_nonnegative_int(aggregation.get("requested_limit", 0)),
+            "candidate_count": _coerce_nonnegative_int(aggregation.get("candidate_count", 0)),
+            "returned_count": _coerce_nonnegative_int(
+                aggregation.get("returned_count", len(sources)), len(sources)
+            ),
+            "source_group_count": source_group_count,
+            "selected_platforms": _coerce_text_list(
+                aggregation.get("selected_platforms"), limit=8, item_chars=32
+            ),
+            "successful_platforms": _coerce_text_list(
+                aggregation.get("successful_platforms"), limit=8, item_chars=32
+            ),
+            "covered_platforms": _coerce_text_list(
+                aggregation.get("covered_platforms"), limit=8, item_chars=32
+            ),
+            "coverage_status": str(aggregation.get("coverage_status") or "").strip()[:24],
+            "satisfies_request": _coerce_bool(aggregation.get("satisfies_request"), False),
+        },
+        "partial": _coerce_bool(packet.get("partial"), False),
+        "warnings": _coerce_text_list(packet.get("warnings"), limit=8, item_chars=120),
+        "sources": sources,
+    }
+
+
+def social_evidence_from_records(tool_results: list[dict[str, Any]] | None) -> dict[str, Any]:
+    sources: list[dict[str, Any]] = []
+    seen_urls: set[str] = set()
+    coverage: dict[str, Any] = {}
+    partial = False
+    warnings: list[str] = []
+    search_seen = False
+    satisfies_request = False
+    for record in list(tool_results or []):
+        if not isinstance(record, dict):
+            continue
+        metadata = record.get("social_evidence")
+        if not isinstance(metadata, dict):
+            metadata = social_evidence_metadata(
+                tool_name=str(record.get("tool_name") or record.get("name") or ""),
+                result=record.get("result") or record.get("text") or "",
+            )
+        if not metadata:
+            continue
+        name = str(metadata.get("tool_name") or "")
+        aggregation = metadata.get("aggregation")
+        if name in _SOCIAL_SEARCH_TOOL_NAMES and isinstance(aggregation, dict):
+            search_seen = True
+            coverage = dict(aggregation)
+            satisfies_request = satisfies_request or bool(aggregation.get("satisfies_request", False))
+        partial = partial or bool(metadata.get("partial", False))
+        for warning in list(metadata.get("warnings") or []):
+            value = str(warning or "").strip()
+            if value and value not in warnings:
+                warnings.append(value)
+        for source in list(metadata.get("sources") or []):
+            if not isinstance(source, dict):
+                continue
+            url = str(source.get("canonical_url") or "").strip()
+            if not url or url in seen_urls:
+                continue
+            seen_urls.add(url)
+            sources.append(dict(source))
+    if search_seen:
+        coverage["satisfies_request"] = satisfies_request
+    return {
+        "sources": sources[:10],
+        "aggregation": coverage,
+        "partial": partial,
+        "warnings": warnings[:8],
+        "satisfies_request": satisfies_request,
+        "search_seen": search_seen,
     }
 
 
@@ -186,8 +413,34 @@ def _render_turn_plan(plan: TurnPlan | Any) -> str:
         "tool_intent": list(getattr(plan, "tool_intent", []) or []),
         "ambiguity_level": str(getattr(plan, "ambiguity_level", "") or ""),
         "session_goal": str(getattr(plan, "session_goal", "") or ""),
+        "domain_focus": str(getattr(plan, "domain_focus", "general") or "general"),
+        "evidence_policy": str(getattr(plan, "evidence_policy", "none") or "none"),
     }
     return json.dumps(payload, ensure_ascii=False)
+
+
+def _independent_source_count(tool_results: list[dict[str, Any]] | None) -> int:
+    sources: set[str] = set()
+    structured_count = 0
+    for item in list(tool_results or []):
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("tool_name", "") or item.get("name", "") or "").strip()
+        result = str(item.get("result", "") or item.get("text", "") or "")
+        social = item.get("social_evidence")
+        if isinstance(social, dict):
+            aggregation = social.get("aggregation")
+            if isinstance(aggregation, dict):
+                count = _coerce_nonnegative_int(aggregation.get("source_group_count", 0))
+                if count > 0:
+                    structured_count = max(structured_count, count)
+        if name in _PARALLEL_RESEARCH_TOOL_NAMES and _extract_verification_labels(name, result):
+            return 2
+        for url in re.findall(r"https?://[^\s\]\[()<>\"']+", result):
+            host = (urlparse(url).hostname or "").lower()
+            if host:
+                sources.add(host.removeprefix("www."))
+    return max(structured_count, len(sources))
 
 
 def _render_memories(candidate_memories: list[dict[str, Any]] | None) -> str:
@@ -248,6 +501,23 @@ def _render_tool_results(tool_results: list[dict[str, Any]] | None, *, cross_ver
         line = (
             f"- tool={name or 'unknown'} args={json.dumps(args, ensure_ascii=False)[:160]} result={result[:700] or '无'}"
         )
+        social = item.get("social_evidence")
+        if isinstance(social, dict):
+            aggregation = social.get("aggregation") if isinstance(social.get("aggregation"), dict) else {}
+            sources = [entry for entry in list(social.get("sources") or []) if isinstance(entry, dict)]
+            compact_sources = "；".join(
+                f"{entry.get('platform') or '-'}|{entry.get('source_group_id') or '-'}|"
+                f"{entry.get('title') or '[无标题]'}|{entry.get('canonical_url') or ''}"
+                for entry in sources[:3]
+            )
+            line += (
+                "\n[社交证据元数据] "
+                f"groups={_coerce_nonnegative_int(aggregation.get('source_group_count', 0))} "
+                f"covered={','.join(aggregation.get('covered_platforms') or []) or '-'} "
+                f"satisfies={str(bool(aggregation.get('satisfies_request', False))).lower()} "
+                f"partial={str(bool(social.get('partial', False))).lower()} "
+                f"sources={compact_sources or '-'}"
+            )
         if cross_verify_enabled:
             verification = _extract_verification_labels(name, result)
             if verification:
@@ -307,6 +577,7 @@ async def synthesize_evidence_with_llm(
                 '"research_followup_query":""}\n'
                 "要求：不要选择冒犯风险、过期、明显不相关的记忆。"
                 "如果工具结果互相冲突或不足，写 uncertainty_notes；只有确实需要再查时才 needs_more_research=true。"
+                "当 TurnPlan.evidence_policy=strict 时，关键事实至少需要两个相互独立的来源；独立来源不足必须 needs_more_research=true 并给出后续查询。"
             ),
         },
         {
@@ -328,16 +599,26 @@ async def synthesize_evidence_with_llm(
         return fallback
     payload = extract_json_payload(str(getattr(response, "content", "") or ""))
     parsed = parse_evidence_synthesis_payload(payload, candidate_memories=candidate_memories)
-    return parsed or fallback
+    result = parsed or fallback
+    if str(getattr(turn_plan, "evidence_policy", "none") or "none") == "strict" and _independent_source_count(tool_results) < 2:
+        result.needs_more_research = True
+        if not result.research_followup_query:
+            result.research_followup_query = str(getattr(turn_plan, "session_goal", "") or "补充独立来源交叉核验")[:160]
+        if "独立来源不足" not in result.uncertainty_notes:
+            result.uncertainty_notes.append("独立来源不足")
+    return result
 
 
 __all__ = [
     "EvidenceSynthesis",
+    "SOCIAL_SEARCH_EQUIVALENT_TOOL_NAMES",
     "build_tool_result_record",
     "evidence_synthesizer_enabled",
     "fallback_evidence_synthesis",
     "plan_for_evidence",
     "parse_evidence_synthesis_payload",
     "render_evidence_guidance",
+    "social_evidence_from_records",
+    "social_evidence_metadata",
     "synthesize_evidence_with_llm",
 ]

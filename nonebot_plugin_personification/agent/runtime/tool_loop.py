@@ -110,15 +110,22 @@ def observe_model_step(
     return content_len
 
 
-def append_assistant_tool_calls_message(*, messages: list[dict], response: Any) -> None:
+def append_assistant_tool_calls_message(
+    *,
+    messages: list[dict],
+    response: Any,
+    tool_caller: Any | None = None,
+) -> None:
     tool_calls = list(getattr(response, "tool_calls", []) or [])
     if not tool_calls:
         return
-    messages.append(
-        {
+    builder = getattr(tool_caller, "build_assistant_tool_calls_message", None)
+    if callable(builder):
+        message = builder(response)
+    else:
+        message = {
             "role": "assistant",
-            # 必须用空字符串而非 None：部分严格 provider（Rust 反序列化）
-            # 会把 null 当作"缺失字段"直接 400 拒绝。
+            # Keep the generic OpenAI-compatible path strict-provider safe.
             "content": getattr(response, "content", None) if getattr(response, "content", None) else "",
             "tool_calls": [
                 {
@@ -132,7 +139,26 @@ def append_assistant_tool_calls_message(*, messages: list[dict], response: Any) 
                 for tool_call in tool_calls
             ],
         }
-    )
+    if isinstance(message, dict):
+        messages.append(message)
+
+
+def append_tool_result_messages(
+    *,
+    messages: list[dict],
+    tool_caller: Any,
+    response: Any,
+    results: list[tuple[Any, str]],
+) -> None:
+    builder = getattr(tool_caller, "build_tool_result_messages", None)
+    if callable(builder):
+        built = list(builder(response, results) or [])
+    else:
+        built = [
+            tool_caller.build_tool_result_message(tool_call.id, tool_call.name, result)
+            for tool_call, result in results
+        ]
+    messages.extend(message for message in built if isinstance(message, dict))
 
 
 def append_single_tool_call_exchange(
@@ -216,6 +242,7 @@ def trace_tool_result(
 __all__ = [
     "append_assistant_tool_calls_message",
     "append_single_tool_call_exchange",
+    "append_tool_result_messages",
     "append_tool_result_message",
     "observe_model_step",
     "record_model_response_usage",

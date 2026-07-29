@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 from typing import Any, Literal
 
 from ...core.reply_style_policy import build_context_continuity_policy_prompt, build_group_no_question_policy_prompt
+from ...core.chat_intent import EmotionalSupport, _parse_emotional_support
 
 
 ReplyAction = Literal["reply", "silence", "ask_clarify"]
@@ -23,9 +24,13 @@ MemoryNeed = Literal["none", "light", "deep"]
 ResearchNeed = Literal["none", "low", "medium", "high"]
 VisionNeed = Literal["none", "summary", "native"]
 OutputMode = Literal["chat_short", "chat_answer", "structured_help", "source_summary", "qzone_reply"]
-ToolIntent = Literal["lookup_web", "lookup_plugin", "vision", "image_gen", "memory", "expression", "none"]
+ToolIntent = Literal[
+    "lookup_web", "lookup_plugin", "runtime_capability", "vision", "image_gen", "memory", "expression", "none"
+]
 AmbiguityLevel = Literal["low", "medium", "high"]
-MessageTarget = Literal["bot", "someone_else", "broadcast", "uncertain"]
+MessageTarget = Literal["bot", "someone_else", "external_plugin", "broadcast", "uncertain"]
+DomainFocus = Literal["general", "social", "technology", "science", "game_anime", "plugin", "realtime", "emotion"]
+EvidencePolicy = Literal["none", "light", "standard", "strict"]
 
 
 ALLOWED_REPLY_ACTIONS = {"reply", "silence", "ask_clarify"}
@@ -43,9 +48,20 @@ ALLOWED_MEMORY_NEEDS = {"none", "light", "deep"}
 ALLOWED_RESEARCH_NEEDS = {"none", "low", "medium", "high"}
 ALLOWED_VISION_NEEDS = {"none", "summary", "native"}
 ALLOWED_OUTPUT_MODES = {"chat_short", "chat_answer", "structured_help", "source_summary", "qzone_reply"}
-ALLOWED_TOOL_INTENTS = {"lookup_web", "lookup_plugin", "vision", "image_gen", "memory", "expression", "none"}
+ALLOWED_TOOL_INTENTS = {
+    "lookup_web", "lookup_plugin", "runtime_capability", "vision", "image_gen", "memory", "expression", "none"
+}
 ALLOWED_AMBIGUITY_LEVELS = {"low", "medium", "high"}
-ALLOWED_MESSAGE_TARGETS = {"bot", "someone_else", "broadcast", "uncertain"}
+ALLOWED_MESSAGE_TARGETS = {"bot", "someone_else", "external_plugin", "broadcast", "uncertain"}
+ALLOWED_DOMAIN_FOCUS = {"general", "social", "technology", "science", "game_anime", "plugin", "realtime", "emotion"}
+ALLOWED_EVIDENCE_POLICIES = {"none", "light", "standard", "strict"}
+
+
+def _normalize_domain_focus(value: Any, fallback: str = "general") -> DomainFocus:
+    normalized = str(value or "").strip().lower()
+    if normalized == "knowledge":
+        normalized = "general"
+    return _enum_value(normalized, ALLOWED_DOMAIN_FOCUS, fallback)  # type: ignore[return-value]
 
 
 OUTPUT_MODE_LENGTHS: dict[str, tuple[int, int]] = {
@@ -72,6 +88,16 @@ class TurnPlan:
     reason: str = ""
     message_target: MessageTarget = "uncertain"
     session_goal: str = ""
+    domain_focus: DomainFocus = "general"
+    evidence_policy: EvidencePolicy = "none"
+    emotional_support: EmotionalSupport = field(default_factory=EmotionalSupport)
+    user_attitude: str = "日常交流"
+    bot_emotion: str = "平静"
+    emotion_intensity: str = "medium"
+    expression_style: str = "自然简短"
+    group_atmosphere_positive: bool = False
+    interaction_interesting: bool = False
+    future_commitment_candidate: bool = False
 
     @property
     def length_bounds(self) -> tuple[int, int]:
@@ -164,6 +190,11 @@ def parse_turn_plan_payload(payload: Any) -> TurnPlan | None:
         default_speech_act(reply_action=reply_action, output_mode=output_mode, tool_intents=list(tool_intent)),
     )
     confidence = max(0.0, min(1.0, _coerce_float(payload.get("confidence"), 0.0)))
+    legacy_domain = "general"
+    if "lookup_plugin" in tool_intent:
+        legacy_domain = "plugin"
+    elif "lookup_web" in tool_intent:
+        legacy_domain = "realtime"
     return TurnPlan(
         reply_action=reply_action,  # type: ignore[arg-type]
         speech_act=speech_act,  # type: ignore[arg-type]
@@ -178,6 +209,18 @@ def parse_turn_plan_payload(payload: Any) -> TurnPlan | None:
         reason=str(payload.get("reason", "") or "").strip()[:80],
         message_target=_enum_value(payload.get("message_target"), ALLOWED_MESSAGE_TARGETS, "uncertain"),  # type: ignore[arg-type]
         session_goal=str(payload.get("session_goal", "") or "").strip()[:80],
+        domain_focus=_normalize_domain_focus(payload.get("domain_focus"), legacy_domain),
+        evidence_policy=_enum_value(payload.get("evidence_policy"), ALLOWED_EVIDENCE_POLICIES, "none"),  # type: ignore[arg-type]
+        emotional_support=_parse_emotional_support(payload.get("emotional_support")),
+        user_attitude=str(payload.get("user_attitude", "") or "").strip()[:80] or "日常交流",
+        bot_emotion=str(payload.get("bot_emotion", "") or "").strip()[:80] or "平静",
+        emotion_intensity=_enum_value(payload.get("emotion_intensity"), {"low", "medium", "high"}, "medium"),
+        expression_style=str(payload.get("expression_style", "") or "").strip()[:80] or "自然简短",
+        group_atmosphere_positive=_coerce_bool(payload.get("group_atmosphere_positive"), False),
+        interaction_interesting=_coerce_bool(payload.get("interaction_interesting"), False),
+        future_commitment_candidate=_coerce_bool(
+            payload.get("future_commitment_candidate"), False
+        ),
     )
 
 
@@ -331,6 +374,7 @@ async def plan_turn_with_llm(
     current_emotion_state: str = "",
     available_tools: list[dict[str, Any]] | None = None,
     group_knowledge_hint: str = "",
+    media_grounding: str = "",
 ) -> TurnPlan:
     fallback = metadata_fallback_turn_plan(
         is_group=is_group,
@@ -362,25 +406,50 @@ async def plan_turn_with_llm(
         '"vision_need":"none|summary|native",'
         '"qzone_continue":false,'
         '"output_mode":"chat_short|chat_answer|structured_help|source_summary|qzone_reply",'
-        '"tool_intent":["lookup_web|lookup_plugin|vision|image_gen|memory|expression|none"],'
+        '"tool_intent":["lookup_web|lookup_plugin|runtime_capability|vision|image_gen|memory|expression|none"],'
         '"ambiguity_level":"low|medium|high",'
-        '"message_target":"bot|someone_else|broadcast|uncertain",'
+        '"message_target":"bot|someone_else|external_plugin|broadcast|uncertain",'
         '"session_goal":"一句短中文目标",'
+        '"domain_focus":"general|social|technology|science|game_anime|plugin|realtime|emotion",'
+        '"evidence_policy":"none|light|standard|strict",'
+        '"emotional_support":{"needed":false,"listen":false,"validate":false,"advice_permission":"not_needed|ask_first|allowed","risk_level":"none|concern|high"},'
+        '"user_attitude":"一句短中文", "bot_emotion":"一句短中文", "emotion_intensity":"low|medium|high", "expression_style":"一句短中文",'
+        '"group_atmosphere_positive":false,"interaction_interesting":false,'
+        '"future_commitment_candidate":false,'
         '"confidence":0.0,'
         '"reason":"极短中文原因"}\n'
         "判别要求：\n"
-        "1. reply_action 只决定回不回复；群聊不确定是否 cue bot 时用 silence。\n"
+        "1. reply_action 只决定回不回复；群聊没有 cue bot 不等于必须 silence。"
+        "开放表达且能沿最近同一话题自然推进时可 reply；明确群友点对点、纯媒体/回声、私密话题或上下文不足时才 silence。\n"
         "2. speech_act 决定最终回复承担的聊天动作：participate=参与讨论/闲聊推进半步，answer=回答问题，ask_followup=追问一个具体点，"
         "clarify=信息不足时短澄清，tease=轻吐槽接梗，execute_action=调用会外发内容的工具后少说或静默，source_summary=基于证据总结，silence=不说。\n"
-        "3. message_target 由 @、引用、称呼、上下文共同判断；uncertain 时通常 silence。\n"
-        "4. 风格、用户态度、bot 情绪、TTS 和表情不要在这里决定。\n"
+        "3. message_target 由 @、引用、称呼、上下文共同判断；uncertain 时继续结合最近话题和参与者判断，"
+        "不能直接当成 someone_else，也不能仅因目标暂不明确就静默。\n"
+        "3b. 明确 @/直呼 bot 只表示轮到 bot 回应，不代表 speech_act 必须是 answer："
+        "正文若是调侃、甩锅、轻挑衅或玩笑指控，优先 tease/participate + chat_short；"
+        "只有真的索取知识结论、查证或步骤时才用 answer/source_summary。\n"
+        "3c. message_target=external_plugin 或最近上下文明示其它插件 interaction episode 时，"
+        "插件输出不是人格 bot 的发言。若选择参与，默认 reply + tease/participate + chat_short + evidence_policy=none，"
+        "围绕插件结果接梗；不要因结果里的专业名词切成百科解释，也不要声称结果是自己刚说、刚查或刚抽到的。"
+        "只有最新消息明确另起独立事实问题时才用 answer/lookup。\n"
+        "4. user_attitude、bot_emotion、emotion_intensity 和 expression_style 要结合上下文规划；TTS 和表情仍由下游决定。\n"
+        "4b. group_atmosphere_positive 只在群聊整体互动明确友好融洽时为 true，私聊必须 false；"
+        "interaction_interesting 只在 bot 与当前用户确实出现明显趣味、默契或高质量互动时为 true，普通成功回复不能机械加分。\n"
+        "4c. future_commitment_candidate 只在私聊用户明确表达带时间线索的未来承诺、计划或待办时为 true；"
+        "已完成事件、无时间的愿望和普通闲聊必须为 false。\n"
         "5. 工具意图只给候选方向，不要因为工具存在就强行使用。\n"
+        "5a. 当前可用工具 metadata 中的 runtime_capability 只表示当前发送者头像画面事实的第一方只读能力。"
+        "当对方询问 bot 能否读取或理解自己的头像画面时，tool_intent 必须包含 runtime_capability，"
+        "规划为调用该工具核实后回答，不能用插件静态说明代替运行时证据。\n"
         "5b. 用户明确要求发送 QQ 表情、小黄脸、收藏表情、推荐表情，或这轮只适合发 QQ 表情时，tool_intent 包含 expression，speech_act 通常是 execute_action。\n"
         "5c. 最新消息如果用“这个动画/这段动画/这个角色/这张图/这场面”等指代最近出现的 ACG 角色、作品、抽卡卡面、图片或视频，"
         "不要规划成空泛闲聊；research_need 至少 low，tool_intent 应包含 lookup_web，speech_act 优先 source_summary 或 participate，"
         "目标是查清对象后用短句参与讨论。\n"
         "6. research_need=high 只给明显需要多源查证、时效或争议的问题。\n"
-        "7. output_mode 控制最终回复长度和形态：chat_short 接梗，chat_answer 普通答，structured_help 教程，source_summary 检索摘要，qzone_reply 空间评论。\n"
+        "6b. 技术、科学、时效或高影响事实通常 evidence_policy=strict；普通事实 standard，轻背景 light，纯闲聊 none。"
+        "情绪支持按倾听、确认、建议权限和风险结构化，不把普通低落自动医疗化。\n"
+        "7. output_mode 控制最终回复长度和形态：chat_short 接梗，chat_answer 普通答，structured_help 教程，source_summary 检索摘要，qzone_reply 空间评论。"
+        "不要因为出现 @ 就把 chat_short 强行升级成长回答。\n"
         "8. fallback 只能当模型不确定时参考，不要机械照抄。\n"
         f"{build_context_continuity_policy_prompt()}\n"
         f"{build_group_no_question_policy_prompt() if is_group else ''}\n"
@@ -397,6 +466,7 @@ async def plan_turn_with_llm(
         f"互动关系：{str(relationship_hint or '').strip()[:600] or '无'}\n"
         f"全局内心状态：{str(current_inner_state or '').strip()[:260] or '无'}\n"
         f"近期情绪记忆：{str(current_emotion_state or '').strip()[:260] or '无'}\n"
+        f"媒体 provenance / 视觉 grounding：\n{str(media_grounding or '').strip()[:1800] or '无'}\n"
         f"复读线索：{'; '.join(repeat_lines) if repeat_lines else '无'}\n"
         f"可用工具元数据：\n{_render_tool_metadata(available_tools)}\n"
         "metadata fallback："
@@ -437,9 +507,13 @@ def turn_plan_from_semantic_frame(frame: Any, *, has_images: bool = False, messa
         research_need = "medium"
         tool_intent = ["lookup_web"]
     elif chat_intent == "plugin_question":
-        output_mode = "structured_help"
-        research_need = "low" if plugin_intent == "latest" else "none"
-        tool_intent = ["lookup_plugin"] if plugin_intent != "latest" else ["lookup_plugin", "lookup_web"]
+        if plugin_intent == "runtime_capability":
+            output_mode = "chat_answer"
+            tool_intent = ["runtime_capability"]
+        else:
+            output_mode = "structured_help"
+            research_need = "low" if plugin_intent == "latest" else "none"
+            tool_intent = ["lookup_plugin"] if plugin_intent != "latest" else ["lookup_plugin", "lookup_web"]
     elif chat_intent == "image_generation":
         output_mode = "chat_answer"
         tool_intent = ["image_gen"]
@@ -459,6 +533,7 @@ def turn_plan_from_semantic_frame(frame: Any, *, has_images: bool = False, messa
     if ambiguity not in ALLOWED_AMBIGUITY_LEVELS:
         ambiguity = "low"
     confidence = max(0.0, min(1.0, _coerce_float(getattr(frame, "confidence", 0.0), 0.0)))
+    legacy_domain = "plugin" if chat_intent == "plugin_question" else ("realtime" if chat_intent == "lookup" else "general")
     return TurnPlan(
         reply_action="silence" if recommend_silence else "reply",
         speech_act=speech_act,
@@ -473,6 +548,21 @@ def turn_plan_from_semantic_frame(frame: Any, *, has_images: bool = False, messa
         reason=str(getattr(frame, "reason", "") or "semantic_frame_adapter").strip()[:80],
         message_target=_enum_value(message_target, ALLOWED_MESSAGE_TARGETS, "uncertain"),  # type: ignore[arg-type]
         session_goal="沿用旧语义帧",
+        domain_focus=_normalize_domain_focus(getattr(frame, "domain_focus", None), legacy_domain),
+        evidence_policy=_enum_value(getattr(frame, "evidence_policy", "none"), ALLOWED_EVIDENCE_POLICIES, "none"),  # type: ignore[arg-type]
+        emotional_support=_parse_emotional_support(
+            getattr(frame, "emotional_support", None),
+            legacy_needed=bool(getattr(frame, "requires_emotional_care", False)),
+        ),
+        user_attitude=str(getattr(frame, "user_attitude", "") or "日常交流"),
+        bot_emotion=str(getattr(frame, "bot_emotion", "") or "平静"),
+        emotion_intensity=_enum_value(getattr(frame, "emotion_intensity", "medium"), {"low", "medium", "high"}, "medium"),
+        expression_style=str(getattr(frame, "expression_style", "") or "自然简短"),
+        group_atmosphere_positive=bool(getattr(frame, "group_atmosphere_positive", False)),
+        interaction_interesting=bool(getattr(frame, "interaction_interesting", False)),
+        future_commitment_candidate=bool(
+            getattr(frame, "future_commitment_candidate", False)
+        ),
     )
 
 
@@ -487,6 +577,9 @@ def turn_plan_to_semantic_frame(plan: TurnPlan) -> Any:
         chat_intent = "image_generation"
     elif "expression" in tool_intents:
         chat_intent = "expression"
+    elif "runtime_capability" in tool_intents:
+        chat_intent = "plugin_question"
+        plugin_intent = "runtime_capability"
     elif "lookup_plugin" in tool_intents:
         chat_intent = "plugin_question"
         plugin_intent = "latest" if "lookup_web" in tool_intents or plan.research_need != "none" else "capability"
@@ -499,14 +592,19 @@ def turn_plan_to_semantic_frame(plan: TurnPlan) -> Any:
         plugin_question_intent=plugin_intent,  # type: ignore[arg-type]
         ambiguity_level=plan.ambiguity_level,
         recommend_silence=plan.reply_action == "silence",
-        requires_emotional_care=False,
+        requires_emotional_care=plan.emotional_support.needed,
         sticker_appropriate=plan.output_mode in {"chat_short", "qzone_reply"} and plan.reply_action == "reply",
         meta_question=False,
-        domain_focus="plugin" if chat_intent == "plugin_question" else ("realtime" if chat_intent == "lookup" else "general"),
-        user_attitude="待 responder 判断",
-        bot_emotion="平静",
-        emotion_intensity="medium",
-        expression_style="自然短句" if plan.output_mode == "chat_short" else "直接清楚",
+        domain_focus=plan.domain_focus,
+        evidence_policy=plan.evidence_policy,
+        emotional_support=plan.emotional_support,
+        user_attitude=plan.user_attitude,
+        bot_emotion=plan.bot_emotion,
+        emotion_intensity=plan.emotion_intensity,
+        expression_style=plan.expression_style,
+        group_atmosphere_positive=plan.group_atmosphere_positive,
+        interaction_interesting=plan.interaction_interesting,
+        future_commitment_candidate=plan.future_commitment_candidate,
         tts_style_hint="自然",
         sticker_mood_hint=default_sticker_semantic_hint(chat_intent, is_random_chat=plan.reply_action == "silence"),
         confidence=plan.confidence,
