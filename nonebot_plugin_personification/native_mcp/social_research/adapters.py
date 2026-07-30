@@ -171,31 +171,45 @@ class PlatformAdapter:
             prefer_headless=self.spec.name == "xiaoheihe",
         )
 
-    async def _page(self, url: str, timeout_seconds: float) -> Any:
-        page = await self.browsers.page(self.spec.name)
-        response = await page.goto(url, wait_until="domcontentloaded", timeout=max(3000, int(timeout_seconds * 1000)))
-        await page.wait_for_timeout(800)
-        state = await page.evaluate(
-            """() => ({
-                title: document.title || '',
-                body: document.body ? document.body.innerText.slice(0, 2500) : '',
-            })"""
-        )
-        state_text = clean_text(f"{state.get('title', '')} {state.get('body', '')}", 3000).lower()
-        verification_markers = ("验证码", "安全验证", "人机验证", "完成下列验证", "拖动完成", "captcha")
-        risk_markers = ("访问过于频繁", "操作频繁", "请求频繁", "risk control", "risk_control")
-        if any(marker in state_text for marker in verification_markers):
-            raise RuntimeError("manual_verification_required")
-        status = int(getattr(response, "status", 0) or 0)
-        if status in {401, 403, 429} or any(marker in state_text for marker in risk_markers):
-            raise RuntimeError("risk_controlled")
-        return page
+    async def _page(self, url: str, timeout_seconds: float) -> tuple[Any, bool]:
+        fresh_page = getattr(self.browsers, "fresh_page", None)
+        owned_page = callable(fresh_page)
+        page = await fresh_page(self.spec.name) if owned_page else await self.browsers.page(self.spec.name)
+        try:
+            response = await page.goto(url, wait_until="domcontentloaded", timeout=max(3000, int(timeout_seconds * 1000)))
+            await page.wait_for_timeout(800)
+            state = await page.evaluate(
+                """() => ({
+                    title: document.title || '',
+                    body: document.body ? document.body.innerText.slice(0, 2500) : '',
+                })"""
+            )
+            state_text = clean_text(f"{state.get('title', '')} {state.get('body', '')}", 3000).lower()
+            verification_markers = ("验证码", "安全验证", "人机验证", "完成下列验证", "拖动完成", "captcha")
+            risk_markers = ("访问过于频繁", "操作频繁", "请求频繁", "risk control", "risk_control")
+            if any(marker in state_text for marker in verification_markers):
+                raise RuntimeError("manual_verification_required")
+            status = int(getattr(response, "status", 0) or 0)
+            if status in {401, 403, 429} or any(marker in state_text for marker in risk_markers):
+                raise RuntimeError("risk_controlled")
+            return page, owned_page
+        except Exception:
+            if owned_page:
+                await page.close()
+            raise
 
     async def search(self, query: str, *, limit: int, timeout_seconds: float) -> list[dict[str, Any]]:
         url = self.spec.search_url.format(query=quote(clean_text(query, 200), safe=""))
-        page = await self._page(url, timeout_seconds)
-        rows = await page.locator(self.spec.content_link_selector).evaluate_all(
-            """(nodes, options) => nodes.slice(0, options.maxItems * 4).map((node) => {
+        page, owned_page = await self._page(url, timeout_seconds)
+        try:
+            if self.spec.name == "xiaoheihe":
+                await page.wait_for_selector(
+                    self.spec.content_link_selector,
+                    state="attached",
+                    timeout=max(1000, int(timeout_seconds * 1000) - 1000),
+                )
+            rows = await page.locator(self.spec.content_link_selector).evaluate_all(
+                """(nodes, options) => nodes.slice(0, options.maxItems * 4).map((node) => {
                 const card = node.closest('article,li,[class*=card],[class*=item],[class*=video],[class*=result]') || node.parentElement;
                 const img = card && card.querySelector('img');
                 const text = (card && card.innerText) || node.innerText || '';
@@ -211,9 +225,12 @@ class PlatformAdapter:
                     metricText,
                     cover: img ? (img.currentSrc || img.src || img.getAttribute('data-src') || '') : '',
                 };
-            })""",
-            {"maxItems": limit, "platform": self.spec.name},
-        )
+                })""",
+                {"maxItems": limit, "platform": self.spec.name},
+            )
+        finally:
+            if owned_page:
+                await page.close()
         result: list[dict[str, Any]] = []
         seen: set[str] = set()
         for raw in rows:
@@ -293,17 +310,18 @@ class PlatformAdapter:
             canonical_url = self.validate_url(url)
         else:
             canonical_url = self.url_for_id(content_id)
-        page = await self._page(canonical_url, timeout_seconds)
-        if self.spec.name == "xiaoheihe":
-            try:
-                await page.wait_for_selector(
-                    ".hb-bbs-post .post__content .hb-article",
-                    state="visible",
-                    timeout=max(1000, int(timeout_seconds * 1000)),
-                )
-            except Exception as exc:
-                raise RuntimeError("detail_content_unavailable") from exc
-            metadata_script = """() => {
+        page, owned_page = await self._page(canonical_url, timeout_seconds)
+        try:
+            if self.spec.name == "xiaoheihe":
+                try:
+                    await page.wait_for_selector(
+                        ".hb-bbs-post .post__content .hb-article",
+                        state="visible",
+                        timeout=max(1000, int(timeout_seconds * 1000)),
+                    )
+                except Exception as exc:
+                    raise RuntimeError("detail_content_unavailable") from exc
+                metadata_script = """() => {
                 const root = document.querySelector('.hb-bbs-post');
                 const title = root && root.querySelector('.link-section-title');
                 const article = root && root.querySelector('.post__content .hb-article');
@@ -314,9 +332,9 @@ class PlatformAdapter:
                     cover: cover ? (cover.currentSrc || cover.src || '') : '',
                     body: '',
                 };
-            }"""
-        else:
-            metadata_script = """() => {
+                }"""
+            else:
+                metadata_script = """() => {
                 const meta = (name, property=false) => {
                     const selector = property ? `meta[property="${name}"]` : `meta[name="${name}"]`;
                     const node = document.querySelector(selector);
@@ -329,37 +347,40 @@ class PlatformAdapter:
                     cover: meta('og:image', true) || '',
                     body: document.body ? document.body.innerText.slice(0, 12000) : '',
                 };
-            }"""
-        metadata = await page.evaluate(metadata_script)
-        discussions: list[dict[str, Any]] = []
-        if any(name in include for name in ("comments", "replies", "danmaku")):
-            for selector, kind in self.spec.discussion_selectors:
-                if kind == "danmaku" and "danmaku" not in include:
-                    continue
-                if kind == "comment" and "comments" not in include:
-                    continue
-                if kind in {"reply", "post"} and "replies" not in include and "comments" not in include:
-                    continue
-                maximum = danmaku_limit if kind == "danmaku" else comment_limit
-                try:
-                    texts = await page.locator(selector).all_inner_texts()
-                except Exception:
-                    texts = []
-                for index, text in enumerate(texts[:maximum]):
-                    cleaned = clean_text(text, 600)
-                    if not cleaned:
+                }"""
+            metadata = await page.evaluate(metadata_script)
+            discussions: list[dict[str, Any]] = []
+            if any(name in include for name in ("comments", "replies", "danmaku")):
+                for selector, kind in self.spec.discussion_selectors:
+                    if kind == "danmaku" and "danmaku" not in include:
                         continue
-                    discussions.append(
-                        {
-                            "discussion_id": stable_fingerprint(canonical_url, kind, index, cleaned)[:32],
-                            "type": kind,
-                            "text": cleaned,
-                            "author": {"display_name": "", "fingerprint": ""},
-                            "published_at": 0,
-                            "offset_seconds": 0,
-                            "stats": {},
-                        }
-                    )
+                    if kind == "comment" and "comments" not in include:
+                        continue
+                    if kind in {"reply", "post"} and "replies" not in include and "comments" not in include:
+                        continue
+                    maximum = danmaku_limit if kind == "danmaku" else comment_limit
+                    try:
+                        texts = await page.locator(selector).all_inner_texts()
+                    except Exception:
+                        texts = []
+                    for index, text in enumerate(texts[:maximum]):
+                        cleaned = clean_text(text, 600)
+                        if not cleaned:
+                            continue
+                        discussions.append(
+                            {
+                                "discussion_id": stable_fingerprint(canonical_url, kind, index, cleaned)[:32],
+                                "type": kind,
+                                "text": cleaned,
+                                "author": {"display_name": "", "fingerprint": ""},
+                                "published_at": 0,
+                                "offset_seconds": 0,
+                                "stats": {},
+                            }
+                        )
+        finally:
+            if owned_page:
+                await page.close()
         title = clean_text(metadata.get("title"), 300)
         description = clean_text(metadata.get("description"), 4000)
         if not description:

@@ -526,6 +526,128 @@ def test_xiaoheihe_detail_read_waits_for_and_extracts_article_container() -> Non
     assert item["caption_or_body"] == "S9赛季正文，不含导航与评论"
 
 
+def test_xiaoheihe_search_waits_for_dynamic_results_and_closes_fresh_page() -> None:
+    adapters_mod = load_personification_module("plugin.personification.native_mcp.social_research.adapters")
+
+    class FakeResponse:
+        status = 200
+
+    class FakeLocator:
+        async def evaluate_all(self, _script, _options):  # noqa: ANN001, ANN201
+            return [
+                {
+                    "href": "https://xiaoheihe.cn/app/bbs/link/179364001",
+                    "title": "花来成就要注意",
+                    "text": "花来成就要注意 三角洲行动",
+                    "metricText": ["161", "408"],
+                    "cover": "",
+                }
+            ]
+
+    class FakePage:
+        def __init__(self) -> None:
+            self.waited_selector = ""
+            self.closed = False
+
+        async def goto(self, _url, **_kwargs):  # noqa: ANN001, ANN201
+            return FakeResponse()
+
+        async def wait_for_timeout(self, _milliseconds):  # noqa: ANN001, ANN201
+            return None
+
+        async def wait_for_selector(self, selector, **_kwargs):  # noqa: ANN001, ANN201
+            self.waited_selector = selector
+            return object()
+
+        async def evaluate(self, _script):  # noqa: ANN001, ANN201
+            return {"title": "小黑盒", "body": "搜索结果"}
+
+        def locator(self, _selector):  # noqa: ANN001, ANN201
+            return FakeLocator()
+
+        async def close(self) -> None:
+            self.closed = True
+
+    class FakeBrowsers:
+        def __init__(self) -> None:
+            self.fake_page = FakePage()
+
+        async def fresh_page(self, _platform):  # noqa: ANN001, ANN201
+            return self.fake_page
+
+    browsers = FakeBrowsers()
+    adapter = adapters_mod.PlatformAdapter(adapters_mod.SPECS["xiaoheihe"], browsers)
+    items = asyncio.run(adapter.search("三角洲行动 花来", limit=10, timeout_seconds=5))
+
+    assert browsers.fake_page.waited_selector == 'a[href*="/app/bbs/link/"]'
+    assert browsers.fake_page.closed is True
+    assert [item["content_id"] for item in items] == ["179364001"]
+
+
+def test_parallel_detail_reads_use_distinct_fresh_pages_and_close_them() -> None:
+    adapters_mod = load_personification_module("plugin.personification.native_mcp.social_research.adapters")
+
+    class FakeResponse:
+        status = 200
+
+    class FakePage:
+        def __init__(self) -> None:
+            self.evaluate_calls = 0
+            self.closed = False
+
+        async def goto(self, _url, **_kwargs):  # noqa: ANN001, ANN201
+            return FakeResponse()
+
+        async def wait_for_timeout(self, _milliseconds):  # noqa: ANN001, ANN201
+            await asyncio.sleep(0)
+
+        async def evaluate(self, _script):  # noqa: ANN001, ANN201
+            self.evaluate_calls += 1
+            if self.evaluate_calls == 1:
+                return {"title": "B站", "body": "视频详情"}
+            return {"title": "花来", "description": "夺舍成功", "cover": "", "body": ""}
+
+        async def close(self) -> None:
+            self.closed = True
+
+    class FakeBrowsers:
+        def __init__(self) -> None:
+            self.pages = []
+
+        async def fresh_page(self, _platform):  # noqa: ANN001, ANN201
+            page = FakePage()
+            self.pages.append(page)
+            return page
+
+    async def run():  # noqa: ANN202
+        browsers = FakeBrowsers()
+        adapter = adapters_mod.PlatformAdapter(adapters_mod.SPECS["bilibili"], browsers)
+        results = await asyncio.gather(
+            adapter.read(
+                content_id="",
+                url="https://www.bilibili.com/video/BV1abc123/",
+                include=["caption"],
+                comment_limit=0,
+                danmaku_limit=0,
+                timeout_seconds=5,
+            ),
+            adapter.read(
+                content_id="",
+                url="https://www.bilibili.com/video/BV1def456/",
+                include=["caption"],
+                comment_limit=0,
+                danmaku_limit=0,
+                timeout_seconds=5,
+            ),
+        )
+        return browsers, results
+
+    browsers, results = asyncio.run(run())
+    assert len(browsers.pages) == 2
+    assert all(page.closed for page in browsers.pages)
+    assert {item["content_id"] for item in results} == {"BV1abc123", "BV1def456"}
+
+
 def test_platform_login_selectors_cover_current_official_qr_surfaces() -> None:
     adapters_mod = load_personification_module("plugin.personification.native_mcp.social_research.adapters")
 

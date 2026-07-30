@@ -289,7 +289,7 @@ class SocialResearchService:
         if quality_mode not in QUALITY_MODES:
             raise ValueError("quality_mode is invalid")
         cache_key = json.dumps(
-            ["search", "multi_source_v1", query, platforms, content_types, limit, quality_mode, self._config],
+            ["search", "multi_source_v2_dynamic_wait", query, platforms, content_types, limit, quality_mode, self._config],
             ensure_ascii=False,
             sort_keys=True,
         )

@@ -202,6 +202,11 @@ class BrowserPool:
         pages = list(context.pages)
         return pages[0] if pages else await context.new_page()
 
+    async def fresh_page(self, platform: str, *, headless: bool = True) -> Any:
+        """Return an isolated page for one concurrent read-only operation."""
+        context = await self.context(platform, headless=headless)
+        return await context.new_page()
+
     async def close_platform(self, platform: str) -> None:
         async with self._locks[platform]:
             context = self._contexts.pop(platform, None)
