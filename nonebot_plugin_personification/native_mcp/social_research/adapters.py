@@ -213,12 +213,6 @@ class PlatformAdapter:
                 const card = node.closest('article,li,[class*=card],[class*=item],[class*=video],[class*=result]') || node.parentElement;
                 const img = card && card.querySelector('img');
                 const text = (card && card.innerText) || node.innerText || '';
-                const images = card
-                    ? Array.from(card.querySelectorAll('img')).map((item) => ({
-                        url: item.currentSrc || item.src || item.getAttribute('data-src') || '',
-                        alt: item.getAttribute('alt') || item.getAttribute('title') || '',
-                    })).filter((item) => item.url)
-                    : [];
                 const metricText = options.platform === 'xiaoheihe' && card
                     ? Array.from(card.querySelectorAll('button,[class*=stat],[class*=count],[class*=like],[class*=comment]'))
                         .map((item) => item.innerText || item.textContent || '')
@@ -230,7 +224,6 @@ class PlatformAdapter:
                     text,
                     metricText,
                     cover: img ? (img.currentSrc || img.src || img.getAttribute('data-src') || '') : '',
-                    images,
                 };
                 })""",
                 {"maxItems": limit, "platform": self.spec.name},
@@ -270,14 +263,6 @@ class PlatformAdapter:
                 "comment_count": counts[1] if self.spec.content_type == "video" and len(counts) > 1 else 0,
                 "reply_count": counts[0] if self.spec.content_type != "video" and counts else 0,
             }
-            image_urls = list(
-                dict.fromkeys(
-                    normalize_url(item.get("url"))
-                    for item in list(raw.get("images") or [])
-                    if isinstance(item, dict) and normalize_url(item.get("url"))
-                )
-            )[:6]
-            image_count_match = re.search(r"共\s*([0-9]+)\s*张", text)
             result.append(
                 {
                     "platform": self.spec.name,
@@ -287,8 +272,6 @@ class PlatformAdapter:
                     "title": title,
                     "caption_or_body": text,
                     "cover_ref": normalize_url(raw.get("cover")),
-                    "image_urls": image_urls,
-                    "image_count": max(len(image_urls), int(image_count_match.group(1)) if image_count_match else 0),
                     "author": {"display_name": "", "fingerprint": ""},
                     "published_at": 0,
                     "stats": stats,
@@ -343,15 +326,10 @@ class PlatformAdapter:
                 const title = root && root.querySelector('.link-section-title');
                 const article = root && root.querySelector('.post__content .hb-article');
                 const cover = article && article.querySelector('img');
-                const images = article ? Array.from(article.querySelectorAll('img')).map((item) => ({
-                    url: item.currentSrc || item.src || item.getAttribute('data-src') || '',
-                    alt: item.getAttribute('alt') || item.getAttribute('title') || '',
-                })).filter((item) => item.url) : [];
                 return {
                     title: title ? title.innerText : '',
                     description: article ? article.innerText : '',
                     cover: cover ? (cover.currentSrc || cover.src || '') : '',
-                    images,
                     body: '',
                 };
                 }"""
@@ -367,7 +345,6 @@ class PlatformAdapter:
                     title: meta('og:title', true) || (h1 && h1.innerText) || document.title || '',
                     description: meta('description') || meta('og:description', true) || '',
                     cover: meta('og:image', true) || '',
-                    images: [],
                     body: document.body ? document.body.innerText.slice(0, 12000) : '',
                 };
                 }"""
@@ -411,13 +388,6 @@ class PlatformAdapter:
         resolved_content_id = self.content_id(canonical_url)
         if not resolved_content_id:
             raise ValueError("content URL is not a supported content route")
-        image_urls = list(
-            dict.fromkeys(
-                normalize_url(item.get("url"))
-                for item in list(metadata.get("images") or [])
-                if isinstance(item, dict) and normalize_url(item.get("url"))
-            )
-        )[:12]
         return {
             "platform": self.spec.name,
             "content_type": self.spec.content_type,
@@ -426,8 +396,6 @@ class PlatformAdapter:
             "title": title,
             "caption_or_body": description,
             "cover_ref": normalize_url(metadata.get("cover")),
-            "image_urls": image_urls,
-            "image_count": len(image_urls),
             "author": {"display_name": "", "fingerprint": ""},
             "published_at": 0,
             "stats": {

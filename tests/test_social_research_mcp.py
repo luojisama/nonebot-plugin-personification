@@ -494,11 +494,7 @@ def test_xiaoheihe_detail_read_waits_for_and_extracts_article_container() -> Non
             return {
                 "title": "花来成就要注意",
                 "description": "S9赛季正文，不含导航与评论",
-                "cover": "https://cdn.xiaoheihe.cn/post/cover.jpg",
-                "images": [
-                    {"url": "https://cdn.xiaoheihe.cn/post/cover.jpg", "alt": "配装图"},
-                    {"url": "https://cdn.xiaoheihe.cn/post/result.jpg", "alt": "结算图"},
-                ],
+                "cover": "",
                 "body": "",
             }
 
@@ -528,11 +524,6 @@ def test_xiaoheihe_detail_read_waits_for_and_extracts_article_container() -> Non
     assert browsers.fake_page.waited_selector == ".hb-bbs-post .post__content .hb-article"
     assert item["content_id"] == "179364001"
     assert item["caption_or_body"] == "S9赛季正文，不含导航与评论"
-    assert item["image_urls"] == [
-        "https://cdn.xiaoheihe.cn/post/cover.jpg",
-        "https://cdn.xiaoheihe.cn/post/result.jpg",
-    ]
-    assert item["image_count"] == 2
 
 
 def test_xiaoheihe_search_waits_for_dynamic_results_and_closes_fresh_page() -> None:
@@ -549,11 +540,7 @@ def test_xiaoheihe_search_waits_for_dynamic_results_and_closes_fresh_page() -> N
                     "title": "花来成就要注意",
                     "text": "花来成就要注意 三角洲行动",
                     "metricText": ["161", "408"],
-                    "cover": "https://cdn.xiaoheihe.cn/post/search-cover.jpg",
-                    "images": [
-                        {"url": "https://cdn.xiaoheihe.cn/post/search-cover.jpg", "alt": "搜索缩略图"},
-                        {"url": "https://cdn.xiaoheihe.cn/post/search-extra.jpg", "alt": "第二张"},
-                    ],
+                    "cover": "",
                 }
             ]
 
@@ -595,106 +582,6 @@ def test_xiaoheihe_search_waits_for_dynamic_results_and_closes_fresh_page() -> N
     assert browsers.fake_page.waited_selector == 'a[href*="/app/bbs/link/"]'
     assert browsers.fake_page.closed is True
     assert [item["content_id"] for item in items] == ["179364001"]
-    assert items[0]["image_urls"] == [
-        "https://cdn.xiaoheihe.cn/post/search-cover.jpg",
-        "https://cdn.xiaoheihe.cn/post/search-extra.jpg",
-    ]
-    assert items[0]["image_count"] == 2
-
-
-def test_detail_read_keeps_selected_source_without_engagement_and_uses_opaque_image_refs(tmp_path: Path) -> None:
-    service_mod = load_personification_module("plugin.personification.native_mcp.social_research.service")
-
-    class FakeAdapter:
-        async def authenticated(self):  # noqa: ANN201
-            return True
-
-        async def read(self, **_kwargs):  # noqa: ANN003, ANN201
-            return {
-                **_fake_social_item("xiaoheihe", 1),
-                "caption_or_body": "作者发布的完整图文正文",
-                "cover_ref": "https://cdn.xiaoheihe.cn/post/cover.jpg",
-                "image_urls": [
-                    "https://cdn.xiaoheihe.cn/post/cover.jpg",
-                    "https://cdn.xiaoheihe.cn/post/result.jpg",
-                ],
-                "image_count": 2,
-                "stats": {"reply_count": 0, "like_count": 0},
-            }
-
-    async def run():  # noqa: ANN202
-        service = service_mod.SocialResearchService(tmp_path)
-        service._config["xiaoheihe"]["enabled"] = True
-        service.adapters["xiaoheihe"] = FakeAdapter()
-        try:
-            return await service.read(
-                {
-                    "platform": "xiaoheihe",
-                    "url": "https://xiaoheihe.cn/app/bbs/link/100001",
-                    "include": ["caption"],
-                }
-            )
-        finally:
-            await service.close()
-
-    packet = asyncio.run(run())
-    assert len(packet["items"]) == 1
-    item = packet["items"][0]
-    assert item["retained"] is False
-    assert item["caption_or_body"] == "作者发布的完整图文正文"
-    assert "image_urls" not in item
-    assert len(item["image_refs"]) == 2
-    assert item["cover_ref"] == item["image_refs"][0]
-    assert all(ref.startswith("cover_") and len(ref) == 46 for ref in item["image_refs"])
-
-
-def test_social_search_enriches_selected_xiaoheihe_card_with_author_text_and_images(tmp_path: Path) -> None:
-    service_mod = load_personification_module("plugin.personification.native_mcp.social_research.service")
-
-    class FakeAdapter:
-        async def authenticated(self):  # noqa: ANN201
-            return True
-
-        async def search(self, _query, *, limit, timeout_seconds):  # noqa: ANN001, ANN201
-            return [
-                {
-                    **_fake_social_item("xiaoheihe", 1),
-                    "caption_or_body": "搜索卡片摘要",
-                    "cover_ref": "https://cdn.xiaoheihe.cn/post/search.jpg",
-                }
-            ][:limit]
-
-        async def read(self, **_kwargs):  # noqa: ANN003, ANN201
-            return {
-                **_fake_social_item("xiaoheihe", 1),
-                "title": "作者的完整图文帖",
-                "caption_or_body": "作者正文：花来挑战的完整说明",
-                "cover_ref": "https://cdn.xiaoheihe.cn/post/full-1.jpg",
-                "image_urls": [
-                    "https://cdn.xiaoheihe.cn/post/full-1.jpg",
-                    "https://cdn.xiaoheihe.cn/post/full-2.jpg",
-                ],
-                "image_count": 2,
-                "stats": {"reply_count": 0, "like_count": 0},
-            }
-
-    async def run():  # noqa: ANN202
-        service = service_mod.SocialResearchService(tmp_path)
-        service._config["xiaoheihe"]["enabled"] = True
-        service.adapters["xiaoheihe"] = FakeAdapter()
-        try:
-            return await service.search({"query": "花来", "platforms": ["xiaoheihe"], "limit": 1})
-        finally:
-            await service.close()
-
-    packet = asyncio.run(run())
-    item = packet["items"][0]
-    assert item["detail_status"] == "ready"
-    assert item["title"] == "作者的完整图文帖"
-    assert item["caption_or_body"] == "作者正文：花来挑战的完整说明"
-    assert item["image_count"] == 2
-    assert len(item["image_refs"]) == 2
-    assert packet["aggregation"]["xiaoheihe_detail_elapsed_ms"] >= 0
 
 
 def test_parallel_detail_reads_use_distinct_fresh_pages_and_close_them() -> None:
