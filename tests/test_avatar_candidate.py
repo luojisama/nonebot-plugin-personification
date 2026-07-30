@@ -125,6 +125,44 @@ def test_pinned_redirect_resolves_each_original_host_and_keeps_relative_base() -
     assert result.final_url == "https://cdn.example.test/avatar.png?size=large"
 
 
+def test_pinned_download_applies_media_allowlist_to_initial_url_and_redirects() -> None:
+    httpx = pytest.importorskip("httpx")
+
+    async def resolver(_host, *_args, **_kwargs):  # noqa: ANN001
+        return [(2, 1, 6, "", ("93.184.216.34", 443))]
+
+    async def redirect_handler(_request):  # noqa: ANN001
+        return httpx.Response(302, headers={"location": "https://evil.example.test/stolen.png"})
+
+    def client_factory(**kwargs):  # noqa: ANN003
+        return httpx.AsyncClient(transport=httpx.MockTransport(redirect_handler), **kwargs)
+
+    allowed = lambda value: value.startswith("https://media.example.test/")
+    with pytest.raises(safe_download.SafeImageDownloadError, match="redirect is outside"):
+        asyncio.run(
+            safe_download.download_public_image(
+                "https://media.example.test/start.png",
+                max_bytes=100,
+                allowed_mimes={"image/png"},
+                resolver=resolver,
+                client_factory=client_factory,
+                url_validator=allowed,
+            )
+        )
+
+    with pytest.raises(safe_download.SafeImageDownloadError, match="outside the allowed"):
+        asyncio.run(
+            safe_download.download_public_image(
+                "https://evil.example.test/start.png",
+                max_bytes=100,
+                allowed_mimes={"image/png"},
+                resolver=resolver,
+                client_factory=client_factory,
+                url_validator=allowed,
+            )
+        )
+
+
 def test_pinned_download_rejects_proxy_and_formats_ipv6() -> None:
     with pytest.raises(safe_download.SafeImageDownloadError, match="proxies"):
         asyncio.run(safe_download.download_public_image(

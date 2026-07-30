@@ -862,6 +862,7 @@ async def run_agent(
             )
 
         turn_tool_results: list[tuple[Any, str]] = []
+        turn_tool_media_urls: list[str] = []
         for tool_call in response.tool_calls:
             stop_state.has_tool_call = True
             logger.info(f"[agent] tool_call name={tool_call.name}")
@@ -940,6 +941,28 @@ async def run_agent(
                     result=result,
                 )
             )
+            media_resolver = getattr(tool, "result_media_resolver", None) if tool is not None else None
+            if callable(media_resolver) and len(turn_tool_media_urls) < 4:
+                try:
+                    resolved_media = await _await_with_deadline(
+                        lambda: media_resolver(str(result or "")),
+                        budget_deadline,
+                    )
+                except Exception:
+                    resolved_media = []
+                for media_url in list(resolved_media or []):
+                    value = str(media_url or "").strip()
+                    if value and value not in turn_tool_media_urls:
+                        turn_tool_media_urls.append(value)
+                    if len(turn_tool_media_urls) >= 4:
+                        break
+                if resolved_media:
+                    _record_reply_trace_stage(
+                        key="agent_social_media_attached",
+                        label="社交图像证据已附加",
+                        status="ok",
+                        detail=f"tool={str(tool_call.name or '').strip()} image_count={len(turn_tool_media_urls)}",
+                    )
             stop_state.semantic_fallback_attempted = False
             direct_result = direct_tool_result_agent_result(
                 registry=registry,
@@ -964,6 +987,7 @@ async def run_agent(
                 tool_caller=tool_caller,
                 response=response,
                 results=turn_tool_results,
+                untrusted_image_urls=turn_tool_media_urls,
             )
             await _append_evidence_guidance_if_needed()
 

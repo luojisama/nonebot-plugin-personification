@@ -504,6 +504,59 @@ def test_builtin_social_agent_tool_requires_one_ready_platform(tmp_path: Path, m
         )
 
 
+def test_builtin_social_result_media_resolver_is_xiaoheihe_only_bounded_and_fail_closed(
+    tmp_path: Path, monkeypatch
+) -> None:
+    _init_store(tmp_path, monkeypatch)
+    management = load_personification_module("plugin.personification.core.mcp_management")
+    safe_download = load_personification_module("plugin.personification.core.safe_image_download")
+    registry_mod = load_personification_module("plugin.personification.agent.tool_registry")
+    config = SimpleNamespace(personification_data_dir=str(tmp_path), personification_mcp_secret_file="")
+    registry = registry_mod.ToolRegistry()
+    runtime = SimpleNamespace(plugin_config=config, runtime_bundle=SimpleNamespace(tool_registry=registry))
+    manager = management.McpRuntimeManager(runtime, registry)
+    tokens = ["cover_" + f"{index:040x}" for index in range(6)]
+    resolved_calls: list[str] = []
+    download_calls: list[str] = []
+
+    async def builtin_request(_method, params):  # noqa: ANN001
+        token = params["cover_ref"]
+        resolved_calls.append(token)
+        index = tokens.index(token)
+        if index == 3:
+            return {"platform": "xiaoheihe", "url": "https://evil.example.test/image.jpg"}
+        return {"platform": "xiaoheihe", "url": f"https://cdn.xiaoheihe.cn/post/{index}.jpg"}
+
+    async def fake_download(url, **kwargs):  # noqa: ANN001, ANN003
+        download_calls.append(url)
+        assert kwargs["max_bytes"] == 4 * 1024 * 1024
+        assert kwargs["url_validator"](url) is True
+        assert kwargs["url_validator"]("https://evil.example.test/image.jpg") is False
+        return safe_download.DownloadedImage(content=url.encode(), content_type="image/jpeg", final_url=url)
+
+    monkeypatch.setattr(manager, "builtin_request", builtin_request)
+    monkeypatch.setattr(management, "download_public_image", fake_download)
+    monkeypatch.setattr(management, "_social_image_data_url", lambda value: "data:image/jpeg;base64," + value.hex())
+    packet = {
+        "trust": "untrusted_data_only",
+        "items": [
+            {"platform": "xiaoheihe", "image_refs": tokens},
+            {"platform": "bilibili", "image_refs": ["cover_" + "f" * 40]},
+        ],
+    }
+
+    media = asyncio.run(manager._resolve_builtin_social_result_media(json.dumps(packet)))
+
+    assert resolved_calls == tokens[:4]
+    assert len(download_calls) == 3
+    assert len(media) == 3
+    assert all(value.startswith("data:image/jpeg;base64,") for value in media)
+    assert asyncio.run(manager._resolve_builtin_social_result_media("not-json")) == []
+    assert asyncio.run(
+        manager._resolve_builtin_social_result_media(json.dumps({"trust": "trusted", "items": packet["items"]}))
+    ) == []
+
+
 def test_builtin_social_result_syncs_target_and_queues_only_extra_claims(tmp_path: Path, monkeypatch) -> None:
     _init_store(tmp_path, monkeypatch)
     management = load_personification_module("plugin.personification.core.mcp_management")

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import hashlib
 import ipaddress
 import json
@@ -11,6 +12,7 @@ import stat
 import threading
 import time
 import uuid
+from io import BytesIO
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote, urlparse, urlsplit, urlunsplit
@@ -29,7 +31,7 @@ from .mcp_builtin import (
 )
 from .meme_learning_store import LearningThresholds, MemeLearningStore
 from .paths import get_data_dir
-from .safe_image_download import resolve_public_url
+from .safe_image_download import download_public_image, resolve_public_url
 from .slang_learning import BoundedSlangDiscoveryQueue, DiscoveryTask, SlangLearningPipeline
 
 
@@ -63,6 +65,53 @@ _MAX_REGISTRY_QUERY_CHARS = 1000
 _MAX_REGISTRY_CURSOR_CHARS = 16384
 _MAX_REGISTRY_INPUT_CHARS = 18000
 _SECRET_LOCK = threading.RLock()
+_SOCIAL_MEDIA_HOSTS = {
+    "bilibili": ("hdslb.com", "biliimg.com"),
+    "douyin": ("douyinpic.com", "byteimg.com", "pstatp.com"),
+    "tieba": ("tiebapic.baidu.com", "imgsa.baidu.com", "hiphotos.baidu.com"),
+    "xiaoheihe": ("xiaoheihe.cn", "heybox.cn", "max-c.com"),
+}
+_SOCIAL_IMAGE_MIMES = {"image/jpeg", "image/png", "image/webp"}
+
+
+def _social_media_url_allowed(platform: str, value: str) -> bool:
+    try:
+        parsed = urlparse(str(value or "").strip())
+    except ValueError:
+        return False
+    host = (parsed.hostname or "").lower()
+    return (
+        parsed.scheme == "https"
+        and parsed.username is None
+        and parsed.password is None
+        and any(
+            host == suffix or host.endswith("." + suffix)
+            for suffix in _SOCIAL_MEDIA_HOSTS.get(str(platform or ""), ())
+        )
+    )
+
+
+def _social_image_data_url(content: bytes) -> str:
+    try:
+        from PIL import Image, ImageOps
+
+        with Image.open(BytesIO(content)) as source:
+            if int(source.width) * int(source.height) > 40_000_000:
+                return ""
+            image = ImageOps.exif_transpose(source).convert("RGB")
+            image.thumbnail((1280, 1280))
+            encoded = b""
+            for quality in (86, 76, 66):
+                output = BytesIO()
+                image.save(output, format="JPEG", quality=quality, optimize=True)
+                encoded = output.getvalue()
+                if len(encoded) <= 900_000:
+                    break
+            if len(encoded) > 900_000:
+                return ""
+    except Exception:
+        return ""
+    return "data:image/jpeg;base64," + base64.b64encode(encoded).decode("ascii")
 
 
 def _loads(value: Any, default: Any) -> Any:
@@ -1193,6 +1242,11 @@ class McpRuntimeManager:
                                 else {}
                             ),
                         },
+                        result_media_resolver=(
+                            self._resolve_builtin_social_result_media
+                            if is_builtin_social_installation(item)
+                            else None
+                        ),
                     )
                 )
                 names.add(registered_name)
@@ -1227,6 +1281,60 @@ class McpRuntimeManager:
             if client is None or not client.is_running:
                 raise RuntimeError("builtin MCP process is unavailable")
         return await client.request(method, dict(params or {}))
+
+    async def _resolve_builtin_social_result_media(self, result: str) -> list[str]:
+        try:
+            packet = json.loads(str(result or ""))
+        except (TypeError, ValueError):
+            return []
+        if not isinstance(packet, dict) or str(packet.get("trust") or "") != "untrusted_data_only":
+            return []
+        refs: list[str] = []
+        for item in list(packet.get("items") or []):
+            if not isinstance(item, dict) or str(item.get("platform") or "") != "xiaoheihe":
+                continue
+            for ref in list(item.get("image_refs") or []):
+                token = str(ref or "").strip()
+                if re.fullmatch(r"cover_[0-9a-f]{40}", token) and token not in refs:
+                    refs.append(token)
+                if len(refs) >= 4:
+                    break
+            if len(refs) >= 4:
+                break
+        resolved: list[tuple[str, str]] = []
+        for ref in refs:
+            try:
+                value = await self.builtin_request(
+                    "personification/builtin/cover/resolve",
+                    {"cover_ref": ref},
+                )
+            except Exception:
+                continue
+            platform = str(value.get("platform") or "") if isinstance(value, dict) else ""
+            url = str(value.get("url") or "") if isinstance(value, dict) else ""
+            if platform == "xiaoheihe" and _social_media_url_allowed(platform, url):
+                resolved.append((platform, url))
+
+        async def materialize(platform: str, url: str) -> str:
+            try:
+                downloaded = await download_public_image(
+                    url,
+                    headers={"Accept": "image/jpeg,image/png,image/webp"},
+                    timeout=8,
+                    connect_timeout=4,
+                    max_bytes=4 * 1024 * 1024,
+                    allowed_mimes=_SOCIAL_IMAGE_MIMES,
+                    max_redirects=3,
+                    url_validator=lambda candidate: _social_media_url_allowed(platform, candidate),
+                )
+            except Exception:
+                return ""
+            if not _social_media_url_allowed(platform, downloaded.final_url):
+                return ""
+            return await asyncio.to_thread(_social_image_data_url, downloaded.content)
+
+        media = await asyncio.gather(*(materialize(platform, url) for platform, url in resolved))
+        return [value for value in media if value][:4]
 
     async def builtin_call_tool(self, remote_name: str, arguments: dict[str, Any] | None = None) -> str:
         allowed = {str(tool.get("name") or "") for tool in builtin_social_tools()}

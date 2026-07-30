@@ -7,6 +7,7 @@ from typing import Any, Awaitable, Callable, Dict, List, Optional
 
 ToolHandler = Callable[..., Awaitable[str]]
 EnabledChecker = Callable[[], bool]
+ResultMediaResolver = Callable[[str], Awaitable[list[str]]]
 
 
 @dataclass
@@ -19,6 +20,7 @@ class AgentTool:
     enabled: EnabledChecker = field(default=lambda: True)
     metadata: dict[str, Any] = field(default_factory=dict)
     per_session_quota: int = 0  # 0 表示无上限；M6 用
+    result_media_resolver: ResultMediaResolver | None = field(default=None, repr=False, compare=False)
 
 
 def _override_is_disabled(name: str) -> bool:

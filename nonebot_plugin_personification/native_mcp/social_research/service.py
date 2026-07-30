@@ -246,6 +246,73 @@ class SocialResearchService:
             raise RuntimeError("login_required")
         return adapter, config
 
+    def _register_item_media(self, platform: str, item: dict[str, Any]) -> None:
+        raw_cover = str(item.get("cover_ref") or "")
+        raw_images = [
+            str(value or "").strip()
+            for value in list(item.pop("image_urls", []) or [])
+            if str(value or "").strip()
+        ]
+        urls = list(dict.fromkeys([raw_cover, *raw_images]))
+        refs = [
+            ref
+            for url in urls
+            for ref in [self.covers.register(platform, url)]
+            if ref
+        ]
+        item["cover_ref"] = refs[0] if refs else ""
+        item["image_refs"] = refs[:6] if platform == "xiaoheihe" else refs[:3]
+        item["image_count"] = max(int(item.get("image_count", 0) or 0), len(raw_images))
+
+    async def _enrich_xiaoheihe_search_items(
+        self,
+        items: list[dict[str, Any]],
+    ) -> tuple[list[dict[str, Any]], list[str], int]:
+        targets = [
+            (index, item)
+            for index, item in enumerate(items)
+            if str(item.get("platform") or "") == "xiaoheihe"
+        ]
+        if not targets:
+            return items, [], 0
+        started = time.monotonic()
+
+        async def enrich(item: dict[str, Any]) -> dict[str, Any] | None:
+            try:
+                packet = await self.read(
+                    {
+                        "platform": "xiaoheihe",
+                        "url": item.get("canonical_url"),
+                        "include": ["caption"],
+                        "comment_limit": 0,
+                        "danmaku_limit": 0,
+                    }
+                )
+            except Exception:
+                return None
+            detailed_items = list(packet.get("items") or [])
+            return dict(detailed_items[0]) if detailed_items and isinstance(detailed_items[0], dict) else None
+
+        results = await asyncio.gather(*(enrich(item) for _, item in targets))
+        enriched = list(items)
+        warnings: list[str] = []
+        for (index, search_item), detailed in zip(targets, results):
+            if detailed is None:
+                fallback = dict(search_item)
+                fallback["detail_status"] = "search_card_only"
+                enriched[index] = fallback
+                warnings.append(
+                    f"detail_content_unavailable:xiaoheihe:{search_item.get('content_id', '')}"
+                )
+                continue
+            merged = dict(search_item)
+            for key in ("title", "caption_or_body", "cover_ref", "image_refs", "image_count"):
+                if detailed.get(key) not in (None, "", []):
+                    merged[key] = detailed[key]
+            merged["detail_status"] = "ready"
+            enriched[index] = merged
+        return enriched, warnings, int((time.monotonic() - started) * 1000)
+
     async def _search_platform(self, platform: str, query: str, limit: int, quality_mode: str) -> tuple[list[dict[str, Any]], dict[str, Any], int]:
         started = time.monotonic()
         adapter, base_config = await self._ready_adapter(platform)
@@ -257,7 +324,7 @@ class SocialResearchService:
         filtered = [apply_quality_filter(item, config) for item in rows]
         retained = [item for item in filtered if item["retained"]]
         for item in retained:
-            item["cover_ref"] = self.covers.register(platform, str(item.get("cover_ref") or ""))
+            self._register_item_media(platform, item)
         return retained, {
             "state": "ready",
             "elapsed_ms": int((time.monotonic() - started) * 1000),
@@ -289,7 +356,7 @@ class SocialResearchService:
         if quality_mode not in QUALITY_MODES:
             raise ValueError("quality_mode is invalid")
         cache_key = json.dumps(
-            ["search", "multi_source_v2_dynamic_wait", query, platforms, content_types, limit, quality_mode, self._config],
+            ["search", "multi_source_v3_xhh_media", query, platforms, content_types, limit, quality_mode, self._config],
             ensure_ascii=False,
             sort_keys=True,
         )
@@ -340,6 +407,12 @@ class SocialResearchService:
                 best_by_content[key] = item
         grouped_candidates = attach_source_group_ids(list(best_by_content.values()))
         packet.items = select_multi_source_items(grouped_candidates, platforms=platforms, limit=limit)
+        packet.items, detail_warnings, xiaoheihe_detail_elapsed_ms = await self._enrich_xiaoheihe_search_items(
+            packet.items
+        )
+        if detail_warnings:
+            packet.partial = True
+            packet.warnings.extend(detail_warnings)
         packet.source_groups = build_source_groups(packet.items)
         covered_platforms = list(dict.fromkeys(str(item.get("platform") or "") for item in packet.items))
         for platform in covered_platforms:
@@ -367,6 +440,7 @@ class SocialResearchService:
             "per_platform_counts": per_platform_counts,
             "coverage_status": coverage_status,
             "satisfies_request": satisfies_request,
+            "xiaoheihe_detail_elapsed_ms": xiaoheihe_detail_elapsed_ms,
         }
         value = packet.to_dict()
         self.cache.set(cache_key, value, packet.ttl_seconds)
@@ -384,7 +458,7 @@ class SocialResearchService:
         content_id = clean_text(params.get("content_id"), 300)
         url = clean_text(params.get("url"), 1000)
         cache_key = json.dumps(
-            ["read", "opaque_cover_v1", platform, content_id, url, include, comment_limit, danmaku_limit],
+            ["read", "opaque_media_v2", platform, content_id, url, include, comment_limit, danmaku_limit],
             ensure_ascii=False,
             sort_keys=True,
         )
@@ -404,9 +478,12 @@ class SocialResearchService:
             timeout=float(config["request_timeout_seconds"]) + 3,
         )
         item = apply_quality_filter(raw, config)
-        item["cover_ref"] = self.covers.register(platform, str(item.get("cover_ref") or ""))
+        self._register_item_media(platform, item)
         packet = ContentPacket(
-            items=[item] if item["retained"] or str(config.get("quality_mode")) == "ranking_only" else [],
+            # A direct detail read is already scoped to an explicitly selected
+            # source. Keep it as untrusted evidence even when detail-page
+            # engagement counters are absent; the quality flags remain visible.
+            items=[item],
             platform_statuses={platform: {"state": "ready"}},
             filtered_counts={platform: int(not item["retained"])},
             ttl_seconds=int(config["cache_ttl_seconds"]),

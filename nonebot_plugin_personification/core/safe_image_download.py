@@ -12,6 +12,7 @@ import httpx
 
 Resolver = Callable[..., Awaitable[Any]]
 ClientFactory = Callable[..., Any]
+UrlValidator = Callable[[str], bool]
 REDIRECT_STATUSES = {301, 302, 303, 307, 308}
 
 
@@ -100,11 +101,14 @@ async def download_public_image(
     proxy: str = "",
     sensitive_headers_origin: str = "",
     client_factory: ClientFactory = httpx.AsyncClient,
+    url_validator: UrlValidator | None = None,
 ) -> DownloadedImage:
     if proxy:
         raise SafeImageDownloadError("pinned image downloads do not support explicit proxies")
     current = str(url or "").strip()
     for redirect_count in range(max_redirects + 1):
+        if url_validator is not None and not url_validator(current):
+            raise SafeImageDownloadError("image URL is outside the allowed media hosts")
         original_url, approved_ip = await resolve_public_url(current, resolver=resolver)
         connection_url, host_header, sni_hostname = _pinned_request_url(original_url, approved_ip)
         request_headers = dict(headers or {})
@@ -128,6 +132,8 @@ async def download_public_image(
                     if redirect_count >= max_redirects:
                         raise SafeImageDownloadError("too many image redirects")
                     current = urljoin(original_url, location)
+                    if url_validator is not None and not url_validator(current):
+                        raise SafeImageDownloadError("image redirect is outside the allowed media hosts")
                     continue
                 if response.status_code != 200:
                     raise SafeImageDownloadError(f"image server returned HTTP {response.status_code}")
