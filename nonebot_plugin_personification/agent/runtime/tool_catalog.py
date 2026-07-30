@@ -35,8 +35,6 @@ _LIGHTWEIGHT_LOOKUP_TOOL_NAMES = frozenset(
         "recall_user_memory",
         "recall_group_memory",
         "get_user_persona",
-        "inspect_current_user_avatar",
-        "inspect_group_user_avatar_pair",
     }
 )
 _IMAGE_GENERATION_CONTEXT_TOOL_NAMES = frozenset(
@@ -84,14 +82,12 @@ _NETWORK_TOOL_NAMES = frozenset(
         "get_baike_entry",
         "get_daily_news",
         "get_ai_news",
-        "get_tech_news",
         "get_trending",
         "get_history_today",
         "get_epic_games",
         "get_gold_price",
         "get_exchange_rate",
         "weather",
-        "inspect_group_user_avatar_pair",
     }
 )
 _ADMIN_TOOL_NAMES = frozenset(
@@ -107,10 +103,6 @@ _ADMIN_TOOL_NAMES = frozenset(
     }
 )
 _MEMORY_TOOL_NAMES = frozenset({"memory_recall", "recall_user_memory", "recall_group_memory", "get_user_persona"})
-_RETRYABLE_EVIDENCE_KINDS = frozenset(
-    {"web", "resource", "plugin_knowledge", "visual_summary"}
-)
-_EVIDENCE_KINDS = _RETRYABLE_EVIDENCE_KINDS | frozenset({"memory"})
 _SEND_MESSAGE_ACTION_TOOL_NAMES = _QQ_EXPRESSION_TOOL_NAMES | frozenset(
     {
         "send_local_sticker",
@@ -138,7 +130,6 @@ def _default_tool_metadata(tool_name: str) -> dict[str, Any]:
         "risk_level": "low",
         "side_effect": "none",
         "final_behavior": "continue",
-        "ack_behavior": "send",
         "retryable": False,
     }
     if name in _ADMIN_TOOL_NAMES:
@@ -256,29 +247,6 @@ def tool_runtime_metadata(registry: ToolRegistry | None, tool_name: str) -> dict
     return metadata
 
 
-def is_retryable_evidence_tool(registry: ToolRegistry | None, tool_name: str) -> bool:
-    metadata = tool_runtime_metadata(registry, tool_name)
-    tags = _coerce_tags(metadata.get("intent_tags"))
-    evidence_kind = str(metadata.get("evidence_kind", "") or "").strip()
-    side_effect = str(metadata.get("side_effect", "none") or "none").strip()
-    return bool(
-        metadata.get("retryable", False)
-        and side_effect == "none"
-        and ("lookup" in tags or evidence_kind in _RETRYABLE_EVIDENCE_KINDS)
-    )
-
-
-def is_evidence_tool(registry: ToolRegistry | None, tool_name: str) -> bool:
-    metadata = tool_runtime_metadata(registry, tool_name)
-    tags = _coerce_tags(metadata.get("intent_tags"))
-    evidence_kind = str(metadata.get("evidence_kind", "") or "").strip()
-    side_effect = str(metadata.get("side_effect", "none") or "none").strip()
-    return bool(
-        side_effect == "none"
-        and ("lookup" in tags or "memory" in tags or evidence_kind in _EVIDENCE_KINDS)
-    )
-
-
 def tool_planner_metadata(tool: AgentTool) -> dict[str, Any]:
     metadata = tool_runtime_metadata(None, tool.name)
     metadata.update(tool.metadata or {})
@@ -293,7 +261,6 @@ def tool_planner_metadata(tool: AgentTool) -> dict[str, Any]:
         "risk_level": str(metadata.get("risk_level", "low") or "low"),
         "side_effect": str(metadata.get("side_effect", "none") or "none"),
         "final_behavior": str(metadata.get("final_behavior", "continue") or "continue"),
-        "ack_behavior": str(metadata.get("ack_behavior", "send") or "send"),
         "retryable": bool(metadata.get("retryable", False)),
         "local": bool(tool.local),
     }
@@ -339,16 +306,6 @@ def _tool_requires_image(registry: ToolRegistry, name: str) -> bool:
     return bool(metadata.get("requires_image", False)) or name in _IMAGE_REQUIRED_TOOL_NAMES
 
 
-def _tool_is_safe_runtime_capability(registry: ToolRegistry, name: str) -> bool:
-    metadata = _tool_metadata_for_name(registry, name)
-    return bool(
-        "runtime_capability" in _coerce_tags(metadata.get("intent_tags"))
-        and str(metadata.get("source_kind", "") or "").strip() == "first_party_runtime"
-        and str(metadata.get("risk_level", "low") or "low").strip() == "low"
-        and str(metadata.get("side_effect", "none") or "none").strip() == "none"
-    )
-
-
 def select_tool_schemas(
     registry: ToolRegistry,
     *,
@@ -369,10 +326,8 @@ def select_tool_schemas(
             for schema in schemas
             if (
                 schema_tool_name(schema) in _LIGHTWEIGHT_LOOKUP_TOOL_NAMES
-                or "game_slang" in _tool_tags(registry, schema_tool_name(schema))
                 or schema_tool_name(schema) in _QQ_EXPRESSION_TOOL_NAMES
                 or "expression" in _tool_tags(registry, schema_tool_name(schema))
-                or "conversation_action" in _tool_tags(registry, schema_tool_name(schema))
                 or (has_images and _tool_requires_image(registry, schema_tool_name(schema)))
             )
         ]
@@ -383,7 +338,6 @@ def select_tool_schemas(
             if (
                 schema_tool_name(schema) in _QQ_EXPRESSION_TOOL_NAMES
                 or "expression" in _tool_tags(registry, schema_tool_name(schema))
-                or "conversation_action" in _tool_tags(registry, schema_tool_name(schema))
             )
         ]
     elif effective_chat_intent == "image_generation":
@@ -398,34 +352,25 @@ def select_tool_schemas(
             )
         ]
     elif effective_chat_intent == "plugin_question":
-        effective_plugin_intent = str(plugin_question_intent or "").strip()
-        include_latest = effective_plugin_intent == "latest"
-        include_runtime_capabilities = effective_plugin_intent == "runtime_capability"
-        if include_runtime_capabilities:
-            result_schemas = [
-                schema
-                for schema in schemas
-                if _tool_is_safe_runtime_capability(registry, schema_tool_name(schema))
-            ]
-        else:
-            if has_images:
-                include_latest = True
-            result_schemas = [
-                schema
-                for schema in schemas
-                if (
-                    "plugin_local" in _tool_tags(registry, schema_tool_name(schema))
-                    or schema_tool_name(schema) in _PLUGIN_LOCAL_TOOL_NAMES
-                    or (
-                        include_latest
-                        and (
-                            "plugin_latest" in _tool_tags(registry, schema_tool_name(schema))
-                            or schema_tool_name(schema) in _PLUGIN_WEB_TOOL_NAMES
-                        )
+        include_latest = str(plugin_question_intent or "").strip() == "latest"
+        if has_images:
+            include_latest = True
+        result_schemas = [
+            schema
+            for schema in schemas
+            if (
+                "plugin_local" in _tool_tags(registry, schema_tool_name(schema))
+                or schema_tool_name(schema) in _PLUGIN_LOCAL_TOOL_NAMES
+                or (
+                    include_latest
+                    and (
+                        "plugin_latest" in _tool_tags(registry, schema_tool_name(schema))
+                        or schema_tool_name(schema) in _PLUGIN_WEB_TOOL_NAMES
                     )
-                    or (has_images and _tool_requires_image(registry, schema_tool_name(schema)))
                 )
-            ]
+                or (has_images and _tool_requires_image(registry, schema_tool_name(schema)))
+            )
+        ]
     elif has_images:
         result_schemas = list(schemas)
     else:
@@ -446,19 +391,14 @@ def semantic_tool_guidance() -> str:
         "工具使用总原则：能直接回答就别起工具；不确定、高风险、时效性强、明显需要查证时再调用工具。"
         "当当前消息包含你不认识、无法确定指代或可能有圈内含义的专有名词、角色名、作品名、游戏/动漫/卡牌术语、"
         "怪物/装备/地图名、外号、别称、缩写、谐音、空耳、梗或活动名时，如果可用工具里有 web_search、search_web、"
-        "wiki_lookup、resolve_acg_entity、research_game_slang 或 parallel_research，必须先调用合适工具查证；"
-        "游戏黑话优先使用已登录的只读社交平台 research_game_slang 做多源核验；不要凭记忆猜，也不要直接在群里问"
+        "wiki_lookup、resolve_acg_entity 或 parallel_research，必须先调用合适工具查证；不要凭记忆猜，也不要直接在群里问"
         "“这是什么梗/哪个游戏/什么意思”。"
         "当用户用“这个/这段/这角色/这动画/这张图”承接最近 ACG 角色、作品、抽卡卡面、图片或视频时，也按指代消解处理，"
         "先结合上下文查角色/作品/剧情锚点，再短句参与讨论。"
         "插件技术问题优先本地插件知识和源码工具。"
-        "如果对方询问你能否读取或理解当前发送者头像中的可观察画面事实，优先调用第一方只读 runtime_capability 工具核实，"
-        "不要用插件清单或静态源码推测当前头像事实是否可用。"
         "用户明确要求生成图片时，必须调用 generate_image，不要只给提示词。"
         "用户明确要求联网搜已有图片或壁纸并发出来时，优先调用 search_and_send_images，不要把搜索链接当最终回复。"
         "涉及本地天气、出行、城市或附近状态时，如果用户没明说地点，先看已注入的用户档案；仍不确定可调用记忆工具确认，不能猜城市。"
-        "当当前群聊确实需要比较候选成员头像时，可调用 inspect_group_user_avatar_pair；它只判断两张头像图像是否近重复、视觉配套、"
-        "可能是同一虚构角色或同一系列。视觉配套绝不表示两位用户现实中是情侣、朋友、认识或同一人，真人头像也不能用于身份或 same-person 推断。"
         "最终回复只输出纯文本，不要 markdown、项目符号列表、编号列表，也不要说正在查询、根据搜索结果或我需要确认一下。"
         "群聊接梗场景优先像群友接话，不要为了显得聪明而滥用工具。"
     )
@@ -469,8 +409,6 @@ __all__ = [
     "MAX_AGENT_MAX_STEPS",
     "MIN_AGENT_MAX_STEPS",
     "apply_tool_metadata_defaults",
-    "is_evidence_tool",
-    "is_retryable_evidence_tool",
     "normalize_agent_max_steps",
     "registry_planner_metadata",
     "schema_tool_name",

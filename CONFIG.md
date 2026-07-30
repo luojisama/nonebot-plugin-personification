@@ -565,26 +565,3 @@ personification_whitelist=["123456789","987654321"]
 | `personification_turn_trace_enabled` | `true` | 是否记录回复链路阶段 trace，供 WebUI 体检和日志排查使用。 |
 | `personification_webui_test_group_id` | `""` | 功能体检实际交互测试使用的目标群号；为空则跳过真实群聊发送。 |
 | `personification_webui_test_user_id` | `""` | 功能体检实际交互测试使用的目标 QQ；为空则跳过真实私聊发送。 |
-
-## 0.7.0 新增与补齐配置项
-
-以下字段随原生社交平台 MCP、并发回复和 Provider 认证增量同步。社交内容、评论和页面提示始终作为 `untrusted_data_only` 证据处理；这些阈值只控制聚合、学习与运行预算，不改变系统指令或人格边界。
-
-| 配置项 | 默认值 | 备注 |
-| --- | --- | --- |
-| `personification_meme_reply_probability` | `0.18` | 已决定回复后自然带入已验证低风险梗的概率；不提高随机发言概率。 |
-| `personification_slang_max_claims` | `20` | 单个社交研究数据包最多提取的独立黑话 claim 数。 |
-| `personification_auto_understand_min_sources` | `2` | 自动进入“只理解”状态所需的最少独立来源组。 |
-| `personification_auto_use_min_sources` | `3` | 自动升级为可主动使用词义所需的最少独立来源组。 |
-| `personification_auto_use_min_platforms` | `2` | 自动升级为可主动使用词义所需的平台覆盖数。 |
-| `personification_claim_min_confidence` | `0.72` | 接受黑话 claim 的最低置信度。 |
-| `personification_semantic_equivalence_min_confidence` | `0.80` | 合并语义等价 claim 的最低置信度。 |
-| `personification_reverify_after_days` | `30` | 已学习词义经过多少天后进入重新查证窗口。 |
-| `personification_stale_after_days` | `90` | 没有新鲜证据经过多少天后降级为 stale。 |
-| `personification_reply_session_concurrency` | `3` | 单个群聊或私聊 session 的并发回复上限。 |
-| `personification_reply_global_concurrency` | `12` | 所有 session 合计的并发回复上限。 |
-| `personification_mcp_registry_sources` | `[]` | 托管 MCP Registry 权威来源列表；安装前仍需校验 metadata 与审批边界。 |
-| `personification_mcp_registry_timeout` | `20` | MCP Registry discovery 和 metadata 请求超时秒数。 |
-| `personification_mcp_secret_file` | `""` | 托管 MCP secret 文件路径；敏感值不进入普通配置响应、日志和 Trace。 |
-| `personification_qzone_semantic_review_timeout` | `120.0` | QQ 空间语义审阅单次超时秒数。 |
-| `personification_gemini_auth_mode` | `"auto"` | Gemini 认证传输模式；`auto` 根据 Provider 路由选择兼容方式。 |

@@ -4,23 +4,10 @@ import re
 import time
 from typing import Any, Callable, Optional, Tuple
 
-from ..core.message_relations import (
-    build_event_relation_metadata,
-    extract_mentioned_ids,
-    extract_reply_message_id,
-)
-from ..core.message_provenance import (
-    is_human_chat_record,
-    is_personification_reply_record,
-)
+from ..core.message_relations import build_event_relation_metadata
 from ..core.group_roles import extract_sender_role
 from ..core.group_mute import is_group_muted
-from ..core.target_inference import (
-    MessageTargetDecision,
-    TARGET_BOT,
-    TARGET_OTHERS,
-    infer_message_target,
-)
+from ..core.target_inference import TARGET_BOT, TARGET_OTHERS, infer_message_target
 
 try:
     from nonebot.adapters.onebot.v11 import Event
@@ -28,6 +15,27 @@ try:
 except Exception:  # pragma: no cover - fallback for lightweight unit-test stubs
     Event = Any
     T_State = dict[str, Any]
+
+
+def _normalize_topic_text(text: Any) -> str:
+    normalized = str(text or "").strip().lower()
+    return "".join(ch for ch in normalized if ch.isalnum() or "\u4e00" <= ch <= "\u9fff")
+
+
+def _topic_related(message_text: str, topic: str) -> bool:
+    normalized_text = _normalize_topic_text(message_text)
+    normalized_topic = _normalize_topic_text(topic)
+    if len(normalized_text) < 2 or len(normalized_topic) < 2:
+        return False
+    if normalized_topic in normalized_text or normalized_text in normalized_topic:
+        return True
+
+    max_span = min(6, len(normalized_topic))
+    for span in range(max_span, 1, -1):
+        for start in range(0, len(normalized_topic) - span + 1):
+            if normalized_topic[start : start + span] in normalized_text:
+                return True
+    return False
 
 
 def _detect_solo_speaker_follow(
@@ -50,7 +58,7 @@ def _detect_solo_speaker_follow(
     ]
     if not recent_window:
         return {}
-    recent_non_bot = [msg for msg in recent_window if is_human_chat_record(msg)]
+    recent_non_bot = [msg for msg in recent_window if not bool(msg.get("is_bot"))]
     if len(recent_non_bot) < 3:
         return {}
     tail = recent_non_bot[-4:]
@@ -59,10 +67,19 @@ def _detect_solo_speaker_follow(
         return {}
     if str(tail[-1].get("user_id", "") or "").strip() != current_user:
         return {}
-    if any(is_personification_reply_record(msg) for msg in recent_window[-6:]):
+    if any(bool(msg.get("is_bot")) for msg in recent_window[-6:]):
         return {}
 
     topic_seed = str(same_user_msgs[-1].get("content", "") or "").strip()
+    if current_text:
+        topic_match = any(
+            _topic_related(current_text, str(msg.get("content", "") or "").strip())
+            or _topic_related(str(msg.get("content", "") or "").strip(), current_text)
+            for msg in same_user_msgs[-3:]
+        )
+        if not topic_match and topic_seed and not _topic_related(current_text, topic_seed):
+            return {}
+
     return {
         "user_id": current_user,
         "count": len(same_user_msgs),
@@ -89,35 +106,12 @@ async def personification_rule(
     group_chat_follow_probability: float,
     looks_like_private_command: Callable[[str], bool],
     get_recent_group_msgs: Optional[Callable[[str, int], list[dict]]] = None,
-    user_policy_gate: Any = None,
 ) -> bool:
     # plugin_invoker 代为执行其它插件命令时会用 handle_event 重新分发合成事件，
     # 这里短路，避免合成事件再次进入拟人回复流程造成递归。
     if getattr(event, "_personification_synthetic", False):
         return False
     user_id = str(event.user_id)
-
-    if user_policy_gate is not None:
-        decision = await user_policy_gate.evaluate(
-            event,
-            bot_self_id=str(getattr(event, "self_id", "") or ""),
-        )
-        state["user_policy_decision"] = decision.to_dict()
-        if not decision.allow_normal_processing:
-            if isinstance(event, private_event_cls) and looks_like_private_command(
-                event.get_plaintext()
-            ):
-                return False
-            if isinstance(event, group_event_cls):
-                group_id = str(event.group_id)
-                if not is_group_whitelisted(group_id, plugin_whitelist):
-                    return False
-                if is_group_muted(group_id):
-                    return False
-            if decision.disposition == "direct_closure_candidate":
-                decision = await user_policy_gate.claim_direct_closure(decision)
-                state["user_policy_decision"] = decision.to_dict()
-            return decision.disposition == "direct_closure"
 
     if sign_in_available:
         user_data = get_user_data(user_id)
@@ -192,17 +186,9 @@ async def personification_rule(
         except Exception as e:
             logger.warning(f"拟人插件: 检查名字提及失败: {e}")
 
-        _, explicitly_at_bot = extract_mentioned_ids(
-            getattr(event, "message", []) or [],
-            bot_self_id=str(getattr(event, "self_id", "") or ""),
-        )
-        adapter_direct_without_reply = bool(event.to_me) and not extract_reply_message_id(event)
-        if explicitly_at_bot or adapter_direct_without_reply or is_name_mentioned:
+        if event.to_me or is_name_mentioned:
             state["is_random_chat"] = False
             state["message_target"] = TARGET_BOT
-            state["message_target_reason"] = (
-                "explicit_persona_mention" if explicitly_at_bot or adapter_direct_without_reply else "persona_name_mention"
-            )
             return True
 
         plain_text = str(event.get_plaintext() or "").strip()
@@ -216,17 +202,12 @@ async def personification_rule(
                 recent_msgs = get_recent_group_msgs(group_id, 8)
             except Exception:
                 recent_msgs = []
-            target_decision = infer_message_target(
+            message_target = infer_message_target(
                 event,
                 bot_self_id=str(getattr(event, "self_id", "") or ""),
                 recent_group_msgs=recent_msgs,
             )
-            if isinstance(target_decision, MessageTargetDecision):
-                state.update(target_decision.trace_fields())
-                message_target = target_decision.target
-            else:
-                message_target = str(target_decision or "")
-                state["message_target"] = message_target
+            state["message_target"] = message_target
         else:
             message_target = state.get("message_target", "")
 
@@ -244,22 +225,17 @@ async def personification_rule(
 
         if group_chat_active_state:
             last_user_id = str(group_chat_active_state.get("last_user_id", "") or "").strip()
+            topic = str(group_chat_active_state.get("topic", "") or "").strip()
             same_user = bool(last_user_id) and last_user_id == user_id
+            related_topic = _topic_related(plain_text, topic)
             current_prob = float(max(0.0, min(1.0, group_chat_follow_probability)))
 
-            recent_bot_participated = any(
-                is_personification_reply_record(
-                    msg,
-                    str(getattr(event, "self_id", "") or ""),
-                )
-                for msg in recent_msgs[-4:]
-            )
-            if message_target == TARGET_OTHERS:
-                current_prob = 0.0
-            elif message_target == TARGET_BOT:
+            if same_user:
                 current_prob = max(current_prob, 0.95)
-            elif same_user and recent_bot_participated:
+            elif related_topic:
                 current_prob = max(current_prob, 0.84)
+            elif message_target == TARGET_OTHERS:
+                current_prob = 0.0
             else:
                 current_prob *= 0.35
 
@@ -293,7 +269,11 @@ async def personification_rule(
         elif msg_len >= 24:
             current_prob *= 1.2
         if idle_active_state:
-            current_prob = min(1.0, max(current_prob, probability * 0.9))
+            topic = str(idle_active_state.get("topic", "") or "").strip()
+            if topic and _topic_related(plain_text, topic):
+                current_prob = min(1.0, max(current_prob, probability * 0.9))
+            else:
+                current_prob = min(current_prob, probability * 0.8)
         if random.random() < min(1.0, current_prob):
             state["is_random_chat"] = True
             return True
@@ -308,17 +288,9 @@ async def personification_rule(
     return False
 
 
-async def record_msg_rule(_event: Event, *, user_policy_gate: Any = None) -> bool:
+async def record_msg_rule(_event: Event) -> bool:
     if getattr(_event, "_personification_synthetic", False):
         return False
-    if not str(getattr(_event, "group_id", "") or "").strip():
-        return False
-    if user_policy_gate is not None:
-        decision = await user_policy_gate.evaluate(
-            _event,
-            bot_self_id=str(getattr(_event, "self_id", "") or ""),
-        )
-        return decision.allow_normal_processing
     return True
 
 
@@ -479,17 +451,9 @@ async def sticker_chat_rule(
     is_group_whitelisted: Callable[[str, list[str]], bool],
     plugin_whitelist: list[str],
     probability: float,
-    user_policy_gate: Any = None,
 ) -> bool:
     if getattr(event, "_personification_synthetic", False):
         return False
-    if user_policy_gate is not None:
-        decision = await user_policy_gate.evaluate(
-            event,
-            bot_self_id=str(getattr(event, "self_id", "") or ""),
-        )
-        if not decision.allow_normal_processing:
-            return False
     if event.to_me:
         return False
     group_id = str(event.group_id)
@@ -504,11 +468,8 @@ async def poke_rule(
     is_group_whitelisted: Callable[[str, list[str]], bool],
     plugin_whitelist: list[str],
     probability: float,
-    user_policy_gate: Any = None,
 ) -> bool:
     if getattr(event, "_personification_synthetic", False):
-        return False
-    if user_policy_gate is not None and not await user_policy_gate.allows_current(event):
         return False
     target_id = getattr(event, "target_id", None)
     self_id = getattr(event, "self_id", None)
@@ -532,13 +493,10 @@ async def poke_notice_rule(
     plugin_whitelist: list[str],
     probability: float,
     logger: Any,
-    user_policy_gate: Any = None,
 ) -> bool:
     notice_type = str(getattr(event, "notice_type", "") or "").strip().lower()
     sub_type = str(getattr(event, "sub_type", "") or "").strip().lower()
     if notice_type != "notify" or sub_type != "poke":
-        return False
-    if user_policy_gate is not None and not await user_policy_gate.allows_current(event):
         return False
 
     target_id = getattr(event, "target_id", None)

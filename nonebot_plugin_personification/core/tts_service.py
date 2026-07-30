@@ -12,8 +12,6 @@ from typing import Any, Callable, Sequence
 
 import httpx
 
-from .qq_outbound import build_outbound_context
-
 
 STYLE_TAG_RE = re.compile(r"^\s*<style>(.*?)</style>\s*", re.IGNORECASE | re.DOTALL)
 AUDIO_STYLE_PREFIX_RE = re.compile(r"^\s*(?:\([^)]{1,80}\)|（[^）]{1,80}）|\[[^\]]{1,80}\])")
@@ -100,14 +98,12 @@ class TtsService:
         get_http_client: Callable[[], httpx.AsyncClient],
         data_dir: Path,
         style_planner: Callable[[list[dict[str, Any]]], Any] | None = None,
-        qq_outbound_ledger: Any | None = None,
     ) -> None:
         self.plugin_config = plugin_config
         self.logger = logger
         self.get_http_client = get_http_client
         self.cache_dir = data_dir / "tts_cache"
         self.style_planner = style_planner
-        self.qq_outbound_ledger = qq_outbound_ledger
 
     def is_enabled(self) -> bool:
         return bool(getattr(self.plugin_config, "personification_tts_enabled", False)) and bool(
@@ -614,12 +610,6 @@ class TtsService:
         group_style: str | None = None,
         persona_tts: dict[str, str] | None = None,
         pause_range: tuple[float, float] = (0.8, 1.4),
-        on_delivery_started: Callable[[], None] | None = None,
-        on_delivery_confirmed: Callable[[], None] | None = None,
-        on_delivery_unknown: Callable[[], None] | None = None,
-        operation_id: str | None = None,
-        user_target: str | None = None,
-        surface: str = "reply_tts",
     ) -> bool:
         audio_files = await self.synthesize(
             text,
@@ -638,36 +628,8 @@ class TtsService:
         if not audio_files:
             return False
 
-        resolved_operation_id = str(operation_id or "").strip()
-        resolved_user_target = str(user_target or "").strip()
         for index, audio_file in enumerate(audio_files):
-            message = message_segment_cls.record(audio_file.absolute().as_uri())
-
-            async def _send_record() -> Any:
-                if on_delivery_started is not None:
-                    on_delivery_started()
-                return await bot.send(event, message)
-
-            if self.qq_outbound_ledger is None:
-                await _send_record()
-                confirmed = True
-            else:
-                context = build_outbound_context(
-                    bot=bot,
-                    event=event,
-                    surface=surface,
-                    operation_id=resolved_operation_id,
-                    user_target=resolved_user_target,
-                )
-                resolved_operation_id = context.operation_id
-                receipt = await self.qq_outbound_ledger.dispatch(context, message, _send_record)
-                confirmed = receipt.status == "sent"
-            if confirmed and on_delivery_confirmed is not None:
-                on_delivery_confirmed()
-            elif not confirmed:
-                if on_delivery_unknown is not None:
-                    on_delivery_unknown()
-                break
+            await bot.send(event, message_segment_cls.record(audio_file.absolute().as_uri()))
             if index < len(audio_files) - 1:
                 await asyncio.sleep(random.uniform(*pause_range))
         return True

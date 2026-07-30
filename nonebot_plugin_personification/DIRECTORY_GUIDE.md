@@ -133,8 +133,6 @@ isolation:
 
 ### MCP 示例
 
-下面是随 Skill 声明的 legacy MCP 配置，适合已经由服务器管理员部署好的本地命令：
-
 ```yaml
 name: ext_mcp_tools
 description: 通过 MCP 暴露外部工具
@@ -147,17 +145,6 @@ mcp:
   name_prefix: ext_
   timeout: 20
 ```
-
-WebUI Skill 页面另有托管 MCP 工作流：
-
-- 搜索 Official MCP Registry，或 `personification_mcp_registry_sources` 配置的兼容 HTTPS Registry。
-- 首版只支持 npm/npx、PyPI/uvx 的 stdio package，并要求精确版本。
-- package metadata digest 绑定管理员确认；Registry 在确认后发生变化时拒绝安装。
-- Secret 只支持环境变量，独立写入受限 Secret 文件；Secret package argument 会被拒绝，避免进入 OS argv。
-- `readOnlyHint` 等 tool annotation 仅展示为 publisher 声明，不作为自动授权；所有 tool 预检后默认关闭，必须逐项确认启用。
-- 未启用任何 tool 时预检进程会退出；启用后 runtime 复用 persistent stdio client，reload/shutdown 会串行停止旧进程。
-
-项目内置 MCP 不走外部 Registry 安装流程。`builtin_social_platform_research` 的可信清单和固定启动元数据在 `core/mcp_builtin.py`，宿主生命周期与 Agent 注册在 `core/mcp_management.py`，独立 stdio 服务位于 `native_mcp/social_research/`；WebUI 通过 `webui/routes/mcp_routes.py` 调用不暴露给 Agent 的登录/配置 JSON-RPC。多梗结构化提取、内容簇去重和后台队列在 `core/slang_learning.py`，多义状态机与审计在 `core/meme_learning_store.py`，回复内 18% 玩梗资格在 `core/meme_reply_policy.py`。详细安全与运维说明见 `SOCIAL_RESEARCH_MCP.md`。
 
 ## 调用策略建议
 

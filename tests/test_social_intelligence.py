@@ -5,7 +5,6 @@ import importlib
 import sys
 import tempfile
 from pathlib import Path
-from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock
 
@@ -25,7 +24,6 @@ ds_mod = load_personification_module("plugin.personification.core.data_store")
 framework = _load_si_submodule("framework")
 quota = _load_si_submodule("quota")
 gate = _load_si_submodule("gate")
-builtin_hooks = load_personification_module("plugin.personification.core.builtin_hooks")
 
 
 # ========== framework ==========
@@ -55,147 +53,6 @@ def test_register_same_name_overwrites() -> None:
     triggers = framework.list_social_triggers()
     assert len(triggers) == 1
     assert triggers[0].schedule_args == {"hour": 9}
-
-
-@pytest.mark.parametrize(("status", "expected"), [("sent", True), ("unknown", False)])
-def test_social_outbound_requires_strict_ledger_confirmation(status: str, expected: bool) -> None:
-    captured: dict[str, Any] = {}
-
-    class _Ledger:
-        async def dispatch(self, context, content, send):  # noqa: ANN001, ANN202
-            captured["context"] = context
-            captured["content"] = content
-            await send()
-            return SimpleNamespace(status=status)
-
-    class _Bot:
-        self_id = "bot-social"
-
-        async def send_private_msg(self, **kwargs):  # noqa: ANN003, ANN202
-            captured["send"] = kwargs
-            return {"message_id": "social-message-1"}
-
-    ctx = framework.SocialContext(
-        plugin_config=SimpleNamespace(),
-        logger=MagicMock(),
-        get_bots=lambda: {},
-        get_whitelisted_groups=lambda: [],
-        tool_caller=None,
-        persona_store=None,
-        data_dir=None,
-        get_now=lambda: None,
-        qq_outbound_ledger=_Ledger(),
-    )
-
-    confirmed = asyncio.run(
-        framework.dispatch_social_outbound(
-            ctx,
-            bot=_Bot(),
-            conversation_kind="private",
-            conversation_id="10001",
-            surface="social_greeting",
-            content="hello",
-            user_target="10001",
-        )
-    )
-
-    assert confirmed is expected
-    assert captured["send"] == {"user_id": 10001, "message": "hello"}
-    assert captured["context"].bot_id == "bot-social"
-    assert captured["context"].conversation_id == "10001"
-    assert captured["context"].surface == "social_greeting"
-
-
-def test_social_text_agent_injects_complete_runtime_persona_once(monkeypatch) -> None:  # noqa: ANN001
-    agent_bridge = load_personification_module("plugin.personification.core.agent_bridge")
-    captured: dict[str, Any] = {}
-
-    async def _agent(**kwargs):  # noqa: ANN003, ANN202
-        captured.update(kwargs)
-        return "随手来问一句"
-
-    monkeypatch.setattr(agent_bridge, "run_text_agent", _agent)
-    persona = {
-        "name": "小满",
-        "system": (
-            "你是小满本人。\n\n"
-            "=== 轻量工具约束（对用户不可见）===\n你首先是群聊成员。"
-        ),
-        "persona_profile": {
-            "identity_rules": ["不脱离角色"],
-            "style_rules": ["说话短一点"],
-        },
-    }
-    ctx = framework.SocialContext(
-        plugin_config=SimpleNamespace(personification_agent_enabled=True),
-        logger=MagicMock(),
-        get_bots=lambda: {},
-        get_whitelisted_groups=lambda: [],
-        tool_caller=object(),
-        persona_store=None,
-        data_dir=None,
-        get_now=lambda: None,
-        load_prompt=lambda _group_id: persona,
-        tool_registry=object(),
-    )
-
-    result = asyncio.run(
-        framework.run_social_text_agent(
-            ctx,
-            messages=[{"role": "user", "content": "生成一条问候"}],
-            trigger_reason="social_morning_greeting",
-        )
-    )
-
-    assert result == "随手来问一句"
-    assert captured["surface"] == "social_morning_greeting"
-    assert captured["output_kind"].value == "persona_text"
-    system_messages = [
-        str(message.get("content", ""))
-        for message in captured["messages"]
-        if message.get("role") == "system"
-    ]
-    assert len(system_messages) == 1
-    assert "角色名：小满" in system_messages[0]
-    assert "你是小满本人" in system_messages[0]
-    assert "不脱离角色" in system_messages[0]
-    assert "说话短一点" in system_messages[0]
-    assert "你首先是群聊成员" not in system_messages[0]
-    assert "PERSONIFICATION_UNTRUSTED_DATA_GUARD_V1" in system_messages[0]
-
-
-def test_social_text_agent_requires_runtime_persona_loader(monkeypatch) -> None:  # noqa: ANN001
-    agent_bridge = load_personification_module("plugin.personification.core.agent_bridge")
-    called = False
-
-    async def _agent(**_kwargs):  # noqa: ANN003
-        nonlocal called
-        called = True
-        return "不应生成"
-
-    monkeypatch.setattr(agent_bridge, "run_text_agent", _agent)
-    ctx = framework.SocialContext(
-        plugin_config=SimpleNamespace(personification_agent_enabled=True),
-        logger=MagicMock(),
-        get_bots=lambda: {},
-        get_whitelisted_groups=lambda: [],
-        tool_caller=object(),
-        persona_store=None,
-        data_dir=None,
-        get_now=lambda: None,
-        tool_registry=object(),
-    )
-
-    result = asyncio.run(
-        framework.run_social_text_agent(
-            ctx,
-            messages=[{"role": "user", "content": "生成问候"}],
-            trigger_reason="social_morning_greeting",
-        )
-    )
-
-    assert result == ""
-    assert called is False
 
 
 # ========== quota ==========
@@ -342,7 +199,7 @@ def test_gate_parses_json_with_markdown_fence() -> None:
         )
     )
     assert allow is True
-    assert rewritten is None
+    assert rewritten == "你好啊"
 
 
 def test_gate_parses_json_inside_prose() -> None:
@@ -362,34 +219,6 @@ def test_gate_parses_json_inside_prose() -> None:
     )
     assert allow is True
     assert rewritten is None
-
-
-def test_gate_agent_is_structured_and_cannot_rewrite_draft(monkeypatch) -> None:  # noqa: ANN001
-    agent_bridge = load_personification_module("plugin.personification.core.agent_bridge")
-    captured: dict = {}
-
-    async def _agent(**kwargs):  # noqa: ANN003, ANN202
-        captured.update(kwargs)
-        return '{"allow":true,"reason":"时机合适","rewritten":"替换正文"}'
-
-    monkeypatch.setattr(agent_bridge, "run_text_agent", _agent)
-    allow, rewritten, reason = asyncio.run(
-        gate.gate_should_send(
-            tool_caller=object(),
-            plugin_config=SimpleNamespace(personification_agent_enabled=True),
-            tool_registry=object(),
-            logger=MagicMock(),
-            scenario="morning",
-            user_id="u",
-            draft="保留这条初稿",
-        )
-    )
-
-    assert allow is True
-    assert rewritten is None
-    assert reason == "时机合适"
-    assert captured["structured_output"] is True
-    assert '"rewritten"' not in captured["messages"][0]["content"]
 
 
 # ========== news_push ==========
@@ -422,54 +251,6 @@ def test_news_push_early_returns_when_scenario_disabled() -> None:
     ctx.get_bots.assert_not_called()
 
 
-@pytest.mark.parametrize(
-    ("agent_enabled", "tool_registry"),
-    [(False, object()), (True, None)],
-)
-def test_greeting_direct_model_fallback_blocks_visible_policy_output(
-    monkeypatch, agent_enabled: bool, tool_registry: object | None
-) -> None:
-    greetings = _load_si_submodule("scenarios.greetings")
-    sent: list[str] = []
-
-    class _Bot:
-        async def send_private_msg(self, *, user_id, message):  # noqa: ANN001, ANN201
-            sent.append(str(message))
-
-    class _Caller:
-        async def chat_with_tools(self, *_args, **_kwargs):  # noqa: ANN002, ANN003
-            return SimpleNamespace(content="provider 安全策略已拦截，请稍后再试")
-
-    class _PersonaStore:
-        def list_core_profiles(self):  # noqa: ANN201
-            return [{"user_id": "10001", "profile_text": "熟悉的朋友", "updated_at": 1}]
-
-    ctx = framework.SocialContext(
-        plugin_config=SimpleNamespace(
-            personification_agent_enabled=agent_enabled,
-            personification_social_intelligence_enabled=True,
-            personification_social_daily_quota_per_user=2,
-            personification_social_greeting_cooldown_seconds=0,
-            personification_social_greeting_max_recipients=1,
-            personification_social_gate_enabled=False,
-            personification_persona_snippet_max_chars=150,
-        ),
-        logger=MagicMock(),
-        get_bots=lambda: {"bot": _Bot()},
-        get_whitelisted_groups=lambda: [],
-        tool_caller=_Caller(),
-        tool_registry=tool_registry,
-        persona_store=_PersonaStore(),
-        data_dir=None,
-        get_now=lambda: None,
-    )
-    monkeypatch.setattr(greetings, "is_quota_exceeded", lambda *_args, **_kwargs: False)
-
-    asyncio.run(greetings.morning_greetings_handler(ctx))
-
-    assert sent == []
-
-
 # ========== pending_topics & topic_extractor ==========
 
 pending_topics_mod = _load_si_submodule("pending_topics")
@@ -479,94 +260,16 @@ topic_extractor = _load_si_submodule("topic_extractor")
 def test_prefilter_rejects_short_or_irrelevant_text() -> None:
     assert topic_extractor.pre_filter("") is False
     assert topic_extractor.pre_filter("好") is False
-    assert topic_extractor.pre_filter("今天天气真好") is True
+    assert topic_extractor.pre_filter("今天天气真好") is False
     # 太长（>400）也跳过
     assert topic_extractor.pre_filter("x" * 401) is False
 
 
-def test_prefilter_accepts_all_structurally_bounded_text_without_keyword_semantics() -> None:
+def test_prefilter_accepts_future_promise_keywords() -> None:
     assert topic_extractor.pre_filter("我下周三要去上海出差") is True
     assert topic_extractor.pre_filter("明天有个面试，紧张") is True
     assert topic_extractor.pre_filter("打算周末搬家") is True
     assert topic_extractor.pre_filter("过几天就出差了") is True
-    assert topic_extractor.pre_filter("这只是普通闲聊") is True
-
-
-def test_topic_extractor_agent_requests_structured_output(monkeypatch) -> None:  # noqa: ANN001
-    agent_bridge = load_personification_module("plugin.personification.core.agent_bridge")
-    captured: dict = {}
-
-    async def _agent(**kwargs):  # noqa: ANN003, ANN202
-        captured.update(kwargs)
-        return (
-            '{"is_pending":true,"topic":"明天参加面试","time_hint":"2026-07-19T09:00:00",'
-            '"raw_quote":"明天有个面试","confidence":0.9}'
-        )
-
-    monkeypatch.setattr(agent_bridge, "run_text_agent", _agent)
-    result = asyncio.run(
-        topic_extractor.extract_pending_topic(
-            "明天有个面试",
-            tool_caller=object(),
-            plugin_config=SimpleNamespace(personification_agent_enabled=True),
-            tool_registry=object(),
-            logger=MagicMock(),
-        )
-    )
-
-    assert result is not None
-    assert result["topic"] == "明天参加面试"
-    assert captured["structured_output"] is True
-    assert captured["tool_profile"] == "none"
-
-
-def test_pending_topic_hook_uses_semantic_frame_instead_of_text_keywords(monkeypatch) -> None:  # noqa: ANN001
-    called = asyncio.Event()
-
-    async def _extract(*_args, **_kwargs):  # noqa: ANN002, ANN003
-        called.set()
-        return None
-
-    monkeypatch.setattr(topic_extractor, "extract_pending_topic", _extract)
-    builtin_hooks._PENDING_TOPIC_TASKS.clear()
-    base = dict(
-        is_private=True,
-        plugin_config=SimpleNamespace(
-            personification_social_intelligence_enabled=True,
-            personification_social_topic_followup_enabled=True,
-            personification_agent_max_steps=4,
-        ),
-        message_text="明天有个面试",
-        message_content="",
-        runtime=SimpleNamespace(
-            agent_tool_caller=object(),
-            tool_registry=object(),
-            logger=MagicMock(),
-        ),
-        user_id="10001",
-    )
-
-    async def _run() -> None:
-        rejected = SimpleNamespace(
-            **base,
-            semantic_frame=SimpleNamespace(future_commitment_candidate=False),
-        )
-        assert await builtin_hooks._pending_topic_extract_hook(rejected) is None
-        await asyncio.sleep(0)
-        assert called.is_set() is False
-
-        accepted = SimpleNamespace(
-            **{
-                **base,
-                "message_text": "这句话本身没有任何固定关键词",
-                "semantic_frame": SimpleNamespace(future_commitment_candidate=True),
-            }
-        )
-        assert await builtin_hooks._pending_topic_extract_hook(accepted) is None
-        await asyncio.wait_for(called.wait(), timeout=1.0)
-
-    asyncio.run(_run())
-    builtin_hooks._PENDING_TOPIC_TASKS.clear()
 
 
 def test_pending_topic_add_and_list() -> None:

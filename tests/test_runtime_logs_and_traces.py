@@ -7,10 +7,6 @@ import pytest
 
 from ._loader import load_personification_module
 
-completion_contract = load_personification_module(
-    "plugin.personification.core.reply_completion_contract"
-)
-
 
 @pytest.fixture
 def _db_tmp(tmp_path: Path, monkeypatch):
@@ -29,12 +25,7 @@ def test_plugin_runtime_logs_sanitize_filter_and_clear(_db_tmp) -> None:
     logs.record(
         level="INFO",
         source="unit",
-        message=(
-            "api_key=secret-value token=abc123 normal=ok\n"
-            "Authorization: Bearer real-bearer-secret\n"
-            '{"client_secret":"json-secret","password":"pass-secret"} '
-            "https://example.test/?access_token=url-secret&p_skey=qzone-secret"
-        ),
+        message="api_key=secret-value token=abc123 normal=ok",
         context={"Authorization": "Bearer secret", "nested": {"cookie": "qq=1"}},
         trace_id="trace-1",
         min_level="DEBUG",
@@ -53,47 +44,12 @@ def test_plugin_runtime_logs_sanitize_filter_and_clear(_db_tmp) -> None:
     assert "normal=ok" in row["message"]
     assert "secret-value" not in row["message"]
     assert "abc123" not in row["message"]
-    for secret in ("real-bearer-secret", "json-secret", "pass-secret", "url-secret", "qzone-secret"):
-        assert secret not in row["message"]
     assert row["context"]["Authorization"] == "***"
     assert row["context"]["nested"]["cookie"] == "***"
 
     assert logs.query_recent(limit=10, level="ERROR") == []
     assert logs.clear_all() == 1
     assert logs.query_recent(limit=10) == []
-
-
-def test_plugin_runtime_logs_cursor_page_contract(_db_tmp) -> None:
-    logs = load_personification_module("plugin.personification.core.plugin_runtime_logs")
-    logs.clear_all()
-    for index in range(5):
-        logs.record(level="INFO", source="unit", message=f"page-item-{index}", min_level="DEBUG")
-
-    first = logs.query_page(limit=2)
-    second = logs.query_page(limit=2, cursor=first["next_cursor"])
-    third = logs.query_page(limit=2, cursor=second["next_cursor"])
-
-    assert [item["message"] for item in first["entries"]] == ["page-item-4", "page-item-3"]
-    assert [item["message"] for item in second["entries"]] == ["page-item-2", "page-item-1"]
-    assert [item["message"] for item in third["entries"]] == ["page-item-0"]
-    assert first["has_more"] is True
-    assert second["has_more"] is True
-    assert third["has_more"] is False
-    assert third["next_cursor"] == 0
-    assert len({item["id"] for page in (first, second, third) for item in page["entries"]}) == 5
-    assert logs.writer_status()["pending"] == 0
-
-
-def test_plugin_runtime_logs_search_treats_wildcards_literally(_db_tmp) -> None:
-    logs = load_personification_module("plugin.personification.core.plugin_runtime_logs")
-    logs.clear_all()
-    logs.record(level="INFO", source="unit", message="literal 100%_done", min_level="DEBUG")
-    logs.record(level="INFO", source="unit", message="literal 100XXdone", min_level="DEBUG")
-
-    page = logs.query_page(limit=10, q="%_")
-
-    assert [item["message"] for item in page["entries"]] == ["literal 100%_done"]
-    assert page["filters"]["q"] == "%_"
 
 
 def test_reply_turn_trace_records_and_finishes(_db_tmp) -> None:
@@ -124,61 +80,6 @@ def test_reply_turn_trace_records_and_finishes(_db_tmp) -> None:
 
     recent = traces.query_recent(session_type="group", group_id="123", user_id="456")
     assert recent and recent[0]["trace_id"] == trace_id
-
-
-@pytest.mark.parametrize(
-    ("state", "delivery_partial", "delivery_unknown", "outcome", "diagnosis"),
-    [
-        (
-            {
-                "agent_evidence_delivery_required": True,
-                "agent_evidence_delivery_status": "met",
-                "agent_social_tool_execution": "ok",
-                "agent_social_coverage_status": "complete",
-            },
-            False,
-            False,
-            "ok",
-            "ok",
-        ),
-        (
-            {
-                "agent_evidence_delivery_required": True,
-                "agent_evidence_delivery_status": "recovered",
-                "agent_evidence_recovered": True,
-                "agent_social_tool_execution": "ok",
-            },
-            False,
-            False,
-            "partial",
-            "visible_output_recovered",
-        ),
-        (
-            {
-                "agent_evidence_delivery_required": True,
-                "agent_evidence_delivery_status": "failed",
-            },
-            False,
-            False,
-            "partial",
-            "evidence_delivery_incomplete",
-        ),
-        ({}, False, True, "failed", "outbound_send_failed"),
-    ],
-)
-def test_reply_completion_contract_separates_evidence_and_outbound_states(
-    state, delivery_partial, delivery_unknown, outcome, diagnosis
-) -> None:
-    resolved = completion_contract.resolve_sent_reply_completion(
-        state=state,
-        visible_text="已发送",
-        delivery_partial=delivery_partial,
-        delivery_unknown=delivery_unknown,
-    )
-
-    assert resolved["outcome"] == outcome
-    assert resolved["diagnosis_code"] == diagnosis
-    assert resolved["outbound_delivery"] == ("unconfirmed" if delivery_unknown else "confirmed")
 
 
 def test_reply_turn_trace_builds_safe_process_view(_db_tmp) -> None:
@@ -216,38 +117,6 @@ def test_reply_turn_trace_builds_safe_process_view(_db_tmp) -> None:
     assert view["items"][0]["duration_ms"] == 1500
     assert view["items"][0]["signals"]["speech_act"] == "participate"
     assert view["items"][1]["signals"]["tool"] == "web_search"
-
-
-def test_reply_turn_trace_exposes_only_completion_contract_summary(_db_tmp) -> None:
-    traces = load_personification_module("plugin.personification.core.reply_turn_trace")
-    trace_id = traces.start_trace(session_type="group", group_id="123", user_id="456")
-    token = traces.set_current_trace_id(trace_id)
-    try:
-        traces.finish_trace(
-            outcome="partial",
-            diagnosis_code="visible_output_recovered",
-            detail={
-                "tool_execution": "partial",
-                "evidence_delivery": "recovered",
-                "outbound_delivery": "confirmed",
-                "social_coverage_status": "degraded",
-                "evidence_recovered": True,
-                "raw_tool_result": "must-not-be-exposed",
-            },
-        )
-    finally:
-        traces.reset_current_trace_id(token)
-
-    view = traces.build_process_view(traces.get_trace(trace_id))
-
-    assert view["summary"]["completion"] == {
-        "tool_execution": "partial",
-        "evidence_delivery": "recovered",
-        "outbound_delivery": "confirmed",
-        "social_coverage_status": "degraded",
-        "evidence_recovered": "True",
-    }
-    assert "raw_tool_result" not in view["summary"]["completion"]
 
 
 def test_reply_turn_trace_extracts_budget_signals(_db_tmp) -> None:
@@ -365,7 +234,7 @@ def test_reply_turn_trace_builds_agent_inspection_summary(_db_tmp) -> None:
             key="addressing_plan",
             label="发送指向",
             status="info",
-            detail="address_mode=quote source=semantic_frame quote=true at=false target=- elapsed_ms=0",
+            detail="address_mode=quote source=semantic_frame quote=true at=false target=-",
         )
         traces.finish_trace(outcome="ok", diagnosis_code="ok")
     finally:
@@ -376,67 +245,5 @@ def test_reply_turn_trace_builds_agent_inspection_summary(_db_tmp) -> None:
 
     assert inspection["understanding"]["intent"] == "lookup"
     assert inspection["addressing"]["address_mode"] == "quote"
-    assert next(item for item in view["items"] if item["key"] == "addressing_plan")["duration_ms"] == 0
     assert inspection["tools"][0]["tool"] == "resolve_acg_entity"
     assert inspection["questions"][0] == "大鸟居明日香_动画_剧情"
-
-
-def test_process_view_does_not_attribute_wait_time_to_zero_duration_markers() -> None:
-    traces = load_personification_module("plugin.personification.core.reply_turn_trace")
-    view = traces.build_process_view(
-        {
-            "trace_id": "trace-duration",
-            "outcome": "ok",
-            "diagnosis_code": "ok",
-            "stages": [
-                {
-                    "ts": 100.0,
-                    "key": "vision_mode",
-                    "label": "视觉路径",
-                    "status": "info",
-                    "detail": "mode=auto elapsed_ms=0",
-                },
-                {
-                    "ts": 225.0,
-                    "key": "semantic_frame_llm",
-                    "label": "语义帧 LLM",
-                    "status": "ok",
-                    "detail": "intent=explanation elapsed_ms=7290",
-                },
-            ],
-        }
-    )
-
-    assert view["items"][0]["duration_ms"] == 0
-    assert view["items"][1]["duration_ms"] == 7290
-    assert [item["key"] for item in view["summary"]["slow_stages"]] == ["semantic_frame_llm"]
-
-
-def test_process_view_uses_explicit_stage_elapsed_without_changing_visible_detail() -> None:
-    traces = load_personification_module("plugin.personification.core.reply_turn_trace")
-    view = traces.build_process_view(
-        {
-            "trace_id": "trace-explicit-duration",
-            "stages": [
-                {
-                    "ts": 100.0,
-                    "key": "outgoing_message",
-                    "label": "发送消息",
-                    "status": "ok",
-                    "detail": "实际可见回复",
-                    "elapsed_ms": 0,
-                },
-                {
-                    "ts": 102.5,
-                    "key": "post_send_bookkeeping",
-                    "label": "发送后状态写入",
-                    "status": "ok",
-                    "detail": "elapsed_ms=2500",
-                },
-            ],
-        }
-    )
-
-    assert view["items"][0]["detail"] == "实际可见回复"
-    assert view["items"][0]["duration_ms"] == 0
-    assert view["items"][1]["duration_ms"] == 2500

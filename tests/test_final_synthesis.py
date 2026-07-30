@@ -111,38 +111,3 @@ def test_synthesize_max_steps_result_wraps_last_tool_result_with_persona() -> No
     sent_messages = caller.calls[0]["messages"]
     assert sent_messages[0]["role"] == "system"
     assert "你是群友" in sent_messages[0]["content"]
-
-
-def test_synthesize_max_steps_preserves_avatar_pair_evidence_for_quality_renderer() -> None:
-    caller = _WrapCaller("他们现实里就是一对")
-    payload = {
-        "type": "personification_evidence_envelope",
-        "available": True,
-        "allowed_claims": ["两张头像在构图、元素或风格上呈现视觉配套。"],
-        "forbidden_inferences": ["不能据此判断两位用户现实中是情侣、朋友、认识或同一人。"],
-        "confidence": 0.9,
-        "natural_fallback": "两张头像在构图、元素或风格上呈现视觉配套。",
-    }
-    registry = tool_registry.ToolRegistry()
-    _register(
-        registry,
-        "inspect_group_user_avatar_pair",
-        {"side_effect": "none", "final_behavior": "constrained_persona_output"},
-    )
-    result = asyncio.run(
-        final_synthesis.synthesize_max_steps_result(
-            registry=registry,
-            tool_name="inspect_group_user_avatar_pair",
-            result_text=json.dumps(payload, ensure_ascii=False),
-            user_query_text="他们头像配吗",
-            messages=[],
-            pending_actions=[],
-            tool_caller=caller,
-        )
-    )
-    assert "呈现视觉配套" in result.text
-    assert "现实里就是一对" not in result.text
-    assert result.direct_output is False
-    assert result.quality_context == "constrained_persona_output"
-    assert result.evidence_envelope == payload
-    assert caller.calls == []

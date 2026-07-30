@@ -3,161 +3,27 @@ from __future__ import annotations
 import asyncio
 import json
 import re
-import threading
 import time
 from datetime import datetime
 from typing import Any, Awaitable, Callable, Optional
 
 from ..agent.inner_state import DEFAULT_STATE, load_inner_state
-from ..core.agent_bridge import TEXT_AGENT_TOOL_PROFILE_QZONE_READ_ONLY, run_text_agent
-from ..core.context_policy import ensure_prompt_injection_guard, strip_response_control_markers
+from ..core.agent_bridge import run_text_agent
+from ..core.context_policy import strip_response_control_markers
 from ..core.data_store import get_data_store
 from ..core.emotion_state import describe_user_emotion_memory, load_emotion_state
 from ..core.image_input import summarize_images_with_vision
-from ..core.qzone_publish import build_qzone_quota, coordinated_qzone_publish
 from ..core.qzone_service import _extract_qzone_comments
 from ..core.time_ctx import inject_current_time_context
-from ..core.user_policy import PolicyAuthorization
-from ..core.visible_output import guard_visible_text
+from ..jobs.periodic_jobs import build_qzone_quota, record_qzone_post
 from .diary_flow import clean_generated_text
 
 
 _STORE_NAME = "qzone_social_state"
-UserPolicyAuthorizer = Callable[[str], Awaitable[PolicyAuthorization]]
+_SCAN_LOCK = asyncio.Lock()
 
-
-async def _user_policy_allows(
-    user_policy_authorizer: UserPolicyAuthorizer | None,
-    user_id: str,
-    *permissions: str,
-    logger: Any = None,
-) -> bool:
-    if user_policy_authorizer is None:
-        return True
-    target = str(user_id or "").strip()
-    if not target:
-        return False
-    try:
-        authorization = await user_policy_authorizer(target)
-    except asyncio.CancelledError:
-        raise
-    except Exception as exc:
-        if logger is not None:
-            logger.warning(
-                f"[qzone_social] user policy authorization failed closed: {type(exc).__name__}"
-            )
-        return False
-    if authorization is None or bool(getattr(authorization, "blocked", True)):
-        return False
-    return all(bool(getattr(authorization, permission, False)) for permission in permissions)
-
-
-async def _filter_qzone_comments_by_policy(
-    comments: list[dict[str, Any]],
-    *,
-    bot_id: str,
-    user_policy_authorizer: UserPolicyAuthorizer | None,
-    logger: Any,
-) -> list[dict[str, Any]]:
-    if user_policy_authorizer is None:
-        return comments
-    allowed: list[dict[str, Any]] = []
-    for comment in comments:
-        commenter_id = str(comment.get("user_id", "") or "")
-        if commenter_id == bot_id or await _user_policy_allows(
-            user_policy_authorizer,
-            commenter_id,
-            "allow_context_read",
-            "allow_qzone",
-            logger=logger,
-        ):
-            allowed.append(comment)
-    return allowed
-
-
-def _qzone_write_available(service: Any, bot_id: str) -> bool:
-    checker = getattr(service, "write_available", None)
-    if not callable(checker):
-        # Compatibility for test doubles and third-party read/write services that
-        # predate the capability snapshot. The first-party service always exposes
-        # the checker and therefore fails closed in production.
-        return True
-    try:
-        return bool(checker(str(bot_id or "")))
-    except Exception:
-        return False
-
-
-class _QzoneScanLease:
-    def __init__(self, coordinator: "_QzoneScanCoordinator", token: str) -> None:
-        self._coordinator = coordinator
-        self._token = token
-
-    async def __aenter__(self) -> "_QzoneScanLease":
-        return self
-
-    async def __aexit__(self, *_args: Any) -> None:
-        self._coordinator.release(self._token)
-
-
-class _QzoneScanCoordinator:
-    def __init__(self) -> None:
-        self._lock = threading.Lock()
-        self._owner = ""
-        self._token = ""
-        self._started_at = 0.0
-        self._busy_skip_count = 0
-
-    def try_acquire(self, owner: str) -> _QzoneScanLease | None:
-        with self._lock:
-            if self._token:
-                self._busy_skip_count += 1
-                return None
-            self._owner = str(owner or "scan")
-            self._token = f"{self._owner}:{time.monotonic_ns()}"
-            self._started_at = time.time()
-            return _QzoneScanLease(self, self._token)
-
-    def release(self, token: str) -> None:
-        with self._lock:
-            if token != self._token:
-                return
-            self._owner = ""
-            self._token = ""
-            self._started_at = 0.0
-
-    def status(self) -> dict[str, Any]:
-        with self._lock:
-            return {
-                "running": bool(self._token),
-                "owner": self._owner,
-                "started_at": self._started_at,
-                "running_seconds": max(0, int(time.time() - self._started_at)) if self._started_at else 0,
-                "busy_skip_count": self._busy_skip_count,
-            }
-
-
-_SCAN_COORDINATOR = _QzoneScanCoordinator()
-
-
-def get_qzone_scan_status() -> dict[str, Any]:
-    return _SCAN_COORDINATOR.status()
-
-
-def _busy_scan_result() -> dict[str, Any]:
-    status = get_qzone_scan_status()
-    return {
-        "ok": True,
-        "status": "skipped",
-        "skipped": True,
-        "reason": "busy",
-        "busy_by": status.get("owner", ""),
-        "running_seconds": status.get("running_seconds", 0),
-        "last_error": "",
-    }
-
-# 空间访问拒绝缓存：对方设置了“主人设置了保密”等访问限制时，记录 uin 跳过后续扫描。
-# 这不是安全 Blacklist；每 7 天自动重检一次，若仍无权限则继续保持 access denied。
+# 权限保密用户黑名单：对方设置了"主人设置了保密"等访问限制时，记录 uin 跳过后续扫描。
+# 每 7 天自动重检一次，若仍无权限则继续保持在黑名单。
 _PERMISSION_BLOCK_RECHECK_SECONDS = 7 * 24 * 3600
 _PERMISSION_DENIED_HINTS = (
     "主人设置了保密",
@@ -179,23 +45,19 @@ def _is_permission_denied_message(message: Any) -> bool:
     return any(hint.lower() in lowered for hint in _PERMISSION_DENIED_HINTS)
 
 
-def _get_access_denied_bucket(state: dict[str, Any]) -> dict[str, Any]:
-    bucket = state.get("qzone_access_denied")
+def _get_permission_block_bucket(state: dict[str, Any]) -> dict[str, Any]:
+    bucket = state.get("qzone_permission_blocked")
     if not isinstance(bucket, dict):
         bucket = {}
-        state["qzone_access_denied"] = bucket
-    legacy = state.pop("qzone_permission_blocked", None)
-    if isinstance(legacy, dict):
-        for user_id, entry in legacy.items():
-            bucket.setdefault(str(user_id), entry)
+        state["qzone_permission_blocked"] = bucket
     return bucket
 
 
-def _is_qzone_access_denied(state: dict[str, Any], user_id: str, *, now_ts: float | None = None) -> bool:
+def _is_qzone_user_blocked(state: dict[str, Any], user_id: str, *, now_ts: float | None = None) -> bool:
     target = str(user_id or "").strip()
     if not target:
         return False
-    bucket = _get_access_denied_bucket(state)
+    bucket = _get_permission_block_bucket(state)
     entry = bucket.get(target)
     if not isinstance(entry, dict):
         return False
@@ -205,11 +67,11 @@ def _is_qzone_access_denied(state: dict[str, Any], user_id: str, *, now_ts: floa
     return (now - last_checked) < _PERMISSION_BLOCK_RECHECK_SECONDS
 
 
-def _mark_qzone_access_denied(state: dict[str, Any], user_id: str, message: str) -> None:
+def _mark_qzone_user_blocked(state: dict[str, Any], user_id: str, message: str) -> None:
     target = str(user_id or "").strip()
     if not target:
         return
-    bucket = _get_access_denied_bucket(state)
+    bucket = _get_permission_block_bucket(state)
     now = time.time()
     entry = bucket.get(target)
     if not isinstance(entry, dict):
@@ -220,11 +82,11 @@ def _mark_qzone_access_denied(state: dict[str, Any], user_id: str, message: str)
     bucket[target] = entry
 
 
-def _clear_qzone_access_denied(state: dict[str, Any], user_id: str) -> None:
+def _clear_qzone_user_block(state: dict[str, Any], user_id: str) -> None:
     target = str(user_id or "").strip()
     if not target:
         return
-    bucket = _get_access_denied_bucket(state)
+    bucket = _get_permission_block_bucket(state)
     if target in bucket:
         bucket.pop(target, None)
 
@@ -237,32 +99,32 @@ def _handle_qzone_fetch_outcome(
     msg: str,
     logger: Any,
 ) -> bool:
-    """根据 fetch_user_feeds 结果维护访问拒绝缓存。"""
+    """根据 fetch_user_feeds 结果维护权限黑名单。返回值表示是否触发了 permission_block。"""
     target = str(user_id or "").strip()
     if not target:
         return False
     if ok:
-        _clear_qzone_access_denied(state, target)
+        _clear_qzone_user_block(state, target)
         return False
     if _is_permission_denied_message(msg):
-        bucket = _get_access_denied_bucket(state)
+        bucket = _get_permission_block_bucket(state)
         existed = target in bucket
-        _mark_qzone_access_denied(state, target, msg)
+        _mark_qzone_user_blocked(state, target, msg)
         if not existed:
-            logger.info(f"[qzone_social] user {target} marked as access_denied: {msg}")
+            logger.info(f"[qzone_social] user {target} marked as permission_blocked: {msg}")
         else:
-            logger.debug(f"[qzone_social] user {target} still access_denied: {msg}")
+            logger.debug(f"[qzone_social] user {target} still permission_blocked: {msg}")
         return True
     return False
 
 
-async def recheck_qzone_access_denied_users(
+async def recheck_qzone_permission_blocked_users(
     *,
     bot: Any,
     qzone_social_service: Any,
     logger: Any,
 ) -> dict[str, Any]:
-    """周期性重检 qzone_access_denied 中的用户，看 bot 是否重新获得查看权限。
+    """周期性重检 qzone_permission_blocked 中的用户，看 bot 是否重新获得查看权限。
 
     每周运行一次。对每个 uid：
     - 调用 fetch_user_feeds 探测一次
@@ -273,8 +135,8 @@ async def recheck_qzone_access_denied_users(
     bot_id = str(getattr(bot, "self_id", "") or "")
     result: dict[str, Any] = {
         "checked": 0,
-        "access_restored": 0,
-        "still_denied": 0,
+        "unblocked": 0,
+        "still_blocked": 0,
         "errors": 0,
         "last_error": "",
     }
@@ -284,7 +146,7 @@ async def recheck_qzone_access_denied_users(
     state = await get_data_store().load(_STORE_NAME, default=lambda: {})
     if not isinstance(state, dict):
         state = {}
-    bucket = _get_access_denied_bucket(state)
+    bucket = state.get("qzone_permission_blocked")
     if not isinstance(bucket, dict) or not bucket:
         return result
     targets = list(bucket.keys())
@@ -305,12 +167,12 @@ async def recheck_qzone_access_denied_users(
             logger.warning(f"[qzone_permission_recheck] error checking {target_uid}: {exc}")
             continue
         if ok:
-            _clear_qzone_access_denied(state, target_uid)
-            result["access_restored"] += 1
+            _clear_qzone_user_block(state, target_uid)
+            result["unblocked"] += 1
             logger.info(f"[qzone_permission_recheck] unblocked {target_uid}, bot has access again")
         elif _is_permission_denied_message(msg):
-            _mark_qzone_access_denied(state, target_uid, msg)
-            result["still_denied"] += 1
+            _mark_qzone_user_blocked(state, target_uid, msg)
+            result["still_blocked"] += 1
         else:
             # 非权限错误（cookie 失效、网络等），不修改黑名单状态
             result["errors"] += 1
@@ -326,11 +188,14 @@ async def recheck_qzone_access_denied_users(
 
 
 def _extract_system_prompt(prompt_data: Any) -> str:
-    from ..core.social_surface_renderer import PersonaScope, SocialSurfaceRenderer
-
-    return ensure_prompt_injection_guard(
-        SocialSurfaceRenderer().project_persona(prompt_data, PersonaScope.QZONE)
-    )
+    if isinstance(prompt_data, dict):
+        value = prompt_data.get("system")
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+        return str(prompt_data)
+    if isinstance(prompt_data, str):
+        return prompt_data.strip()
+    return ""
 
 
 def _extract_json_object(raw: Any) -> dict[str, Any] | None:
@@ -379,7 +244,7 @@ def _build_qzone_forward_quota(plugin_config: Any, now: datetime) -> dict[str, A
         state = {}
     if not isinstance(state, dict):
         state = {}
-    monthly_limit = int(getattr(plugin_config, "personification_qzone_monthly_limit", 30))
+    monthly_limit = int(getattr(plugin_config, "personification_qzone_monthly_limit", 30) or 30)
     min_interval_hours = float(getattr(plugin_config, "personification_qzone_min_interval_hours", 12.0) or 0)
     return build_qzone_quota(
         state=state,
@@ -521,15 +386,15 @@ def _prune_state_maps(state: dict[str, Any], *, max_items: int = 2000) -> None:
             reverse=True,
         )
         state[key] = dict(items[:max_items])
-    # 访问拒绝缓存按 last_checked_ts 排序裁剪，同时完成旧 key 的一次性迁移。
-    access_bucket = _get_access_denied_bucket(state)
-    if len(access_bucket) > max_items:
+    # 权限黑名单按 last_checked_ts 排序裁剪
+    block_bucket = state.get("qzone_permission_blocked")
+    if isinstance(block_bucket, dict) and len(block_bucket) > max_items:
         items = sorted(
-            access_bucket.items(),
+            block_bucket.items(),
             key=lambda item: float((item[1] if isinstance(item[1], dict) else {}).get("last_checked_ts", 0) or 0),
             reverse=True,
         )
-        state["qzone_access_denied"] = dict(items[:max_items])
+        state["qzone_permission_blocked"] = dict(items[:max_items])
 
 
 def _save_state(state: dict[str, Any], result: dict[str, Any]) -> None:
@@ -701,19 +566,8 @@ async def _record_qzone_profile_evidence(
     state: dict[str, Any],
     result: dict[str, Any],
     logger: Any,
-    user_policy_authorizer: UserPolicyAuthorizer | None = None,
 ) -> None:
     if persona_store is None or not user_id or not evidence_key:
-        return
-    if not await _user_policy_allows(
-        user_policy_authorizer,
-        user_id,
-        "allow_context_read",
-        "allow_qzone",
-        "allow_profile_write",
-        "allow_history_write",
-        logger=logger,
-    ):
         return
     if _profile_evidence_already_recorded(state, evidence_key):
         return
@@ -878,11 +732,7 @@ async def _decide_feed_action(
         ]
     )
     result = ""
-    if (
-        getattr(plugin_config, "personification_agent_enabled", True)
-        and agent_tool_caller is not None
-        and agent_tool_registry is not None
-    ):
+    if agent_tool_caller is not None and agent_tool_registry is not None:
         try:
             result = await run_text_agent(
                 messages=messages,
@@ -894,9 +744,6 @@ async def _decide_feed_action(
                 use_builtin_search_hint=True,
                 trigger_reason="qzone_social_feed_action",
                 chat_intent_hint="qzone_social_feed_action",
-                surface="qzone_social_feed_action",
-                structured_output=True,
-                tool_profile=TEXT_AGENT_TOOL_PROFILE_QZONE_READ_ONLY,
             )
         except Exception as exc:
             if logger is not None:
@@ -1091,11 +938,7 @@ async def _decide_bot_comment_reply(
         ]
     )
     result = ""
-    if (
-        getattr(plugin_config, "personification_agent_enabled", True)
-        and agent_tool_caller is not None
-        and agent_tool_registry is not None
-    ):
+    if agent_tool_caller is not None and agent_tool_registry is not None:
         try:
             result = await run_text_agent(
                 messages=messages,
@@ -1107,9 +950,6 @@ async def _decide_bot_comment_reply(
                 use_builtin_search_hint=True,
                 trigger_reason="qzone_comment_reply",
                 chat_intent_hint="qzone_comment_reply",
-                surface="qzone_comment_reply",
-                structured_output=True,
-                tool_profile=TEXT_AGENT_TOOL_PROFILE_QZONE_READ_ONLY,
             )
         except Exception as exc:
             if logger is not None:
@@ -1198,7 +1038,6 @@ async def _scan_bot_space_comments(
     agent_tool_caller: Any = None,
     agent_tool_registry: Any = None,
     agent_max_steps: int = 4,
-    user_policy_authorizer: UserPolicyAuthorizer | None = None,
 ) -> None:
     bot_id = str(getattr(bot, "self_id", "") or "")
     if not bot_id:
@@ -1224,12 +1063,6 @@ async def _scan_bot_space_comments(
     for feed in checked_feeds:
         feed_key = str(feed.get("feed_key", "") or "")
         comments = _extract_qzone_comments(feed.get("raw") if isinstance(feed.get("raw"), dict) else {})
-        comments = await _filter_qzone_comments_by_policy(
-            comments,
-            bot_id=bot_id,
-            user_policy_authorizer=user_policy_authorizer,
-            logger=logger,
-        )
         if not process_existing_comments and feed_key and not _bot_space_feed_has_baseline(state, feed_key):
             for comment in comments[: max(1, min(100, int(max_comments_per_feed or 20)))]:
                 commenter_id = str(comment.get("user_id", "") or "")
@@ -1253,14 +1086,6 @@ async def _scan_bot_space_comments(
             ):
                 _mark_comment_processed(state, comment_key, action="baseline", reason="before_feed_baseline")
                 continue
-            if not await _user_policy_allows(
-                user_policy_authorizer,
-                commenter_id,
-                "allow_context_read",
-                "allow_qzone",
-                logger=logger,
-            ):
-                continue
             result["inbound_comments"] = int(result.get("inbound_comments", 0) or 0) + 1
             await _record_qzone_profile_evidence(
                 persona_store=persona_store,
@@ -1271,16 +1096,7 @@ async def _scan_bot_space_comments(
                 state=state,
                 result=result,
                 logger=logger,
-                user_policy_authorizer=user_policy_authorizer,
             )
-            if not await _user_policy_allows(
-                user_policy_authorizer,
-                commenter_id,
-                "allow_context_read",
-                "allow_qzone",
-                logger=logger,
-            ):
-                continue
             profile = friend_profiles.get(commenter_id, {})
             persona_snippet = _get_persona_snippet(persona_store, commenter_id, persona_snippet_max_chars)
             commenter_profile = {
@@ -1295,15 +1111,6 @@ async def _scan_bot_space_comments(
             emotion_memory = describe_user_emotion_memory(emotion_state or {}, commenter_id)
             is_reply_to_bot = _comment_targets_user(comment, bot_id)
             previous_bot_reply = _latest_bot_reply_for_feed(state, feed_key) if is_reply_to_bot else ""
-            if not await _user_policy_allows(
-                user_policy_authorizer,
-                commenter_id,
-                "allow_context_read",
-                "allow_qzone",
-                "allow_agent_action",
-                logger=logger,
-            ):
-                continue
             decision = await _decide_bot_comment_reply(
                 feed=feed,
                 comment=comment,
@@ -1337,40 +1144,12 @@ async def _scan_bot_space_comments(
                 )
                 continue
             reply = str(decision.get("reply", "") or "").strip()
-            reply = guard_visible_text(
-                reply,
-                logger=logger,
-                surface="qzone_comment_reply",
-                allow_direct_media=False,
-            )
             if not reply:
                 _mark_comment_processed(
                     state,
                     comment_key,
                     action="ignore",
                     reason=str(decision.get("reason", "") or "empty_reply"),
-                )
-                continue
-            if not await _user_policy_allows(
-                user_policy_authorizer,
-                commenter_id,
-                "allow_qzone",
-                "allow_reply",
-                logger=logger,
-            ):
-                _mark_comment_processed(
-                    state,
-                    comment_key,
-                    action="ignore",
-                    reason="user_policy_blocked_after_decision",
-                )
-                continue
-            if not _qzone_write_available(qzone_social_service, bot_id):
-                _mark_comment_processed(
-                    state,
-                    comment_key,
-                    action="ignore",
-                    reason="qzone_read_only",
                 )
                 continue
             ok_reply, reply_msg = await qzone_social_service.comment_feed(
@@ -1408,7 +1187,6 @@ async def _scan_bot_outbound_comment_replies(
     agent_tool_caller: Any = None,
     agent_tool_registry: Any = None,
     agent_max_steps: int = 4,
-    user_policy_authorizer: UserPolicyAuthorizer | None = None,
 ) -> None:
     """对 Bot 之前在好友空间评论过的动态进行 3 分钟近实时反查，看是否有人回复 Bot。"""
     bot_id = str(getattr(bot, "self_id", "") or "")
@@ -1458,15 +1236,7 @@ async def _scan_bot_outbound_comment_replies(
         state["bot_outbound_replies"] = bot_replies_state
 
     for owner_uin, owner_items in by_owner.items():
-        if not await _user_policy_allows(
-            user_policy_authorizer,
-            owner_uin,
-            "allow_context_read",
-            "allow_qzone",
-            logger=logger,
-        ):
-            continue
-        if _is_qzone_access_denied(state, owner_uin):
+        if _is_qzone_user_blocked(state, owner_uin):
             logger.debug(f"[qzone_outbound] skip permission-blocked owner {owner_uin}")
             continue
         try:
@@ -1489,14 +1259,6 @@ async def _scan_bot_outbound_comment_replies(
             result["last_error"] = msg
             logger.warning(f"[qzone_outbound] fetch failed for owner {owner_uin}: {msg}")
             continue
-        if not await _user_policy_allows(
-            user_policy_authorizer,
-            owner_uin,
-            "allow_context_read",
-            "allow_qzone",
-            logger=logger,
-        ):
-            continue
 
         feed_index = {str(feed.get("feed_key", "") or ""): feed for feed in feeds if isinstance(feed, dict)}
         for feed_key, info in owner_items:
@@ -1504,12 +1266,6 @@ async def _scan_bot_outbound_comment_replies(
             if not feed:
                 continue
             comments = _extract_qzone_comments(feed.get("raw") if isinstance(feed.get("raw"), dict) else {})
-            comments = await _filter_qzone_comments_by_policy(
-                comments,
-                bot_id=bot_id,
-                user_policy_authorizer=user_policy_authorizer,
-                logger=logger,
-            )
             last_seen_ts = float(info.get("last_seen_ts", 0) or 0)
             new_max_seen = last_seen_ts
             for comment in comments:
@@ -1526,14 +1282,6 @@ async def _scan_bot_outbound_comment_replies(
                     continue
                 comment_key = f"{feed_key}:{comment.get('comment_key') or commenter_id}:{int(created_at) or 'na'}"
                 if comment_key in bot_replies_state:
-                    continue
-                if not await _user_policy_allows(
-                    user_policy_authorizer,
-                    commenter_id,
-                    "allow_context_read",
-                    "allow_qzone",
-                    logger=logger,
-                ):
                     continue
                 result["inbound_comments"] = int(result.get("inbound_comments", 0) or 0) + 1
                 profile = friend_profiles.get(commenter_id, {})
@@ -1554,23 +1302,6 @@ async def _scan_bot_outbound_comment_replies(
                     or ""
                 ).strip()
                 is_reply_to_bot = _comment_targets_user(comment, bot_id) or bool(previous_bot_reply)
-                if not await _user_policy_allows(
-                    user_policy_authorizer,
-                    commenter_id,
-                    "allow_context_read",
-                    "allow_qzone",
-                    "allow_agent_action",
-                    logger=logger,
-                ):
-                    continue
-                if commenter_id != owner_uin and not await _user_policy_allows(
-                    user_policy_authorizer,
-                    owner_uin,
-                    "allow_context_read",
-                    "allow_qzone",
-                    logger=logger,
-                ):
-                    continue
                 decision = await _decide_bot_comment_reply(
                     feed=feed,
                     comment=comment,
@@ -1605,48 +1336,11 @@ async def _scan_bot_outbound_comment_replies(
                         new_max_seen = created_at
                     continue
                 reply_text = str(decision.get("reply", "") or "").strip()
-                reply_text = guard_visible_text(
-                    reply_text,
-                    logger=logger,
-                    surface="qzone_outbound_comment_reply",
-                    allow_direct_media=False,
-                )
                 if not reply_text:
                     bot_replies_state[comment_key] = {
                         "at": time.time(),
                         "action": "ignore",
                         "reason": "empty_reply",
-                    }
-                    if created_at > new_max_seen:
-                        new_max_seen = created_at
-                    continue
-                commenter_can_reply = await _user_policy_allows(
-                    user_policy_authorizer,
-                    commenter_id,
-                    "allow_qzone",
-                    "allow_reply",
-                    logger=logger,
-                )
-                owner_allows_qzone = commenter_id == owner_uin or await _user_policy_allows(
-                    user_policy_authorizer,
-                    owner_uin,
-                    "allow_qzone",
-                    logger=logger,
-                )
-                if not commenter_can_reply or not owner_allows_qzone:
-                    bot_replies_state[comment_key] = {
-                        "at": time.time(),
-                        "action": "ignore",
-                        "reason": "user_policy_blocked_after_decision",
-                    }
-                    if created_at > new_max_seen:
-                        new_max_seen = created_at
-                    continue
-                if not _qzone_write_available(qzone_social_service, bot_id):
-                    bot_replies_state[comment_key] = {
-                        "at": time.time(),
-                        "action": "ignore",
-                        "reason": "qzone_read_only",
                     }
                     if created_at > new_max_seen:
                         new_max_seen = created_at
@@ -1697,12 +1391,10 @@ async def scan_qzone_social_feeds(
     agent_max_steps: int = 4,
     target_user_id: str = "",
     allow_open_user: bool = False,
-    user_policy_authorizer: UserPolicyAuthorizer | None = None,
 ) -> dict[str, Any]:
-    lease = _SCAN_COORDINATOR.try_acquire("social")
-    if lease is None:
-        return _busy_scan_result()
-    async with lease:
+    if _SCAN_LOCK.locked():
+        return {"ok": False, "skipped": True, "last_error": "qzone_social_scan_already_running"}
+    async with _SCAN_LOCK:
         now = get_now()
         today = now.strftime("%Y-%m-%d")
         state = _normalize_state(now)
@@ -1722,18 +1414,6 @@ async def scan_qzone_social_feeds(
             "last_error": "",
         }
         try:
-            target_uid = str(target_user_id or "").strip()
-            if target_uid and not await _user_policy_allows(
-                user_policy_authorizer,
-                target_uid,
-                "allow_context_read",
-                "allow_qzone",
-                logger=logger,
-            ):
-                result["skipped"] = True
-                result["reason"] = "user_policy_blocked"
-                _save_state(state, result)
-                return result
             friend_profiles = await _get_friend_profiles(bot, logger)
             if not friend_profiles and not (target_user_id and allow_open_user):
                 result["ok"] = False
@@ -1741,38 +1421,7 @@ async def scan_qzone_social_feeds(
                 _save_state(state, result)
                 return result
 
-            policy_allowed_ids: set[str] = set()
-            if target_uid:
-                policy_allowed_ids.add(target_uid)
-            else:
-                for user_id in friend_profiles:
-                    if await _user_policy_allows(
-                        user_policy_authorizer,
-                        user_id,
-                        "allow_context_read",
-                        "allow_qzone",
-                        logger=logger,
-                    ):
-                        policy_allowed_ids.add(str(user_id))
-                if user_policy_authorizer is not None:
-                    friend_profiles = {
-                        user_id: profile
-                        for user_id, profile in friend_profiles.items()
-                        if str(user_id) in policy_allowed_ids
-                    }
-                if not friend_profiles:
-                    result["skipped"] = True
-                    result["reason"] = "user_policy_blocked"
-                    _save_state(state, result)
-                    return result
-
             proactive_state = load_proactive_state() or {}
-            if user_policy_authorizer is not None:
-                proactive_state = {
-                    user_id: user_state
-                    for user_id, user_state in proactive_state.items()
-                    if str(user_id) in policy_allowed_ids
-                }
             persona_snippet_max_chars = int(
                 getattr(plugin_config, "personification_persona_snippet_max_chars", 150)
             )
@@ -1788,23 +1437,6 @@ async def scan_qzone_social_feeds(
                 result["ok"] = False
                 result["skipped"] = True
                 result["last_error"] = "target_not_bot_friend" if target_user_id else "no_candidates"
-                _save_state(state, result)
-                return result
-
-            policy_candidates: list[dict[str, Any]] = []
-            for candidate in candidates:
-                if await _user_policy_allows(
-                    user_policy_authorizer,
-                    str(candidate.get("user_id", "") or ""),
-                    "allow_context_read",
-                    "allow_qzone",
-                    logger=logger,
-                ):
-                    policy_candidates.append(candidate)
-            candidates = policy_candidates
-            if not candidates:
-                result["skipped"] = True
-                result["reason"] = "user_policy_blocked"
                 _save_state(state, result)
                 return result
 
@@ -1844,16 +1476,8 @@ async def scan_qzone_social_feeds(
                 if processed_feeds >= max_feeds:
                     break
                 candidate_uid = str(candidate["user_id"])
-                if _is_qzone_access_denied(state, candidate_uid):
+                if _is_qzone_user_blocked(state, candidate_uid):
                     logger.debug(f"[qzone_social] skip permission-blocked user {candidate_uid}")
-                    continue
-                if not await _user_policy_allows(
-                    user_policy_authorizer,
-                    candidate_uid,
-                    "allow_context_read",
-                    "allow_qzone",
-                    logger=logger,
-                ):
                     continue
                 ok, msg, feeds = await qzone_social_service.fetch_user_feeds(
                     target_uin=candidate_uid,
@@ -1875,23 +1499,6 @@ async def scan_qzone_social_feeds(
                     feed_key = str(feed.get("feed_key", "") or "")
                     if not feed_key or _feed_already_reacted(state, feed_key):
                         continue
-                    feed_owner_uid = str(feed.get("owner_uin", "") or candidate_uid)
-                    if not await _user_policy_allows(
-                        user_policy_authorizer,
-                        candidate_uid,
-                        "allow_context_read",
-                        "allow_qzone",
-                        logger=logger,
-                    ):
-                        continue
-                    if feed_owner_uid != candidate_uid and not await _user_policy_allows(
-                        user_policy_authorizer,
-                        feed_owner_uid,
-                        "allow_context_read",
-                        "allow_qzone",
-                        logger=logger,
-                    ):
-                        continue
                     processed_feeds += 1
                     result["feeds_seen"] += 1
                     _mark_seen(state, feed_key)
@@ -1900,22 +1507,6 @@ async def scan_qzone_social_feeds(
                         images=list(feed.get("images") or []),
                         logger=logger,
                     )
-                    if not await _user_policy_allows(
-                        user_policy_authorizer,
-                        candidate_uid,
-                        "allow_context_read",
-                        "allow_qzone",
-                        logger=logger,
-                    ):
-                        continue
-                    if feed_owner_uid != candidate_uid and not await _user_policy_allows(
-                        user_policy_authorizer,
-                        feed_owner_uid,
-                        "allow_context_read",
-                        "allow_qzone",
-                        logger=logger,
-                    ):
-                        continue
                     await _record_qzone_profile_evidence(
                         persona_store=persona_store,
                         user_id=str(candidate["user_id"]),
@@ -1926,43 +1517,8 @@ async def scan_qzone_social_feeds(
                         state=state,
                         result=result,
                         logger=logger,
-                        user_policy_authorizer=user_policy_authorizer,
                     )
-                    if not await _user_policy_allows(
-                        user_policy_authorizer,
-                        candidate_uid,
-                        "allow_context_read",
-                        "allow_qzone",
-                        logger=logger,
-                    ):
-                        continue
-                    if feed_owner_uid != candidate_uid and not await _user_policy_allows(
-                        user_policy_authorizer,
-                        feed_owner_uid,
-                        "allow_context_read",
-                        "allow_qzone",
-                        logger=logger,
-                    ):
-                        continue
                     emotion_memory = describe_user_emotion_memory(emotion_state or {}, str(candidate["user_id"]))
-                    if not await _user_policy_allows(
-                        user_policy_authorizer,
-                        candidate_uid,
-                        "allow_context_read",
-                        "allow_qzone",
-                        "allow_agent_action",
-                        logger=logger,
-                    ):
-                        continue
-                    if feed_owner_uid != candidate_uid and not await _user_policy_allows(
-                        user_policy_authorizer,
-                        feed_owner_uid,
-                        "allow_context_read",
-                        "allow_qzone",
-                        "allow_agent_action",
-                        logger=logger,
-                    ):
-                        continue
                     decision = await _decide_feed_action(
                         feed=feed,
                         candidate=candidate,
@@ -2006,84 +1562,32 @@ async def scan_qzone_social_feeds(
                         continue
 
                     acted = False
-                    liked = False
-                    commented = False
-                    forwarded = False
                     comment_text = str(decision.get("comment", "") or "")
-                    if action in {"comment", "like_comment"}:
-                        comment_text = guard_visible_text(
-                            comment_text,
-                            logger=logger,
-                            surface="qzone_feed_comment",
-                            allow_direct_media=False,
-                        )
-                        if not comment_text:
-                            result["ignored"] += 1
-                            continue
-                    if action in {"forward", "like", "comment", "like_comment"} and not _qzone_write_available(
-                        qzone_social_service,
-                        str(getattr(bot, "self_id", "") or ""),
-                    ):
-                        result["ignored"] += 1
-                        result["last_error"] = "qzone_read_only"
-                        continue
                     reaction_text = comment_text
                     if action == "forward":
                         forward_text = str(decision.get("forward_text", "") or "")
-                        forward_text = guard_visible_text(
-                            forward_text,
-                            logger=logger,
-                            surface="qzone_forward_text",
-                            allow_direct_media=False,
-                        )
-                        if str(decision.get("forward_text", "") or "").strip() and not forward_text:
-                            result["ignored"] += 1
-                            continue
                         reaction_text = forward_text
-                        if not await _user_policy_allows(
-                            user_policy_authorizer,
-                            feed_owner_uid,
-                            "allow_qzone",
-                            "allow_visible_reaction",
-                            logger=logger,
-                        ):
-                            result["ignored"] += 1
-                            continue
-                        published = await coordinated_qzone_publish(
-                            operation_id=f"social-forward:{feed_key}:{today}",
-                            content=_format_qzone_forward_record(feed, forward_text),
+                        forward_ok, forward_msg = await qzone_social_service.forward_feed(
+                            feed=feed,
                             bot_id=str(getattr(bot, "self_id", "") or ""),
-                            payload_identity={
-                                "owner_uin": str(feed.get("owner_uin") or ""),
-                                "feed_id": str(feed.get("feed_id") or ""),
-                                "topic_id": str(feed.get("topic_id") or ""),
-                                "appid": str(feed.get("appid") or ""),
-                            },
-                            now=now,
-                            monthly_limit=int(getattr(plugin_config, "personification_qzone_monthly_limit", 30)),
-                            min_interval_hours=float(getattr(plugin_config, "personification_qzone_min_interval_hours", 12.0) or 0),
-                            kind="forward",
-                            publish=lambda: qzone_social_service.forward_feed(
-                                feed=feed,
-                                bot_id=str(getattr(bot, "self_id", "") or ""),
-                                content=forward_text,
-                            ),
+                            content=forward_text,
                         )
-                        forward_ok = bool(published.get("success"))
-                        forward_msg = str(published.get("message") or published.get("status") or "")
                         if forward_ok:
                             acted = True
-                            forwarded = True
                             forwarded_this_scan += 1
                             result["forwarded"] += 1
                             state["forward_count"] = int(state.get("forward_count", 0) or 0) + 1
                             friend_state["forward_count"] = int(friend_state.get("forward_count", 0) or 0) + 1
-                            updated_post_state = published.get("state") or get_data_store().load_sync("qzone_post_state")
+                            updated_post_state = record_qzone_post(
+                                _format_qzone_forward_record(feed, forward_text),
+                                now=now,
+                                kind="forward",
+                            )
                             forward_quota = build_qzone_quota(
                                 state=updated_post_state,
                                 now=now,
                                 monthly_limit=int(
-                                    getattr(plugin_config, "personification_qzone_monthly_limit", 30)
+                                    getattr(plugin_config, "personification_qzone_monthly_limit", 30) or 30
                                 ),
                                 min_interval_hours=float(
                                     getattr(plugin_config, "personification_qzone_min_interval_hours", 12.0) or 0
@@ -2098,26 +1602,18 @@ async def scan_qzone_social_feeds(
                                 state=state,
                                 result=result,
                                 logger=logger,
-                                user_policy_authorizer=user_policy_authorizer,
                             )
                         else:
                             result["failed"] += 1
                             result["last_error"] = forward_msg
                             logger.warning(f"[qzone_social] forward failed for {feed_key}: {forward_msg}")
-                    if action in {"like", "like_comment"} and await _user_policy_allows(
-                        user_policy_authorizer,
-                        feed_owner_uid,
-                        "allow_qzone",
-                        "allow_visible_reaction",
-                        logger=logger,
-                    ):
+                    if action in {"like", "like_comment"}:
                         like_ok, like_msg = await qzone_social_service.like_feed(
                             feed=feed,
                             bot_id=str(getattr(bot, "self_id", "") or ""),
                         )
                         if like_ok:
                             acted = True
-                            liked = True
                             result["liked"] += 1
                             state["like_count"] = int(state.get("like_count", 0) or 0) + 1
                             friend_state["like_count"] = int(friend_state.get("like_count", 0) or 0) + 1
@@ -2130,23 +1626,12 @@ async def scan_qzone_social_feeds(
                                 state=state,
                                 result=result,
                                 logger=logger,
-                                user_policy_authorizer=user_policy_authorizer,
                             )
                         else:
                             result["failed"] += 1
                             result["last_error"] = like_msg
                             logger.warning(f"[qzone_social] like failed for {feed_key}: {like_msg}")
-                    if (
-                        action in {"comment", "like_comment"}
-                        and comment_text
-                        and await _user_policy_allows(
-                            user_policy_authorizer,
-                            feed_owner_uid,
-                            "allow_qzone",
-                            "allow_reply",
-                            logger=logger,
-                        )
-                    ):
+                    if action in {"comment", "like_comment"} and comment_text:
                         comment_ok, comment_msg = await qzone_social_service.comment_feed(
                             feed=feed,
                             bot_id=str(getattr(bot, "self_id", "") or ""),
@@ -2154,7 +1639,6 @@ async def scan_qzone_social_feeds(
                         )
                         if comment_ok:
                             acted = True
-                            commented = True
                             result["commented"] += 1
                             state["comment_count"] = int(state.get("comment_count", 0) or 0) + 1
                             friend_state["comment_count"] = int(friend_state.get("comment_count", 0) or 0) + 1
@@ -2177,7 +1661,6 @@ async def scan_qzone_social_feeds(
                                 state=state,
                                 result=result,
                                 logger=logger,
-                                user_policy_authorizer=user_policy_authorizer,
                             )
                         else:
                             result["failed"] += 1
@@ -2185,21 +1668,7 @@ async def scan_qzone_social_feeds(
                             logger.warning(f"[qzone_social] comment failed for {feed_key}: {comment_msg}")
                     if acted:
                         friend_state["action_count"] = int(friend_state.get("action_count", 0) or 0) + 1
-                        actual_action = (
-                            "forward"
-                            if forwarded
-                            else "like_comment"
-                            if liked and commented
-                            else "like"
-                            if liked
-                            else "comment"
-                        )
-                        _mark_reacted(
-                            state,
-                            feed_key,
-                            action=actual_action,
-                            comment=comment_text if commented else reaction_text if forwarded else "",
-                        )
+                        _mark_reacted(state, feed_key, action=action, comment=reaction_text)
                     else:
                         result["ignored"] += 1
             if not target_user_id and friend_profiles:
@@ -2224,7 +1693,6 @@ async def scan_qzone_social_feeds(
                     agent_tool_caller=agent_tool_caller,
                     agent_tool_registry=agent_tool_registry,
                     agent_max_steps=agent_max_steps,
-                    user_policy_authorizer=user_policy_authorizer,
                 )
             _save_state(state, result)
             return result
@@ -2251,13 +1719,11 @@ async def scan_qzone_inbound_messages(
     agent_tool_caller: Any = None,
     agent_tool_registry: Any = None,
     agent_max_steps: int = 4,
-    user_policy_authorizer: UserPolicyAuthorizer | None = None,
 ) -> dict[str, Any]:
     """Poll comments under the bot's own Qzone feeds and let the LLM decide replies."""
-    lease = _SCAN_COORDINATOR.try_acquire("inbound")
-    if lease is None:
-        return _busy_scan_result()
-    async with lease:
+    if _SCAN_LOCK.locked():
+        return {"ok": False, "skipped": True, "last_error": "qzone_scan_already_running"}
+    async with _SCAN_LOCK:
         state = _normalize_state(get_now())
         result: dict[str, Any] = {
             "ok": True,
@@ -2327,7 +1793,6 @@ async def scan_qzone_inbound_messages(
                 agent_tool_caller=agent_tool_caller,
                 agent_tool_registry=agent_tool_registry,
                 agent_max_steps=agent_max_steps,
-                user_policy_authorizer=user_policy_authorizer,
             )
             if bool(getattr(plugin_config, "personification_qzone_outbound_reply_enabled", True)):
                 now_ts = time.time()
@@ -2353,7 +1818,6 @@ async def scan_qzone_inbound_messages(
                             agent_tool_caller=agent_tool_caller,
                             agent_tool_registry=agent_tool_registry,
                             agent_max_steps=agent_max_steps,
-                            user_policy_authorizer=user_policy_authorizer,
                         )
                     except Exception as exc:
                         result["failed"] = int(result.get("failed", 0) or 0) + 1

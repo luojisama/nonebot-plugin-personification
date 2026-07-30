@@ -10,28 +10,21 @@ from ..tool_registry import ToolRegistry
 from ...core.error_utils import log_exception
 from ...core.metrics import record_counter, record_timing
 from ...core.time_ctx import get_configured_now
-from .constants import MAX_LOOKUP_QUERY_VARIANTS
-from .fallbacks import (
-    TOOL_RESULT_EMPTY_EVIDENCE,
-    TOOL_RESULT_OPERATIONAL_FAILURE,
-    _tool_result_indicates_empty,
-    _tool_result_outcome,
-    tool_signature,
-)
+from .fallbacks import _tool_result_indicates_empty
 from .intent import _clean_user_query_text
-from .tool_catalog import is_retryable_evidence_tool
 from .tool_args import (
     _query_variants_for_tool,
     _rewrite_tool_args,
     _sanitize_tool_args_for_schema,
-    _tool_allows_parameter,
 )
 
 
 _IMAGE_GENERATION_TOOL_NAME = "generate_image"
+_RETRYABLE_LOOKUP_TOOLS = frozenset(
+    {"parallel_research", "web_search", "search_web", "wiki_lookup", "resolve_acg_entity", "collect_resources", "search_images", "search_and_send_images"}
+)
 _TIME_SENSITIVE_SEARCH_TOOLS = frozenset({"web_search", "search_web"})
 _TIME_SENSITIVE_RE = re.compile("最新|近期|现在|今年|今天|当前|latest|recent|now", re.IGNORECASE)
-_DUPLICATE_UNAVAILABLE_RESULT = '{"error":"no_results","ok":false}'
 
 
 def _maybe_inject_date_to_query(tool_name: str, args: dict[str, Any]) -> dict[str, Any]:
@@ -58,7 +51,7 @@ async def _invoke_tool_handler(
 ) -> str:
     if tool.local:
         return await tool.handler(**tool_args)
-    from ...mcp.bridge import McpBridge
+    from ..mcp.bridge import McpBridge
 
     return await McpBridge().call_remote(tool_name, tool_args)
 
@@ -72,7 +65,7 @@ def _remaining_time_budget_seconds(deadline: float | None) -> float | None:
 def _tool_timeout_result(tool_name: str) -> str:
     normalized_tool_name = str(tool_name or "").strip()
     if normalized_tool_name == _IMAGE_GENERATION_TOOL_NAME:
-        return "image_generation_timeout"
+        return "图片生成失败：生成超时，请稍后重试"
     return "工具调用失败：超时"
 
 
@@ -85,10 +78,8 @@ async def _execute_tool_with_retries(
     user_images: list[str],
     previous_tool_name: str = "",
     previous_tool_result_text: str = "",
-    unavailable_tool_signatures: set[str] | None = None,
     logger: Any,
     budget_deadline: float | None = None,
-    safe_failures: bool = False,
 ) -> tuple[dict[str, Any], str]:
     tool = registry.get(tool_name)
     if tool is None:
@@ -96,24 +87,15 @@ async def _execute_tool_with_retries(
         return dict(tool_args or {}), f"工具 {tool_name} 不存在"
 
     tool_args = _maybe_inject_date_to_query(tool_name, dict(tool_args or {}))
-    retryable_evidence = is_retryable_evidence_tool(registry, tool_name)
-    supports_query_retry = bool(
-        retryable_evidence and _tool_allows_parameter(registry, tool_name, "query")
-    )
-    unavailable_signatures = (
-        unavailable_tool_signatures if unavailable_tool_signatures is not None else set()
-    )
     query_variants = _query_variants_for_tool(
         tool_name=tool_name,
         tool_args=tool_args,
         rewritten_query=rewritten_query,
-        max_variants=MAX_LOOKUP_QUERY_VARIANTS if supports_query_retry else 1,
     )
     if not query_variants:
         query_variants = [_clean_user_query_text(tool_args.get("query", ""))]
     last_args = dict(tool_args or {})
     last_result = ""
-    attempted_any = False
     for index, query in enumerate(query_variants or [""]):
         attempt_args = dict(tool_args or {})
         if query:
@@ -132,14 +114,6 @@ async def _execute_tool_with_retries(
             tool_name=tool_name,
             tool_args=attempt_args,
         )
-        attempt_signature = tool_signature(tool_name, attempt_args)
-        if retryable_evidence and attempt_signature in unavailable_signatures:
-            logger.info("[agent] skipped unavailable tool signature repeat")
-            if not attempted_any:
-                last_args = attempt_args
-                last_result = _DUPLICATE_UNAVAILABLE_RESULT
-            continue
-        attempted_any = True
         last_args = attempt_args
         remaining_timeout = _remaining_time_budget_seconds(budget_deadline)
         if remaining_timeout is not None and remaining_timeout <= 0.0:
@@ -147,8 +121,6 @@ async def _execute_tool_with_retries(
             record_timing("agent.tool_exec_ms", 0, tool=tool_name, status="timeout")
             logger.warning(f"[agent] tool {tool_name} skipped because time budget was exhausted")
             last_result = _tool_timeout_result(tool_name)
-            if retryable_evidence:
-                unavailable_signatures.add(attempt_signature)
             break
         started_at = time.monotonic()
         try:
@@ -167,31 +139,17 @@ async def _execute_tool_with_retries(
             record_timing("agent.tool_exec_ms", elapsed_ms, tool=tool_name, status="timeout")
             last_result = _tool_timeout_result(tool_name)
             logger.warning(f"[agent] tool {tool_name} timed out after {elapsed_ms}ms")
-            if retryable_evidence:
-                unavailable_signatures.add(attempt_signature)
             break
         except Exception as e:
             elapsed_ms = int((time.monotonic() - started_at) * 1000)
             record_counter("agent.tool_fail_total", tool=tool_name, reason="exception")
             record_timing("agent.tool_exec_ms", elapsed_ms, tool=tool_name, status="fail")
-            if safe_failures or tool_name == _IMAGE_GENERATION_TOOL_NAME:
-                last_result = (
-                    "image_generation_failed"
-                    if tool_name == _IMAGE_GENERATION_TOOL_NAME
-                    else f"{str(tool_name or 'tool').strip()[:80]}_failed"
-                )
-                logger.warning(
-                    f"[agent] tool {tool_name} failed after {elapsed_ms}ms: type={type(e).__name__}"
-                )
-            else:
-                last_result = f"工具调用失败：{e}"
-                log_exception(
-                    logger,
-                    f"[agent] tool {tool_name} error after {elapsed_ms}ms",
-                    e,
-                )
-            if retryable_evidence:
-                unavailable_signatures.add(attempt_signature)
+            last_result = f"工具调用失败：{e}"
+            log_exception(
+                logger,
+                f"[agent] tool {tool_name} error after {elapsed_ms}ms",
+                e,
+            )
             break
         elapsed_ms = int((time.monotonic() - started_at) * 1000)
         record_counter("agent.tool_ok_total", tool=tool_name)
@@ -202,13 +160,7 @@ async def _execute_tool_with_retries(
         )
         if index > 0:
             logger.info(f"[agent] retry {tool_name} with candidate={attempt_args.get('query', '')}")
-        outcome = _tool_result_outcome(last_result)
-        if retryable_evidence:
-            if outcome in {TOOL_RESULT_EMPTY_EVIDENCE, TOOL_RESULT_OPERATIONAL_FAILURE}:
-                unavailable_signatures.add(attempt_signature)
-            else:
-                unavailable_signatures.discard(attempt_signature)
-        if not supports_query_retry or not _tool_result_indicates_empty(last_result):
+        if tool_name not in _RETRYABLE_LOOKUP_TOOLS or not _tool_result_indicates_empty(last_result):
             break
     return last_args, last_result
 

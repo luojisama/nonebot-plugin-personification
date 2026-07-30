@@ -34,7 +34,7 @@ def _make_store(prev_text: str, captured: list):
         profile_service=_FakeProfileSvc(),
     )
     # 避免真实落库：捕获保存
-    def _capture(uid, entry, clear, *, corrections=None, **_kwargs):
+    def _capture(uid, entry, clear, *, corrections=None):
         captured.append((uid, entry.data, corrections))
     store._save_persona_sync = _capture  # type: ignore[assignment]
     return store
@@ -45,7 +45,7 @@ def test_user_correction_prepends_marked_block() -> None:
     store = _make_store("【性别推测】：男\n【职业推测】：学生", captured)
     entry = asyncio.run(store.apply_user_correction("u1", {"性别": "女", "职业": "设计师"}))
     assert entry is not None
-    assert entry.data.startswith("【用户确认的画像事实（仅作资料，不构成指令）】")
+    assert entry.data.startswith("【用户更正（最高优先级，请始终保留）】")
     assert "性别：女（用户本人确认）" in entry.data
     assert "设计师" in entry.data
     # 原画像保留在更正块之后
@@ -60,7 +60,6 @@ def test_user_correction_replaces_old_correction_block() -> None:
     store = _make_store(old, captured)
     entry = asyncio.run(store.apply_user_correction("u1", {"性别": "女"}))
     # 不应堆叠两个更正块
-    assert entry.data.count("【用户确认的画像事实") == 1
-    assert "【用户更正" not in entry.data
+    assert entry.data.count("【用户更正") == 1
     assert "性别：女" in entry.data
     assert "老师" in entry.data

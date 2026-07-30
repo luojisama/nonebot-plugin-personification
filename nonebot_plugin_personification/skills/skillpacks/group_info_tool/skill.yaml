@@ -1,5 +1,5 @@
 name: group_info_tool
-enabled: false
+enabled: true
 category: action
 entrypoint: scripts/main.py
 description: 查询白名单群列表信息

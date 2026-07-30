@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 import time
 from typing import Any, Dict, List, Optional
 
@@ -17,8 +16,6 @@ from .prompt_hooks import HookContext, register_prompt_hook
 
 _FRIEND_IDS_CACHE: Dict[str, tuple[float, set[str]]] = {}
 _REGISTERED = False
-_PENDING_TOPIC_TASKS: dict[str, asyncio.Task[None]] = {}
-_PENDING_TOPIC_MAX_CONCURRENCY = 4
 
 
 def _stringify_message_content(content: Any) -> str:
@@ -79,17 +76,11 @@ def _format_recent_group_context(
     trigger_user_id: str = "",
     bot_self_id: str = "",
     repeat_clusters: list[dict[str, Any]] | None = None,
-    recent_messages: list[dict[str, Any]] | None = None,
-    excluded_user_ids: set[str] | None = None,
 ) -> str:
-    recent = (
-        list(recent_messages)
-        if recent_messages is not None
-        else build_group_context_window(
-            group_id,
-            limit=limit,
-            include_message_ids=[reply_to_msg_id],
-        )
+    recent = build_group_context_window(
+        group_id,
+        limit=limit,
+        include_message_ids=[reply_to_msg_id],
     )
     if not recent:
         return ""
@@ -99,41 +90,8 @@ def _format_recent_group_context(
         trigger_user_id=trigger_user_id,
         bot_self_id=bot_self_id,
         repeat_clusters=repeat_clusters,
-        excluded_user_ids=set(excluded_user_ids or set()),
     )
     return render_group_conversation_context(context)
-
-
-async def _format_recent_group_context_with_policy(
-    ctx: HookContext,
-    *,
-    limit: int,
-) -> str:
-    reply_to_msg_id = extract_reply_message_id(ctx.event)
-    recent = build_group_context_window(
-        ctx.group_id,
-        limit=limit,
-        include_message_ids=[reply_to_msg_id],
-    )
-    excluded_user_ids: set[str] = set()
-    user_policy_gate = getattr(ctx.runtime, "user_policy_gate", None)
-    bot_self_id = str(getattr(ctx.bot, "self_id", "") or "")
-    if user_policy_gate is not None:
-        recent, excluded_user_ids = await user_policy_gate.filter_context_messages(
-            recent,
-            bot_self_id=bot_self_id,
-        )
-    return _format_recent_group_context(
-        ctx.group_id,
-        limit=limit,
-        trigger_msg_id=extract_event_message_id(ctx.event),
-        reply_to_msg_id=reply_to_msg_id,
-        trigger_user_id=ctx.user_id,
-        bot_self_id=bot_self_id,
-        repeat_clusters=ctx.repeat_clusters,
-        recent_messages=recent,
-        excluded_user_ids=excluded_user_ids,
-    )
 
 
 def _is_domain_sensitive_frame(frame: Any) -> bool:
@@ -186,10 +144,6 @@ async def _schedule_hook(ctx: HookContext) -> Optional[str]:
 
 
 async def _user_persona_hook(ctx: HookContext) -> Optional[str]:
-    if not bool(getattr(ctx.plugin_config, "personification_persona_enabled", True)):
-        return None
-    if str(getattr(ctx, "user_profile_block", "") or "").strip():
-        return None
     persona_store = getattr(ctx.runtime, "persona_store", None)
     if not persona_store:
         return None
@@ -277,16 +231,26 @@ async def _group_style_hook(ctx: HookContext) -> Optional[str]:
 async def _recent_group_context_hook(ctx: HookContext) -> Optional[str]:
     if ctx.is_private:
         return None
-    base_recent = await _format_recent_group_context_with_policy(
-        ctx,
+    base_recent = _format_recent_group_context(
+        ctx.group_id,
         limit=6,
+        trigger_msg_id=extract_event_message_id(ctx.event),
+        reply_to_msg_id=extract_reply_message_id(ctx.event),
+        trigger_user_id=ctx.user_id,
+        bot_self_id=str(getattr(ctx.bot, "self_id", "") or ""),
+        repeat_clusters=ctx.repeat_clusters,
     )
     frame = await _ensure_semantic_frame(ctx, recent_context=base_recent)
     is_meta_question = bool(getattr(frame, "meta_question", False))
 
-    recent_block = await _format_recent_group_context_with_policy(
-        ctx,
+    recent_block = _format_recent_group_context(
+        ctx.group_id,
         limit=8 if is_meta_question else 6,
+        trigger_msg_id=extract_event_message_id(ctx.event),
+        reply_to_msg_id=extract_reply_message_id(ctx.event),
+        trigger_user_id=ctx.user_id,
+        bot_self_id=str(getattr(ctx.bot, "self_id", "") or ""),
+        repeat_clusters=ctx.repeat_clusters,
     )
     if not recent_block:
         return None
@@ -315,19 +279,11 @@ async def _group_relationship_hook(ctx: HookContext) -> Optional[str]:
         limit=8,
         include_message_ids=[extract_reply_message_id(ctx.event)],
     )
-    excluded_user_ids: set[str] = set()
-    user_policy_gate = getattr(ctx.runtime, "user_policy_gate", None)
-    if user_policy_gate is not None:
-        recent, excluded_user_ids = await user_policy_gate.filter_context_messages(
-            recent,
-            bot_self_id=str(getattr(ctx.bot, "self_id", "") or ""),
-        )
     summary = summarize_group_relationships(
         recent,
         trigger_msg_id=extract_event_message_id(ctx.event),
         trigger_user_id=ctx.user_id,
         bot_self_id=str(getattr(ctx.bot, "self_id", "") or ""),
-        excluded_user_ids=excluded_user_ids,
     )
     return summary or None
 
@@ -336,12 +292,6 @@ async def _group_member_alias_hook(ctx: HookContext) -> Optional[str]:
     if ctx.is_private:
         return None
     recent = build_group_context_window(ctx.group_id, limit=30)
-    user_policy_gate = getattr(ctx.runtime, "user_policy_gate", None)
-    if user_policy_gate is not None:
-        recent, _ = await user_policy_gate.filter_context_messages(
-            recent,
-            bot_self_id=str(getattr(ctx.bot, "self_id", "") or ""),
-        )
     known_names: dict[str, list[str]] = {}
     for msg in recent:
         if not isinstance(msg, dict):
@@ -567,7 +517,7 @@ async def _friend_request_hook(ctx: HookContext) -> Optional[str]:
     return None
 
 
-async def schedule_pending_topic_extraction(ctx: HookContext) -> Optional[str]:
+async def _pending_topic_extract_hook(ctx: HookContext) -> Optional[str]:
     """私聊场景下尝试从用户消息抽取 pending topic，fire-and-forget；
     不阻塞回复主流程，返回 None 即不注入 prompt。
     """
@@ -586,11 +536,6 @@ async def schedule_pending_topic_extraction(ctx: HookContext) -> Optional[str]:
         return None
     if not pre_filter(text):
         return None
-    semantic_frame = getattr(ctx, "semantic_frame", None)
-    if semantic_frame is None or not bool(
-        getattr(semantic_frame, "future_commitment_candidate", False)
-    ):
-        return None
 
     tool_caller = getattr(ctx.runtime, "agent_tool_caller", None)
     tool_registry = getattr(ctx.runtime, "tool_registry", None)
@@ -598,13 +543,8 @@ async def schedule_pending_topic_extraction(ctx: HookContext) -> Optional[str]:
     if not tool_caller or not logger:
         return None
     user_id = ctx.user_id
-    active_task = _PENDING_TOPIC_TASKS.get(user_id)
-    if active_task is not None and not active_task.done():
-        return None
-    active_count = sum(not task.done() for task in _PENDING_TOPIC_TASKS.values())
-    if active_count >= _PENDING_TOPIC_MAX_CONCURRENCY:
-        logger.debug("[topic_extract] background classifier capacity reached, skip")
-        return None
+
+    import asyncio as _asyncio
 
     async def _bg() -> None:
         try:
@@ -635,19 +575,8 @@ async def schedule_pending_topic_extraction(ctx: HookContext) -> Optional[str]:
         except Exception as exc:
             logger.debug(f"[topic_extract] bg failed: {exc}")
 
-    task = asyncio.create_task(_bg())
-    _PENDING_TOPIC_TASKS[user_id] = task
-
-    def _discard(completed: asyncio.Task[None], *, expected_user_id: str = user_id) -> None:
-        if _PENDING_TOPIC_TASKS.get(expected_user_id) is completed:
-            _PENDING_TOPIC_TASKS.pop(expected_user_id, None)
-
-    task.add_done_callback(_discard)
+    _asyncio.create_task(_bg())
     return None
-
-
-async def _pending_topic_extract_hook(ctx: HookContext) -> Optional[str]:
-    return await schedule_pending_topic_extraction(ctx)
 
 
 def register_all_builtin_hooks() -> None:

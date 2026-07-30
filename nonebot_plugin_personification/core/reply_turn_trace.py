@@ -108,7 +108,6 @@ def record_stage(
     status: str = "info",
     detail: Any = "",
     hint: str = "",
-    elapsed_ms: int | None = None,
 ) -> None:
     trace = str(trace_id or current_trace_id() or "").strip()
     if not trace:
@@ -121,11 +120,6 @@ def record_stage(
         "detail": sanitize_text(detail)[:1000],
         "hint": sanitize_text(hint)[:500],
     }
-    if elapsed_ms is not None:
-        try:
-            stage["elapsed_ms"] = max(0, int(elapsed_ms))
-        except (TypeError, ValueError):
-            pass
     try:
         with connect_sync() as conn:
             stages = _load_stages(conn, trace)
@@ -374,13 +368,7 @@ def build_process_view(trace: dict[str, Any] | None, *, logs: list[dict[str, Any
         hint = sanitize_text(stage.get("hint", ""))[:500]
         status = str(stage.get("status") or "info")[:16]
         category = _stage_category(stage)
-        try:
-            explicit_elapsed_ms = stage.get("elapsed_ms")
-            elapsed_ms = max(0, int(explicit_elapsed_ms)) if explicit_elapsed_ms is not None else None
-        except (TypeError, ValueError):
-            elapsed_ms = None
-        if elapsed_ms is None:
-            elapsed_ms = _elapsed_from_detail(detail)
+        elapsed_ms = _elapsed_from_detail(detail)
         if elapsed_ms is None and ts > 0 and next_ts > ts:
             elapsed_ms = int((next_ts - ts) * 1000)
         item = {
@@ -422,18 +410,6 @@ def build_process_view(trace: dict[str, Any] | None, *, logs: list[dict[str, Any
 
     outcome = str(trace.get("outcome") or "")
     diagnosis_code = str(trace.get("diagnosis_code") or "")
-    trace_detail = trace.get("detail") if isinstance(trace.get("detail"), dict) else {}
-    completion = {
-        key: _compact_value(trace_detail.get(key), limit=80)
-        for key in (
-            "tool_execution",
-            "evidence_delivery",
-            "outbound_delivery",
-            "social_coverage_status",
-            "evidence_recovered",
-        )
-        if trace_detail.get(key) not in {None, ""}
-    }
     return {
         "summary": {
             "trace_id": str(trace.get("trace_id") or ""),
@@ -447,7 +423,6 @@ def build_process_view(trace: dict[str, Any] | None, *, logs: list[dict[str, Any
             "category_counts": category_counts,
             "log_levels": log_levels,
             "slow_stages": slow_items[:5],
-            "completion": completion,
         },
         "items": items,
         "agent_inspection": _build_agent_inspection(items),

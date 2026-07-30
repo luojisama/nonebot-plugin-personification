@@ -10,14 +10,13 @@ from __future__ import annotations
 from typing import Any
 
 from .. import pending_topics as pt
-from ..framework import SocialContext, dispatch_social_outbound, run_social_text_agent
+from ..framework import SocialContext, run_social_text_agent
 from ..gate import gate_should_send
 from ..quota import is_quota_exceeded, mark_sent
-from ....core.visible_output import guard_visible_text
 
 _SCENARIO = "topic_followup"
 
-_FOLLOWUP_PROMPT = """延续你既定的人设，主动给一位朋友发一条消息，
+_FOLLOWUP_PROMPT = """你是一个性格自然的聊天 bot，主动给一位朋友发一条消息，
 关心他/她之前提过的事情。
 
 [对方原话]
@@ -77,8 +76,9 @@ async def topic_followup_handler(ctx: SocialContext) -> None:
         if not draft:
             pt.mark_skipped(topic_id)
             continue
+        final_text = draft
         if gate_enabled:
-            allow, _rewritten, reason = await gate_should_send(
+            allow, rewritten, reason = await gate_should_send(
                 tool_caller=ctx.tool_caller,
                 plugin_config=ctx.plugin_config,
                 tool_registry=ctx.tool_registry,
@@ -94,30 +94,12 @@ async def topic_followup_handler(ctx: SocialContext) -> None:
                 ctx.logger.info(f"[social/topic_followup] gate denied uid={uid} tid={topic_id}: {reason}")
                 pt.mark_skipped(topic_id)
                 continue
-        final_text = draft
-        final_text = guard_visible_text(
-            final_text, logger=ctx.logger, surface="social_topic_followup", allow_direct_media=False
-        )
-        if not final_text:
-            pt.mark_skipped(topic_id)
-            continue
+            if rewritten:
+                final_text = rewritten
         try:
-            confirmed = await dispatch_social_outbound(
-                ctx,
-                bot=bot,
-                conversation_kind="private",
-                conversation_id=uid,
-                surface="social_topic_followup",
-                content=final_text,
-                user_target=uid,
-            )
+            await bot.send_private_msg(user_id=int(uid), message=final_text)
         except Exception as exc:
             ctx.logger.warning(f"[social/topic_followup] send {uid} failed: {exc}")
-            continue
-        if not confirmed:
-            ctx.logger.warning(
-                f"[social/topic_followup] send {uid} outcome unknown; quota/history not committed"
-            )
             continue
         mark_sent(uid, scenario=_SCENARIO)
         pt.mark_followed_up(topic_id)
@@ -135,28 +117,37 @@ def _get_first_bot(ctx: SocialContext) -> Any | None:
 
 
 async def _generate_followup(ctx: SocialContext, topic_entry: dict) -> str:
-    if not (
-        getattr(ctx.plugin_config, "personification_agent_enabled", True)
-        and ctx.tool_caller
-        and ctx.tool_registry
-    ):
-        return ""
+    if not ctx.tool_caller:
+        topic = str(topic_entry.get("topic", "") or "")
+        return f"上次你说的{topic}怎么样了？" if topic else ""
     prompt = _FOLLOWUP_PROMPT.format(
         raw_quote=str(topic_entry.get("raw_quote", "") or "")[:200],
         topic=str(topic_entry.get("topic", "") or "")[:120],
     )
     messages = [{"role": "user", "content": prompt}]
+    if ctx.tool_caller and ctx.tool_registry:
+        try:
+            text = await run_social_text_agent(
+                ctx,
+                messages=messages,
+                trigger_reason="social_topic_followup",
+                chat_intent_hint="social_topic_followup",
+            )
+        except Exception as exc:
+            ctx.logger.debug(f"[social/topic_followup] Agent gen failed: {exc}")
+            return ""
+        text = text.strip('"').strip("'").strip("「」").strip()
+        return text[:120] if text else ""
     try:
-        text = await run_social_text_agent(
-            ctx,
+        response = await ctx.tool_caller.chat_with_tools(
             messages=messages,
-            trigger_reason="social_topic_followup",
-            chat_intent_hint="social_topic_followup",
+            tools=[],
+            use_builtin_search=False,
         )
     except Exception as exc:
-        ctx.logger.debug(f"[social/topic_followup] Agent gen failed: {exc}")
+        ctx.logger.debug(f"[social/topic_followup] gen failed: {exc}")
         return ""
-    text = text.strip().strip('"').strip("'").strip("「」")
+    text = str(getattr(response, "content", "") or "").strip().strip('"').strip("'")
     return text[:120] if text else ""
 
 

@@ -1,8 +1,7 @@
 from __future__ import annotations
 
 import hashlib
-import ipaddress
-from typing import Any, Callable
+from typing import Any
 
 from fastapi import HTTPException, Request
 
@@ -15,31 +14,17 @@ _CSRF_HEADER_NAME = "x-personification-csrf"
 # 非 GET/HEAD/OPTIONS 请求都必须带 CSRF header；
 # 浏览器跨站点 form POST 无法设置自定义 header，可阻断常见 CSRF。
 _CSRF_SAFE_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
-_admin_authorizer: Callable[[str], bool] | None = None
-
-
-def set_admin_authorizer(authorizer: Callable[[str], bool]) -> None:
-    global _admin_authorizer
-    _admin_authorizer = authorizer
 
 
 def get_client_ip(request: Request) -> str:
-    client = request.client
-    peer = str(getattr(client, "host", "") or "").strip()
-    try:
-        peer_ip = ipaddress.ip_address(peer)
-        trust_forwarded = peer_ip.is_loopback or peer_ip.is_private
-    except ValueError:
-        trust_forwarded = False
-    if trust_forwarded:
-        forwarded = request.headers.get("x-forwarded-for", "") or ""
+    """取 X-Forwarded-For 头第一段，否则取 client.host。"""
+    forwarded = request.headers.get("x-forwarded-for", "") or ""
+    if forwarded:
         first = forwarded.split(",")[0].strip()
         if first:
-            try:
-                return str(ipaddress.ip_address(first))
-            except ValueError:
-                pass
-    return peer
+            return first
+    client = request.client
+    return getattr(client, "host", "") or ""
 
 
 def get_user_agent(request: Request) -> str:
@@ -55,14 +40,6 @@ def require_admin(request: Request) -> AdminIdentity:
     record = webui_auth_store.lookup_device(token, ua=ua)
     if not record:
         raise HTTPException(status_code=401, detail="设备令牌无效、已被撤销或已过期")
-    qq = str(record.get("qq", "") or "").strip()
-    try:
-        still_admin = bool(_admin_authorizer and _admin_authorizer(qq))
-    except Exception:
-        still_admin = False
-    if not still_admin:
-        webui_auth_store.revoke_device(hashlib.sha256(token.encode("utf-8")).hexdigest())
-        raise HTTPException(status_code=401, detail="管理员权限已撤销")
     # 待审批设备：除"查询自身状态"外一律拒绝，返回可识别的 detail 供前端切到等待页
     if str(record.get("status", "approved") or "approved") == "pending":
         raise HTTPException(status_code=403, detail="DEVICE_PENDING")
@@ -74,7 +51,7 @@ def require_admin(request: Request) -> AdminIdentity:
             raise HTTPException(status_code=403, detail="CSRF token 校验失败")
 
     return AdminIdentity(
-        qq=qq,
+        qq=str(record.get("qq", "")),
         device_id=hashlib.sha256(token.encode("utf-8")).hexdigest(),
         label=str(record.get("label", "")),
     )

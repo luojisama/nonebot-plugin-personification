@@ -191,13 +191,13 @@ def _webui_runtime_with_style(tmp_path: Path, monkeypatch):
     store = memory_store_mod.MemoryStore(plugin_config=cfg, logger=SimpleNamespace(warning=lambda *_a, **_k: None))
     store.initialize()
     # 注入足够的群对话样本
-    for i in range(40):
+    for i in range(30):
         store.append_group_message(
             group_id="g_style",
-            role="user" if i % 2 == 0 else "assistant",
+            role="user",
             content={"text": f"消息 #{i}"},
             metadata={"user_id": f"u{i%5}"},
-            created_at=time.time() - (40 - i),
+            created_at=time.time() - (30 - i),
         )
 
     class _StyleMockCaller:
@@ -281,12 +281,7 @@ def test_style_rebuild_rejects_insufficient_messages(_webui_runtime_with_style) 
     _login(client, _webui_runtime_with_style)
     res = client.post("/personification/api/groups/g_empty/style/rebuild", json={})
     assert res.status_code == 400
-    report = res.json()["detail"]
-    assert report["code"] == "group_style_sample_insufficient"
-    assert report["phase"] == "source"
-    assert report["retryable"] is False
-    assert report["partial"] is False
-    assert report["outcome_unknown"] is False
+    assert "样本太少" in res.json()["detail"]
 
 
 def test_style_rebuild_rate_limit(_webui_runtime_with_style) -> None:

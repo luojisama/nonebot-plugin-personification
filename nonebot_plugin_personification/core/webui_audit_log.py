@@ -5,7 +5,6 @@ import time
 from typing import Any
 
 from .db import connect_sync
-from .sensitive_data import sanitize_object, sanitize_text
 
 
 _RETENTION_DAYS = 90
@@ -23,7 +22,7 @@ def record(
 ) -> None:
     """记录一条 WebUI 审计日志。即使失败也不抛异常（不要影响主流程）。"""
     try:
-        payload = json.dumps(sanitize_object(detail or {}), ensure_ascii=False, separators=(",", ":"))
+        payload = json.dumps(detail or {}, ensure_ascii=False, separators=(",", ":"))
         with connect_sync() as conn:
             conn.execute(
                 """
@@ -36,7 +35,7 @@ def record(
                     str(action or "")[:64],
                     str(qq or "")[:32],
                     str(device_id or "")[:64],
-                    sanitize_text(target, limit=128),
+                    str(target or "")[:128],
                     str(ip_hash or "")[:32],
                     payload[:2000],
                     str(outcome or "ok")[:16],
@@ -81,7 +80,7 @@ def query_recent(
     out: list[dict[str, Any]] = []
     for row in rows:
         try:
-            detail = sanitize_object(json.loads(row["detail"] or "{}"))
+            detail = json.loads(row["detail"] or "{}")
         except Exception:
             detail = {}
         out.append({
@@ -96,24 +95,6 @@ def query_recent(
             "outcome": str(row["outcome"] or "ok"),
         })
     return out
-
-
-def scrub_sensitive_details() -> int:
-    updated = 0
-    with connect_sync() as conn:
-        rows = conn.execute("SELECT id, detail FROM webui_audit_log").fetchall()
-        for row in rows:
-            try:
-                original = json.loads(row["detail"] or "{}")
-            except Exception:
-                original = {}
-            sanitized = json.dumps(sanitize_object(original), ensure_ascii=False, separators=(",", ":"))[:2000]
-            if sanitized == str(row["detail"] or ""):
-                continue
-            conn.execute("UPDATE webui_audit_log SET detail=? WHERE id=?", (sanitized, int(row["id"])))
-            updated += 1
-        conn.commit()
-    return updated
 
 
 def prune_old_entries(*, retention_days: int = _RETENTION_DAYS) -> int:

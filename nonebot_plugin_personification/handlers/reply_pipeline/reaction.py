@@ -2,7 +2,7 @@
 
 真群友最高频的互动不是说话，而是给消息贴个表情。本模块在 intent/LLM 判定
 NO_REPLY 时按概率把"沉默"升级成"贴表情"，不新增任何 LLM 调用：
-表情只消费 TurnSemanticFrame 的结构化情绪标签，从内置 情绪→face_id 表中选取。
+表情用关键词启发式从内置 情绪→face_id 表中选取。
 
 风控三重闸：概率、同群冷却、每群每日上限；协议端不支持时静默降级。
 """
@@ -10,6 +10,7 @@ NO_REPLY 时按概率把"沉默"升级成"贴表情"，不新增任何 LLM 调�
 from __future__ import annotations
 
 import random
+import re
 import time
 from typing import Any
 
@@ -25,21 +26,13 @@ _FACES_BY_MOOD: dict[str, tuple[int, ...]] = {
     "generic": (76, 182, 13, 14),  # 强/笑哭/呲牙/微笑
 }
 
-_FACE_GROUP_BY_SEMANTIC_MOOD: dict[str, str] = {
-    "搞笑": "funny",
-    "开心": "funny",
-    "得意": "funny",
-    "赞同": "praise",
-    "期待": "praise",
-    "感动": "love",
-    "害羞": "love",
-    "撒娇": "love",
-    "委屈": "sad",
-    "失落": "sad",
-    "惊讶": "surprise",
-    "困惑": "surprise",
-    "震惊": "surprise",
-}
+_MOOD_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
+    ("funny", re.compile(r"哈哈|hhh|草|笑死|乐|🤣|😂|绷不住|蚌埠")),
+    ("praise", re.compile(r"牛|强|厉害|可以啊|👍|nb|тql|tql|666|赢")),
+    ("sad", re.compile(r"呜|难过|哭|惨|寄|emo|唉|😭|心碎")),
+    ("surprise", re.compile(r"？？|\?\?|啊\?|什么鬼|离谱|震惊|没想到")),
+    ("love", re.compile(r"爱了|可爱|喜欢|贴贴|抱抱|❤|😘|mua")),
+)
 
 _COOLDOWN_SECONDS = 60.0
 
@@ -55,11 +48,13 @@ _PROACTIVE_POKE_MIN_FAV = 85.0
 _PROACTIVE_POKE_DAILY_LIMIT = 3
 
 
-def pick_face_id(mood_hint: str, rng: random.Random | None = None) -> int:
+def pick_face_id(message_text: str, rng: random.Random | None = None) -> int:
     r = rng or random
-    semantic_mood = str(mood_hint or "").split("|", 1)[0].strip()
-    face_group = _FACE_GROUP_BY_SEMANTIC_MOOD.get(semantic_mood, "generic")
-    return r.choice(_FACES_BY_MOOD[face_group])
+    text = str(message_text or "")
+    for mood, pattern in _MOOD_PATTERNS:
+        if pattern.search(text):
+            return r.choice(_FACES_BY_MOOD[mood])
+    return r.choice(_FACES_BY_MOOD["generic"])
 
 
 def _today(now_fn: Any = time.time) -> str:
@@ -87,7 +82,7 @@ async def maybe_react_on_silence(
     runtime: Any,
     *,
     event: Any,
-    mood_hint: str,
+    message_text: str,
     group_id: str,
     user_id: str,
     is_private: bool,
@@ -105,7 +100,7 @@ async def maybe_react_on_silence(
     plugin_config = runtime.plugin_config
     try:
         if message_id is not None and _reaction_allowed(plugin_config, group_id, now_fn=now_fn, rng=rng):
-            face_id = pick_face_id(mood_hint, rng=rng if isinstance(rng, random.Random) else None)
+            face_id = pick_face_id(message_text, rng=rng if isinstance(rng, random.Random) else None)
             ok = await protocol_capabilities.emoji_react(
                 bot,
                 plugin_config,

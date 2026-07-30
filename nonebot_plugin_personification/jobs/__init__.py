@@ -74,11 +74,9 @@ class JobSetupDeps:
     qzone_inbound_enabled: bool = True
     qzone_inbound_check_interval_minutes: int = 3
     qzone_inbound_poll_flow: Any = None
-    user_policy_authorizer: Any = None
     persona_store: Any = None
     vision_caller: Any = None
     agent_tool_caller: Any = None
-    get_agent_tool_caller: Any = None
     agent_tool_registry: Any = None
     agent_max_steps: int = 4
     agent_data_dir: Any = None
@@ -122,11 +120,9 @@ def setup_jobs(*, scheduler: Any, deps: JobSetupDeps) -> Dict[str, Any]:
         call_ai_api=deps.call_ai_api,
         logger=deps.logger,
         agent_tool_caller=deps.agent_tool_caller,
-        get_agent_tool_caller=deps.get_agent_tool_caller,
         agent_tool_registry=deps.agent_tool_registry,
         agent_max_steps=deps.agent_max_steps,
         agent_data_dir=deps.agent_data_dir,
-        user_policy_authorizer=deps.user_policy_authorizer,
     )
     auto_post_diary = None
     proactive_qzone_post = None
@@ -145,11 +141,9 @@ def setup_jobs(*, scheduler: Any, deps: JobSetupDeps) -> Dict[str, Any]:
                 call_ai_api=deps.call_ai_api,
                 logger=deps.logger,
                 agent_tool_caller=deps.agent_tool_caller,
-                get_agent_tool_caller=deps.get_agent_tool_caller,
                 agent_tool_registry=deps.agent_tool_registry,
                 agent_max_steps=deps.agent_max_steps,
                 agent_data_dir=deps.agent_data_dir,
-                user_policy_authorizer=deps.user_policy_authorizer,
             )
             proactive_qzone_post = build_proactive_qzone_post_task(
                 run_proactive_qzone_post=run_proactive_qzone_post,
@@ -191,16 +185,11 @@ def setup_jobs(*, scheduler: Any, deps: JobSetupDeps) -> Dict[str, Any]:
                     persona_store=deps.persona_store,
                     vision_caller=deps.vision_caller,
                     agent_data_dir=deps.agent_data_dir,
-                    agent_tool_caller=(
-                        deps.get_agent_tool_caller()
-                        if callable(deps.get_agent_tool_caller)
-                        else deps.agent_tool_caller
-                    ),
+                    agent_tool_caller=deps.agent_tool_caller,
                     agent_tool_registry=deps.agent_tool_registry,
                     agent_max_steps=deps.agent_max_steps,
                     target_user_id=target_user_id,
                     allow_open_user=allow_open_user,
-                    user_policy_authorizer=deps.user_policy_authorizer,
                 )
 
             qzone_social_scan = build_qzone_social_scan_task(
@@ -232,14 +221,9 @@ def setup_jobs(*, scheduler: Any, deps: JobSetupDeps) -> Dict[str, Any]:
                     logger=deps.logger,
                     persona_store=deps.persona_store,
                     agent_data_dir=deps.agent_data_dir,
-                    agent_tool_caller=(
-                        deps.get_agent_tool_caller()
-                        if callable(deps.get_agent_tool_caller)
-                        else deps.agent_tool_caller
-                    ),
+                    agent_tool_caller=deps.agent_tool_caller,
                     agent_tool_registry=deps.agent_tool_registry,
                     agent_max_steps=deps.agent_max_steps,
-                    user_policy_authorizer=deps.user_policy_authorizer,
                 )
 
             qzone_inbound_poll = build_qzone_inbound_poll_task(
@@ -259,24 +243,24 @@ def setup_jobs(*, scheduler: Any, deps: JobSetupDeps) -> Dict[str, Any]:
                     logger=deps.logger,
                 )
 
-        # 每周重检曾拒绝访问的 QZone 用户
+        # 每周重检 qzone 权限黑名单
         if deps.qzone_social_service is not None:
-            async def _recheck_qzone_access_denied() -> None:
-                from ..flows.qzone_social_flow import recheck_qzone_access_denied_users
-                bots = deps.get_bots() if callable(deps.get_bots) else {}
-                for bot in (bots or {}).values():
+            async def _recheck_qzone_permissions() -> None:
+                from ..flows.qzone_social_flow import recheck_qzone_permission_blocked_users
+                bots = deps.get_bots() if callable(deps.get_bots) else []
+                for bot in (bots or []):
                     try:
-                        await recheck_qzone_access_denied_users(
+                        await recheck_qzone_permission_blocked_users(
                             bot=bot,
                             qzone_social_service=deps.qzone_social_service,
                             logger=deps.logger,
                         )
                     except Exception as exc:
-                        deps.logger.warning(f"[qzone_access_denied_recheck] bot {getattr(bot, 'self_id', '?')} failed: {exc}")
+                        deps.logger.warning(f"[qzone_permission_recheck] bot {getattr(bot, 'self_id', '?')} failed: {exc}")
 
             register_qzone_permission_recheck_job(
                 scheduler=scheduler,
-                permission_recheck_job=_recheck_qzone_access_denied,
+                permission_recheck_job=_recheck_qzone_permissions,
                 logger=deps.logger,
             )
     if getattr(deps, "proactive_enabled", True):

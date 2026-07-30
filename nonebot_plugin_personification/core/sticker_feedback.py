@@ -110,9 +110,8 @@ async def _mutate_sticker_feedback(
         return dict(_DEFAULT_STATE)
 
     store = get_data_store()
-
-    def _mutate(raw: Any) -> dict[str, Any]:
-        current = _normalize_state(raw)
+    async with store._alock(_STORE_NAME):
+        current = _normalize_state(await store.load(_STORE_NAME))
         items = dict(current.get("items", {}) or {})
         entry = dict(items.get(name, {}) or {})
         updated_entry = on_update(entry)
@@ -127,10 +126,8 @@ async def _mutate_sticker_feedback(
             "items": items,
             "updated_at": _now_text(),
         }
+        await store.save(_STORE_NAME, updated)
         return updated
-
-    updated = await store.mutate(_STORE_NAME, _mutate)
-    return _normalize_state(updated)
 
 
 async def record_sticker_sent(sticker_name: str) -> dict[str, Any]:

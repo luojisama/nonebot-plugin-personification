@@ -15,7 +15,6 @@ import pytest
 impl = load_personification_module(
     "plugin.personification.skills.skillpacks.tool_caller.scripts.impl"
 )
-llm_context = load_personification_module("plugin.personification.core.llm_context")
 
 
 @pytest.fixture(autouse=True)
@@ -75,121 +74,6 @@ def test_model_candidates_unknown_user_model_keeps_first_with_fallback() -> None
     cs = impl._antigravity_cli_model_candidates("some-future-model-x")
     assert cs[0] == "some-future-model-x"
     assert "gemini-3.5-flash-low" in cs
-
-
-def test_single_attempt_reuses_model_selected_by_normal_probe(monkeypatch) -> None:  # noqa: ANN001
-    caller = impl.AntigravityCliToolCaller(
-        model="auto-gemini-3",
-        auth_path="",
-        project="fake-project-id",
-        thinking_mode="none",
-        timeout=30.0,
-    )
-    requested_models: list[str] = []
-
-    class _Client:
-        async def post(self, url, *, json, headers):  # noqa: ANN001, ANN202
-            requested_models.append(json["model"])
-            request = impl.httpx.Request("POST", url)
-            if json["model"] == "gemini-3.5-flash-low":
-                return impl.httpx.Response(404, request=request, text="not found")
-            return impl.httpx.Response(
-                200,
-                request=request,
-                text='data: {"response":{"candidates":[{"content":{"parts":[{"text":"ok"}]}}]}}\n\n',
-            )
-
-    async def _get_access_token(*, force_refresh=False):  # noqa: ANN001
-        return "fake-token", pathlib.Path("/tmp/fake_auth.json")
-
-    async def _get_client(*_args, **_kwargs):  # noqa: ANN001, ANN202
-        return _Client()
-
-    monkeypatch.setattr(caller, "_get_access_token", _get_access_token)
-    monkeypatch.setattr(impl, "_get_pooled_http_client", _get_client)
-
-    probe = asyncio.run(caller.chat_with_tools([{"role": "user", "content": "hi"}], [], False))
-    assert probe.model_used == "gemini-3-flash-agent"
-    assert requested_models == ["gemini-3.5-flash-low", "gemini-3-flash-agent"]
-
-    requested_models.clear()
-    token = llm_context.set_llm_context(
-        purpose="qzone_generation",
-        retry_policy=llm_context.LLM_RETRY_POLICY_SINGLE_ATTEMPT,
-    )
-    try:
-        qzone = asyncio.run(caller.chat_with_tools([{"role": "user", "content": "hi"}], [], False))
-    finally:
-        llm_context.reset_llm_context(token)
-
-    assert qzone.model_used == "gemini-3-flash-agent"
-    assert requested_models == ["gemini-3-flash-agent"]
-
-
-def test_single_attempt_rotates_404_candidate_without_probe_state(monkeypatch) -> None:  # noqa: ANN001
-    caller = impl.AntigravityCliToolCaller(
-        model="auto-gemini-3",
-        auth_path="",
-        project="fake-project-id",
-        thinking_mode="none",
-        timeout=30.0,
-    )
-    requested_models: list[str] = []
-
-    class _Client:
-        async def post(self, url, *, json, headers):  # noqa: ANN001, ANN202
-            requested_models.append(json["model"])
-            request = impl.httpx.Request("POST", url)
-            if json["model"] == "gemini-3.5-flash-low":
-                return impl.httpx.Response(404, request=request, text="not found")
-            return impl.httpx.Response(
-                200,
-                request=request,
-                text='data: {"response":{"candidates":[{"content":{"parts":[{"text":"ok"}]}}]}}\n\n',
-            )
-
-    async def _get_access_token(*, force_refresh=False):  # noqa: ANN001
-        return "fake-token", pathlib.Path("/tmp/fake_auth.json")
-
-    async def _get_client(*_args, **_kwargs):  # noqa: ANN001, ANN202
-        return _Client()
-
-    monkeypatch.setattr(caller, "_get_access_token", _get_access_token)
-    monkeypatch.setattr(impl, "_get_pooled_http_client", _get_client)
-    probe_token = llm_context.set_llm_context(
-        purpose="qzone_provider_probe",
-        retry_policy=llm_context.LLM_RETRY_POLICY_SINGLE_ATTEMPT,
-    )
-    try:
-        with pytest.raises(impl.httpx.HTTPStatusError):
-            asyncio.run(caller.chat_with_tools([{"role": "user", "content": "hi"}], [], False))
-    finally:
-        llm_context.reset_llm_context(probe_token)
-    assert getattr(caller, "_preferred_concrete_model", "") == ""
-    assert requested_models == ["gemini-3.5-flash-low"]
-
-    token = llm_context.set_llm_context(
-        purpose="qzone_generation",
-        retry_policy=llm_context.LLM_RETRY_POLICY_SINGLE_ATTEMPT,
-    )
-    try:
-        with pytest.raises(impl.httpx.HTTPStatusError) as caught:
-            asyncio.run(caller.chat_with_tools([{"role": "user", "content": "hi"}], [], False))
-        assert getattr(caught.value, "code", "") == "provider_model_candidate_unavailable"
-        assert getattr(caught.value, "concrete_model", "") == "gemini-3.5-flash-low"
-        assert getattr(caught.value, "next_model", "") == "gemini-3-flash-agent"
-        assert requested_models == ["gemini-3.5-flash-low", "gemini-3.5-flash-low"]
-
-        result = asyncio.run(caller.chat_with_tools([{"role": "user", "content": "hi"}], [], False))
-    finally:
-        llm_context.reset_llm_context(token)
-
-    assert result.model_used == "gemini-3-flash-agent"
-    assert requested_models == [
-        "gemini-3.5-flash-low",
-        "gemini-3.5-flash-low",
-        "gemini-3-flash-agent",
-    ]
 
 
 # ====== 协议端到端测试（mock httpx） ======

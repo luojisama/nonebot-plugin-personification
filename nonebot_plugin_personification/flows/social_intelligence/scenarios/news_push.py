@@ -11,14 +11,13 @@ from __future__ import annotations
 
 from typing import Any
 
-from ..framework import SocialContext, dispatch_social_outbound, run_social_text_agent
+from ..framework import SocialContext, run_social_text_agent
 from ..gate import gate_should_send
 from ..quota import is_quota_exceeded, mark_sent
-from ....core.visible_output import guard_visible_text
 
 _SCENARIO = "news_push"
 
-_PACK_PROMPT = """延续你既定的人设，把今天的{source_label}用你自己的话
+_PACK_PROMPT = """你是一个性格自然的聊天 bot，要把今天的{source_label}用你自己的话
 转述给一位朋友/群友，不要列点、不要工整结尾，像随手分享，30-90 字。
 
 [原始内容]
@@ -85,26 +84,10 @@ async def news_push_handler(ctx: SocialContext) -> None:
         final_text = await _gate_or_pass(ctx, uid, draft, gate_enabled)
         if final_text is None:
             continue
-        final_text = guard_visible_text(
-            final_text, logger=ctx.logger, surface="social_news_private", allow_direct_media=False
-        )
-        if not final_text:
-            continue
         try:
-            confirmed = await dispatch_social_outbound(
-                ctx,
-                bot=bot,
-                conversation_kind="private",
-                conversation_id=uid,
-                surface="social_news_private",
-                content=final_text,
-                user_target=uid,
-            )
+            await bot.send_private_msg(user_id=int(uid), message=final_text)
         except Exception as exc:
             ctx.logger.warning(f"[social/news] send user {uid} failed: {exc}")
-            continue
-        if not confirmed:
-            ctx.logger.warning(f"[social/news] send user {uid} outcome unknown")
             continue
         mark_sent(uid, scenario=_SCENARIO)
         sent_user += 1
@@ -120,25 +103,10 @@ async def news_push_handler(ctx: SocialContext) -> None:
         final_text = await _gate_or_pass(ctx, gid_key, draft, gate_enabled)
         if final_text is None:
             continue
-        final_text = guard_visible_text(
-            final_text, logger=ctx.logger, surface="social_news_group", allow_direct_media=False
-        )
-        if not final_text:
-            continue
         try:
-            confirmed = await dispatch_social_outbound(
-                ctx,
-                bot=bot,
-                conversation_kind="group",
-                conversation_id=gid,
-                surface="social_news_group",
-                content=final_text,
-            )
+            await bot.send_group_msg(group_id=int(gid), message=final_text)
         except Exception as exc:
             ctx.logger.warning(f"[social/news] send group {gid} failed: {exc}")
-            continue
-        if not confirmed:
-            ctx.logger.warning(f"[social/news] send group {gid} outcome unknown")
             continue
         mark_sent(gid_key, scenario=_SCENARIO)
         sent_group += 1
@@ -203,25 +171,34 @@ async def _pack_news(ctx: SocialContext, source: str, raw_news: str) -> str:
     label = _SOURCE_LABELS.get(source, "新闻")
     prompt = _PACK_PROMPT.format(source_label=label, raw_news=raw_news[:1500])
     messages = [{"role": "user", "content": prompt}]
-    if not (
-        getattr(ctx.plugin_config, "personification_agent_enabled", True)
-        and ctx.tool_caller
-        and ctx.tool_registry
-    ):
-        return ""
+    if ctx.tool_caller and ctx.tool_registry:
+        try:
+            text = await run_social_text_agent(
+                ctx,
+                messages=messages,
+                trigger_reason="social_news_push",
+                chat_intent_hint="social_news_push",
+                use_builtin_search_hint=True,
+            )
+        except Exception as exc:
+            ctx.logger.debug(f"[social/news] Agent pack failed: {exc}")
+            return ""
+        text = text.strip('"').strip("'").strip("「」").strip()
+        return text[:300] if text else ""
+    if not ctx.tool_caller:
+        # 无 tool_caller 时退化为原文截断（避免完全发不出去）
+        return raw_news[:200]
     try:
-        text = await run_social_text_agent(
-            ctx,
+        response = await ctx.tool_caller.chat_with_tools(
             messages=messages,
-            trigger_reason="social_news_push",
-            chat_intent_hint="social_news_push",
-            use_builtin_search_hint=True,
+            tools=[],
+            use_builtin_search=False,
         )
     except Exception as exc:
-        ctx.logger.debug(f"[social/news] Agent pack failed: {exc}")
-        return ""
-    text = text.strip().strip('"').strip("'").strip("「」")
-    return text[:300] if text else ""
+        ctx.logger.debug(f"[social/news] LLM pack failed: {exc}")
+        return raw_news[:200]
+    text = str(getattr(response, "content", "") or "").strip().strip('"').strip("'")
+    return text[:300] if text else raw_news[:200]
 
 
 async def _gate_or_pass(
@@ -229,7 +206,7 @@ async def _gate_or_pass(
 ) -> str | None:
     if not gate_enabled:
         return draft
-    allow, _rewritten, reason = await gate_should_send(
+    allow, rewritten, reason = await gate_should_send(
         tool_caller=ctx.tool_caller,
         plugin_config=ctx.plugin_config,
         tool_registry=ctx.tool_registry,
@@ -244,7 +221,7 @@ async def _gate_or_pass(
     if not allow:
         ctx.logger.info(f"[social/news] gate denied {target_key}: {reason}")
         return None
-    return draft
+    return rewritten or draft
 
 
 def _now_str(ctx: SocialContext) -> str:

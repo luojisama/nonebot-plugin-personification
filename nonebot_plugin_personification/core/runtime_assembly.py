@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from types import SimpleNamespace
 from typing import Any, Callable, Dict
 
 from ..flows import FlowSetupDeps
@@ -144,29 +143,14 @@ class PluginRuntimeBundle:
     persona_store: Any = None
     memory_store: Any = None
     profile_service: Any = None
-    scoped_profile_service: Any = None
     memory_curator: Any = None
     memory_decay_scheduler: Any = None
     background_intelligence: Any = None
-    user_policy_service: Any = None
-    qq_user_policy_gate: Any = None
-    qq_outbound_ledger: Any = None
     qzone_social_scan: Any = None
     qzone_inbound_poll: Any = None
     qzone_generate_post: Any = None
     get_knowledge_build_task: Any = None
     set_knowledge_build_task: Any = None
-
-    async def reload_all_runtime_services(self) -> dict[str, Any]:
-        from ..skill_runtime.reload import reload_all_runtime_services
-
-        runtime = SimpleNamespace(
-            plugin_config=self.plugin_config,
-            logger=self.logger,
-            get_bots=self.get_bots,
-            runtime_bundle=self,
-        )
-        return await reload_all_runtime_services(runtime)
 
     def make_flow_setup_deps(self) -> FlowSetupDeps:
         return FlowSetupDeps(
@@ -196,7 +180,6 @@ class PluginRuntimeBundle:
             get_whitelisted_groups=self._get_whitelisted_groups,
             record_group_msg=record_group_msg,
             build_grounding_context=self.reply_processor_deps.runtime.build_grounding_context,
-            qq_outbound_ledger=self.qq_outbound_ledger,
         )
 
     def _get_whitelisted_groups(self) -> list[str]:
@@ -334,15 +317,9 @@ class PluginRuntimeBundle:
                 getattr(self.plugin_config, "personification_qzone_inbound_check_interval", 3)
             ),
             qzone_inbound_poll_flow=self.qzone_inbound_poll_flow,
-            user_policy_authorizer=(
-                self.qq_user_policy_gate.current_authorization
-                if self.qq_user_policy_gate is not None
-                else None
-            ),
             persona_store=self.persona_store,
             vision_caller=self.reply_processor_deps.runtime.vision_caller,
             agent_tool_caller=self.reply_processor_deps.runtime.agent_tool_caller,
-            get_agent_tool_caller=lambda: self.reply_processor_deps.runtime.agent_tool_caller,
             agent_tool_registry=self.reply_processor_deps.runtime.tool_registry,
             agent_max_steps=int(getattr(self.plugin_config, "personification_qzone_agent_max_steps", 4)),
             agent_data_dir=get_personification_data_dir(self.plugin_config),
@@ -369,7 +346,6 @@ class PluginRuntimeBundle:
             sticker_chat_rule_core=sticker_chat_rule_core,
             process_response_logic_core=process_response_logic_core,
             reply_processor_deps=self.reply_processor_deps,
-            user_policy_gate=self.qq_user_policy_gate,
             handle_reply_event_core=handle_reply_event,
             run_buffer_timer_core=run_buffer_timer_core,
             msg_buffer=self.msg_buffer,
@@ -464,7 +440,7 @@ class PluginRuntimeBundle:
             handle_global_switch_command=handle_global_switch_command,
             handle_tts_global_switch_command=handle_tts_global_switch_command,
             load_plugin_runtime_config=self.load_plugin_runtime_config,
-            reload_runtime_services=self.reload_all_runtime_services,
+            reload_runtime_services=self.reload_runtime_services,
             apply_web_search_switch=apply_web_search_switch,
             apply_proactive_switch=apply_proactive_switch,
             apply_global_switch=apply_global_switch,

@@ -121,9 +121,6 @@ def register_proactive_qzone_job(
             minutes=safe_interval,
             id="personification_proactive_qzone",
             replace_existing=True,
-            max_instances=1,
-            coalesce=True,
-            misfire_grace_time=120,
         )
         logger.info(f"拟人插件：主动空间动态任务已注册，检测间隔 {safe_interval} 分钟")
     except Exception as e:
@@ -145,9 +142,6 @@ def register_qzone_social_scan_job(
             minutes=safe_interval,
             id="personification_qzone_social_scan",
             replace_existing=True,
-            max_instances=1,
-            coalesce=True,
-            misfire_grace_time=300,
         )
         logger.info(f"拟人插件：好友空间互动扫描任务已注册，检测间隔 {safe_interval} 分钟")
     except Exception as e:
@@ -169,9 +163,6 @@ def register_qzone_inbound_poll_job(
             minutes=safe_interval,
             id="personification_qzone_inbound_poll",
             replace_existing=True,
-            max_instances=1,
-            coalesce=True,
-            misfire_grace_time=60,
         )
         logger.info(f"拟人插件：空间消息轮询任务已注册，检测间隔 {safe_interval} 分钟")
     except Exception as e:
@@ -184,7 +175,7 @@ def register_qzone_permission_recheck_job(
     permission_recheck_job: Any,
     logger: Any,
 ) -> None:
-    """每周重检 qzone_access_denied 中的 uid 是否重新可访问。"""
+    """每周重检 qzone_permission_blocked 中的 uid 是否重新可访问。"""
     try:
         scheduler.add_job(
             permission_recheck_job,

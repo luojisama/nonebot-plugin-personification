@@ -119,8 +119,6 @@ def test_patch_sticker_updates_metadata(_runtime_with_stickers) -> None:
     )
     assert res.status_code == 200, res.text
     body = res.json()
-    assert body["code"] == "sticker_metadata_saved"
-    assert body["diagnostic"]["steps"][-1]["status"] == "ok"
     assert body["entry"]["description"] == "新的描述"
     assert body["entry"]["weight"] == 2.0
     assert body["entry"]["proactive_send"] is True
@@ -132,9 +130,7 @@ def test_delete_moves_to_trash(_runtime_with_stickers) -> None:
     res = client.delete("/personification/api/stickers/c.gif")
     assert res.status_code == 200, res.text
     body = res.json()
-    assert body["code"] == "sticker_deleted"
-    assert body["trash_path"].startswith("trash/")
-    assert str(_runtime_with_stickers.sticker_dir) not in body["trash_path"]
+    assert "trash" in body["trash_path"]
     assert not (_runtime_with_stickers.sticker_dir / "c.gif").exists()
     # 从 manifest 移除
     manifest = json.loads((_runtime_with_stickers.sticker_dir / "stickers.json").read_text(encoding="utf-8"))
@@ -153,8 +149,6 @@ def test_upload_creates_file_and_manifest_entry(_runtime_with_stickers) -> None:
     assert res.status_code == 200, res.text
     body = res.json()
     assert body["success"] is True
-    assert body["code"] == "sticker_uploaded"
-    assert [step["status"] for step in body["steps"]] == ["ok", "ok", "ok"]
     assert (_runtime_with_stickers.sticker_dir / body["filename"]).exists()
     manifest = json.loads((_runtime_with_stickers.sticker_dir / "stickers.json").read_text(encoding="utf-8"))
     assert manifest[body["filename"]]["description"] == "用户描述"
@@ -169,10 +163,6 @@ def test_upload_rejects_oversized_file(_runtime_with_stickers) -> None:
         files={"file": ("big.png", payload, "image/png")},
     )
     assert res.status_code == 413
-    detail = res.json()["detail"]
-    assert detail["code"] == "sticker_upload_too_large"
-    assert detail["phase"] == "file_validation"
-    assert detail["steps"][1]["status"] == "skipped"
 
 
 def test_rescan_force_all_clears_all_entries(_runtime_with_stickers) -> None:
@@ -180,8 +170,6 @@ def test_rescan_force_all_clears_all_entries(_runtime_with_stickers) -> None:
     _login(client, _runtime_with_stickers)
     res = client.post("/personification/api/stickers/rescan", json={"mode": "force_all"})
     assert res.status_code == 200, res.text
-    assert res.json()["code"] == "sticker_rescan_scheduled"
-    assert res.json()["diagnostic"]["steps"][-1]["status"] == "ok"
     assert res.json()["scheduled"] >= 1
     manifest = json.loads((_runtime_with_stickers.sticker_dir / "stickers.json").read_text(encoding="utf-8"))
     # 所有有 manifest 的条目都被清空
@@ -198,172 +186,3 @@ def test_rescan_missing_only_keeps_labeled(_runtime_with_stickers) -> None:
     assert manifest["a.png"].get("description") == "笑脸"
     # b.jpg 没 description 应当被清空（为重新打标准备）
     assert manifest["b.jpg"] == {}
-
-
-def test_upload_rejects_invalid_filename_with_structured_diagnostic(_runtime_with_stickers) -> None:
-    client = _build_client(_runtime_with_stickers)
-    _login(client, _runtime_with_stickers)
-    res = client.post(
-        "/personification/api/stickers/upload",
-        files={"file": ("../secret.png", b"valid-bytes", "image/png")},
-    )
-    assert res.status_code == 400
-    detail = res.json()["detail"]
-    assert detail["code"] == "sticker_invalid_filename"
-    assert detail["phase"] == "file_validation"
-    assert detail["retryable"] is True
-    assert "secret.png" not in str(detail)
-
-
-def test_upload_write_error_is_structured_and_redacted(_runtime_with_stickers, monkeypatch) -> None:
-    client = _build_client(_runtime_with_stickers)
-    _login(client, _runtime_with_stickers)
-    route_mod = load_personification_module("plugin.personification.webui.routes.sticker_routes")
-    secret = "D:/private/api_key=super-secret"
-
-    def _fail_write(_path, _payload):
-        raise PermissionError(secret)
-
-    monkeypatch.setattr(route_mod.Path, "write_bytes", _fail_write)
-    res = client.post(
-        "/personification/api/stickers/upload",
-        files={"file": ("write-fail.png", b"valid-bytes", "image/png")},
-    )
-    assert res.status_code == 500
-    detail = res.json()["detail"]
-    assert detail["code"] == "sticker_upload_write_failed"
-    assert detail["phase"] == "file_write"
-    assert detail["partial"] is False
-    assert detail["steps"][1]["status"] == "error"
-    assert secret not in str(detail)
-
-
-def test_upload_metadata_error_reports_partial_outcome(_runtime_with_stickers, monkeypatch) -> None:
-    client = _build_client(_runtime_with_stickers)
-    _login(client, _runtime_with_stickers)
-    route_mod = load_personification_module("plugin.personification.webui.routes.sticker_routes")
-    secret = "D:/private/stickers.json token=super-secret"
-    monkeypatch.setattr(
-        route_mod,
-        "save_sticker_metadata_sync",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError(secret)),
-    )
-    res = client.post(
-        "/personification/api/stickers/upload",
-        files={"file": ("metadata-fail.png", b"valid-bytes", "image/png")},
-    )
-    assert res.status_code == 500
-    detail = res.json()["detail"]
-    assert detail["code"] == "sticker_upload_metadata_partial"
-    assert detail["phase"] == "metadata_save"
-    assert detail["partial"] is True
-    assert detail["retryable"] is False
-    assert [step["status"] for step in detail["steps"]] == ["ok", "ok", "error"]
-    assert (_runtime_with_stickers.sticker_dir / "metadata-fail.png").exists()
-    assert secret not in str(detail)
-    assert str(_runtime_with_stickers.sticker_dir) not in str(detail)
-
-
-def test_patch_manifest_error_is_structured_and_outcome_unknown(_runtime_with_stickers, monkeypatch) -> None:
-    client = _build_client(_runtime_with_stickers)
-    _login(client, _runtime_with_stickers)
-    route_mod = load_personification_module("plugin.personification.webui.routes.sticker_routes")
-    secret = "D:/private/stickers.json password=super-secret"
-    monkeypatch.setattr(
-        route_mod,
-        "save_sticker_metadata_sync",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError(secret)),
-    )
-    res = client.patch(
-        "/personification/api/stickers/a.png",
-        json={"description": "不会确认保存"},
-    )
-    assert res.status_code == 500
-    detail = res.json()["detail"]
-    assert detail["code"] == "sticker_metadata_save_failed"
-    assert detail["phase"] == "metadata_save"
-    assert detail["outcome_unknown"] is True
-    assert detail["steps"][-1]["status"] == "error"
-    assert secret not in str(detail)
-
-
-def test_delete_move_error_is_structured_and_keeps_manifest(_runtime_with_stickers, monkeypatch) -> None:
-    client = _build_client(_runtime_with_stickers)
-    _login(client, _runtime_with_stickers)
-    route_mod = load_personification_module("plugin.personification.webui.routes.sticker_routes")
-    secret = "D:/private/trash password=super-secret"
-    monkeypatch.setattr(
-        route_mod.shutil,
-        "move",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(PermissionError(secret)),
-    )
-    res = client.delete("/personification/api/stickers/a.png")
-    assert res.status_code == 500
-    detail = res.json()["detail"]
-    assert detail["code"] == "sticker_trash_move_failed"
-    assert detail["phase"] == "trash_move"
-    assert detail["partial"] is False
-    assert detail["outcome_unknown"] is False
-    assert (_runtime_with_stickers.sticker_dir / "a.png").exists()
-    assert secret not in str(detail)
-
-
-def test_delete_manifest_error_reports_file_move_as_partial(_runtime_with_stickers, monkeypatch) -> None:
-    client = _build_client(_runtime_with_stickers)
-    _login(client, _runtime_with_stickers)
-    route_mod = load_personification_module("plugin.personification.webui.routes.sticker_routes")
-    secret = "D:/private/stickers.json p_skey=super-secret"
-    monkeypatch.setattr(
-        route_mod,
-        "save_sticker_metadata_sync",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError(secret)),
-    )
-    res = client.delete("/personification/api/stickers/c.gif")
-    assert res.status_code == 500
-    detail = res.json()["detail"]
-    assert detail["code"] == "sticker_delete_manifest_partial"
-    assert detail["phase"] == "manifest_save"
-    assert detail["partial"] is True
-    assert detail["retryable"] is False
-    assert [step["status"] for step in detail["steps"]] == ["ok", "ok", "error"]
-    assert not (_runtime_with_stickers.sticker_dir / "c.gif").exists()
-    assert "trash/" in str(detail)
-    assert str(_runtime_with_stickers.sticker_dir) not in str(detail)
-    assert secret not in str(detail)
-
-
-def test_rescan_filesystem_error_is_structured_and_redacted(_runtime_with_stickers, monkeypatch) -> None:
-    client = _build_client(_runtime_with_stickers)
-    _login(client, _runtime_with_stickers)
-    route_mod = load_personification_module("plugin.personification.webui.routes.sticker_routes")
-    original_write_text = route_mod.Path.write_text
-    secret = "D:/private/stickers.json api_key=super-secret"
-
-    def _fail_manifest_write(path, *args, **kwargs):
-        if path.name == "stickers.json":
-            raise PermissionError(secret)
-        return original_write_text(path, *args, **kwargs)
-
-    monkeypatch.setattr(route_mod.Path, "write_text", _fail_manifest_write)
-    res = client.post("/personification/api/stickers/rescan", json={"mode": "force_all"})
-    assert res.status_code == 500
-    detail = res.json()["detail"]
-    assert detail["code"] == "sticker_rescan_filesystem_failed"
-    assert detail["phase"] == "manifest_save"
-    assert detail["outcome_unknown"] is True
-    assert detail["steps"][1]["status"] == "ok"
-    assert detail["steps"][2]["status"] == "unknown"
-    assert secret not in str(detail)
-    assert str(_runtime_with_stickers.sticker_dir) not in str(detail)
-
-
-def test_sticker_frontend_persists_and_renders_operation_diagnostics() -> None:
-    source = ((Path(__file__).parents[1] / "nonebot_plugin_personification") / "webui" / "static" / "app-content.js").read_text(encoding="utf-8")
-    assert "STICKER_DIAGNOSTICS_STORAGE_KEY" in source
-    assert "sessionStorage.setItem(STICKER_DIAGNOSTICS_STORAGE_KEY" in source
-    assert "renderOperationHistory(stickerDiagnostics()" in source
-    assert source.count("rememberStickerDiagnostic(") >= 8
-    assert source.count("operationDiagnosticFromError(") >= 4
-    assert 'await api("/stickers/upload"' in source
-    for legacy in ("上传失败：\" + e.message", "保存失败：\" + e.message", "删除失败：\" + e.message"):
-        assert legacy not in source

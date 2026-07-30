@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import json
-import secrets
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -16,7 +14,6 @@ from .routes.proactive_routes import build_proactive_router
 from .routes.config_routes import build_config_router
 from .routes.group_routes import build_group_router
 from .routes.memory_routes import build_memory_router
-from .routes.mcp_routes import build_mcp_router
 from .routes.metrics_routes import build_metrics_router
 from .routes.persona_routes import build_persona_router
 from .routes.persona_template_routes import build_persona_template_router
@@ -30,11 +27,6 @@ from .routes.qzone_routes import build_qzone_router
 from .routes.skill_routes import build_skill_router
 from .routes.sticker_routes import build_sticker_router
 from .routes.test_routes import build_test_router
-from .routes.tool_creator_routes import build_tool_creator_router
-from .routes.agent_status_routes import build_agent_status_router
-from .routes.data_transfer_routes import build_data_transfer_router
-from .routes.user_policy_routes import build_user_policy_router
-from .routes.outbound_routes import build_outbound_router
 
 
 @dataclass
@@ -47,7 +39,6 @@ class _RuntimeContext:
 
 
 _RUNTIME: _RuntimeContext | None = None
-_WEBUI_INSTANCE_ID = secrets.token_urlsafe(18)
 
 
 def set_runtime_context(
@@ -66,16 +57,6 @@ def set_runtime_context(
         logger=logger,
         runtime_bundle=runtime_bundle,
     )
-    from ..core import admin_acl
-    from . import deps
-
-    def _is_current_admin(qq: str) -> bool:
-        context = _RUNTIME
-        if context is None:
-            return False
-        return qq in context.superusers or admin_acl.is_plugin_admin(qq)
-
-    deps.set_admin_authorizer(_is_current_admin)
 
 
 def get_runtime_context() -> _RuntimeContext:
@@ -96,7 +77,6 @@ def build_router() -> APIRouter:
     router.include_router(build_skill_router(runtime=runtime))
     router.include_router(build_test_router(runtime=runtime))
     router.include_router(build_memory_router(runtime=runtime))
-    router.include_router(build_mcp_router(runtime=runtime))
     router.include_router(build_sticker_router(runtime=runtime))
     router.include_router(build_audit_router(runtime=runtime))
     router.include_router(build_proactive_router(runtime=runtime))
@@ -107,11 +87,6 @@ def build_router() -> APIRouter:
     router.include_router(build_health_router(runtime=runtime))
     router.include_router(build_log_router(runtime=runtime))
     router.include_router(build_qq_router(runtime=runtime))
-    router.include_router(build_agent_status_router(runtime=runtime))
-    router.include_router(build_data_transfer_router(runtime=runtime))
-    router.include_router(build_tool_creator_router(runtime=runtime))
-    router.include_router(build_user_policy_router(runtime=runtime))
-    router.include_router(build_outbound_router(runtime=runtime))
 
     @router.get("/", response_class=HTMLResponse)
     async def index() -> HTMLResponse:
@@ -136,7 +111,6 @@ _STATIC_ROOT = _STATIC_INDEX_PATH.parent
 _STATIC_CONTENT_TYPES = {
     ".css": "text/css; charset=utf-8",
     ".js": "text/javascript; charset=utf-8",
-    ".svg": "image/svg+xml",
 }
 
 
@@ -155,23 +129,16 @@ def _asset_version(filename: str) -> str:
 
 def _render_index_html() -> str:
     html = _load_index_html()
-    assets = (
+    for filename in (
         "style.css",
         "app-core.js",
         "app-activity.js",
         "app-content.js",
         "app-admin.js",
         "app-tools.js",
-        "app-mcp.js",
-        "app-tool-creator.js",
         "app-config.js",
         "app-auth.js",
-        "app-operations.js",
-    )
-    versions = {filename: _asset_version(filename) for filename in assets}
-    html = html.replace("__PERSONIFICATION_WEBUI_INSTANCE_ID__", json.dumps(_WEBUI_INSTANCE_ID))
-    html = html.replace("__PERSONIFICATION_ASSET_VERSIONS__", json.dumps(versions, ensure_ascii=False))
-    for filename in assets:
+    ):
         html = html.replace(
             f"/personification/static/{filename}",
             f"/personification/static/{filename}?v={_asset_version(filename)}",

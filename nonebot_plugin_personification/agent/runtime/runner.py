@@ -5,13 +5,7 @@ import re
 import time
 from typing import Any, Awaitable, Callable, List
 
-from ..query_rewriter import (
-    ContextualQueryRewrite,
-    QueryRewriteContext,
-    _fallback_rewrite,
-    contextual_query_rewriter,
-)
-from ...core.chat_intent import metadata_fallback_turn_semantic_frame_for_session
+from ..query_rewriter import ContextualQueryRewrite, QueryRewriteContext, contextual_query_rewriter
 from ...core.metrics import record_counter, record_timing
 from ...core.time_ctx import get_configured_now
 from ..tool_registry import ToolRegistry
@@ -28,12 +22,10 @@ from .executor import (
 )
 from .evidence import (
     EvidenceSynthesis,
-    SOCIAL_SEARCH_EQUIVALENT_TOOL_NAMES,
     build_tool_result_record as _build_tool_result_record,
     evidence_synthesizer_enabled as _evidence_synthesizer_enabled,
     plan_for_evidence as _plan_for_evidence,
     render_evidence_guidance as _evidence_guidance,
-    social_evidence_from_records,
     synthesize_evidence_with_llm,
 )
 from .image_generation import (
@@ -55,23 +47,23 @@ from .intent import (
     _render_message_text,
 )
 from .loop_utils import (
+    _RETRYABLE_LOOKUP_TOOLS,
     caller_supports_builtin_search as _caller_supports_builtin_search,
     record_reply_trace_stage as _record_reply_trace_stage,
     safe_ack as _safe_ack,
     tool_result_trace_status as _tool_result_trace_status,
 )
 from .prompting import append_agent_system_prompts
-from .reply_quality import finalize_agent_reply_quality, finalize_social_evidence_delivery
+from .reply_quality import finalize_agent_reply_quality
 from .stop_flow import (
     StopFlowState,
     _has_lookup_schema,
     _should_review_banter_lookup_draft,
     handle_model_stop,
-    update_stop_flow_tool_result,
 )
 from .tool_loop import (
     append_assistant_tool_calls_message,
-    append_tool_result_messages,
+    append_tool_result_message,
     observe_model_step,
     selected_tool_names,
     trace_tool_call,
@@ -86,13 +78,12 @@ from .tool_args import (
 )
 from .budgeting import apply_agent_budget_profile, derive_agent_budget_profile, render_agent_budget_trace_detail
 from .final_synthesis import AgentResult, direct_tool_result_agent_result, synthesize_max_steps_result
-from .tool_catalog import tool_runtime_metadata
-from .tool_contracts import recommended_tools_for_chat_intent
 from .tool_selection import (
     _normalize_agent_max_steps,
     _schema_tool_name,
     _select_tool_schemas,
 )
+from .tool_contracts import recommended_tools_for_chat_intent
 from .wrappers import (
     _IMAGE_B64_TOOL_RESULT_RE,
     _render_tool_result_for_user,
@@ -102,23 +93,11 @@ from .fallbacks import (
     _cancel_task_safely,
     _parse_json_tool_result,
     _select_semantic_fallback_tool,
+    _tool_result_indicates_empty,
 )
 
 _TIME_SENSITIVE_SEARCH_TOOLS = frozenset({"web_search", "search_web"})
 _TIME_SENSITIVE_RE = re.compile("\u6700\u65b0|\u8fd1\u671f|\u73b0\u5728|\u4eca\u5e74|\u4eca\u5929|\u5f53\u524d|latest|recent|now", re.IGNORECASE)
-_QUERY_REWRITE_TIMEOUT_SECONDS = 8.0
-
-
-async def _await_with_deadline(
-    factory: Callable[[], Awaitable[Any]],
-    deadline: float | None,
-) -> Any:
-    if deadline is None:
-        return await factory()
-    remaining = max(0.0, float(deadline) - time.monotonic())
-    if remaining <= 0.0:
-        raise asyncio.TimeoutError
-    return await asyncio.wait_for(factory(), timeout=remaining)
 
 
 async def _spawn_active_learning(
@@ -232,14 +211,6 @@ async def run_agent(
     quote_chain: list[dict[str, Any]] | None = None,
     time_budget_seconds: float | None = None,
     ack_sender: Callable[[str], Awaitable[None]] | None = None,
-    is_group: bool | None = None,
-    is_direct_mention: bool = False,
-    reply_required: bool = False,
-    surface: str = "",
-    finalize_quality: bool = True,
-    structured_output: bool = False,
-    allow_builtin_search: bool = True,
-    turn_media_context: list[Any] | None = None,
 ) -> AgentResult:
     use_builtin_search = (
         bool(
@@ -250,96 +221,23 @@ async def run_agent(
             )
         )
         and _caller_supports_builtin_search(tool_caller)
-        and bool(allow_builtin_search)
     )
     pending_actions: List[dict] = []
     bind_actions = getattr(executor, "bind_pending_actions", None)
     if callable(bind_actions):
         bind_actions(pending_actions)
     stop_state = StopFlowState()
-    agent_started_at = time.monotonic()
-    budget_deadline = (
-        agent_started_at + max(0.0, float(time_budget_seconds or 0.0))
-        if time_budget_seconds is not None
-        else None
-    )
 
     async def _finalize_result(result: AgentResult, *, reason: str) -> AgentResult:
-        social = social_evidence_from_records(stop_state.tool_result_records)
-        result.social_evidence = list(social.get("sources") or [])
-        result.social_coverage = {
-            **dict(social.get("aggregation") or {}),
-            "partial": bool(social.get("partial", False)),
-            "warnings": list(social.get("warnings") or []),
-        }
-        result.evidence_delivery_required = bool(
-            result.social_evidence
-            or (
-                bool(social.get("search_seen", False))
-                and int(result.social_coverage.get("returned_count", 0) or 0) > 0
-            )
-        )
-        if structured_output or not finalize_quality:
-            return result
-        try:
-            finalized = await _await_with_deadline(
-                lambda: finalize_agent_reply_quality(
-                    result,
-                    tool_caller=tool_caller,
-                    messages=messages,
-                    turn_plan=turn_plan,
-                    is_group=is_group,
-                    is_direct_mention=is_direct_mention,
-                    reply_required=reply_required,
-                    current_user_text=user_text,
-                    record_trace=_record_reply_trace_stage,
-                    logger=logger,
-                    reason=reason,
-                ),
-                budget_deadline,
-            )
-        except asyncio.TimeoutError:
-            _record_reply_trace_stage(
-                key="agent_quality_timeout",
-                label="Agent 质量收口超时",
-                status="warn",
-                detail=f"reason={reason} elapsed_ms=0",
-            )
-            if str(getattr(result, "failure_code", "") or ""):
-                finalized = result
-            elif (
-                str(getattr(result, "quality_context", "") or "")
-                == "constrained_persona_output"
-                and getattr(result, "evidence_envelope", None) is not None
-            ):
-                finalized = result
-            else:
-                finalized = AgentResult(
-                    text="[NO_REPLY]",
-                    pending_actions=list(getattr(result, "pending_actions", []) or []),
-                    failure_code="agent_quality_timeout",
-                    social_evidence=list(result.social_evidence),
-                    social_coverage=dict(result.social_coverage),
-                    evidence_delivery_required=bool(result.evidence_delivery_required),
-                )
-        return finalize_social_evidence_delivery(
-            finalized,
-            sources=list(social.get("sources") or []),
-            coverage=dict(social.get("aggregation") or {}),
-            partial=bool(social.get("partial", False)),
-            warnings=list(social.get("warnings") or []),
+        return await finalize_agent_reply_quality(
+            result,
+            tool_caller=tool_caller,
+            messages=messages,
+            turn_plan=turn_plan,
             record_trace=_record_reply_trace_stage,
+            logger=logger,
+            reason=reason,
         )
-
-    def _mark_social_evidence_satisfied() -> None:
-        marker = "社交证据已满足，直接收束回答"
-        for plan in (turn_plan, evidence_turn_plan):
-            if plan is None or not hasattr(plan, "session_goal"):
-                continue
-            current = str(getattr(plan, "session_goal", "") or "").strip()
-            if marker in current:
-                continue
-            setattr(plan, "session_goal", f"{current}；{marker}".strip("；")[:80])
 
     evidence_synthesis_rounds = 0
     last_evidence_tool_count = 0
@@ -370,29 +268,14 @@ async def run_agent(
         )
     else:
         intent_started_at = time.monotonic()
-        try:
-            intent_decision = await _await_with_deadline(
-                lambda: _infer_intent_decision_with_context(
-                    preliminary_query_text or user_text,
-                    messages,
-                    tool_caller=tool_caller,
-                    repeat_clusters=repeat_clusters,
-                    relationship_hint=relationship_hint,
-                    recent_bot_replies=recent_bot_replies,
-                ),
-                budget_deadline,
-            )
-        except asyncio.TimeoutError:
-            intent_decision = metadata_fallback_turn_semantic_frame_for_session(
-                is_group=bool(is_group),
-                is_random_chat=False,
-            ).to_intent_decision()
-            _record_reply_trace_stage(
-                key="agent_intent_timeout",
-                label="Agent 意图判别超时",
-                status="warn",
-                detail="fallback=metadata elapsed_ms=0",
-            )
+        intent_decision = await _infer_intent_decision_with_context(
+            preliminary_query_text or user_text,
+            messages,
+            tool_caller=tool_caller,
+            repeat_clusters=repeat_clusters,
+            relationship_hint=relationship_hint,
+            recent_bot_replies=recent_bot_replies,
+        )
         intent_elapsed_ms = int((time.monotonic() - intent_started_at) * 1000)
         record_timing("agent.intent_ms", intent_elapsed_ms)
         _record_reply_trace_stage(
@@ -425,13 +308,6 @@ async def run_agent(
         actual_max_steps=effective_max_steps,
         actual_time_budget_seconds=time_budget_seconds,
     )
-    profile_deadline = (
-        agent_started_at + max(0.0, float(time_budget_seconds or 0.0))
-        if time_budget_seconds is not None
-        else None
-    )
-    if profile_deadline is not None:
-        budget_deadline = profile_deadline if budget_deadline is None else min(budget_deadline, profile_deadline)
     record_counter(
         "agent.budget_profile_total",
         mode=budget_profile.mode,
@@ -464,8 +340,7 @@ async def run_agent(
         status="info",
         detail=(
             f"max_steps={effective_max_steps} builtin_search={bool(use_builtin_search)} "
-            f"images={len(user_images)} required={str(bool(reply_required)).lower()} "
-            f"caller={type(tool_caller).__name__} elapsed_ms=0"
+            f"images={len(user_images)} caller={type(tool_caller).__name__}"
         ),
     )
     rewrite_context = _derive_query_rewrite_context(
@@ -473,27 +348,7 @@ async def run_agent(
         current_images=user_images,
         provided=query_rewrite_context,
     )
-    turn_tool_intents = {
-        str(item or "").strip()
-        for item in list(getattr(turn_plan, "tool_intent", []) or [])
-        if str(item or "").strip()
-    }
-    research_need = str(getattr(turn_plan, "research_need", "") or "").strip()
-    direct_native_image_answer = bool(
-        direct_image_input
-        and user_images
-        and runtime_chat_intent not in {"lookup", "plugin_question"}
-        and research_need not in {"medium", "high"}
-        and not (turn_tool_intents & {"lookup_web", "lookup_plugin"})
-    )
-    skip_rewrite_reason = ""
     if runtime_chat_intent in {"banter", "image_generation", "expression"}:
-        skip_rewrite_reason = f"intent_{runtime_chat_intent or 'unknown'}"
-    elif runtime_chat_intent == "plugin_question" and plugin_query_intent == "runtime_capability":
-        skip_rewrite_reason = "intent_runtime_capability"
-    elif direct_native_image_answer:
-        skip_rewrite_reason = "direct_native_image"
-    if skip_rewrite_reason:
         rewritten_query = ContextualQueryRewrite(
             primary_query=preliminary_query_text,
             query_candidates=[preliminary_query_text] if preliminary_query_text else [],
@@ -501,65 +356,31 @@ async def run_agent(
             need_image_understanding=bool(user_images),
             recommended_tools=recommended_tools_for_chat_intent(registry, runtime_chat_intent),
             search_plan=[],
-            source="skipped",
-            fallback_reason=skip_rewrite_reason,
         )
         _record_reply_trace_stage(
             key="agent_query_rewrite",
             label="Agent 查询改写",
             status="info",
-            detail=(
-                f"skipped=true intent={runtime_chat_intent or '-'} "
-                f"reason={skip_rewrite_reason} elapsed_ms=0"
-            ),
+            detail=f"skipped=true intent={runtime_chat_intent or '-'}",
         )
     else:
         rewrite_started_at = time.monotonic()
-        remaining_budget = _remaining_time_budget_seconds(budget_deadline)
-        rewrite_timeout = _QUERY_REWRITE_TIMEOUT_SECONDS
-        if remaining_budget is not None:
-            rewrite_timeout = min(rewrite_timeout, max(0.0, remaining_budget))
-        rewrite_timed_out = False
-        try:
-            if rewrite_timeout <= 0.0:
-                raise asyncio.TimeoutError
-            rewritten_query = await asyncio.wait_for(
-                contextual_query_rewriter(
-                    tool_caller=tool_caller,
-                    history_new=rewrite_context.history_new,
-                    history_last=rewrite_context.history_last,
-                    trigger_reason=rewrite_context.trigger_reason,
-                    images=rewrite_context.images,
-                    quoted_message=rewrite_context.quoted_message,
-                    topic_hint=context_hint,
-                ),
-                timeout=rewrite_timeout,
-            )
-        except asyncio.TimeoutError:
-            rewrite_timed_out = True
-            rewritten_query = _fallback_rewrite(
-                history_new=rewrite_context.history_new,
-                history_last=rewrite_context.history_last,
-                trigger_reason=rewrite_context.trigger_reason,
-                images=rewrite_context.images,
-                quoted_message=rewrite_context.quoted_message,
-                topic_hint=context_hint,
-            )
-            rewritten_query.fallback_reason = "query_timeout"
+        rewritten_query = await contextual_query_rewriter(
+            tool_caller=tool_caller,
+            history_new=rewrite_context.history_new,
+            history_last=rewrite_context.history_last,
+            trigger_reason=rewrite_context.trigger_reason,
+            images=rewrite_context.images,
+            quoted_message=rewrite_context.quoted_message,
+            topic_hint=context_hint,
+        )
         rewrite_elapsed_ms = int((time.monotonic() - rewrite_started_at) * 1000)
-        rewrite_fallback = str(getattr(rewritten_query, "source", "model") or "model") == "structural"
         record_timing("agent.query_rewrite_ms", rewrite_elapsed_ms, intent=runtime_chat_intent or "unknown")
         _record_reply_trace_stage(
             key="agent_query_rewrite",
             label="Agent 查询改写",
-            status="warn" if rewrite_fallback else "ok",
-            detail=(
-                f"intent={runtime_chat_intent or '-'} elapsed_ms={rewrite_elapsed_ms} "
-                f"timeout={str(rewrite_timed_out).lower()} "
-                f"source={getattr(rewritten_query, 'source', 'model')} "
-                f"fallback={getattr(rewritten_query, 'fallback_reason', '') or 'none'}"
-            ),
-            hint="查询改写失败后使用结构化 fallback，继续进入 Agent 主模型" if rewrite_fallback else "",
+            status="ok",
+            detail=f"intent={runtime_chat_intent or '-'} elapsed_ms={rewrite_elapsed_ms}",
         )
     effective_query_text = (
         rewritten_query.primary_query
@@ -574,6 +395,11 @@ async def run_agent(
         )
     )
     ack_sent = False
+    budget_deadline = (
+        time.monotonic() + max(0.0, float(time_budget_seconds or 0.0))
+        if time_budget_seconds is not None
+        else None
+    )
     background_image_request = user_query_text or preliminary_query_text or user_text
     if (
         runtime_chat_intent == "image_generation"
@@ -584,25 +410,12 @@ async def run_agent(
             user_request=background_image_request,
         )
     ):
-        try:
-            status_reply = await _await_with_deadline(
-                lambda: _generate_image_generation_status_reply(
-                    tool_caller=tool_caller,
-                    messages=messages,
-                    user_request=background_image_request,
-                    logger=logger,
-                ),
-                budget_deadline,
-            )
-        except asyncio.TimeoutError:
-            return await _finalize_result(
-                AgentResult(
-                    text="[NO_REPLY]",
-                    pending_actions=pending_actions,
-                    failure_code="agent_image_status_timeout",
-                ),
-                reason="background_image_status_timeout",
-            )
+        status_reply = await _generate_image_generation_status_reply(
+            tool_caller=tool_caller,
+            messages=messages,
+            user_request=background_image_request,
+            logger=logger,
+        )
         if _start_background_image_generation(
             registry=registry,
             executor=executor,
@@ -620,7 +433,6 @@ async def run_agent(
                     pending_actions=pending_actions,
                     direct_output=False,
                     bypass_length_limits=False,
-                    suppress_reply_recovery=True,
                 ),
                 reason="background_image_generation",
             )
@@ -633,11 +445,6 @@ async def run_agent(
         turn_plan=turn_plan,
         user_images=user_images,
         direct_image_input=direct_image_input,
-        is_group=is_group,
-        is_direct_mention=is_direct_mention,
-        reply_required=reply_required,
-        surface=surface,
-        turn_media_context=turn_media_context,
     )
 
     async def _append_evidence_guidance_if_needed(*, draft_answer_text: str = "") -> EvidenceSynthesis | None:
@@ -649,31 +456,17 @@ async def run_agent(
         if not stop_state.tool_result_records or len(stop_state.tool_result_records) <= last_evidence_tool_count:
             return None
         started_at = time.monotonic()
-        try:
-            evidence = await _await_with_deadline(
-                lambda: synthesize_evidence_with_llm(
-                    tool_caller=tool_caller,
-                    turn_plan=evidence_turn_plan,
-                    candidate_memories=list(candidate_memories or [])[:12],
-                    tool_results=stop_state.tool_result_records[:8],
-                    draft_answer_text=draft_answer_text,
-                    url_summaries=list(url_summaries or [])[:5],
-                    group_context=context_hint,
-                    quote_chain=list(quote_chain or [])[:8],
-                    cross_verify_enabled=bool(
-                        getattr(plugin_config, "personification_cross_verify_enabled", False)
-                    ),
-                ),
-                budget_deadline,
-            )
-        except asyncio.TimeoutError:
-            _record_reply_trace_stage(
-                key="agent_evidence_timeout",
-                label="Agent 证据合成超时",
-                status="warn",
-                detail="budget_exhausted=true elapsed_ms=0",
-            )
-            return None
+        evidence = await synthesize_evidence_with_llm(
+            tool_caller=tool_caller,
+            turn_plan=evidence_turn_plan,
+            candidate_memories=list(candidate_memories or [])[:12],
+            tool_results=stop_state.tool_result_records[:8],
+            draft_answer_text=draft_answer_text,
+            url_summaries=list(url_summaries or [])[:5],
+            group_context=context_hint,
+            quote_chain=list(quote_chain or [])[:8],
+            cross_verify_enabled=bool(getattr(plugin_config, "personification_cross_verify_enabled", False)),
+        )
         evidence_synthesis_rounds += 1
         last_evidence_tool_count = len(stop_state.tool_result_records)
         record_counter(
@@ -685,12 +478,8 @@ async def run_agent(
             "evidence_synthesizer.synthesis_ms",
             (time.monotonic() - started_at) * 1000.0,
         )
-        if stop_state.social_evidence_satisfied:
-            evidence.needs_more_research = False
-            evidence.research_followup_query = ""
-            _mark_social_evidence_satisfied()
         messages.append({"role": "system", "content": _evidence_guidance(evidence)})
-        if evidence.needs_more_research and not stop_state.social_evidence_satisfied:
+        if evidence.needs_more_research:
             stop_state.semantic_fallback_attempted = False
             stop_state.pending_evidence_followup_query = str(evidence.research_followup_query or "").strip()
         logger.info(
@@ -722,11 +511,24 @@ async def run_agent(
                 f"[agent] time budget exhausted at step={_step + 1}, "
                 f"forcing answer from last_tool_result={bool(stop_state.last_tool_result_text)}"
             )
+            if stop_state.last_tool_result_text:
+                return await _finalize_result(
+                    await synthesize_max_steps_result(
+                        registry=registry,
+                        tool_name=stop_state.last_tool_name,
+                        result_text=stop_state.last_tool_result_text,
+                        user_query_text=user_query_text,
+                        messages=messages,
+                        pending_actions=pending_actions,
+                        tool_caller=tool_caller,
+                        turn_plan=turn_plan,
+                    ),
+                    reason="time_budget_last_tool",
+                )
             return await _finalize_result(
                 AgentResult(
                     text="[NO_REPLY]",
                     pending_actions=pending_actions,
-                    failure_code="agent_time_budget_exhausted",
                 ),
                 reason="time_budget_empty",
             )
@@ -737,41 +539,15 @@ async def run_agent(
             chat_intent=runtime_chat_intent,
             plugin_question_intent=plugin_query_intent,
         )
-        if stop_state.social_evidence_satisfied:
-            active_schemas = [
-                schema
-                for schema in active_schemas
-                if _schema_tool_name(schema) not in SOCIAL_SEARCH_EQUIVALENT_TOOL_NAMES
-            ]
-            _mark_social_evidence_satisfied()
         selected_names = selected_tool_names(active_schemas, _schema_tool_name)
         logger.debug(f"[agent] exposed {len(active_schemas)} tools to model")
         logger.info(f"[agent] selected tools: {', '.join(selected_names) if selected_names else 'none'}")
         model_started_at = time.monotonic()
-        try:
-            response = await _await_with_deadline(
-                lambda: tool_caller.chat_with_tools(
-                    messages,
-                    active_schemas,
-                    use_builtin_search and not stop_state.social_evidence_satisfied,
-                ),
-                budget_deadline,
-            )
-        except asyncio.TimeoutError:
-            _record_reply_trace_stage(
-                key="agent_model_timeout",
-                label=f"Agent 模型步 {_step + 1} 超时",
-                status="warn",
-                detail=f"step={_step + 1} budget_exhausted=true elapsed_ms=0",
-            )
-            return await _finalize_result(
-                AgentResult(
-                    text="[NO_REPLY]",
-                    pending_actions=pending_actions,
-                    failure_code="agent_model_timeout",
-                ),
-                reason="model_timeout",
-            )
+        response = await tool_caller.chat_with_tools(
+            messages,
+            active_schemas,
+            use_builtin_search,
+        )
         model_elapsed_ms = int((time.monotonic() - model_started_at) * 1000)
         content_len = observe_model_step(
             response=response,
@@ -787,81 +563,43 @@ async def run_agent(
             if _evidence_synthesizer_enabled(plugin_config) and stop_state.has_tool_call:
                 await _append_evidence_guidance_if_needed(draft_answer_text=str(response.content or ""))
         if response.finish_reason == "stop":
-            try:
-                stop_decision = await _await_with_deadline(
-                    lambda: handle_model_stop(
-                        state=stop_state,
-                        response=response,
-                        content_len=content_len,
-                        active_schemas=active_schemas,
-                        runtime_chat_intent=runtime_chat_intent,
-                        intent_decision=intent_decision,
-                        registry=registry,
-                        tool_caller=tool_caller,
-                        logger=logger,
-                        messages=messages,
-                        pending_actions=pending_actions,
-                        plugin_config=plugin_config,
-                        user_query_text=user_query_text,
-                        user_text=user_text,
-                        user_images=user_images,
-                        rewritten_query=rewritten_query,
-                        context_hint=context_hint,
-                        plugin_query_intent=plugin_query_intent,
-                        budget_deadline=budget_deadline,
-                        step=_step + 1,
-                        record_trace=_record_reply_trace_stage,
-                        append_evidence_guidance=_append_evidence_guidance_if_needed,
-                        classify_deferred_lookup_reply=_classify_deferred_lookup_reply,
-                        select_semantic_fallback_tool=_select_semantic_fallback_tool,
-                        structured_output=structured_output,
-                    ),
-                    budget_deadline,
-                )
-            except asyncio.TimeoutError:
-                return await _finalize_result(
-                    AgentResult(
-                        text="[NO_REPLY]",
-                        pending_actions=pending_actions,
-                        failure_code="agent_stop_flow_timeout",
-                    ),
-                    reason="stop_flow_timeout",
-                )
+            stop_decision = await handle_model_stop(
+                state=stop_state,
+                response=response,
+                content_len=content_len,
+                active_schemas=active_schemas,
+                runtime_chat_intent=runtime_chat_intent,
+                intent_decision=intent_decision,
+                registry=registry,
+                tool_caller=tool_caller,
+                logger=logger,
+                messages=messages,
+                pending_actions=pending_actions,
+                plugin_config=plugin_config,
+                user_query_text=user_query_text,
+                user_text=user_text,
+                user_images=user_images,
+                rewritten_query=rewritten_query,
+                context_hint=context_hint,
+                plugin_query_intent=plugin_query_intent,
+                budget_deadline=budget_deadline,
+                step=_step + 1,
+                record_trace=_record_reply_trace_stage,
+                append_evidence_guidance=_append_evidence_guidance_if_needed,
+                classify_deferred_lookup_reply=_classify_deferred_lookup_reply,
+                select_semantic_fallback_tool=_select_semantic_fallback_tool,
+            )
             if stop_decision.action == "continue":
                 continue
             if stop_decision.result is not None:
                 return await _finalize_result(stop_decision.result, reason="model_stop")
 
         if response.tool_calls:
-            suppress_first_ack = any(
-                str(
-                    tool_runtime_metadata(registry, tool_call.name).get("ack_behavior", "")
-                    or ""
-                ).strip().lower()
-                == "suppress"
-                for tool_call in response.tool_calls
-            )
-            if (
-                not stop_state.has_tool_call
-                and not ack_sent
-                and ack_sender is not None
-                and not suppress_first_ack
-            ):
+            if not stop_state.has_tool_call and not ack_sent and ack_sender is not None:
                 ack_sent = True
-                try:
-                    await _await_with_deadline(
-                        lambda: _safe_ack(ack_sender, "", logger),
-                        budget_deadline,
-                    )
-                except asyncio.TimeoutError:
-                    pass
-            append_assistant_tool_calls_message(
-                messages=messages,
-                response=response,
-                tool_caller=tool_caller,
-            )
+                await _safe_ack(ack_sender, "", logger)
+            append_assistant_tool_calls_message(messages=messages, response=response)
 
-        turn_tool_results: list[tuple[Any, str]] = []
         for tool_call in response.tool_calls:
             stop_state.has_tool_call = True
             logger.info(f"[agent] tool_call name={tool_call.name}")
@@ -871,30 +609,6 @@ async def run_agent(
                 step=_step + 1,
                 record_trace=_record_reply_trace_stage,
             )
-            if (
-                stop_state.social_evidence_satisfied
-                and str(tool_call.name or "").strip() in SOCIAL_SEARCH_EQUIVALENT_TOOL_NAMES
-            ):
-                result = (
-                    '{"status":"skipped","error_code":"social_evidence_already_satisfied",'
-                    '"message":"Structured social evidence already satisfies this turn."}'
-                )
-                trace_tool_result(
-                    tool_name=str(tool_call.name or "").strip(),
-                    result=result,
-                    step=_step + 1,
-                    elapsed_ms=0,
-                    record_trace=_record_reply_trace_stage,
-                    status_for_result=_tool_result_trace_status,
-                )
-                _record_reply_trace_stage(
-                    key="agent_social_search_suppressed",
-                    label="社交检索去重",
-                    status="info",
-                    detail=f"tool={str(tool_call.name or '').strip()} reason=evidence_satisfied",
-                )
-                turn_tool_results.append((tool_call, result))
-                continue
             tool_started_at = time.monotonic()
             if tool is None:
                 result = f"工具 {tool_call.name} 不存在"
@@ -907,7 +621,6 @@ async def run_agent(
                     user_images=user_images,
                     previous_tool_name=stop_state.last_tool_name,
                     previous_tool_result_text=stop_state.last_tool_result_text,
-                    unavailable_tool_signatures=stop_state.unavailable_tool_signatures,
                     logger=logger,
                     budget_deadline=budget_deadline,
                 )
@@ -920,19 +633,18 @@ async def run_agent(
                 record_trace=_record_reply_trace_stage,
                 status_for_result=_tool_result_trace_status,
             )
+            tool_result_preview_limit = (
+                1000
+                if str(tool_call.name or "").strip() == _IMAGE_GENERATION_TOOL_NAME
+                else 220
+            )
             logger.info(
                 f"[agent] tool_result name={tool_call.name} "
-                f"result_len={len(str(result or ''))}"
+                f"preview={str(result).replace(chr(10), ' ')[:tool_result_preview_limit]}"
             )
-            update_stop_flow_tool_result(
-                state=stop_state,
-                registry=registry,
-                tool_name=str(tool_call.name or "").strip(),
-                tool_args=tool_args,
-                result=result,
-            )
-            if stop_state.social_evidence_satisfied:
-                _mark_social_evidence_satisfied()
+            stop_state.last_tool_name = str(tool_call.name or "").strip()
+            if str(result or "").strip():
+                stop_state.last_tool_result_text = str(result).strip()
             stop_state.tool_result_records.append(
                 _build_tool_result_record(
                     tool_name=stop_state.last_tool_name,
@@ -940,6 +652,11 @@ async def run_agent(
                     result=result,
                 )
             )
+            if stop_state.last_tool_name in _RETRYABLE_LOOKUP_TOOLS:
+                if _tool_result_indicates_empty(result):
+                    stop_state.empty_lookup_tools.add(stop_state.last_tool_name)
+                else:
+                    stop_state.empty_lookup_tools.discard(stop_state.last_tool_name)
             stop_state.semantic_fallback_attempted = False
             direct_result = direct_tool_result_agent_result(
                 registry=registry,
@@ -947,7 +664,7 @@ async def run_agent(
                 result_text=result,
                 pending_actions=pending_actions,
             )
-            if direct_result is not None and not structured_output:
+            if direct_result is not None:
                 _record_reply_trace_stage(
                     key="agent_finish",
                     label="Agent 收尾",
@@ -956,14 +673,11 @@ async def run_agent(
                 )
                 return await _finalize_result(direct_result, reason="direct_tool_result")
 
-            turn_tool_results.append((tool_call, str(result or "")))
-
-        if turn_tool_results:
-            append_tool_result_messages(
+            append_tool_result_message(
                 messages=messages,
                 tool_caller=tool_caller,
-                response=response,
-                results=turn_tool_results,
+                tool_call=tool_call,
+                result=result,
             )
             await _append_evidence_guidance_if_needed()
 
@@ -974,40 +688,25 @@ async def run_agent(
         status="warn",
         detail=f"max_steps={effective_max_steps} last_tool={stop_state.last_tool_name or '-'}",
     )
-    if structured_output:
-        return AgentResult(
-            text="[NO_REPLY]",
-            pending_actions=pending_actions,
-            failure_code="agent_structured_max_steps_exhausted",
+    if stop_state.last_tool_result_text:
+        logger.warning("[agent] using last tool result as fallback final answer")
+        return await _finalize_result(
+            await synthesize_max_steps_result(
+                registry=registry,
+                tool_name=stop_state.last_tool_name,
+                result_text=stop_state.last_tool_result_text,
+                user_query_text=user_query_text,
+                messages=messages,
+                pending_actions=pending_actions,
+                tool_caller=tool_caller,
+                turn_plan=turn_plan,
+            ),
+            reason="max_steps_last_tool",
         )
-    if stop_state.last_usable_tool_result_text or stop_state.last_tool_result_text:
-        fallback_tool_name = stop_state.last_usable_tool_name or stop_state.last_tool_name
-        fallback_result_text = (
-            stop_state.last_usable_tool_result_text or stop_state.last_tool_result_text
-        )
-        logger.warning(f"[agent] using fallback tool result: {fallback_tool_name}")
-        try:
-            synthesized = await _await_with_deadline(
-                lambda: synthesize_max_steps_result(
-                    registry=registry,
-                    tool_name=fallback_tool_name,
-                    result_text=fallback_result_text,
-                    user_query_text=user_query_text,
-                    messages=messages,
-                    pending_actions=pending_actions,
-                    tool_caller=tool_caller,
-                    turn_plan=turn_plan,
-                ),
-                budget_deadline,
-            )
-            return await _finalize_result(synthesized, reason="max_steps_last_tool")
-        except asyncio.TimeoutError:
-            pass
     return await _finalize_result(
         AgentResult(
             text="[NO_REPLY]",
             pending_actions=pending_actions,
-            failure_code="agent_max_steps_exhausted",
         ),
         reason="max_steps_empty",
     )

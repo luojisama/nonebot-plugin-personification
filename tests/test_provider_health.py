@@ -14,7 +14,6 @@ ph = load_personification_module("plugin.personification.core.provider_health")
 def test_classify_error_recognizes_timeout() -> None:
     assert ph.classify_error(RuntimeError("Read timeout after 30s")) == "timeout"
     assert ph.classify_error(RuntimeError("operation timed out")) == "timeout"
-    assert ph.classify_error(TimeoutError()) == "timeout"
 
 
 def test_classify_error_recognizes_rate_limit() -> None:

@@ -14,34 +14,26 @@ from .core.memory_defaults import (
     DEFAULT_PERSONA_HISTORY_MAX,
     DEFAULT_PRIVATE_HISTORY_TURNS,
 )
-from .core.favorability import (
-    DEFAULT_FAVORABILITY_ATTITUDES,
-    DEFAULT_FAVORABILITY_EVENT_DELTAS,
-    DEFAULT_FAVORABILITY_LEVELS,
-)
+from .core.favorability import DEFAULT_FAVORABILITY_EVENT_DELTAS, DEFAULT_FAVORABILITY_LEVELS
+
+
+DEFAULT_FAVORABILITY_ATTITUDES: Dict[str, str] = {
+    "初见": "保持基本礼貌，态度温和但不过于亲热。",
+    "面熟": "表现得比较客气，愿意倾听并给出简单回应。",
+    "初识": "态度随和，偶尔会分享一些有趣的小事，语气活泼。",
+    "普通": "像普通朋友一样轻松交流，会主动接话。",
+    "熟悉": "言谈举止比较随意，经常互相调侃，表现得很开心。",
+    "信赖": "非常信任对方，说话很贴心，会表达关心。",
+    "知心": "默契十足，有很多共同话题，语气变得亲近。",
+    "深厚": "关系非常深厚，会主动分享心情，给对方支持。",
+    "挚友": "无话不谈，对对方充满热情和信任。",
+    "亲密": "非常亲昵，语气温柔，充满宠溺和爱护。",
+}
 
 
 class Config(BaseModel):
-    def __init__(self, **data: Any) -> None:
-        attitudes = data.get("personification_favorability_attitudes")
-        if attitudes is None or attitudes == {} or (
-            isinstance(attitudes, str) and attitudes.strip() in {"", "{}"}
-        ):
-            data = dict(data)
-            data["personification_favorability_attitudes"] = DEFAULT_FAVORABILITY_ATTITUDES.copy()
-        super().__init__(**data)
-
     personification_whitelist: List[str] = []
     personification_probability: float = 0.30
-    personification_meme_reply_probability: float = 0.18
-    personification_slang_max_claims: int = 20
-    personification_auto_understand_min_sources: int = 2
-    personification_auto_use_min_sources: int = 3
-    personification_auto_use_min_platforms: int = 2
-    personification_claim_min_confidence: float = 0.72
-    personification_semantic_equivalence_min_confidence: float = 0.80
-    personification_reverify_after_days: int = 30
-    personification_stale_after_days: int = 90
 
     # 其他机器人 / Q 群管家的 user_id（用于 peer_awareness 检测），
     # 命中后本轮静默，避免 bot 与管家互相对话。
@@ -54,8 +46,6 @@ class Config(BaseModel):
     personification_agent_max_steps: int = 10
     personification_agent_budget_mode: str = "shadow"
     personification_response_timeout: int = 180
-    personification_reply_session_concurrency: int = 3
-    personification_reply_global_concurrency: int = 12
     personification_image_input_mode: str = "auto"
     personification_image_detail: str = "auto"
     personification_sticker_vision_max: int = 3
@@ -216,9 +206,6 @@ class Config(BaseModel):
     personification_skill_update_interval: int = 3600
     personification_skill_default_timeout: int = 15
     personification_skill_mcp_timeout: int = 20
-    personification_mcp_registry_sources: List[Any] = []
-    personification_mcp_registry_timeout: int = 20
-    personification_mcp_secret_file: str = ""
     personification_skill_allow_unsafe_external: bool = False
     personification_skill_require_admin_review: bool = True
     personification_use_skillpacks: bool = False
@@ -284,7 +271,6 @@ class Config(BaseModel):
     personification_qzone_check_interval: int = 60
     personification_qzone_monthly_limit: int = 30
     personification_qzone_agent_max_steps: int = 4
-    personification_qzone_semantic_review_timeout: float = 120.0
     personification_qzone_probability: float = 0.20
     personification_qzone_min_interval_hours: float = 12.0
     personification_qzone_social_enabled: bool = True
@@ -323,7 +309,6 @@ class Config(BaseModel):
     personification_api_type: str = "openai"
     personification_api_url: str = ""
     personification_api_key: str = ""
-    personification_gemini_auth_mode: str = "auto"
     personification_model: str = "gpt-4o-mini"
     # 轻量任务（intent 分类、回复 review、随机插话判定、图片分类）使用的模型名。
     # 留空时 fallback 到主模型，无需额外配置。
@@ -376,9 +361,8 @@ class Config(BaseModel):
     personification_core_values_prompt: str = (
         "你有稳定的基础三观和判断底线：尊重生命、公共安全、法律责任与人的尊严；"
         "不要把违法、危险、伤害他人、逃避责任或损害公共秩序的行为说成值得同情、羡慕或鼓励的事。"
-        "安全底线不是危险词触发器：先判断描述是否现实、话锋指向谁、是否明确向你求助，还是引用、玩笑或群友之间的连续对话。"
-        "没有明确 cue 你的群友玩笑不要主动升级成报警、急救或训诫；明确向你求助且现实风险成立时，再给简短可执行的安全建议。"
-        "群聊玩笑可以接，但底线不能歪；不要长篇说教，也不要装成官方普法。"
+        "群聊玩笑可以接，但底线不能歪：如果话题涉及安全、违法、伤害或责任，"
+        "先自然承认行为本身不对或风险很大，再用简短口语把话接住；不要长篇说教，也不要装成官方普法。"
         "对受害者、弱者、被伤害的人保持基本共情；不嘲笑苦难，不美化欺凌、歧视、暴力或剥削。"
     )
     personification_prompt_path: Optional[str] = None
@@ -386,7 +370,7 @@ class Config(BaseModel):
 
     personification_favorability_enabled: bool = True
     personification_favorability_default_score: float = 0.0
-    personification_favorability_group_default_score: float = 35.0
+    personification_favorability_group_default_score: float = 100.0
     personification_favorability_levels: Dict[str, float] = DEFAULT_FAVORABILITY_LEVELS.copy()
     personification_favorability_attitudes: Dict[str, str] = DEFAULT_FAVORABILITY_ATTITUDES.copy()
     personification_favorability_event_deltas: Dict[str, float] = DEFAULT_FAVORABILITY_EVENT_DELTAS.copy()
@@ -511,10 +495,10 @@ class Config(BaseModel):
     # 私聊回复前显示"正在输入"（仅 NapCat 系支持）
     personification_humanize_input_status_enabled: bool = True
 
-    # 兼容旧配置；当前管理员验证码通过后即批准设备，不再二次审批。
-    personification_webui_require_device_approval: bool = False
-    # 兼容旧配置；当前登录页固定展示可选管理员，不再接受手动输入 QQ。
-    personification_webui_expose_admin_list: bool = True
+    # WebUI 新设备登录需已批准设备确认（首个设备自动批准，防锁死）
+    personification_webui_require_device_approval: bool = True
+    # 登录页是否公开展示可登录管理员 QQ；公网暴露 WebUI 时建议保持关闭，改为手动输入 QQ
+    personification_webui_expose_admin_list: bool = False
     personification_webui_log_retention_days: int = 7
     personification_webui_log_max_entries: int = 10000
     personification_webui_log_capture_level: str = "INFO"

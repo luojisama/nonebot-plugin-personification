@@ -26,7 +26,6 @@ def build_personification_rule(
     group_chat_follow_probability: float,
     looks_like_private_command: Callable[[str], bool],
     get_recent_group_msgs: Callable[[str, int], list[dict]] | None = None,
-    user_policy_gate: Any = None,
 ) -> Callable[[Event, T_State], Awaitable[bool]]:
     async def _rule(event: Event, state: T_State) -> bool:
         return await personification_rule_core(
@@ -47,7 +46,6 @@ def build_personification_rule(
             group_chat_follow_probability=group_chat_follow_probability,
             looks_like_private_command=looks_like_private_command,
             get_recent_group_msgs=get_recent_group_msgs,
-            user_policy_gate=user_policy_gate,
         )
 
     return _rule
@@ -59,7 +57,6 @@ def build_poke_rule(
     is_group_whitelisted: Callable[[str, list[str]], bool],
     plugin_whitelist: list[str],
     probability: float,
-    user_policy_gate: Any = None,
 ) -> Callable[[Event], Awaitable[bool]]:
     async def _rule(event: Event) -> bool:
         return await poke_rule_core(
@@ -67,7 +64,6 @@ def build_poke_rule(
             is_group_whitelisted=is_group_whitelisted,
             plugin_whitelist=plugin_whitelist,
             probability=probability,
-            user_policy_gate=user_policy_gate,
         )
 
     return _rule
@@ -80,7 +76,6 @@ def build_poke_notice_rule(
     plugin_whitelist: list[str],
     probability: float,
     logger: Any,
-    user_policy_gate: Any = None,
 ) -> Callable[[Event], Awaitable[bool]]:
     async def _rule(event: Event) -> bool:
         return await poke_notice_rule_core(
@@ -89,7 +84,6 @@ def build_poke_notice_rule(
             plugin_whitelist=plugin_whitelist,
             probability=probability,
             logger=logger,
-            user_policy_gate=user_policy_gate,
         )
 
     return _rule
