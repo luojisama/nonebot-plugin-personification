@@ -25,7 +25,7 @@ jobs:
         run: pdm run python -m compileall -q nonebot_plugin_personification tools tests
 
       - name: Run package tests
-        run: pdm run python -m pytest tests --basetemp .tmp/pytest
+        run: mkdir -p .tmp && pdm run python -m pytest tests --basetemp .tmp/pytest
 
       - name: Run semantic scan
         run: pdm run python -m tools.personification_semantic_scan
