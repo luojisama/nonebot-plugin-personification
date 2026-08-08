@@ -174,11 +174,16 @@ def _probe_response_matches_expected(content: str) -> bool:
 
 
 def heuristic_supports_video(api_type: str, model: str | None = None) -> bool:
-    api = str(api_type or "").strip().lower().replace("-", "_")
-    model_text = str(model or "").strip().lower()
-    if api in {"gemini", "gemini_official", "gemini_cli", "antigravity_cli"}:
-        return True
-    return "gemini" in model_text
+    from .media_provider_adapters import resolve_media_provider_adapter
+
+    return resolve_media_provider_adapter(
+        {
+            "api_type": str(api_type or ""),
+            "api_url": "",
+            "model": str(model or ""),
+            "media_protocol": "auto",
+        }
+    ).supports_video
 
 
 def provider_supports_vision(

@@ -77,3 +77,17 @@ def test_looks_like_question_reply_detects_visible_questions() -> None:
     assert reply_text_policy.looks_like_question_reply("你那边是哪儿啊，我别乱猜天气。")
     assert reply_text_policy.looks_like_question_reply("这个几点开始？")
     assert not reply_text_policy.looks_like_question_reply("地点没拿准，我别乱猜天气。")
+
+
+def test_looks_like_question_reply_can_allow_exclamatory_banter_retort() -> None:
+    text = "杂鱼哥哥你说谁嗷嗷叫呢！"
+
+    assert reply_text_policy.looks_like_question_reply(text)
+    assert not reply_text_policy.looks_like_question_reply(
+        text,
+        allow_exclamatory_rhetorical=True,
+    )
+    assert reply_text_policy.looks_like_question_reply(
+        "你那边是哪儿啊？",
+        allow_exclamatory_rhetorical=True,
+    )

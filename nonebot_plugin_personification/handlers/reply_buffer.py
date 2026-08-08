@@ -1,7 +1,24 @@
 import asyncio
 import re
 import time
+from collections import OrderedDict
+from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from typing import Any, Callable, Dict
+
+from ..core import metrics
+from ..core.context_cleanup import release_message_buffer_entry_resources
+from ..core.message_relations import extract_reply_message_id
+from ..core.target_inference import normalize_message_target_for_review
+from ..core.turn_media import (
+    TurnMediaRef,
+    coerce_turn_media,
+    extract_turn_media_from_event,
+    media_from_batched_events,
+    resolve_onebot_quoted_media_refs,
+    serialize_turn_media,
+)
+from .reply_commit import reply_lifecycle_snapshot
 
 
 _GROUP_BATCH_DELAY_SECONDS = 1.2
@@ -9,6 +26,385 @@ _PRIVATE_BATCH_DELAY_SECONDS = 0.8
 _MAX_BATCH_EVENTS = 8
 _PROCESS_RESPONSE_TIMEOUT_SECONDS = 180.0
 _DIRECT_REPLY_PREEMPT_SECONDS = 8.0
+_ADMISSION_TIMEOUT_SECONDS = 15.0
+_RECENT_MEDIA_TTL_SECONDS = 300.0
+_RECENT_MEDIA_MAX_ENTRIES = 256
+_recent_media_by_sender: OrderedDict[str, tuple[float, list[dict[str, Any]]]] = OrderedDict()
+
+
+def _recent_media_key(session_key: str, user_id: str) -> str:
+    return f"{str(session_key or '').strip()}\0{str(user_id or '').strip()}"
+
+
+def _prune_recent_media(*, now: float) -> None:
+    expired = [
+        key
+        for key, (expires_at, _refs) in _recent_media_by_sender.items()
+        if float(expires_at or 0.0) <= now
+    ]
+    for key in expired:
+        _recent_media_by_sender.pop(key, None)
+    while len(_recent_media_by_sender) > _RECENT_MEDIA_MAX_ENTRIES:
+        _recent_media_by_sender.popitem(last=False)
+
+
+def _remember_recent_media(
+    *,
+    session_key: str,
+    user_id: str,
+    values: list[TurnMediaRef] | list[dict[str, Any]],
+    now: float,
+) -> None:
+    normalized_user_id = str(user_id or "").strip()
+    refs = [
+        item
+        for item in coerce_turn_media(values)
+        if item.kind in {"video", "audio"}
+        and item.owner_user_id == normalized_user_id
+    ]
+    if not refs or not normalized_user_id:
+        return
+    serialized = serialize_turn_media(refs)
+    for item in serialized:
+        item["origin"] = "batch"
+    key = _recent_media_key(session_key, normalized_user_id)
+    _recent_media_by_sender[key] = (now + _RECENT_MEDIA_TTL_SECONDS, serialized)
+    _recent_media_by_sender.move_to_end(key)
+    _prune_recent_media(now=now)
+
+
+def _recent_media_for_followup(
+    *,
+    session_key: str,
+    user_id: str,
+    now: float,
+) -> list[TurnMediaRef]:
+    _prune_recent_media(now=now)
+    key = _recent_media_key(session_key, user_id)
+    cached = _recent_media_by_sender.get(key)
+    if cached is None:
+        return []
+    expires_at, values = cached
+    if float(expires_at or 0.0) <= now:
+        _recent_media_by_sender.pop(key, None)
+        return []
+    _recent_media_by_sender.pop(key, None)
+    return [
+        item
+        for item in coerce_turn_media(values)
+        if item.owner_user_id == str(user_id or "").strip()
+    ]
+
+
+def _clear_recent_media_for_test() -> None:
+    _recent_media_by_sender.clear()
+
+
+async def _handle_reply_timeout(
+    *,
+    bot: Any,
+    event: Any,
+    state: dict[str, Any],
+    session_key: str,
+    timeout_seconds: float,
+    logger: Any,
+    commit_lock: asyncio.Lock | None = None,
+) -> None:
+    del bot, event, logger, commit_lock
+    delivery_started = bool(state.get("reply_delivery_started", False))
+    delivery_confirmed = bool(state.get("reply_delivery_confirmed", False))
+    delivery_complete = bool(state.get("reply_delivery_complete", False))
+    lifecycle = reply_lifecycle_snapshot(state)
+    if delivery_complete:
+        delivery_state = "complete"
+        outcome = "ok"
+        diagnosis_code = "post_send_timeout"
+    elif delivery_confirmed:
+        delivery_state = "partial"
+        outcome = "partial"
+        diagnosis_code = "partial_reply_timeout"
+    elif delivery_started:
+        delivery_state = "dispatching"
+        outcome = "outcome_unknown"
+        diagnosis_code = "send_outcome_unknown"
+    else:
+        delivery_state = "not_started"
+        outcome = "failed"
+        diagnosis_code = "reply_timeout"
+    try:
+        from ..core import reply_turn_trace
+
+        trace_id = str(state.get("reply_trace_id", "") or "")
+        reply_turn_trace.record_stage(
+            trace_id=trace_id,
+            key="reply_timeout",
+            label="回复超时",
+            status="warn" if delivery_confirmed else "error",
+            detail=(
+                f"timeout_seconds={timeout_seconds:g} reply_required={str(bool(state.get('reply_required', False))).lower()} "
+                f"delivery_started={str(delivery_started).lower()} "
+                f"delivery_confirmed={str(delivery_confirmed).lower()} "
+                f"delivery_complete={str(delivery_complete).lower()} "
+                f"delivery_state={delivery_state} "
+                f"last_phase={lifecycle['last_phase']} "
+                f"phase_age_ms={lifecycle['phase_age_ms']} "
+                f"elapsed_ms={lifecycle['elapsed_ms']}"
+            ),
+            hint="基础设施故障保持静默；检查 Provider、工具耗时、状态锁与发送回执",
+        )
+        reply_turn_trace.finish_trace(
+            trace_id=trace_id,
+            outcome=outcome,
+            diagnosis_code=diagnosis_code,
+            detail={
+                "timeout_seconds": timeout_seconds,
+                "session": session_key,
+                "reply_required": bool(state.get("reply_required", False)),
+                "delivery_started": delivery_started,
+                "delivery_confirmed": delivery_confirmed,
+                "delivery_complete": delivery_complete,
+                "delivery_state": delivery_state,
+                "last_phase": lifecycle["last_phase"],
+                "phase_age_ms": lifecycle["phase_age_ms"],
+                "elapsed_ms": lifecycle["elapsed_ms"],
+                "silent": True,
+            },
+        )
+    except Exception:
+        pass
+
+
+def _record_reply_admission_timeout(
+    *,
+    event: Any,
+    state: dict[str, Any],
+    session_key: str,
+    wait_ms: int,
+    mode: str,
+) -> None:
+    try:
+        from ..core import reply_turn_trace
+
+        trace_id = reply_turn_trace.start_trace(
+            trace_id=str(state.get("reply_trace_id", "") or ""),
+            session_type="group" if getattr(event, "group_id", None) else "private",
+            group_id=str(getattr(event, "group_id", "") or ""),
+            user_id=str(getattr(event, "user_id", "") or ""),
+            detail={"source": "reply_admission", "mode": mode},
+        )
+        state["reply_trace_id"] = trace_id
+        reply_turn_trace.record_stage(
+            trace_id=trace_id,
+            key="reply_admission_timeout",
+            label="回复排队超时",
+            status="warn",
+            detail=(
+                f"mode={mode} wait_ms={max(0, int(wait_ms))} "
+                f"reply_required={str(bool(state.get('reply_required', False))).lower()}"
+            ),
+            hint="检查回复并发、事件循环延迟和上游请求耗时",
+        )
+        reply_turn_trace.finish_trace(
+            trace_id=trace_id,
+            outcome="failed" if state.get("reply_required") else "no_reply",
+            diagnosis_code="reply_admission_timeout",
+            detail={
+                "session": session_key,
+                "mode": mode,
+                "wait_ms": max(0, int(wait_ms)),
+                "reply_required": bool(state.get("reply_required", False)),
+                "silent": True,
+            },
+        )
+    except Exception:
+        pass
+
+
+def _pop_buffer_entry(
+    msg_buffer: Dict[str, Dict[str, Any]],
+    key: str,
+) -> dict[str, Any] | None:
+    entry = msg_buffer.pop(key, None)
+    if isinstance(entry, dict):
+        release_message_buffer_entry_resources(entry)
+    return entry
+
+
+def _retain_buffer_entry(
+    *,
+    entry: dict[str, Any],
+    key: str,
+    concurrency_controller: "ReplyConcurrencyController | None",
+) -> None:
+    if concurrency_controller is None or callable(entry.get("_release_concurrency_gate")):
+        return
+    concurrency_controller.retain_buffer_session(key)
+    entry["_release_concurrency_gate"] = (
+        lambda controller=concurrency_controller, session_key=key: controller.release_buffer_session(
+            session_key
+        )
+    )
+
+
+class ReplyAdmissionTimeout(asyncio.TimeoutError):
+    def __init__(self, wait_ms: int) -> None:
+        super().__init__("reply admission timed out")
+        self.wait_ms = max(0, int(wait_ms))
+
+
+@dataclass
+class _SessionGate:
+    semaphore: asyncio.Semaphore
+    commit_lock: asyncio.Lock
+    direct_idle: asyncio.Event
+    refs: int = 0
+    direct_count: int = 0
+    waiters: int = 0
+    active: int = 0
+
+
+class ReplyConcurrencyController:
+    def __init__(self, *, session_limit: int = 3, global_limit: int = 12) -> None:
+        self._global_semaphore = asyncio.Semaphore(max(1, int(global_limit)))
+        self._session_limit = max(1, int(session_limit))
+        self._session_gates: dict[str, _SessionGate] = {}
+
+    def _gate(self, key: str) -> _SessionGate:
+        gate = self._session_gates.get(key)
+        if gate is None:
+            idle = asyncio.Event()
+            idle.set()
+            gate = _SessionGate(
+                semaphore=asyncio.Semaphore(self._session_limit),
+                commit_lock=asyncio.Lock(),
+                direct_idle=idle,
+            )
+            self._session_gates[key] = gate
+        return gate
+
+    def _retain(self, key: str) -> _SessionGate:
+        gate = self._gate(key)
+        gate.refs += 1
+        return gate
+
+    def _release(self, key: str, gate: _SessionGate) -> None:
+        gate.refs = max(0, gate.refs - 1)
+        self._cleanup(key, gate)
+
+    def _cleanup(self, key: str, gate: _SessionGate) -> None:
+        if (
+            gate.refs == 0
+            and gate.direct_count == 0
+            and gate.waiters == 0
+            and gate.active == 0
+            and not gate.commit_lock.locked()
+            and self._session_gates.get(key) is gate
+        ):
+            self._session_gates.pop(key, None)
+
+    def retain_buffer_session(self, key: str) -> None:
+        self._retain(key)
+
+    def release_buffer_session(self, key: str) -> None:
+        gate = self._session_gates.get(key)
+        if gate is not None:
+            self._release(key, gate)
+
+    def commit_lock(self, key: str) -> asyncio.Lock:
+        return self._gate(key).commit_lock
+
+    async def wait_for_direct_idle(self, key: str) -> None:
+        gate = self._retain(key)
+        try:
+            await gate.direct_idle.wait()
+        finally:
+            self._release(key, gate)
+
+    def snapshot(self) -> dict[str, int]:
+        return {
+            "active": sum(gate.active for gate in self._session_gates.values()),
+            "waiting": sum(gate.waiters for gate in self._session_gates.values()),
+            "session_gates": len(self._session_gates),
+        }
+
+    @staticmethod
+    def _admission_deadline(deadline: float | None) -> float:
+        now = time.monotonic()
+        allowed = _ADMISSION_TIMEOUT_SECONDS
+        if deadline is not None:
+            allowed = min(allowed, max(0.0, float(deadline) - now))
+        return now + max(0.0, allowed)
+
+    async def _wait_until(self, awaitable: Any, *, deadline: float) -> None:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            close = getattr(awaitable, "close", None)
+            if callable(close):
+                close()
+            raise asyncio.TimeoutError
+        await asyncio.wait_for(awaitable, timeout=remaining)
+
+    @asynccontextmanager
+    async def _turn(self, key: str, *, direct: bool, deadline: float | None = None):
+        gate = self._retain(key)
+        started_at = time.monotonic()
+        acquired_session = False
+        acquired_global = False
+        admitted = False
+        if direct:
+            gate.direct_count += 1
+            gate.direct_idle.clear()
+        gate.waiters += 1
+        try:
+            try:
+                admission_deadline = self._admission_deadline(deadline)
+                if not direct:
+                    await self._wait_until(gate.direct_idle.wait(), deadline=admission_deadline)
+                await self._wait_until(gate.semaphore.acquire(), deadline=admission_deadline)
+                acquired_session = True
+                await self._wait_until(self._global_semaphore.acquire(), deadline=admission_deadline)
+                acquired_global = True
+            except asyncio.TimeoutError as exc:
+                wait_ms = int(max(0.0, (time.monotonic() - started_at) * 1000.0))
+                metrics.record_counter(
+                    "reply_admission_timeout_total",
+                    mode="direct" if direct else "buffered",
+                )
+                raise ReplyAdmissionTimeout(wait_ms) from exc
+            gate.waiters = max(0, gate.waiters - 1)
+            gate.active += 1
+            admitted = True
+            wait_ms = max(0.0, (time.monotonic() - started_at) * 1000.0)
+            metrics.record_timing(
+                "reply_admission_wait_ms",
+                wait_ms,
+                mode="direct" if direct else "buffered",
+            )
+            yield gate.commit_lock
+        finally:
+            if admitted:
+                gate.active = max(0, gate.active - 1)
+            else:
+                gate.waiters = max(0, gate.waiters - 1)
+            if acquired_global:
+                self._global_semaphore.release()
+            if acquired_session:
+                gate.semaphore.release()
+            if direct:
+                gate.direct_count = max(0, gate.direct_count - 1)
+                if gate.direct_count == 0:
+                    gate.direct_idle.set()
+            self._release(key, gate)
+
+    @asynccontextmanager
+    async def direct_turn(self, key: str, *, deadline: float | None = None):
+        async with self._turn(key, direct=True, deadline=deadline) as commit_lock:
+            yield commit_lock
+
+    @asynccontextmanager
+    async def buffered_turn(self, key: str, *, deadline: float | None = None):
+        async with self._turn(key, direct=False, deadline=deadline) as commit_lock:
+            yield commit_lock
 
 
 def _has_reply_semantics(event: Any) -> bool:
@@ -106,8 +502,11 @@ def _is_direct_mention(event: Any, bot_self_id: str) -> bool:
     return False
 
 
-def _is_reply_to_bot(event: Any, bot_self_id: str) -> bool:
+def _is_reply_to_bot(event: Any, bot_self_id: str, *, message_target: str = "") -> bool:
     if not bot_self_id:
+        return False
+    normalized_target = normalize_message_target_for_review(message_target)
+    if normalized_target in {"external_plugin", "others"}:
         return False
     reply = getattr(event, "reply", None)
     if not reply:
@@ -124,6 +523,8 @@ def _is_reply_to_bot(event: Any, bot_self_id: str) -> bool:
         reply_user_id = str(getattr(reply, "self_id", "") or "").strip()
         if not reply_user_id and isinstance(reply, dict):
             reply_user_id = str(reply.get("self_id", "") or "").strip()
+    if normalized_target == "bot":
+        return True
     return bool(reply_user_id and reply_user_id == bot_self_id)
 
 
@@ -134,8 +535,13 @@ def _select_merged_event(events: list[Any]) -> Any:
     return events[-1]
 
 
-def _serialize_batched_event(item: dict[str, Any]) -> dict[str, Any]:
+def _serialize_batched_event(
+    item: dict[str, Any],
+    *,
+    selected_event: Any = None,
+) -> dict[str, Any]:
     event = item.get("event")
+    current_origin = "current" if event is selected_event else "batch"
     return {
         "message_id": str(getattr(event, "message_id", "") or "").strip(),
         "user_id": str(getattr(event, "user_id", "") or "").strip(),
@@ -145,6 +551,12 @@ def _serialize_batched_event(item: dict[str, Any]) -> dict[str, Any]:
         "is_direct_mention": bool(item.get("is_direct_mention")),
         "is_reply_to_bot": bool(item.get("is_reply_to_bot")),
         "has_reply_semantics": _has_reply_semantics(event),
+        "media": serialize_turn_media(
+            extract_turn_media_from_event(
+                event,
+                current_origin=current_origin,
+            )
+        ),
     }
 
 
@@ -222,11 +634,18 @@ def _build_combined_message(
     return combined_message
 
 
-def _session_key(event: Any, *, group_message_event_cls: Any) -> str:
+def _session_key(
+    event: Any,
+    *,
+    group_message_event_cls: Any,
+    bot_self_id: str = "",
+) -> str:
     user_id = str(getattr(event, "user_id", "") or "")
     if isinstance(event, group_message_event_cls):
-        return str(getattr(event, "group_id", "") or "")
-    return f"private_{user_id}"
+        scope = str(getattr(event, "group_id", "") or "")
+    else:
+        scope = f"private_{user_id}"
+    return f"{bot_self_id}:{scope}" if bot_self_id else scope
 
 
 def _batch_delay(event: Any, *, group_message_event_cls: Any) -> float:
@@ -323,6 +742,8 @@ async def run_buffer_timer(
     finished_exception_cls: Any = None,
     delay: float = 0.0,
     response_timeout_seconds: float = _PROCESS_RESPONSE_TIMEOUT_SECONDS,
+    concurrency_controller: ReplyConcurrencyController | None = None,
+    user_policy_gate: Any = None,
 ) -> None:
     started_at = time.monotonic()
     await asyncio.sleep(max(0.0, float(delay or 0.0)))
@@ -350,6 +771,14 @@ async def run_buffer_timer(
         return
 
     items = list(entry.get("items") or [])
+    if user_policy_gate is not None and items:
+        allowed = await asyncio.gather(
+            *(
+                user_policy_gate.allows_current(item.get("event"))
+                for item in items
+            )
+        )
+        items = [item for item, is_allowed in zip(items, allowed) if is_allowed]
     if not items:
         if entry.get("pending_items"):
             _promote_pending_batch(entry)
@@ -371,11 +800,13 @@ async def run_buffer_timer(
                         finished_exception_cls=finished_exception_cls,
                         delay=_delay,
                         response_timeout_seconds=response_timeout_seconds,
+                        concurrency_controller=concurrency_controller,
+                        user_policy_gate=user_policy_gate,
                     )
                 ),
             )
             return
-        msg_buffer.pop(key, None)
+        _pop_buffer_entry(msg_buffer, key)
         return
 
     entry["processing"] = True
@@ -392,12 +823,14 @@ async def run_buffer_timer(
     selected_event = trigger_item.get("event")
     if selected_event is None:
         entry["processing"] = False
+        _pop_buffer_entry(msg_buffer, key)
         return
 
     state = dict(trigger_item.get("state") or {})
     events = [item.get("event") for item in items if isinstance(item.get("event"), message_event_cls)]
     if not events:
         entry["processing"] = False
+        _pop_buffer_entry(msg_buffer, key)
         return
 
     combined_message = None
@@ -410,7 +843,10 @@ async def run_buffer_timer(
     except Exception as exc:
         logger.warning(f"拟人插件：拼接消息构建失败，回退单条处理: {exc}")
 
-    serialized_items = [_serialize_batched_event(item) for item in items]
+    serialized_items = [
+        _serialize_batched_event(item, selected_event=selected_event)
+        for item in items
+    ]
     repeat_clusters = _build_repeat_clusters(items)
     if combined_message is not None:
         state["concatenated_message"] = combined_message
@@ -419,6 +855,7 @@ async def run_buffer_timer(
         "selected_event_index": max(0, events.index(selected_event)),
     }
     state["batched_events"] = serialized_items
+    state["turn_media_context"] = serialize_turn_media(media_from_batched_events(serialized_items))
     state["batch_trigger"] = {
         "type": trigger_type,
         "message_id": str(getattr(selected_event, "message_id", "") or "").strip(),
@@ -434,6 +871,7 @@ async def run_buffer_timer(
     entry["current_trigger_type"] = trigger_type
     entry["current_is_random_chat"] = bool(state.get("is_random_chat", False))
     timeout_seconds = max(30.0, float(response_timeout_seconds or _PROCESS_RESPONSE_TIMEOUT_SECONDS))
+    state["response_deadline"] = time.monotonic() + timeout_seconds
     try:
         from ..core import reply_turn_trace
 
@@ -451,31 +889,44 @@ async def run_buffer_timer(
         pass
 
     try:
-        await asyncio.wait_for(
-            process_response_logic(bot, selected_event, state),
-            timeout=timeout_seconds,
+        if concurrency_controller is None:
+            await asyncio.wait_for(
+                process_response_logic(bot, selected_event, state),
+                timeout=max(0.001, float(state["response_deadline"]) - time.monotonic()),
+            )
+        else:
+            async with concurrency_controller.buffered_turn(
+                key,
+                deadline=float(state["response_deadline"]),
+            ) as commit_lock:
+                state["reply_commit_lock"] = commit_lock
+                await asyncio.wait_for(
+                    process_response_logic(bot, selected_event, state),
+                    timeout=max(0.001, float(state["response_deadline"]) - time.monotonic()),
+                )
+    except ReplyAdmissionTimeout as exc:
+        logger.warning(
+            f"拟人插件：会话 {key} 缓冲回复排队超时，已静默放弃。"
+        )
+        _record_reply_admission_timeout(
+            event=selected_event,
+            state=state,
+            session_key=key,
+            wait_ms=exc.wait_ms,
+            mode="buffered",
         )
     except asyncio.TimeoutError:
         logger.warning(
             f"拟人插件：会话 {key} 单轮回复超时（>{timeout_seconds:.0f}s），已放弃旧批次。"
         )
-        try:
-            from ..core import reply_turn_trace
-
-            reply_turn_trace.record_stage(
-                key="reply_timeout",
-                label="回复超时",
-                status="error",
-                detail=f"process_response_logic 超过 {timeout_seconds:.0f}s",
-                hint="检查 provider 超时、工具耗时、模型路由与重试次数",
-            )
-            reply_turn_trace.finish_trace(
-                outcome="failed",
-                diagnosis_code="reply_timeout",
-                detail={"timeout_seconds": timeout_seconds, "session": key},
-            )
-        except Exception:
-            pass
+        await _handle_reply_timeout(
+            bot=bot,
+            event=selected_event,
+            state=state,
+            session_key=key,
+            timeout_seconds=timeout_seconds,
+            logger=logger,
+        )
     except asyncio.CancelledError:
         if int(entry.get("superseded_generation", 0) or 0) >= current_generation:
             logger.info(f"拟人插件：会话 {key} 当前批次已被新的直呼消息抢占。")
@@ -484,34 +935,19 @@ async def run_buffer_timer(
         if finished_exception_cls and isinstance(exc, finished_exception_cls):
             logger.debug("拟人插件：拼接消息处理提前结束（FinishedException）")
         else:
-            if "concatenated_message" in state:
-                retry_state = dict(state)
-                retry_state["disable_network_hooks"] = True
-                try:
-                    await process_response_logic(bot, selected_event, retry_state)
-                    logger.warning(
-                        f"拟人插件：拼接消息处理失败（{type(exc).__name__}: {exc}），"
-                        "已禁用联网/grounding 后重试同批成功"
-                    )
-                    return
-                except Exception:
-                    pass
-
-                fallback_state = dict(state)
-                fallback_state.pop("concatenated_message", None)
-                fallback_state["disable_network_hooks"] = True
-                fallback_state["batch_event_count"] = 1
-                fallback_state["batched_events"] = [serialized_items[-1]] if serialized_items else []
-                fallback_state["repeat_clusters"] = []
-                try:
-                    await process_response_logic(bot, selected_event, fallback_state)
-                    logger.warning(
-                        f"拟人插件：拼接消息处理失败（{type(exc).__name__}: {exc}），已回退单条处理成功"
-                    )
-                    return
-                except Exception:
-                    pass
-            logger.exception("拟人插件：处理拼接消息失败")
+            delivery_state = (
+                "complete"
+                if state.get("reply_delivery_complete")
+                else "partial"
+                if state.get("reply_delivery_confirmed")
+                else "dispatching"
+                if state.get("reply_delivery_started")
+                else "not_started"
+            )
+            logger.error(
+                f"拟人插件：处理拼接消息失败，保持静默: "
+                f"type={type(exc).__name__} delivery_state={delivery_state}"
+            )
     finally:
         entry["processing"] = False
         entry["active_task"] = None
@@ -539,6 +975,8 @@ async def run_buffer_timer(
                             finished_exception_cls=finished_exception_cls,
                             delay=_delay,
                             response_timeout_seconds=response_timeout_seconds,
+                            concurrency_controller=concurrency_controller,
+                            user_policy_gate=user_policy_gate,
                         )
                     ),
                 )
@@ -566,11 +1004,13 @@ async def run_buffer_timer(
                             finished_exception_cls=finished_exception_cls,
                             delay=_delay,
                             response_timeout_seconds=response_timeout_seconds,
+                            concurrency_controller=concurrency_controller,
+                            user_policy_gate=user_policy_gate,
                         )
                     ),
                 )
         elif not entry.get("items"):
-            msg_buffer.pop(key, None)
+            _pop_buffer_entry(msg_buffer, key)
 
 
 async def handle_reply_event(
@@ -585,24 +1025,217 @@ async def handle_reply_event(
     msg_buffer: Dict[str, Dict[str, Any]],
     start_buffer_timer: Callable[[str, Any, float], Any],
     logger: Any,
+    concurrency_controller: ReplyConcurrencyController | None = None,
+    response_timeout_seconds: float = _PROCESS_RESPONSE_TIMEOUT_SECONDS,
+    finished_exception_cls: Any = None,
+    user_policy_gate: Any = None,
 ) -> None:
+    if user_policy_gate is not None and not await user_policy_gate.allows_current(event):
+        return
     if isinstance(event, poke_event_cls):
-        await process_response_logic(bot, event, state)
+        if concurrency_controller is None:
+            await process_response_logic(bot, event, state)
+            return
+        bot_self_id = str(getattr(bot, "self_id", "") or "")
+        group_id = str(getattr(event, "group_id", "") or "")
+        user_id = str(getattr(event, "user_id", "") or "")
+        scope = group_id or f"private_{user_id}"
+        session_key = f"{bot_self_id}:{scope}" if bot_self_id else scope
+        direct_state = dict(state)
+        direct_state["batch_session_key"] = session_key
+        direct_state["reply_required"] = True
+        timeout_seconds = max(30.0, float(response_timeout_seconds or _PROCESS_RESPONSE_TIMEOUT_SECONDS))
+        direct_state["response_deadline"] = time.monotonic() + timeout_seconds
+        try:
+            async with concurrency_controller.direct_turn(
+                session_key,
+                deadline=float(direct_state["response_deadline"]),
+            ) as commit_lock:
+                direct_state["reply_commit_lock"] = commit_lock
+                await asyncio.wait_for(
+                    process_response_logic(bot, event, direct_state),
+                    timeout=max(
+                        0.001,
+                        float(direct_state["response_deadline"]) - time.monotonic(),
+                    ),
+                )
+        except ReplyAdmissionTimeout as exc:
+            logger.warning(f"拟人插件：会话 {session_key} poke turn 排队超时，已静默放弃。")
+            _record_reply_admission_timeout(
+                event=event,
+                state=direct_state,
+                session_key=session_key,
+                wait_ms=exc.wait_ms,
+                mode="direct",
+            )
+        except asyncio.TimeoutError:
+            logger.warning(
+                f"拟人插件：会话 {session_key} poke turn 超时（>{timeout_seconds:.0f}s），已终止本轮。"
+            )
+            await _handle_reply_timeout(
+                bot=bot,
+                event=event,
+                state=direct_state,
+                session_key=session_key,
+                timeout_seconds=timeout_seconds,
+                logger=logger,
+            )
         return
 
     if not isinstance(event, message_event_cls):
         return
 
-    session_key = _session_key(event, group_message_event_cls=group_message_event_cls)
-    delay = _batch_delay(event, group_message_event_cls=group_message_event_cls)
-    entry = msg_buffer.setdefault(session_key, _new_entry(delay))
-    entry["delay"] = delay
-
     bot_self_id = str(getattr(bot, "self_id", "") or "")
+    session_key = _session_key(
+        event,
+        group_message_event_cls=group_message_event_cls,
+        bot_self_id=bot_self_id,
+    )
+    delay = _batch_delay(event, group_message_event_cls=group_message_event_cls)
     is_private_session = not isinstance(event, group_message_event_cls)
     is_direct_mention = _is_direct_mention(event, bot_self_id)
-    is_reply_to_bot = _is_reply_to_bot(event, bot_self_id)
-    immediate_flush = bool(is_private_session or is_direct_mention or is_reply_to_bot)
+    is_reply_to_bot = _is_reply_to_bot(
+        event,
+        bot_self_id,
+        message_target=str(state.get("message_target", "") or ""),
+    )
+    targets_bot = normalize_message_target_for_review(state.get("message_target")) == "bot"
+    reply_required = bool(
+        not state.get("is_random_chat", False)
+        and (is_private_session or is_direct_mention or is_reply_to_bot or targets_bot)
+    )
+    state["reply_required"] = reply_required
+    state.setdefault("received_wall_at", time.time())
+    event_plain_text = _extract_plain_text(event)
+    event_media = extract_turn_media_from_event(event, current_origin="current")
+    if event_media and not event_plain_text:
+        _remember_recent_media(
+            session_key=session_key,
+            user_id=str(getattr(event, "user_id", "") or ""),
+            values=event_media,
+            now=time.monotonic(),
+        )
+    immediate_flush = reply_required
+    if immediate_flush and concurrency_controller is not None:
+        entry = msg_buffer.get(session_key)
+        if isinstance(entry, dict):
+            if entry.get("processing"):
+                entry["newer_batch_for_current"] = True
+                entry["superseded_generation"] = max(
+                    int(entry.get("superseded_generation", 0) or 0),
+                    int(entry.get("current_generation", 0) or 0),
+                )
+                active_task = entry.get("active_task")
+                if active_task and not active_task.done():
+                    active_task.cancel()
+        direct_state = dict(state)
+        direct_state["batch_session_key"] = session_key
+        direct_state["batched_events"] = []
+        direct_media = await resolve_onebot_quoted_media_refs(event, bot)
+        recent_media: list[TurnMediaRef] = []
+        if not any(item.kind in {"video", "audio"} for item in direct_media) and event_plain_text:
+            recent_media = _recent_media_for_followup(
+                session_key=session_key,
+                user_id=str(getattr(event, "user_id", "") or ""),
+                now=time.monotonic(),
+            )
+            direct_media.extend(recent_media)
+        media_reference_unavailable = bool(
+            event_plain_text
+            and extract_reply_message_id(event)
+            and not direct_media
+        )
+        direct_state["media_reference_unavailable"] = media_reference_unavailable
+        direct_state["batch_event_count"] = 1 + int(bool(recent_media))
+        direct_state["turn_media_context"] = serialize_turn_media(
+            coerce_turn_media(direct_media)
+        )
+        try:
+            from ..core import reply_turn_trace
+
+            media_counts = {
+                "current": sum(item.origin == "current" for item in direct_media),
+                "quoted": sum(item.origin == "quoted" for item in direct_media),
+                "recent": len(recent_media),
+                "video": sum(item.kind == "video" for item in direct_media),
+                "audio": sum(item.kind == "audio" for item in direct_media),
+            }
+            if any(media_counts.values()) or media_reference_unavailable:
+                reply_turn_trace.record_stage(
+                    key="turn_media_resolved",
+                    label="轮次媒体解析",
+                    status="warn" if media_reference_unavailable else "ok",
+                    detail=(
+                        " ".join(f"{key}={value}" for key, value in media_counts.items())
+                        + f" reference_unavailable={str(media_reference_unavailable).lower()}"
+                    ),
+                    hint="引用媒体通过 message_id 回查；近期媒体只在同一会话与同一发送者内承接",
+                )
+        except Exception:
+            pass
+        timeout_seconds = max(30.0, float(response_timeout_seconds or _PROCESS_RESPONSE_TIMEOUT_SECONDS))
+        direct_state["response_deadline"] = time.monotonic() + timeout_seconds
+        try:
+            async with concurrency_controller.direct_turn(
+                session_key,
+                deadline=float(direct_state["response_deadline"]),
+            ) as commit_lock:
+                direct_state["reply_commit_lock"] = commit_lock
+                await asyncio.wait_for(
+                    process_response_logic(bot, event, direct_state),
+                    timeout=max(
+                        0.001,
+                        float(direct_state["response_deadline"]) - time.monotonic(),
+                    ),
+                )
+        except ReplyAdmissionTimeout as exc:
+            logger.warning(f"拟人插件：会话 {session_key} direct turn 排队超时，已静默放弃。")
+            _record_reply_admission_timeout(
+                event=event,
+                state=direct_state,
+                session_key=session_key,
+                wait_ms=exc.wait_ms,
+                mode="direct",
+            )
+        except asyncio.TimeoutError:
+            logger.warning(
+                f"拟人插件：会话 {session_key} direct turn 超时（>{timeout_seconds:.0f}s），已终止本轮。"
+            )
+            await _handle_reply_timeout(
+                bot=bot,
+                event=event,
+                state=direct_state,
+                session_key=session_key,
+                timeout_seconds=timeout_seconds,
+                logger=logger,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            if finished_exception_cls and isinstance(exc, finished_exception_cls):
+                logger.debug("拟人插件：direct turn 提前结束（FinishedException）")
+            else:
+                delivery_state = (
+                    "complete"
+                    if direct_state.get("reply_delivery_complete")
+                    else "partial"
+                    if direct_state.get("reply_delivery_confirmed")
+                    else "dispatching"
+                    if direct_state.get("reply_delivery_started")
+                    else "not_started"
+                )
+                logger.error(
+                    f"拟人插件：会话 {session_key} direct turn 处理失败，保持静默: "
+                    f"type={type(exc).__name__} delivery_state={delivery_state}"
+                )
+        return
+    entry = msg_buffer.setdefault(session_key, _new_entry(delay))
+    _retain_buffer_entry(
+        entry=entry,
+        key=session_key,
+        concurrency_controller=concurrency_controller,
+    )
+    entry["delay"] = delay
     now_ts = time.monotonic()
     item = {
         "event": event,
@@ -611,6 +1244,8 @@ async def handle_reply_event(
         "is_reply_to_bot": is_reply_to_bot,
         "received_at": now_ts,
     }
+    if concurrency_controller is not None:
+        item["state"]["reply_commit_lock"] = concurrency_controller.commit_lock(session_key)
 
     if entry.get("processing"):
         pending_items = list(entry.get("pending_items") or [])

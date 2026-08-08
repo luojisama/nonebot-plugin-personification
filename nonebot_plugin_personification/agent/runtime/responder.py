@@ -4,6 +4,10 @@ import json
 from dataclasses import dataclass
 from typing import Any
 
+from ...core.reply_style_policy import (
+    build_directed_exchange_policy_prompt,
+    build_empty_evidence_output_policy_prompt,
+)
 from .planner import OUTPUT_MODE_LENGTHS, extract_json_payload
 
 
@@ -73,12 +77,14 @@ def with_persona_responder_instruction(
     *,
     semantic_frame: Any = None,
     is_direct_mention: bool = False,
+    reply_required: bool = False,
     relationship_hint: str = "",
     recent_bot_replies: list[str] | None = None,
     emotional_climate: str = "",
     message_text: str = "",
     lorebook_enabled: bool = False,
     memory_store: Any = None,
+    reply_length_hint: str = "",
 ) -> list[dict[str, Any]]:
     lorebook_section = ""
     if lorebook_enabled and message_text and memory_store:
@@ -92,10 +98,12 @@ def with_persona_responder_instruction(
     instruction = _build_persona_responder_instruction(
         semantic_frame=semantic_frame,
         is_direct_mention=is_direct_mention,
+        reply_required=reply_required,
         relationship_hint=relationship_hint,
         recent_bot_replies=recent_bot_replies,
         emotional_climate=emotional_climate,
         lorebook_section=lorebook_section,
+        reply_length_hint=reply_length_hint,
     )
     copied = [dict(item) for item in list(messages or [])]
     if copied and copied[0].get("role") == "system":
@@ -119,14 +127,21 @@ def _build_persona_responder_instruction(
     *,
     semantic_frame: Any = None,
     is_direct_mention: bool = False,
+    reply_required: bool = False,
     relationship_hint: str = "",
     recent_bot_replies: list[str] | None = None,
     emotional_climate: str = "",
     lorebook_section: str = "",
+    reply_length_hint: str = "",
 ) -> str:
     output_mode = str(getattr(semantic_frame, "output_mode", "") or "").strip() or "chat_short"
     min_chars, max_chars = OUTPUT_MODE_LENGTHS.get(output_mode, OUTPUT_MODE_LENGTHS["chat_short"])
-    no_reply_rule = "直呼/提及时禁止输出 [NO_REPLY]。" if is_direct_mention else "只有明显不该回复时才可把 reply_text 设为 [NO_REPLY]。"
+    if is_direct_mention:
+        no_reply_rule = "直呼/提及时禁止输出 [NO_REPLY]。"
+    elif reply_required:
+        no_reply_rule = "当前是强交互轮次，禁止输出 [NO_REPLY]。"
+    else:
+        no_reply_rule = "只有明显不该回复时才可把 reply_text 设为 [NO_REPLY]。"
     session_goal = str(getattr(semantic_frame, "session_goal", "") or "").strip()[:100]
     user_attitude = str(getattr(semantic_frame, "user_attitude", "") or "").strip()[:100]
     bot_emotion = str(getattr(semantic_frame, "bot_emotion", "") or "").strip()[:100]
@@ -169,16 +184,30 @@ def _build_persona_responder_instruction(
         )
         + "\n"
         f"reply_text 按 output_mode={output_mode} 控制在 {min_chars}-{max_chars} 字附近。"
-        "如果只是在复述用户语义，把 info_added 标为 tone_only；如果复用了用户原话连续片段，把 echoed_user_phrase 标为 true。"
+        + (f"\n{reply_length_hint}" if reply_length_hint else "")
+        + "如果只是在复述用户语义，把 info_added 标为 tone_only；如果复用了用户原话连续片段，把 echoed_user_phrase 标为 true。"
         f"{no_reply_rule}\n"
-        "## 不确定性硬约束（拟人优先于装懂）\n"
+        "## 事实与不确定性硬约束（拟人优先于装懂）\n"
         "- 涉及具体事实、数字、时间、人名、新闻、产品参数、专有名词、角色/作品/游戏/动漫/卡牌术语、外号、缩写或梗的问题，"
         "  如果可用查证工具存在，Agent 阶段应已经先调用工具；本 JSON 收尾阶段不要再承诺『我去查查』，也不要反问群友这是什么。"
-        "  如果没有调用工具且你对答案不完全确定，reply_text 应当用口语自然地承认当前不知道（例如：『这个我不太确定』），"
-        "  把 info_added 设为 'refuse'。**禁止凭印象编造具体数字、链接、日期、官方说法。**\n"
-        "- 如果工具结果明显为空或与问题无关，也要承认信息不足，而不是绕开。\n"
-        "- 但闲聊、共情、表达情绪、复述用户观点这些**不需要外部事实**的话题，依然要正常回答，不要滥用『不知道』。"
+        "  没有可用证据时不得凭印象编造具体数字、链接、日期、官方说法或出处。\n"
+        "- 如果必须回应且只缺一个对方能提供的条件，reply_text 只索取这一项并把 info_added 设为 'redirect'；"
+        "  没有具体可索取条件时使用 [SILENCE]，不要把失败或不确定状态写成 reply_text。\n"
+        "- 闲聊、共情和表达情绪不需要外部事实时依然正常回答，不要误用空证据收口。\n"
+        + build_empty_evidence_output_policy_prompt()
     )
+    directed_exchange_prompt = build_directed_exchange_policy_prompt(
+        is_direct_mention=is_direct_mention,
+        is_group=is_direct_mention,
+        speech_act=str(getattr(semantic_frame, "speech_act", "") or ""),
+        output_mode=output_mode,
+    )
+    if directed_exchange_prompt:
+        instruction += (
+            "\n\n"
+            + directed_exchange_prompt
+            + "\n需要拆成多条时，在 reply_text 字符串内部用两个换行符分隔，仍然只输出一个合法 JSON 对象。"
+        )
     if lorebook_section:
         instruction = f"{lorebook_section}\n\n{instruction}"
     peer_section = _peer_plugins_section()

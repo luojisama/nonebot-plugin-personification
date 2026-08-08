@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import threading
 from pathlib import Path
 from typing import Any
@@ -467,8 +468,14 @@ class PluginKnowledgeStore:
     def _to_search_tokens(text: str) -> list[str]:
         normalized = text.lower().replace("_", " ").replace("-", " ")
         words = [token for token in normalized.split() if token]
-        compact = "".join(ch for ch in normalized if not ch.isspace())
-        bigrams = [compact[i : i + 2] for i in range(max(0, len(compact) - 1))]
+        # 二元分词只用于没有天然空格边界的中日韩文本。英文长词若也拆成
+        # ``on``/``at`` 之类的二字母片段，会让几乎所有插件都成为误命中。
+        cjk_runs = re.findall(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]{2,}", normalized)
+        bigrams = [
+            run[index : index + 2]
+            for run in cjk_runs
+            for index in range(len(run) - 1)
+        ]
         tokens: list[str] = []
         for token in words + bigrams:
             if token and token not in tokens:

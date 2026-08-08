@@ -169,6 +169,7 @@ def test_plugin_knowledge_routes_expose_full_input_coverage(tmp_path: Path) -> N
     assert item["source_coverage"]["full_input"] is True
     assert item["source_coverage"]["source_chars"] == 1200
     assert item["analysis_scope"] == "full_readable_python_source"
+    assert listed.json()["diagnostic"]["code"] == "plugin_knowledge_list_loaded"
 
     detail = client.get("/api/plugin-knowledge/detail/demo")
     assert detail.status_code == 200, detail.text
@@ -176,3 +177,33 @@ def test_plugin_knowledge_routes_expose_full_input_coverage(tmp_path: Path) -> N
     assert body["source_coverage"]["full_input"] is True
     assert body["source_coverage"]["source_chunk_count"] == 3
     assert body["source_snapshot"]["source_truncated"] is False
+    assert body["diagnostic"]["code"] == "plugin_knowledge_detail_loaded"
+
+
+def test_plugin_knowledge_search_does_not_split_english_words_into_bigrams(tmp_path: Path) -> None:
+    store_mod = load_personification_module("plugin.personification.core.knowledge_store")
+    store = store_mod.PluginKnowledgeStore(tmp_path)
+    store.save_index_sync(
+        {
+            "plugins": {
+                "personification": {
+                    "display_name": "Personification",
+                    "summary": "LLM-led dialogue",
+                    "keywords": ["persona"],
+                },
+                "unrelated": {
+                    "display_name": "Configuration helper",
+                    "summary": "Notification and formatting tools",
+                    "keywords": ["integration"],
+                },
+                "memory": {
+                    "display_name": "记忆宫殿",
+                    "summary": "长期对话记忆检索",
+                    "keywords": [],
+                },
+            }
+        }
+    )
+
+    assert store.search_plugins("personification", top_k=30) == ["personification"]
+    assert store.search_plugins("对话检索", top_k=30) == ["memory"]

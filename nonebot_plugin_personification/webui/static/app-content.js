@@ -1,3 +1,34 @@
+const STICKER_DIAGNOSTICS_STORAGE_KEY = "personification_sticker_diagnostics_v1";
+
+function stickerDiagnostics() {
+  if (Array.isArray(state.stickerDiagnostics)) return state.stickerDiagnostics;
+  try {
+    const saved = JSON.parse(sessionStorage.getItem(STICKER_DIAGNOSTICS_STORAGE_KEY) || "[]");
+    state.stickerDiagnostics = Array.isArray(saved) ? saved.slice(0, 8) : [];
+  } catch {
+    state.stickerDiagnostics = [];
+  }
+  return state.stickerDiagnostics;
+}
+
+function rememberStickerDiagnostic(value) {
+  const diagnostic = value && value.diagnostic && typeof value.diagnostic === "object"
+    ? value.diagnostic
+    : value;
+  if (!diagnostic || typeof diagnostic !== "object" || !diagnostic.code) return null;
+  state.stickerDiagnostics = [diagnostic, ...stickerDiagnostics()].slice(0, 8);
+  try {
+    sessionStorage.setItem(STICKER_DIAGNOSTICS_STORAGE_KEY, JSON.stringify(state.stickerDiagnostics));
+  } catch {}
+  return diagnostic;
+}
+
+function clearStickerDiagnostics() {
+  state.stickerDiagnostics = [];
+  try { sessionStorage.removeItem(STICKER_DIAGNOSTICS_STORAGE_KEY); } catch {}
+  render();
+}
+
 function renderStickers() {
   const data = state.stickers;
   if (!data) return `<div class="card muted">加载中…</div>`;
@@ -12,10 +43,10 @@ function renderStickers() {
   const grid = filtered.map(s => {
     const tags = [...(s.mood_tags||[]), ...(s.scene_tags||[])].slice(0, 5).map(t => `<span class="tag">${escapeHtml(t)}</span>`).join("");
     const labelTag = s.labeled
-      ? '<span class="tag" style="background:rgba(52,211,153,0.18);color:var(--ok)">已标</span>'
-      : '<span class="tag" style="background:rgba(245,158,11,0.18);color:var(--warn)">待标</span>';
+      ? '<span class="tag tag--status" style="background:rgba(52,211,153,0.18);color:var(--ok)">已标</span>'
+      : '<span class="tag tag--status" style="background:rgba(245,158,11,0.18);color:var(--warn)">待标</span>';
     return `<div class="sticker-card" onclick="openStickerEdit('${escapeAttr(s.filename)}')">
-      <button class="sticker-delete-btn" title="移到回收" onclick="event.stopPropagation();deleteStickerByName('${escapeAttr(s.filename)}')">×</button>
+      <button class="sticker-delete-btn" title="移到回收" aria-label="将 ${escapeAttr(s.filename)} 移到回收" onclick="event.stopPropagation();deleteStickerByName('${escapeAttr(s.filename)}')">${renderIcon('archive')}</button>
       <img src="${escapeAttr(s.thumbnail_url)}" loading="lazy" alt="${escapeAttr(s.filename)}">
       <div class="sticker-meta">
         <div class="sticker-name" title="${escapeAttr(s.filename)}">${escapeHtml(s.filename)}</div>
@@ -24,6 +55,10 @@ function renderStickers() {
       </div>
     </div>`;
   }).join("");
+  const diagnostics = renderOperationHistory(stickerDiagnostics(), {group:`view-${state.view}`});
+  const diagnosticCard = diagnostics
+    ? `<div class="card"><div class="between"><h2>表情包操作诊断</h2><button class="btn small" onclick="clearStickerDiagnostics()">清空</button></div>${diagnostics}</div>`
+    : "";
   return `<div class="toolbar">
       <input id="sticker-search-input" type="search" placeholder="按文件名/描述/标签搜索…" value="${escapeAttr(state.stickerSearch)}" oninput="state.stickerSearch=this.value;render()" style="flex:1;max-width:340px">
       <span class="muted">共 ${data.total} 张，已标 ${data.labeled_count}</span>
@@ -32,7 +67,8 @@ function renderStickers() {
       <button class="btn" onclick="rescanStickers('missing_only')">扫描未打标</button>
       <button class="btn" onclick="rescanStickers('force_all')" style="color:var(--warn)">全部重打标</button>
     </div>
-    <p class="muted" style="font-size:12px;margin:0 0 12px">表情包目录：<code>${escapeHtml(data.sticker_dir)}</code>。删除会移到 trash/YYYYMMDD/ 子目录，可手动恢复。</p>
+    <p class="muted u-wrap" style="font-size:12px;margin:0 0 12px">表情包目录：<code class="u-wrap">${escapeHtml(data.sticker_dir)}</code>。删除会移到 trash/YYYYMMDD/ 子目录，可手动恢复。</p>
+    ${diagnosticCard}
     <div class="sticker-grid">${grid || '<p class="muted">暂无表情包</p>'}</div>
     ${state.selectedSticker ? renderStickerEdit() : ''}`;
 }
@@ -43,17 +79,17 @@ async function uploadStickerFromInput(input) {
   const form = new FormData();
   form.append("file", file);
   try {
-    const res = await fetch(API + "/stickers/upload", { method: "POST", credentials: "include", body: form });
-    if (!res.ok) {
-      let detail = res.statusText;
-      try { detail = (await res.json()).detail || detail; } catch {}
-      throw new Error(detail);
-    }
-    const out = await res.json();
+    const out = await api("/stickers/upload", { method: "POST", body: form });
+    rememberStickerDiagnostic(out);
     alertFlash("ok", `上传成功：${out.filename}${out.needs_labeling?'（待打标）':''}`);
     await loadView(); render();
-  } catch (e) { alertFlash("err", "上传失败：" + e.message); }
-  input.value = "";
+  } catch (e) {
+    const diagnostic = rememberStickerDiagnostic(operationDiagnosticFromError(e, "表情包上传未完成"));
+    alertFlash("err", diagnostic?.message || "表情包上传未完成");
+    if (diagnostic?.partial) { await loadView(); render(); }
+  } finally {
+    input.value = "";
+  }
 }
 
 async function rescanStickers(mode) {
@@ -61,9 +97,13 @@ async function rescanStickers(mode) {
   if (!confirm(`${label}：将清空对应表情包的标签元数据，等待下次启动或后台 labeler 扫描时重打。继续？`)) return;
   try {
     const out = await api("/stickers/rescan", { method:"POST", headers:{"content-type":"application/json"}, body: JSON.stringify({mode}) });
+    rememberStickerDiagnostic(out);
     alertFlash("ok", `${label}：已清空 ${out.scheduled} 个条目`);
     await loadView(); render();
-  } catch (e) { alertFlash("err", "操作失败：" + e.message); }
+  } catch (e) {
+    const diagnostic = rememberStickerDiagnostic(operationDiagnosticFromError(e, "表情包扫描未完成"));
+    alertFlash("err", diagnostic?.message || "表情包扫描未完成");
+  }
 }
 
 function openStickerEdit(name) {
@@ -76,11 +116,11 @@ function openStickerEdit(name) {
 function renderStickerEdit() {
   const s = state.selectedSticker;
   return `<div class="card" style="margin-top:14px">
-    <div class="between"><h2 style="margin:0">编辑 ${escapeHtml(s.filename)}</h2>
+    <div class="between sticker-edit-head"><h2 style="margin:0">编辑 ${escapeHtml(s.filename)}</h2>
       <button class="btn small" onclick="state.selectedSticker=null;render()">关闭</button></div>
-    <div style="display:flex;gap:20px;margin-top:14px;flex-wrap:wrap">
+    <div class="sticker-edit-layout">
       <img src="${escapeAttr(s.thumbnail_url)}" style="max-width:200px;max-height:200px;border-radius:6px;object-fit:contain;background:#0b0d12">
-      <div style="flex:1;min-width:280px">
+      <div class="sticker-edit-form">
         <label class="muted">描述</label>
         <textarea oninput="state.selectedSticker.description=this.value" style="width:100%;min-height:50px;margin:4px 0 10px">${escapeHtml(s.description)}</textarea>
         <label class="muted">心情标签（逗号分隔）</label>
@@ -106,7 +146,7 @@ function renderStickerEdit() {
 async function saveSticker() {
   const s = state.selectedSticker;
   try {
-    await api("/stickers/" + encodeURIComponent(s.filename), {
+    const out = await api("/stickers/" + encodeURIComponent(s.filename), {
       method:"PATCH",
       headers:{"content-type":"application/json"},
       body: JSON.stringify({
@@ -115,29 +155,40 @@ async function saveSticker() {
         weight: s.weight,
       }),
     });
+    rememberStickerDiagnostic(out);
     alertFlash("ok", "已保存");
     state.selectedSticker = null;
     await loadView(); render();
-  } catch (e) { alertFlash("err", "保存失败：" + e.message); }
+  } catch (e) {
+    const diagnostic = rememberStickerDiagnostic(operationDiagnosticFromError(e, "表情包 metadata 保存未完成"));
+    alertFlash("err", diagnostic?.message || "表情包 metadata 保存未完成");
+  }
 }
 
 async function deleteSticker() {
   const s = state.selectedSticker;
   if (!s) return;
   await deleteStickerByName(s.filename);
-  state.selectedSticker = null;
 }
 
 async function deleteStickerByName(name) {
   if (!confirm(`将 ${name} 移到 trash 目录？可手动恢复。`)) return;
   try {
-    await api("/stickers/" + encodeURIComponent(name), { method:"DELETE" });
+    const out = await api("/stickers/" + encodeURIComponent(name), { method:"DELETE" });
+    rememberStickerDiagnostic(out);
     alertFlash("ok", `已移到回收：${name}`);
     if (state.selectedSticker && state.selectedSticker.filename === name) {
       state.selectedSticker = null;
     }
     await loadView(); render();
-  } catch (e) { alertFlash("err", "删除失败：" + e.message); }
+  } catch (e) {
+    const diagnostic = rememberStickerDiagnostic(operationDiagnosticFromError(e, "表情包回收未完成"));
+    alertFlash("err", diagnostic?.message || "表情包回收未完成");
+    if (diagnostic?.partial || diagnostic?.outcome_unknown) {
+      state.selectedSticker = null;
+      await loadView(); render();
+    }
+  }
 }
 
 function formatInnerPendingThoughts(value) {
@@ -156,6 +207,69 @@ function formatInnerPendingThoughts(value) {
     return String(item || "").trim();
   }).filter(Boolean);
   return texts.slice(-3).join(" / ") || "-";
+}
+
+const MEMORY_DIAGNOSTICS_STORAGE_KEY = "personification_memory_diagnostics_v1";
+
+function memoryDiagnostics() {
+  if (Array.isArray(state.memoryDiagnostics)) return state.memoryDiagnostics;
+  try {
+    const saved = JSON.parse(sessionStorage.getItem(MEMORY_DIAGNOSTICS_STORAGE_KEY) || "[]");
+    state.memoryDiagnostics = Array.isArray(saved) ? saved.slice(0, 12) : [];
+  } catch {
+    state.memoryDiagnostics = [];
+  }
+  return state.memoryDiagnostics;
+}
+
+function rememberMemoryDiagnostic(value) {
+  const diagnostic = value && value.diagnostic && typeof value.diagnostic === "object"
+    ? value.diagnostic
+    : value;
+  if (!diagnostic || typeof diagnostic !== "object" || !diagnostic.code) return null;
+  state.memoryDiagnostics = [diagnostic, ...memoryDiagnostics()].slice(0, 12);
+  try {
+    sessionStorage.setItem(MEMORY_DIAGNOSTICS_STORAGE_KEY, JSON.stringify(state.memoryDiagnostics));
+  } catch {}
+  return diagnostic;
+}
+
+function clearMemoryDiagnostics() {
+  state.memoryDiagnostics = [];
+  try { sessionStorage.removeItem(MEMORY_DIAGNOSTICS_STORAGE_KEY); } catch {}
+  render();
+}
+
+function renderMemoryDiagnosticsCard() {
+  const diagnostics = renderOperationHistory(memoryDiagnostics(), {group:`view-${state.view}`});
+  return diagnostics
+    ? `<div class="card"><div class="between"><h2>记忆操作诊断</h2><button class="btn small" onclick="clearMemoryDiagnostics()">清空</button></div>${diagnostics}</div>`
+    : "";
+}
+
+function renderMemoryRecallPolicyCard(memory) {
+  const policy = memory && memory.memory_recall_policy ? memory.memory_recall_policy : null;
+  const social = memory && memory.social_memory ? memory.social_memory : null;
+  if (!policy && !social) return "";
+  const p = policy || {};
+  const s = social || {};
+  return `<div class="card"><h2>记忆召回闸门</h2>
+    <div class="row" style="gap:22px;flex-wrap:wrap;font-size:13px">
+      <div><span class="muted">自动注入上限</span><strong style="margin-left:6px">${Number(p.auto_inject_top_k || 0)}</strong></div>
+      <div><span class="muted">最低相关分</span><strong style="margin-left:6px">${Number(p.auto_min_score || 0).toFixed(2)}</strong></div>
+      <div><span class="muted">语义闸门</span><strong style="margin-left:6px">${escapeHtml(p.semantic_gate || 'fail_closed')}</strong></div>
+      <div><span class="muted">社交摘要</span><strong style="margin-left:6px">${s.enabled === false ? '关闭' : '开启'}</strong></div>
+      <div><span class="muted">候选/verified/过期</span><strong style="margin-left:6px">${Number(s.candidate_count || 0)}/${Number(s.verified_count || 0)}/${Number(s.expired_count || 0)}</strong></div>
+    </div>
+    <p class="muted" style="font-size:12px;margin-bottom:0">向量、全文和实体只负责扩大候选；自动上下文最多保留三条，并在模型闸门不可用时不注入。</p>
+  </div>`;
+}
+
+function reportMemoryError(error, title) {
+  const diagnostic = rememberMemoryDiagnostic(operationDiagnosticFromError(error, title));
+  alertFlash("err", diagnostic?.message || title);
+  render();
+  return diagnostic;
 }
 
 const MEMORY_TYPE_LABELS = {
@@ -194,10 +308,12 @@ function memoryNodeKindLabel(value, fallback) {
 function renderMemory() {
   const mem = state.memory;
   const inner = state.memoryInnerState;
-  if (state.selectedMemory) return renderMemoryDetail();
-  if (!mem) return `<div class="card muted">加载中…</div>`;
+  const diagnosticCard = renderMemoryDiagnosticsCard();
+  const policyCard = renderMemoryRecallPolicyCard(mem);
+  if (state.selectedMemory) return `${diagnosticCard}${policyCard}${renderMemoryDetail()}`;
+  if (!mem) return `${diagnosticCard}${policyCard}<div class="card muted">加载中…</div>`;
   if (!mem.palace_enabled) {
-    return `<div class="card"><h2>Agent 记忆</h2>
+    return `${diagnosticCard}${policyCard}<div class="card"><h2>Agent 记忆</h2>
       <p class="muted">memory palace 未启用。要查看长期记忆，需在配置中开启 <code>personification_memory_palace_enabled</code>。</p></div>`;
   }
   const filters = ["", "group_knowledge", "user_persona", "fact"].map(t =>
@@ -207,12 +323,12 @@ function renderMemory() {
     (state.memoryPalaceZones || []).map(z => `<option value="${escapeAttr(z)}" ${state.memoryPalaceZone===z?'selected':''}>${escapeHtml(z)}</option>`)
   ).join("");
   const rows = (mem.items || []).map(it => `<tr>
-    <td><span class="tag">${escapeHtml(memoryTypeLabel(it))}</span>${it.tier ? `<br><span class="muted" style="font-size:11px">${escapeHtml(memoryTierLabel(it))}</span>` : ''}</td>
-    <td><code style="font-size:11px">${escapeHtml(it.group_id||'')}${it.user_id ? '/'+escapeHtml(it.user_id) : ''}</code></td>
-    <td>${escapeHtml(it.summary)}</td>
-    <td class="muted" style="font-size:12px">置信 ${it.confidence.toFixed(2)}<br>显著 ${it.salience.toFixed(2)}</td>
-    <td class="muted" style="font-size:12px">${it.updated_at?new Date(it.updated_at*1000).toLocaleString():'-'}</td>
-    <td><button class="btn small" onclick="openMemoryDetail('${escapeAttr(it.memory_id)}')">详情</button></td>
+    <td class="col-status"><span class="tag tag--ellipsis" title="${escapeAttr(memoryTypeLabel(it))}">${escapeHtml(memoryTypeLabel(it))}</span>${it.tier ? `<br><span class="muted" style="font-size:11px">${escapeHtml(memoryTierLabel(it))}</span>` : ''}</td>
+    <td class="col-id"><code class="u-ellipsis u-tabular" title="${escapeAttr((it.group_id || '') + (it.user_id ? '/' + it.user_id : ''))}" style="font-size:11px">${escapeHtml(it.group_id||'')}${it.user_id ? '/'+escapeHtml(it.user_id) : ''}</code></td>
+    <td class="col-summary u-wrap">${escapeHtml(it.summary)}</td>
+    <td class="col-number muted u-atomic u-tabular" style="font-size:12px">置信 ${it.confidence.toFixed(2)}<br>显著 ${it.salience.toFixed(2)}</td>
+    <td class="col-time muted u-atomic u-tabular" style="font-size:12px">${it.updated_at?new Date(it.updated_at*1000).toLocaleString():'-'}</td>
+    <td class="col-actions"><button class="btn small" aria-label="查看记忆 ${escapeAttr(it.memory_id)}" onclick="openMemoryDetail('${escapeAttr(it.memory_id)}')">详情</button></td>
   </tr>`).join("");
   const hiddenNote = mem.hidden_self_count
     ? `<span class="muted" style="font-size:12px;margin-left:10px">已默认隐藏 ${mem.hidden_self_count} 条 bot 自言条目</span>`
@@ -221,17 +337,17 @@ function renderMemory() {
   if (inner && inner.available) {
     const s = inner.state || {};
     const warm = s.relation_warmth || {};
-    const warmRows = Object.keys(warm).slice(0,12).map(k => `<tr><td><code>${escapeHtml(k)}</code></td><td>${typeof warm[k]==='number'?warm[k].toFixed(2):escapeHtml(String(warm[k]))}</td></tr>`).join("");
+    const warmRows = Object.keys(warm).slice(0,12).map(k => `<tr><td class="col-id"><code class="u-ellipsis u-tabular" title="${escapeAttr(k)}">${escapeHtml(k)}</code></td><td class="col-number u-atomic u-tabular">${typeof warm[k]==='number'?warm[k].toFixed(2):escapeHtml(String(warm[k]))}</td></tr>`).join("");
     innerBlock = `<div class="card"><h2>Inner State（情绪/能量/关系）</h2>
       <div class="row" style="gap:30px;flex-wrap:wrap">
         <div><div class="muted">mood</div><div style="font-size:18px;margin-top:4px">${escapeHtml(String(s.mood||'-'))}</div></div>
         <div><div class="muted">energy</div><div style="font-size:18px;margin-top:4px">${escapeHtml(String(s.energy||'-'))}</div></div>
         <div><div class="muted">pending</div><div style="font-size:13px;margin-top:4px">${escapeHtml(formatInnerPendingThoughts(s.pending_thoughts)).slice(0,120)||'-'}</div></div>
       </div>
-      ${warmRows ? `<h3 style="margin-top:14px;margin-bottom:6px;font-size:13px">用户好感度</h3><table style="max-width:420px"><thead><tr><th>用户</th><th>好感</th></tr></thead><tbody>${warmRows}</tbody></table>`:''}</div>`;
+      ${warmRows ? `<h3 style="margin-top:14px;margin-bottom:6px;font-size:13px">用户好感度</h3><div class="table-wrap table-scroll" tabindex="0" role="region" aria-label="Inner State 用户好感度"><table class="data-table compact" style="max-width:420px"><thead><tr><th scope="col" class="col-id">用户</th><th scope="col" class="col-number">好感</th></tr></thead><tbody>${warmRows}</tbody></table></div>`:''}</div>`;
   }
   const vectorPanel = renderMemoryVectorPanel();
-  return `${innerBlock}
+  return `${diagnosticCard}${policyCard}${innerBlock}
     ${vectorPanel}
     <div class="toolbar">
       <div class="group-bar" style="margin-bottom:0">${filters}</div>
@@ -258,8 +374,8 @@ function renderMemory() {
         ${state.memoryIncludeSelf ? '当前显示 bot 自言条目。' : 'bot 自己的发言默认隐藏，勾选上方复选框可显示。'}
         要看群里的原始对话历史，请进入「群信息」→ 选择群 → 切「对话原文」tab。
       </p>
-      <table><thead><tr><th>类型</th><th>作用域</th><th>摘要</th><th>分数</th><th>更新</th><th></th></tr></thead>
-      <tbody>${rows || '<tr><td colspan="6" class="muted">暂无记忆条目</td></tr>'}</tbody></table>
+      <div class="table-wrap table-scroll" tabindex="0" role="region" aria-label="长期记忆列表"><table class="data-table xwide"><thead><tr><th scope="col" class="col-status">类型</th><th scope="col" class="col-id">作用域</th><th scope="col" class="col-summary">摘要</th><th scope="col" class="col-number">分数</th><th scope="col" class="col-time">更新</th><th scope="col" class="col-actions"><span class="sr-only">操作</span></th></tr></thead>
+      <tbody>${rows || '<tr><td colspan="6" class="muted">暂无记忆条目</td></tr>'}</tbody></table></div>
     </div>`;
 }
 
@@ -270,17 +386,17 @@ function renderMemoryVectorPanel() {
     ? `<span class="tag ${idx.enabled ? 'source-env_json' : ''}">${idx.enabled ? '已启用' : '未启用'}</span>`
     : `<span class="tag required">不可用</span>`;
   const searchRows = ((state.memorySearchResult || {}).items || []).map(it => `<tr>
-    <td><code style="font-size:11px">${escapeHtml(it.memory_id || '')}</code><br><span class="tag">${escapeHtml(it.search_source_label || '检索结果')}</span></td>
-    <td>${escapeHtml(it.summary || '')}</td>
-    <td class="muted" style="font-size:12px">${escapeHtml(it.why_relevant || '')}</td>
-    <td>${Number(it.score || 0).toFixed(3)}</td>
+    <td class="col-id"><code class="u-ellipsis" title="${escapeAttr(it.memory_id || '')}" style="font-size:11px">${escapeHtml(it.memory_id || '')}</code><span class="tag tag--ellipsis" title="${escapeAttr(it.search_source_label || '检索结果')}">${escapeHtml(it.search_source_label || '检索结果')}</span></td>
+    <td class="col-summary u-wrap">${escapeHtml(it.summary || '')}</td>
+    <td class="col-description muted u-wrap" style="font-size:12px">${escapeHtml(it.why_relevant || '')}</td>
+    <td class="col-number u-atomic u-tabular">${Number(it.score || 0).toFixed(3)}</td>
   </tr>`).join("");
   return `<div class="card">
     <div class="row" style="justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap">
       <h2 style="margin:0">RAG 索引</h2>
       <div class="row" style="gap:8px;align-items:center;flex-wrap:wrap">
         ${statusTag}
-        <span class="muted" style="font-size:12px">backend=${escapeHtml(idx.backend || '-')} model=${escapeHtml(idx.model_version || '-')}</span>
+        <span class="muted u-ellipsis" title="backend=${escapeAttr(idx.backend || '-')} model=${escapeAttr(idx.model_version || '-')}" style="font-size:12px">backend=${escapeHtml(idx.backend || '-')} model=${escapeHtml(idx.model_version || '-')}</span>
         <button class="btn small" onclick="rebuildMemoryVectorIndex()" ${state.memoryVectorBusy?'disabled':''}>重建索引</button>
       </div>
     </div>
@@ -293,13 +409,13 @@ function renderMemoryVectorPanel() {
       <input id="memory-search-query" placeholder="测试长期记忆召回" value="${escapeAttr(state.memorySearchQuery || '')}" onkeydown="if(event.key==='Enter')testMemoryRecall()" style="min-width:260px;flex:1">
       <button class="btn small primary" onclick="testMemoryRecall()">测试召回</button>
     </div>
-    ${state.memorySearchResult ? `<table style="margin-top:10px"><thead><tr><th>记忆</th><th>摘要</th><th>相关性</th><th>分数</th></tr></thead><tbody>${searchRows || '<tr><td colspan="4" class="muted">无召回结果</td></tr>'}</tbody></table>` : ''}
+    ${state.memorySearchResult ? `<div class="table-wrap table-scroll" tabindex="0" role="region" aria-label="RAG 召回测试结果"><table class="data-table wide" style="margin-top:10px"><thead><tr><th scope="col" class="col-id">记忆</th><th scope="col" class="col-summary">摘要</th><th scope="col" class="col-description">相关性</th><th scope="col" class="col-number">分数</th></tr></thead><tbody>${searchRows || '<tr><td colspan="4" class="muted">无召回结果</td></tr>'}</tbody></table></div>` : ''}
   </div>`;
 }
 
 async function pickMemoryFilter(t) {
   state.memoryFilter = t;
-  try { await loadView(); render(); } catch (e) { alertFlash("err", e.message); }
+  try { await loadView(); render(); } catch (e) { reportMemoryError(e, "记忆列表加载失败"); }
 }
 
 async function rebuildMemoryVectorIndex() {
@@ -307,11 +423,13 @@ async function rebuildMemoryVectorIndex() {
   render();
   try {
     const result = await api("/memory/vector-index/rebuild", { method:"POST" });
+    rememberMemoryDiagnostic(result);
     state.memoryVectorIndex = result.index || state.memoryVectorIndex;
-    alertFlash("ok", `已重建 ${result.rebuilt || 0} 条记忆索引`);
+    alertFlash("ok", result.message || `已重建 ${result.rebuilt || 0} 条记忆索引`);
     await loadView(); render();
   } catch (e) {
-    alertFlash("err", "重建失败：" + e.message);
+    const diagnostic = reportMemoryError(e, "记忆向量索引重建未完成");
+    if (diagnostic?.partial || diagnostic?.outcome_unknown) await loadView().catch(() => {});
   } finally {
     state.memoryVectorBusy = false;
     render();
@@ -327,40 +445,42 @@ async function testMemoryRecall() {
   if (state.memoryUserId) qs.set("user_id", state.memoryUserId);
   if (state.memoryGroupId) qs.set("group_id", state.memoryGroupId);
   try {
-    state.memorySearchResult = await api("/memory/search-test?" + qs.toString());
+    const result = await api("/memory/search-test?" + qs.toString());
+    rememberMemoryDiagnostic(result);
+    state.memorySearchResult = result;
     render();
   } catch (e) {
-    alertFlash("err", "召回测试失败：" + e.message);
+    reportMemoryError(e, "记忆召回测试未完成");
   }
 }
 
 async function toggleMemoryIncludeSelf(checked) {
   state.memoryIncludeSelf = !!checked;
-  try { await loadView(); render(); } catch (e) { alertFlash("err", e.message); }
+  try { await loadView(); render(); } catch (e) { reportMemoryError(e, "记忆列表加载失败"); }
 }
 
 async function applyMemoryFilters() {
   state.memoryUserId = (document.getElementById("mem-user-input")?.value || "").trim();
   state.memoryGroupId = (document.getElementById("mem-group-input")?.value || "").trim();
-  try { await loadView(); render(); } catch (e) { alertFlash("err", e.message); }
+  try { await loadView(); render(); } catch (e) { reportMemoryError(e, "记忆筛选加载失败"); }
 }
 
 async function pickPalaceZone(zone) {
   state.memoryPalaceZone = zone || "";
-  try { await loadView(); render(); } catch (e) { alertFlash("err", e.message); }
+  try { await loadView(); render(); } catch (e) { reportMemoryError(e, "记忆分区加载失败"); }
 }
 
 async function pickMemoryLimit(value) {
   const n = Number(value || 200);
   state.memoryLimit = [100, 200, 500].includes(n) ? n : 200;
-  try { await loadView(); render(); } catch (e) { alertFlash("err", e.message); }
+  try { await loadView(); render(); } catch (e) { reportMemoryError(e, "记忆列表加载失败"); }
 }
 
 async function clearMemoryFilters() {
   state.memoryUserId = "";
   state.memoryGroupId = "";
   state.memoryPalaceZone = "";
-  try { await loadView(); render(); } catch (e) { alertFlash("err", e.message); }
+  try { await loadView(); render(); } catch (e) { reportMemoryError(e, "记忆筛选重置失败"); }
 }
 
 async function openMemoryDetail(memoryId) {
@@ -368,7 +488,7 @@ async function openMemoryDetail(memoryId) {
   try {
     state.selectedMemory = await api("/memory/detail/" + encodeURIComponent(memoryId));
     render();
-  } catch (e) { alertFlash("err", e.message); }
+  } catch (e) { reportMemoryError(e, "记忆详情加载失败"); }
 }
 
 function renderMemoryDetail() {
@@ -377,35 +497,31 @@ function renderMemoryDetail() {
   const related = d.related || [];
   const tagLine = (label, arr) => arr && arr.length ? `<div style="margin:4px 0"><span class="muted" style="font-size:12px">${escapeHtml(label)}：</span>${arr.map(v => `<span class="tag">${escapeHtml(String(v))}</span>`).join("")}</div>` : '';
   const relatedRows = related.map(r => `<tr>
-    <td><span class="tag">${escapeHtml(memoryTypeLabel(r))}</span></td>
-    <td>${escapeHtml((r.summary||'').slice(0,120))}</td>
-    <td><button class="btn small" onclick="openMemoryDetail('${escapeAttr(r.memory_id||'')}')">查看</button></td>
+    <td class="col-status"><span class="tag tag--ellipsis" title="${escapeAttr(memoryTypeLabel(r))}">${escapeHtml(memoryTypeLabel(r))}</span></td>
+    <td class="col-summary u-wrap">${escapeHtml((r.summary||'').slice(0,120))}</td>
+    <td class="col-actions"><button class="btn small" aria-label="查看关联记忆 ${escapeAttr(r.memory_id || '')}" onclick="openMemoryDetail('${escapeAttr(r.memory_id||'')}')">查看</button></td>
   </tr>`).join("");
   return `<div class="row" style="margin-bottom:10px"><button class="btn small" onclick="state.selectedMemory=null;render()">返回列表</button><span class="muted">记忆 ${escapeHtml(d.memory_id)}</span></div>
     <div class="card">
-      <h2>${escapeHtml(memoryTypeLabel(it))} <code style="font-size:13px;color:var(--muted)">${escapeHtml(d.memory_id)}</code></h2>
+      <h2>${escapeHtml(memoryTypeLabel(it))} <code class="u-ellipsis" title="${escapeAttr(d.memory_id)}" style="font-size:13px;color:var(--muted)">${escapeHtml(d.memory_id)}</code></h2>
       <div class="row" style="gap:20px;flex-wrap:wrap;font-size:13px">
         ${it.palace_zone ? `<div><span class="muted">记忆分区：</span><strong>${escapeHtml(it.palace_zone_label || it.palace_zone)}</strong></div>` : ''}
-        ${it.group_id ? `<div><span class="muted">群：</span><code>${escapeHtml(it.group_id)}</code></div>` : ''}
-        ${it.user_id ? `<div><span class="muted">用户：</span><code>${escapeHtml(it.user_id)}</code></div>` : ''}
+        ${it.group_id ? `<div class="u-atomic"><span class="muted">群：</span><code class="u-tabular">${escapeHtml(it.group_id)}</code></div>` : ''}
+        ${it.user_id ? `<div class="u-atomic"><span class="muted">用户：</span><code class="u-tabular">${escapeHtml(it.user_id)}</code></div>` : ''}
         <div><span class="muted">置信度：</span>${(it.confidence||0).toFixed(2)}</div>
         <div><span class="muted">显著度：</span>${(it.salience||0).toFixed(2)}</div>
         ${typeof it.stability === 'number' ? `<div><span class="muted">稳定度：</span>${it.stability.toFixed(2)}</div>` : ''}
       </div>
       <h3 style="margin-top:14px">摘要</h3>
-      <pre style="white-space:pre-wrap;margin:0;font-family:inherit">${escapeHtml(it.summary || '')}</pre>
+      <pre class="u-pre-wrap code-scroll" style="margin:0;font-family:inherit">${escapeHtml(it.summary || '')}</pre>
       ${tagLine('主题标签', it.topic_tags)}
       ${tagLine('实体标签', it.entity_tags)}
       ${tagLine('别名', it.aliases)}
       ${it.why_relevant ? `<h3>关联说明</h3><p>${escapeHtml(it.why_relevant)}</p>` : ''}
       ${it.time_hint ? `<p class="muted" style="font-size:12px">时间提示：${escapeHtml(it.time_hint)}</p>` : ''}
-      <details style="margin-top:12px"><summary class="muted">完整数据</summary><pre style="white-space:pre-wrap;font-size:12px;background:#0b0d12;padding:10px;border-radius:6px;overflow-x:auto">${escapeHtml(JSON.stringify(it, null, 2))}</pre></details>
+      <details style="margin-top:12px"><summary class="muted">完整数据</summary><pre class="u-pre-wrap code-scroll" style="font-size:12px;background:#0b0d12;padding:10px;border-radius:6px">${escapeHtml(JSON.stringify(it, null, 2))}</pre></details>
     </div>
-    ${related.length ? `<div class="card"><h3>关联记忆（${related.length}）</h3><table><tbody>${relatedRows}</tbody></table></div>` : ''}`;
-}
-
-function viewTitle() {
-  return ({dashboard:"仪表盘",config:"配置中心",personas:"用户画像",groups:"群信息",group_switch:"群开关",memory:"Agent 记忆",memory_graph:"记忆宫殿",stickers:"表情包",skills:"Skill 管理",plugin_knowledge:"插件知识库",plugin_manager:"插件管理",test:"模型测试",persona_prompt:"人设预览",persona_builder:"人设构建",audit:"审计日志",logs:"插件日志",traces:"消息 Trace",trace_detail:"Trace 详情",proactive:"主动诊断",health:"功能体检",qzone:"QQ 空间",qq:"QQ 管理",devices:"设备管理"})[state.view] || state.view;
+    ${related.length ? `<div class="card"><h3>关联记忆（${related.length}）</h3><div class="table-wrap table-scroll" tabindex="0" role="region" aria-label="关联记忆"><table class="data-table compact"><tbody>${relatedRows}</tbody></table></div></div>` : ''}`;
 }
 
 // ---------------------------------------------------------------------------
@@ -413,6 +529,12 @@ function viewTitle() {
 // ---------------------------------------------------------------------------
 let _cytoscapeLoaded = false;
 let _cytoscapeInstance = null;
+
+function destroyMemoryGraphCanvas() {
+  if (!_cytoscapeInstance) return;
+  try { _cytoscapeInstance.destroy(); } catch {}
+  _cytoscapeInstance = null;
+}
 
 function ensureCytoscapeLoaded() {
   if (_cytoscapeLoaded) return Promise.resolve();
@@ -444,7 +566,7 @@ function renderMemoryGraph() {
     ? `<div class="alert err" style="margin-bottom:10px">记忆宫殿不可用（${escapeHtml(data.reason||data.error||'未知原因')}）。检查 personification_memory_palace_enabled。</div>`
     : '';
   setTimeout(() => { try { renderMemoryGraphCanvas(); } catch(e) { console.warn('cytoscape', e); } }, 60);
-  return `<div class="card">
+  return `${renderMemoryDiagnosticsCard()}<div class="card">
     <div class="between" style="margin-bottom:10px">
       <h2 style="margin:0">记忆宫殿 力导向图</h2>
       <div class="row">
@@ -481,7 +603,9 @@ async function renderMemoryGraphCanvas() {
   const el = document.getElementById('memory-graph-canvas');
   if (!el) return;
   try { await ensureCytoscapeLoaded(); } catch (e) {
-    el.innerHTML = '<p class="muted" style="padding:20px">' + escapeHtml(e.message) + '</p>';
+    const diagnostic = rememberMemoryDiagnostic(operationDiagnosticFromError(e, "记忆图谱渲染依赖加载失败"));
+    el.innerHTML = '<p class="muted" style="padding:20px">' + escapeHtml(diagnostic?.message || '记忆图谱渲染依赖加载失败') + '</p>';
+    alertFlash('err', diagnostic?.message || '记忆图谱渲染依赖加载失败');
     return;
   }
   const nodes = (data.nodes || []).map(n => {
@@ -501,7 +625,7 @@ async function renderMemoryGraphCanvas() {
       thickness: Math.max(1, Math.min(6, Number(e.weight || 1))),
     }
   }));
-  if (_cytoscapeInstance) { try { _cytoscapeInstance.destroy(); } catch {} _cytoscapeInstance = null; }
+  destroyMemoryGraphCanvas();
   const theme = document.documentElement.getAttribute('data-theme') || 'dark';
   const labelColor = theme === 'light' ? '#1f2937' : '#e6e8ef';
   const labelOutline = theme === 'light' ? '#ffffff' : '#0f1115';
@@ -572,5 +696,5 @@ function exportMemoryGraphPNG() {
     a.href = url; a.download = 'memory-palace.png';
     document.body.appendChild(a); a.click(); a.remove();
     setTimeout(() => URL.revokeObjectURL(url), 4000);
-  } catch (e) { alertFlash('err', '导出失败：' + e.message); }
+  } catch (e) { reportMemoryError(e, '记忆图谱导出失败'); }
 }

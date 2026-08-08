@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import json
+import os
 import re
 from pathlib import Path
 from typing import Any
@@ -20,7 +21,12 @@ from .skill_isolation import (
     run_skill_in_subprocess,
     script_supports_function,
 )
-from .source_resolver import discover_skill_dirs, get_skill_cache_dir, resolve_skill_source_dirs
+from .source_resolver import (
+    discover_skill_dirs,
+    get_skill_cache_dir,
+    resolve_skill_sources,
+    skill_source_content_digest,
+)
 
 
 def _load_skill_yaml(path: Path) -> dict | None:
@@ -88,29 +94,90 @@ def _load_openai_meta(skill_dir: Path) -> dict[str, Any]:
     return data if isinstance(data, dict) else {}
 
 
-def _resolve_script_path(skill_dir: Path, frontmatter: dict[str, Any]) -> Path | None:
+def _is_path_within(root: Path, candidate: Path) -> bool:
+    try:
+        return os.path.commonpath([str(root.resolve()), str(candidate.resolve())]) == str(root.resolve())
+    except Exception:
+        return False
+
+
+def _resolve_script_path(
+    skill_dir: Path,
+    frontmatter: dict[str, Any],
+    *,
+    allowed_root: Path,
+) -> Path | None:
     scripts_dir = skill_dir / "scripts"
     entry = str(frontmatter.get("entrypoint") or frontmatter.get("script") or "").strip()
     if entry:
-        candidate = skill_dir / entry
-        if candidate.exists():
+        candidate = (skill_dir / entry).resolve()
+        if _is_path_within(allowed_root, candidate) and candidate.is_file() and not candidate.is_symlink():
             return candidate
-        candidate = scripts_dir / entry
-        return candidate if candidate.exists() else None
+        candidate = (scripts_dir / entry).resolve()
+        return (
+            candidate
+            if _is_path_within(allowed_root, candidate) and candidate.is_file() and not candidate.is_symlink()
+            else None
+        )
     if not scripts_dir.exists():
         return None
     for name in ("main.py", "run.py", "skill.py"):
         candidate = scripts_dir / name
         if candidate.exists():
-            return candidate
+            return candidate.resolve() if _is_path_within(allowed_root, candidate) else None
     py_files = sorted(scripts_dir.glob("*.py"))
-    return py_files[0] if py_files else None
+    return py_files[0].resolve() if py_files and _is_path_within(allowed_root, py_files[0]) else None
 
 
 def _normalize_parameters(value: Any) -> dict[str, Any]:
     if isinstance(value, dict):
         return value
     return {"type": "object", "properties": {}, "required": []}
+
+
+def _stamp_tool_source(tool: AgentTool, source_kind: str) -> AgentTool:
+    metadata = dict(tool.metadata or {})
+    metadata["source_kind"] = str(source_kind or "local").strip().lower() or "local"
+    tool.metadata = metadata
+    return tool
+
+
+def _stable_fingerprint_value(value: Any) -> str:
+    try:
+        return json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
+    except Exception:
+        return repr(value)
+
+
+def _tool_registration_fingerprint(tool: AgentTool) -> tuple[Any, ...]:
+    return (
+        id(tool),
+        str(tool.name or ""),
+        str(tool.description or ""),
+        _stable_fingerprint_value(tool.parameters or {}),
+        id(tool.handler),
+        bool(tool.local),
+        id(tool.enabled),
+        _stable_fingerprint_value(tool.metadata or {}),
+        int(tool.per_session_quota or 0),
+    )
+
+
+def _registry_tool_fingerprints(registry: ToolRegistry) -> dict[str, tuple[Any, ...]]:
+    _, current = registry.snapshot()
+    return {name: _tool_registration_fingerprint(tool) for name, tool in current.items()}
+
+
+def _stamp_registered_tool_sources(
+    registry: ToolRegistry,
+    before: dict[str, tuple[Any, ...]],
+    source_kind: str,
+) -> None:
+    _, current = registry.snapshot()
+    for name, tool in current.items():
+        if before.get(name) == _tool_registration_fingerprint(tool):
+            continue
+        registry.register(_stamp_tool_source(tool, source_kind))
 
 
 def _build_skill_config(
@@ -158,8 +225,10 @@ async def _register_skill(registry: ToolRegistry, logger: Any, skill_dir: Path, 
     allow_unsafe_external = bool(
         getattr(plugin_config, "personification_skill_allow_unsafe_external", False)
     ) if plugin_config is not None else False
+    expected_content_digest = str(config.get("content_digest") or "").strip().lower()
+    source_kind = str(config.get("source_kind") or "local").strip().lower() or "local"
 
-    if not trusted and not allow_unsafe_external and not is_process_isolated and not is_mcp_isolated:
+    if not trusted and not allow_unsafe_external and (is_mcp_isolated or not is_process_isolated):
         logger.warning(
             f"[custom skill] skip untrusted external skill without explicit opt-in: {skill_dir.name}"
         )
@@ -172,6 +241,8 @@ async def _register_skill(registry: ToolRegistry, logger: Any, skill_dir: Path, 
             skill_dir=skill_dir,
             base_name=str(config.get("name") or skill_dir.name),
             config=mcp,
+            approved_root=container_root if isinstance(container_root, Path) else skill_dir,
+            content_digest=expected_content_digest,
         )
         if loaded <= 0:
             logger.warning(f"[custom skill] MCP tool registration failed: {skill_dir.name}")
@@ -189,6 +260,13 @@ async def _register_skill(registry: ToolRegistry, logger: Any, skill_dir: Path, 
             return
 
         async def _handler(**kwargs) -> str:
+            if expected_content_digest and isinstance(container_root, Path):
+                try:
+                    current_digest = skill_source_content_digest(container_root)
+                except Exception:
+                    current_digest = ""
+                if current_digest != expected_content_digest:
+                    return "isolated skill blocked: approved content digest changed"
             return await run_skill_in_subprocess(
                 script_path=script_path,
                 function_name="run",
@@ -208,7 +286,7 @@ async def _register_skill(registry: ToolRegistry, logger: Any, skill_dir: Path, 
                 local=bool(config.get("local", True)),
                 metadata={
                     "category": "skillpack",
-                    "source_kind": str(config.get("source_kind") or "local"),
+                    "source_kind": source_kind,
                     "skill_dir": skill_dir.name,
                     "isolation": str(isolation.get("mode") or "process"),
                 },
@@ -232,6 +310,7 @@ async def _register_skill(registry: ToolRegistry, logger: Any, skill_dir: Path, 
 
     register_handler = getattr(module, "register", None)
     if callable(register_handler) and runtime is not None:
+        before = _registry_tool_fingerprints(registry)
         try:
             result = register_handler(runtime, registry)
             if inspect.isawaitable(result):
@@ -240,6 +319,8 @@ async def _register_skill(registry: ToolRegistry, logger: Any, skill_dir: Path, 
         except Exception as e:
             logger.warning(f"[custom skill] register failed {skill_dir.name}: {e}")
             return
+        finally:
+            _stamp_registered_tool_sources(registry, before, source_kind)
 
     build_tools_handler = getattr(module, "build_tools", None)
     if callable(build_tools_handler) and runtime is not None:
@@ -250,7 +331,7 @@ async def _register_skill(registry: ToolRegistry, logger: Any, skill_dir: Path, 
             tools = result if isinstance(result, list) else []
             for tool in tools:
                 if isinstance(tool, AgentTool):
-                    registry.register(tool)
+                    registry.register(_stamp_tool_source(tool, source_kind))
             if isinstance(result, list):
                 return
         except Exception as e:
@@ -275,7 +356,7 @@ async def _register_skill(registry: ToolRegistry, logger: Any, skill_dir: Path, 
             local=bool(config.get("local", True)),
             metadata={
                 "category": "skillpack",
-                "source_kind": str(config.get("source_kind") or "local"),
+                "source_kind": source_kind,
                 "skill_dir": skill_dir.name,
                 "isolation": str(isolation.get("mode") or "inprocess"),
             },
@@ -303,20 +384,28 @@ async def _load_standard_skill_dir(
     trusted: bool = True,
     source_kind: str = "local",
     plugin_config: Any = None,
+    content_digest: str = "",
 ) -> bool:
     parsed = _load_standard_skill_metadata(skill_dir)
     if not parsed:
         return False
     frontmatter, markdown_body = parsed
+    allowed_root = container_root if isinstance(container_root, Path) else skill_dir
+    raw_mcp_config = frontmatter.get("mcp")
     mcp_config = normalize_mcp_config(
         skill_dir=skill_dir,
-        raw=frontmatter.get("mcp"),
+        raw=raw_mcp_config,
         default_timeout=max(
             1,
             int(getattr(plugin_config, "personification_skill_mcp_timeout", 20) or 20),
         ) if plugin_config is not None else 20,
+        allowed_root=allowed_root,
+        restrict_paths=not trusted,
     )
-    script_path = _resolve_script_path(skill_dir, frontmatter)
+    if isinstance(raw_mcp_config, dict) and raw_mcp_config and mcp_config is None:
+        logger.warning(f"[custom skill] rejected invalid MCP config: {skill_dir.name}")
+        return False
+    script_path = _resolve_script_path(skill_dir, frontmatter, allowed_root=allowed_root)
     if script_path is None and mcp_config is None:
         compat_tools = build_compat_tools(
             skill_dir=skill_dir,
@@ -326,7 +415,7 @@ async def _load_standard_skill_dir(
         if compat_tools:
             for tool in compat_tools:
                 if isinstance(tool, AgentTool):
-                    registry.register(tool)
+                    registry.register(_stamp_tool_source(tool, source_kind))
             logger.info(
                 f"[custom skill] registered compatibility adapter tools for {skill_dir.name}: "
                 f"{', '.join(tool.name for tool in compat_tools)}"
@@ -343,12 +432,23 @@ async def _load_standard_skill_dir(
     )
     python_paths = frontmatter.get("python_paths")
     if isinstance(python_paths, list):
-        config["python_paths"] = [str(item).strip() for item in python_paths if str(item).strip()]
+        resolved_python_paths: list[str] = []
+        for item in python_paths:
+            value = str(item).strip()
+            if not value:
+                continue
+            candidate = (skill_dir / value).resolve()
+            if not _is_path_within(allowed_root, candidate) or not candidate.is_dir() or candidate.is_symlink():
+                logger.warning(f"[custom skill] rejected python_path outside approved root: {skill_dir.name}")
+                return False
+            resolved_python_paths.append(str(candidate))
+        config["python_paths"] = resolved_python_paths
     config["runtime"] = runtime
     config["container_root"] = container_root
     config["trusted"] = trusted
     config["source_kind"] = source_kind
     config["plugin_config"] = plugin_config
+    config["content_digest"] = str(content_digest or "")
     config["isolation"] = normalize_isolation_config(
         frontmatter.get("isolation"),
         trusted=trusted,
@@ -357,6 +457,13 @@ async def _load_standard_skill_dir(
             int(getattr(plugin_config, "personification_skill_default_timeout", 15) or 15),
         ) if plugin_config is not None else 15,
     )
+    cwd_raw = str(config["isolation"].get("cwd") or "").strip()
+    if cwd_raw:
+        cwd_path = (skill_dir / cwd_raw).resolve()
+        if not _is_path_within(allowed_root, cwd_path) or not cwd_path.is_dir() or cwd_path.is_symlink():
+            logger.warning(f"[custom skill] rejected cwd outside approved root: {skill_dir.name}")
+            return False
+        config["isolation"]["cwd"] = str(cwd_path)
     config["mcp"] = mcp_config
     await _register_skill(registry, logger, skill_dir, config)
     return True
@@ -397,6 +504,7 @@ async def _load_discovered_skill_dirs(
     trusted: bool = False,
     source_kind: str = "remote",
     plugin_config: Any = None,
+    content_digest: str = "",
 ) -> int:
     loaded = 0
     for skill_dir in discover_skill_dirs(root):
@@ -409,6 +517,7 @@ async def _load_discovered_skill_dirs(
             trusted=trusted,
             source_kind=source_kind,
             plugin_config=plugin_config,
+            content_digest=content_digest,
         ):
             loaded += 1
     return loaded
@@ -501,11 +610,21 @@ async def load_custom_skills(
                 "set personification_skill_remote_enabled=true to allow fetching"
             )
         elif has_remote_sources:
+            cache_dir = get_skill_cache_dir(plugin_config, Path(runtime.data_dir or "data/personification"))
+            resolved_sources = await resolve_skill_sources(
+                plugin_config=plugin_config,
+                logger=logger,
+                cache_dir=cache_dir,
+            )
+            prepared_sources = [
+                {**item.source, "content_digest": item.content_digest}
+                for item in resolved_sources
+            ]
             require_admin_review = bool(
                 getattr(plugin_config, "personification_skill_require_admin_review", True)
             )
             approved_sources, pending_reviews = filter_approved_remote_sources(
-                raw_remote_sources,
+                prepared_sources,
                 logger,
                 require_confirmation=require_admin_review,
             )
@@ -521,32 +640,35 @@ async def load_custom_skills(
             if not approved_sources:
                 logger.info("[custom skill] no approved remote skill sources to load")
             else:
-                class _RemoteSourceConfigProxy:
-                    def __init__(self, original: Any, approved: list[dict[str, Any]]) -> None:
-                        self._original = original
-                        self._approved = approved
-
-                    def __getattr__(self, name: str) -> Any:
-                        if name == "personification_skill_sources":
-                            return self._approved
-                        return getattr(self._original, name)
-
-                remote_config = _RemoteSourceConfigProxy(plugin_config, approved_sources)
-                cache_dir = get_skill_cache_dir(remote_config, Path(runtime.data_dir or "data/personification"))
-                source_roots = await resolve_skill_source_dirs(
-                    plugin_config=remote_config,
-                    logger=logger,
-                    cache_dir=cache_dir,
-                )
-                for source_root in source_roots:
+                approved_bindings = {
+                    (
+                        str(source.get("source") or "").strip(),
+                        str(source.get("ref") or "").strip(),
+                        str(source.get("subdir") or "").strip(),
+                        str(source.get("kind") or "auto").strip().lower() or "auto",
+                        str(source.get("content_digest") or "").strip().lower(),
+                    )
+                    for source in approved_sources
+                }
+                for resolved_source in resolved_sources:
+                    binding = (
+                        str(resolved_source.source.get("source") or "").strip(),
+                        str(resolved_source.source.get("ref") or "").strip(),
+                        str(resolved_source.source.get("subdir") or "").strip(),
+                        str(resolved_source.source.get("kind") or "auto").strip().lower() or "auto",
+                        resolved_source.content_digest,
+                    )
+                    if binding not in approved_bindings:
+                        continue
                     source_loaded += await _load_discovered_skill_dirs(
-                        source_root,
+                        resolved_source.root,
                         registry,
                         logger,
                         runtime=runtime,
                         trusted=False,
                         source_kind="remote",
                         plugin_config=plugin_config,
+                        content_digest=resolved_source.content_digest,
                     )
     logger.info(
         f"[custom skill] loaded bundled={bundled_loaded} external={external_loaded} "

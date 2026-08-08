@@ -177,6 +177,8 @@ def test_handler_disabled() -> None:
     )
     out = asyncio.run(tool.handler(plugin_name="weather", command_text="/天气 北京"))
     assert "未启用" in out
+    assert tool.metadata["side_effect"] == "external"
+    assert tool.metadata["retryable"] is False
 
 
 def test_handler_rejects_self_plugin() -> None:

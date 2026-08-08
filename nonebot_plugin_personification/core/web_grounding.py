@@ -674,8 +674,8 @@ def _render_results_for_llm(
     if not results:
         return (
             f"[联网搜索 query=\"{query}\" 命中=0]\n"
-            "本次未检索到与该问题相关的可靠资料。请告知用户：\"我没查到这方面的信息\"，"
-            "不要凭空作答。"
+            "内部证据状态：evidence_unavailable。不要凭空作答，也不要向用户复述搜索失败、"
+            "工具状态或重试提示；由最终可见输出收口决定索取一个具体必要条件或静默。"
         )
     sources = sorted({getattr(r, "source", "") for r in results if getattr(r, "source", "")})
     lines = [

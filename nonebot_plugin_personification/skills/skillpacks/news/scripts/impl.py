@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from datetime import datetime
 from typing import Any, Iterable
 
@@ -17,6 +18,20 @@ PLATFORM_MAP = {
     "抖音": "douyin",
     "B站": "bili",
     "哔哩哔哩": "bili",
+    "百度": "baidu/hot",
+    "百度热搜": "baidu/hot",
+    "头条": "toutiao",
+    "今日头条": "toutiao",
+    "小红书": "rednote",
+    "RedNote": "rednote",
+}
+
+TECH_NEWS_SOURCE_MAP = {
+    "IT之家": ("it-news", "IT之家"),
+    "IT": ("it-news", "IT之家"),
+    "Hacker News": ("hacker-news/top", "Hacker News"),
+    "HackerNews": ("hacker-news/top", "Hacker News"),
+    "HN": ("hacker-news/top", "Hacker News"),
 }
 
 
@@ -25,13 +40,18 @@ DAILY_NEWS_DESCRIPTION = """获取今天的60秒新闻早报，包含当天重�
 挑1-3条最有意思的新闻分享，加上自己的感受，不要逐条列举，不要说"根据新闻API"。"""
 
 TRENDING_DESCRIPTION = """获取各平台实时热搜榜单。
-支持平台：微博、知乎、抖音、B站（哔哩哔哩）。
+支持平台：微博、知乎、抖音、B站（哔哩哔哩）、百度、头条、小红书。
 适合场景：用户问"微博在讨论什么"、"知乎热搜是啥"、"B站最近流行什么"。
 返回 top10，可以加入自己对某个话题的看法。"""
 
 AI_NEWS_DESCRIPTION = """获取 AI 领域今日资讯。
 适合场景：用户问"AI 最近有什么新闻"、"今天 AI 圈有什么动静"、"给我来点 AI 资讯"。
+当天尚未发布时自动返回最近一期，并在标题中保留实际日期。
 挑 1-3 条重点自然概括，不要机械逐条播报，不要说"根据 API"。"""
+
+TECH_NEWS_DESCRIPTION = """获取科技资讯，支持 IT之家和 Hacker News。
+适合场景：用户问最近科技圈、数码行业、开发者社区有什么新闻。
+source 可选 IT之家或 Hacker News；没有指定时使用 IT之家。"""
 
 JOKE_DESCRIPTION = """获取一条随机搞笑段子。
 适合场景：用户让你讲笑话、群聊气氛需要活跃时。
@@ -136,6 +156,87 @@ def _extract_text(data: Any, *keys: str) -> str:
         if text:
             return text
     return ""
+
+
+def _canonical_failure(error: str) -> str:
+    return json.dumps(
+        {"ok": False, "error": error},
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
+def _valid_ai_news_items(data: Any) -> list[dict[str, Any]]:
+    items = _extract_items(data, "news", "items", "list")
+    return [item for item in items if isinstance(item, dict) and _extract_text(item, "title", "name")]
+
+
+def _latest_ai_news_data(data: Any) -> dict[str, Any]:
+    items = _valid_ai_news_items(data)
+    dated_items = [item for item in items if _extract_text(item, "date")]
+    if dated_items:
+        latest_date = max(_extract_text(item, "date") for item in dated_items)
+        return {
+            "date": latest_date,
+            "news": [item for item in dated_items if _extract_text(item, "date") == latest_date],
+        }
+    date = _extract_text(data, "date")
+    return {"date": date if date and date != "all" else "最近一期", "news": items}
+
+
+async def _fetch_latest_ai_news(
+    remote_base_url: str,
+    *,
+    local_base_url: str | None = None,
+) -> dict[str, Any]:
+    primary_error: Exception | None = None
+    primary_data: Any = {}
+    try:
+        primary_data = await _fetch_v2_data(
+            remote_base_url,
+            "/v2/ai-news",
+            local_base_url=local_base_url,
+        )
+        if _valid_ai_news_items(primary_data):
+            return _latest_ai_news_data(primary_data)
+    except Exception as exc:
+        primary_error = exc
+
+    try:
+        history_data = await _fetch_v2_data(
+            remote_base_url,
+            "/v2/ai-news",
+            local_base_url=local_base_url,
+            params={"all": 1},
+        )
+    except Exception as history_error:
+        if primary_error is not None:
+            raise primary_error from history_error
+        raise
+
+    latest = _latest_ai_news_data(history_data)
+    if _valid_ai_news_items(latest):
+        return latest
+    if primary_error is not None:
+        raise primary_error
+    return _latest_ai_news_data(primary_data)
+
+
+def _format_ai_news(data: Any) -> str:
+    date = _extract_text(data, "date") or "今日"
+    lines = [f"【AI 资讯 {date}】"]
+    for idx, item in enumerate(_valid_ai_news_items(data)[:8], 1):
+        title = _extract_text(item, "title", "name")
+        detail = _extract_text(item, "summary", "description", "detail", "content")
+        source = _extract_text(item, "source")
+        line = f"{idx}. {title}"
+        if source:
+            line += f" [{source}]"
+        lines.append(line)
+        if detail:
+            lines.append(detail[:80])
+    return "\n".join(lines) if len(lines) > 1 else _canonical_failure("no_results")
 
 
 def _format_epic_end_date(game: dict[str, Any]) -> str:
@@ -300,14 +401,16 @@ def build_daily_news_tool(
 
             lines = [f"【今日早报 {date}】"]
             if isinstance(news_items, list):
-                for idx, item in enumerate(news_items[:15], 1):
-                    lines.append(f"{idx}. {str(item)}")
+                for item in news_items[:15]:
+                    text = str(item or "").strip()
+                    if text:
+                        lines.append(f"{len(lines)}. {text}")
             if tip:
                 lines.append(f"💬 每日一句：{tip}")
-            return "\n".join(lines)
-        except Exception as e:
-            logger.warning(f"[news] get_daily_news 失败: {e}")
-            return "今日早报获取失败，稍后再试。"
+            return "\n".join(lines) if len(lines) > 1 else _canonical_failure("no_results")
+        except Exception:
+            logger.warning("[news] get_daily_news 失败")
+            return _canonical_failure("fetch_failed")
 
     return AgentTool(
         name="get_daily_news",
@@ -328,32 +431,14 @@ def build_ai_news_tool(
 ) -> AgentTool:
     async def _handler() -> str:
         try:
-            data = await _fetch_v2_data(
+            data = await _fetch_latest_ai_news(
                 remote_base_url,
-                "/v2/ai-news",
                 local_base_url=local_base_url,
             )
-            date = str(data.get("date", "今日")).strip() or "今日"
-            items = _extract_items(data, "news", "items", "list")
-            lines = [f"【AI 资讯 {date}】"]
-            for idx, item in enumerate(items[:8], 1):
-                if not isinstance(item, dict):
-                    continue
-                title = _extract_text(item, "title", "name")
-                detail = _extract_text(item, "summary", "description", "detail", "content")
-                source = _extract_text(item, "source")
-                if not title:
-                    continue
-                line = f"{idx}. {title}"
-                if source:
-                    line += f" [{source}]"
-                lines.append(line)
-                if detail:
-                    lines.append(detail[:80])
-            return "\n".join(lines) if len(lines) > 1 else "AI 资讯暂时获取失败，稍后再试。"
-        except Exception as e:
-            logger.warning(f"[news] get_ai_news 失败: {e}")
-            return "AI 资讯暂时获取失败，稍后再试。"
+            return _format_ai_news(data)
+        except Exception:
+            logger.warning("[news] get_ai_news 失败")
+            return _canonical_failure("fetch_failed")
 
     return AgentTool(
         name="get_ai_news",
@@ -367,6 +452,93 @@ def build_ai_news_tool(
     )
 
 
+def _resolve_tech_news_source(source: str) -> tuple[str, str] | None:
+    requested = str(source or "IT之家").strip() or "IT之家"
+    requested_key = requested.casefold()
+    for alias, target in TECH_NEWS_SOURCE_MAP.items():
+        if alias.casefold() == requested_key:
+            return target
+    return None
+
+
+def _format_tech_news(data: Any, source_name: str) -> str:
+    items = _extract_items(data, "news", "items", "list")
+    lines = [f"【{source_name} 科技资讯】"]
+    item_number = 0
+    for item in items[:10]:
+        if not isinstance(item, dict):
+            continue
+        title = _extract_text(item, "title", "name")
+        if not title:
+            continue
+        item_number += 1
+        score = item.get("score")
+        score_suffix = (
+            f" [{score} points]"
+            if source_name == "Hacker News" and score not in (None, "")
+            else ""
+        )
+        lines.append(f"{item_number}. {title}{score_suffix}")
+        detail = _extract_text(item, "description", "summary", "detail")
+        if detail:
+            lines.append(detail[:100])
+    return "\n".join(lines) if item_number else _canonical_failure("no_results")
+
+
+def build_tech_news_tool(
+    remote_base_url: str,
+    logger: Any,
+    local_base_url: str | None = None,
+) -> AgentTool:
+    async def _handler(source: str = "IT之家") -> str:
+        resolved = _resolve_tech_news_source(source)
+        if resolved is None:
+            return _canonical_failure("invalid_source")
+        endpoint, source_name = resolved
+        try:
+            data = await _fetch_v2_data(
+                remote_base_url,
+                f"/v2/{endpoint}",
+                local_base_url=local_base_url,
+            )
+            return _format_tech_news(data, source_name)
+        except Exception:
+            logger.warning("[news] get_tech_news 失败")
+            return _canonical_failure("fetch_failed")
+
+    return AgentTool(
+        name="get_tech_news",
+        description=TECH_NEWS_DESCRIPTION,
+        parameters={
+            "type": "object",
+            "properties": {
+                "source": {
+                    "type": "string",
+                    "enum": ["IT之家", "Hacker News"],
+                    "description": "资讯来源；未指定时默认 IT之家",
+                },
+            },
+            "required": [],
+        },
+        handler=_handler,
+    )
+
+
+def _format_trending(data: Any, platform_name: str) -> str:
+    items = _extract_items(data, "list", "items")
+    lines = [f"【{platform_name} 热搜 Top10】"]
+    item_number = 0
+    for item in items[:10]:
+        if isinstance(item, dict):
+            title = _extract_text(item, "title", "name", "word", "hotword", "keyword")
+        else:
+            title = str(item or "").strip()
+        if title:
+            item_number += 1
+            lines.append(f"{item_number}. {title}")
+    return "\n".join(lines) if item_number else _canonical_failure("no_results")
+
+
 def build_trending_tool(
     remote_base_url: str,
     logger: Any,
@@ -376,7 +548,7 @@ def build_trending_tool(
         platform_name = str(platform or "").strip()
         mapped = PLATFORM_MAP.get(platform_name)
         if not mapped:
-            return "不支持该平台，可选：微博、知乎、抖音、B站"
+            return _canonical_failure("invalid_platform")
 
         try:
             data = await _fetch_v2_data(
@@ -384,20 +556,10 @@ def build_trending_tool(
                 f"/v2/{mapped}",
                 local_base_url=local_base_url,
             )
-            items = _extract_items(data, "list", "items")
-            lines = [f"【{platform_name} 热搜 Top10】"]
-            for idx, item in enumerate(items[:10], 1):
-                title = ""
-                if isinstance(item, dict):
-                    title = _extract_text(item, "title", "name", "word", "hotword", "keyword")
-                else:
-                    title = str(item or "").strip()
-                if title:
-                    lines.append(f"{idx}. {title}")
-            return "\n".join(lines)
-        except Exception as e:
-            logger.warning(f"[news] get_trending 失败: {e}")
-            return "热搜获取失败，稍后再试。"
+            return _format_trending(data, platform_name)
+        except Exception:
+            logger.warning("[news] get_trending 失败")
+            return _canonical_failure("fetch_failed")
 
     return AgentTool(
         name="get_trending",
@@ -405,7 +567,11 @@ def build_trending_tool(
         parameters={
             "type": "object",
             "properties": {
-                "platform": {"type": "string", "description": "平台中文名，如微博、知乎、抖音、B站"},
+                "platform": {
+                    "type": "string",
+                    "enum": ["微博", "知乎", "抖音", "B站", "百度", "头条", "小红书"],
+                    "description": "热榜平台",
+                },
             },
             "required": ["platform"],
         },
@@ -426,10 +592,10 @@ def build_joke_tool(
                 local_base_url=local_base_url,
             )
             content = _extract_text(data, "duanzi", "content", "text")
-            return content or "段子暂时获取失败，等会再讲一个。"
-        except Exception as e:
-            logger.warning(f"[news] get_joke 失败: {e}")
-            return "段子暂时获取失败，等会再讲一个。"
+            return content or _canonical_failure("no_results")
+        except Exception:
+            logger.warning("[news] get_joke 失败")
+            return _canonical_failure("fetch_failed")
 
     return AgentTool(
         name="get_joke",
@@ -464,10 +630,10 @@ def build_history_today_tool(
                 title = str(item.get("title", "")).strip()
                 if year and title:
                     lines.append(f"{year}年：{title}")
-            return "\n".join(lines)
-        except Exception as e:
-            logger.warning(f"[news] get_history_today 失败: {e}")
-            return "历史上的今天获取失败，稍后再试。"
+            return "\n".join(lines) if len(lines) > 1 else _canonical_failure("no_results")
+        except Exception:
+            logger.warning("[news] get_history_today 失败")
+            return _canonical_failure("fetch_failed")
 
     return AgentTool(
         name="get_history_today",
@@ -499,10 +665,10 @@ def build_epic_games_tool(
                 if not isinstance(game, dict):
                     continue
                 lines.extend(_format_epic_game_line(game))
-            return "\n".join(lines) if len(lines) > 1 else "Epic 本周暂无免费游戏信息。"
-        except Exception as e:
-            logger.warning(f"[news] get_epic_games 失败: {e}")
-            return "Epic 免费游戏信息获取失败，稍后再试。"
+            return "\n".join(lines) if len(lines) > 1 else _canonical_failure("no_results")
+        except Exception:
+            logger.warning("[news] get_epic_games 失败")
+            return _canonical_failure("fetch_failed")
 
     return AgentTool(
         name="get_epic_games",
@@ -531,10 +697,10 @@ def build_gold_price_tool(
             lines = ["【黄金价格】"]
             for row in list(_iter_gold_rows(data))[:5]:
                 lines.append(_format_gold_row(row))
-            return "\n".join(lines) if len(lines) > 1 else "黄金价格暂时获取失败，稍后再试。"
-        except Exception as e:
-            logger.warning(f"[news] get_gold_price 失败: {e}")
-            return "黄金价格暂时获取失败，稍后再试。"
+            return "\n".join(lines) if len(lines) > 1 else _canonical_failure("no_results")
+        except Exception:
+            logger.warning("[news] get_gold_price 失败")
+            return _canonical_failure("fetch_failed")
 
     return AgentTool(
         name="get_gold_price",
@@ -556,7 +722,7 @@ def build_baike_tool(
     async def _handler(word: str) -> str:
         keyword = str(word or "").strip()
         if not keyword:
-            return "请告诉我想查的百科词条。"
+            return _canonical_failure("invalid_word")
 
         try:
             data = await _fetch_v2_data(
@@ -579,10 +745,10 @@ def build_baike_tool(
                 lines.append(summary)
             if url:
                 lines.append(url)
-            return "\n".join(lines) if len(lines) > 1 else f"没有查到“{keyword}”的百科摘要。"
-        except Exception as e:
-            logger.warning(f"[news] get_baike_entry 失败: {e}")
-            return "百科词条暂时获取失败，稍后再试。"
+            return "\n".join(lines) if len(lines) > 1 else _canonical_failure("no_results")
+        except Exception:
+            logger.warning("[news] get_baike_entry 失败")
+            return _canonical_failure("fetch_failed")
 
     return AgentTool(
         name="get_baike_entry",
@@ -610,15 +776,18 @@ def build_exchange_rate_tool(
                 "/v2/exchange-rate",
                 local_base_url=local_base_url,
             )
+            _reference_code, rates = _coerce_rate_lookup(data)
+            if not rates:
+                return _canonical_failure("no_results")
             lines = _build_exchange_lines(
                 data,
                 base_currency=base_currency,
                 quote_currency=quote_currency,
             )
             return "\n".join(lines)
-        except Exception as e:
-            logger.warning(f"[news] get_exchange_rate 失败: {e}")
-            return "汇率暂时获取失败，稍后再试。"
+        except Exception:
+            logger.warning("[news] get_exchange_rate 失败")
+            return _canonical_failure("fetch_failed")
 
     return AgentTool(
         name="get_exchange_rate",

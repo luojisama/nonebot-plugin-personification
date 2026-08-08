@@ -129,7 +129,12 @@ from .plugin_runtime_logs import maybe_prune as maybe_prune_plugin_logs
 from .plugin_runtime_logs import wrap_logger as wrap_plugin_logger
 from .proactive_store import load_proactive_state, save_proactive_state, update_private_interaction_time
 from .profile_service import ProfileService
+from .scoped_profile_service import ScopedProfileService
+from .policy_classifier import PolicyClassifier
 from .qzone_service import build_qzone_services, build_qzone_social_service
+from .qq_user_policy import QQUserPolicyGate
+from .qq_outbound import QQOutboundLedger
+from .qq_recall import QQRecallService
 from .runtime_assembly import PluginRuntimeBundle
 from .memory_defaults import DEFAULT_PERSONA_HISTORY_MAX
 from .model_router import (
@@ -149,6 +154,7 @@ from .runtime_config import get_runtime_load_info
 from .runtime_state import get_shared_http_client, schedule_disabled_override_prompt
 from .service_factory import (
     build_agent_runtime_deps,
+    build_agent_tool_registry,
     build_ai_api_caller,
     build_custom_title_getter,
     build_grounding_context_builder,
@@ -161,6 +167,7 @@ from .service_factory import (
     build_web_search_executor,
 )
 from .tts_service import TtsService
+from .user_policy import UserPolicyService, load_or_create_policy_evidence_key
 from ..agent.inner_state import get_personification_data_dir
 from .persona_service import PersonaStore
 from .session_store import (
@@ -216,6 +223,18 @@ def build_plugin_runtime(
     )
     qzone_social_service = build_qzone_social_service(plugin_config=plugin_config, logger=logger)
     data_dir = get_personification_data_dir(plugin_config)
+    policy_evidence_key = load_or_create_policy_evidence_key(data_dir)
+    qq_outbound_ledger = QQOutboundLedger(content_hmac_key=policy_evidence_key)
+    recovered_recall_count = QQRecallService(
+        qq_outbound_ledger,
+        plugin_config=plugin_config,
+        logger=logger,
+    ).recover_interrupted_dispatches()
+    if recovered_recall_count:
+        logger.warning(
+            "personification: recovered interrupted QQ recall operations "
+            f"count={recovered_recall_count}; status set to unknown without retry"
+        )
     knowledge_store = PluginKnowledgeStore(data_dir)
 
     if sign_in_available:
@@ -234,7 +253,13 @@ def build_plugin_runtime(
     msg_buffer: Dict[str, Dict[str, Any]] = {}
     persona_store = None
     memory_store = init_memory_store(plugin_config, logger=logger)
-    profile_service = ProfileService(memory_store)
+    profile_service = ProfileService(
+        memory_store,
+        enabled_getter=lambda: bool(
+            getattr(plugin_config, "personification_persona_enabled", True)
+        ),
+    )
+    scoped_profile_service = None
     memory_decay_scheduler = MemoryDecayScheduler(memory_store, logger=logger)
     scheduler = get_scheduler()
     background_intelligence = BackgroundIntelligence(
@@ -364,32 +389,59 @@ def build_plugin_runtime(
         f"primary={route_state['primary']} "
         f"fallback={route_state['fallback']} "
         f"fallback_source={route_state['fallback_source'] or 'none'} "
+        f"video_route={route_state['video_route_mode']} "
+        f"video_frames={route_state['video_frame_preset']} "
+        f"video_asr={route_state['audio_transcription_provider']} "
         f"video_fallback={route_state['video_fallback']} "
         f"video_fallback_source={route_state['video_fallback_source'] or 'none'}"
     )
-    if getattr(plugin_config, "personification_persona_enabled", True):
-        persona_tool_caller = build_routed_tool_caller(
-            plugin_config=plugin_config,
-            logger=logger,
-        )
-        persona_data_path_raw = str(
-            getattr(plugin_config, "personification_persona_data_path", "") or ""
-        ).strip()
-        persona_data_file = (
-            Path(persona_data_path_raw)
-            if persona_data_path_raw
-            else get_personification_data_dir(plugin_config) / "user_personas.json"
-        )
-        persona_store = PersonaStore(
-            data_dir=persona_data_file.parent,
-            data_file=persona_data_file,
-            tool_caller=persona_tool_caller,
-            history_max=int(
-                getattr(plugin_config, "personification_persona_history_max", DEFAULT_PERSONA_HISTORY_MAX)
+    persona_tool_caller = build_routed_tool_caller(
+        plugin_config=plugin_config,
+        logger=logger,
+    )
+    persona_data_path_raw = str(
+        getattr(plugin_config, "personification_persona_data_path", "") or ""
+    ).strip()
+    persona_data_file = (
+        Path(persona_data_path_raw)
+        if persona_data_path_raw
+        else get_personification_data_dir(plugin_config) / "user_personas.json"
+    )
+    persona_enabled = lambda: bool(
+        getattr(plugin_config, "personification_persona_enabled", True)
+    )
+    persona_store = PersonaStore(
+        data_dir=persona_data_file.parent,
+        data_file=persona_data_file,
+        tool_caller=persona_tool_caller,
+        history_max=int(
+            getattr(plugin_config, "personification_persona_history_max", DEFAULT_PERSONA_HISTORY_MAX)
+        ),
+        logger=logger,
+        profile_service=profile_service,
+        enabled_getter=persona_enabled,
+    )
+    scoped_profile_service = ScopedProfileService(
+        profile_service=profile_service,
+        tool_caller=persona_tool_caller,
+        logger=logger,
+        enabled=persona_enabled,
+        auto_threshold=max(
+            2,
+            min(
+                8,
+                int(
+                    getattr(
+                        plugin_config,
+                        "personification_persona_history_max",
+                        DEFAULT_PERSONA_HISTORY_MAX,
+                    )
+                    or DEFAULT_PERSONA_HISTORY_MAX
+                )
+                // 3,
             ),
-            logger=logger,
-            profile_service=profile_service,
-        )
+        ),
+    )
     tool_registry, inner_state_updater, agent_tool_caller, lite_tool_caller = build_agent_runtime_deps(
         plugin_config=plugin_config,
         logger=logger,
@@ -404,13 +456,40 @@ def build_plugin_runtime(
         profile_service=profile_service,
         memory_curator=memory_curator,
         background_intelligence=background_intelligence,
+        qq_outbound_ledger=qq_outbound_ledger,
     )
+    policy_classifier = PolicyClassifier(
+        lite_tool_caller or agent_tool_caller,
+        logger=logger,
+    )
+    user_policy_service = UserPolicyService(
+        evidence_key=policy_evidence_key,
+        classifier=policy_classifier,
+        logger=logger,
+    )
+    if not user_policy_service.evidence_cipher.available:
+        logger.warning(
+            "personification: user policy evidence encryption unavailable; excerpts will not be persisted"
+        )
+    def _legacy_policy_blocked(user_id: str) -> bool:
+        if favorability_service is None or not hasattr(favorability_service, "peek_user_data"):
+            return False
+        profile = favorability_service.peek_user_data(str(user_id or "").strip())
+        return bool(isinstance(profile, dict) and profile.get("is_perm_blacklisted", False))
+
+    qq_user_policy_gate = QQUserPolicyGate(
+        user_policy_service,
+        logger=logger,
+        legacy_block_checker=_legacy_policy_blocked,
+    )
+    qzone_social_service.user_policy_authorizer = qq_user_policy_gate.current_authorization
     tts_service = TtsService(
         plugin_config=plugin_config,
         logger=logger,
         get_http_client=lambda: get_shared_http_client(max_connections=20),
         data_dir=data_dir,
         style_planner=tts_decision_call_ai_api,
+        qq_outbound_ledger=qq_outbound_ledger,
     )
     save_plugin_runtime_config, load_plugin_runtime_config = build_runtime_config_io(
         plugin_config=plugin_config,
@@ -446,12 +525,14 @@ def build_plugin_runtime(
         ),
         looks_like_private_command=looks_like_private_command,
         get_recent_group_msgs=get_recent_group_msgs,
+        user_policy_gate=qq_user_policy_gate,
     )
     poke_rule = build_poke_rule(
         poke_rule_core=poke_rule_core,
         is_group_whitelisted=is_group_whitelisted,
         plugin_whitelist=plugin_config.personification_whitelist,
         probability=plugin_config.personification_poke_probability,
+        user_policy_gate=qq_user_policy_gate,
     )
     poke_notice_rule = build_poke_notice_rule(
         poke_notice_rule_core=poke_notice_rule_core,
@@ -459,6 +540,7 @@ def build_plugin_runtime(
         plugin_whitelist=plugin_config.personification_whitelist,
         probability=plugin_config.personification_poke_probability,
         logger=logger,
+        user_policy_gate=qq_user_policy_gate,
     )
 
     yaml_response_processor = build_yaml_response_processor(
@@ -495,6 +577,8 @@ def build_plugin_runtime(
         knowledge_store=knowledge_store,
         inner_state_updater=inner_state_updater,
         favorability_service=favorability_service,
+        user_policy_gate=qq_user_policy_gate,
+        qq_outbound_ledger=qq_outbound_ledger,
     )
 
     get_custom_title = build_custom_title_getter(
@@ -587,6 +671,8 @@ def build_plugin_runtime(
             profile_service=profile_service,
             memory_curator=memory_curator,
             background_intelligence=background_intelligence,
+            user_policy_gate=qq_user_policy_gate,
+            qq_outbound_ledger=qq_outbound_ledger,
         ),
         types=TypeDeps(
             poke_event_cls=poke_event_cls,
@@ -631,6 +717,44 @@ def build_plugin_runtime(
             warn=True,
             model_override=get_model_override_for_role(plugin_config, MODEL_ROLE_STICKER),
         )
+        registry_version = None
+        candidate_registry = None
+        extension_tools: list[Any] = []
+        if tool_registry is not None:
+            registry_version, registry_snapshot = tool_registry.snapshot()
+            extension_source_kinds = {
+                "generated",
+                "local",
+                "mcp",
+                "mcp_builtin",
+                "mcp_managed",
+                "remote",
+            }
+            extension_tools = [
+                tool
+                for tool in registry_snapshot.values()
+                if str((tool.metadata or {}).get("source_kind") or "").strip().lower() in extension_source_kinds
+            ]
+            candidate_registry = build_agent_tool_registry(
+                plugin_config=plugin_config,
+                logger=logger,
+                get_now=get_current_local_time,
+                tool_caller=new_agent_tool_caller,
+                persona_store=persona_store,
+                vision_caller=new_vision_caller,
+                scheduler=scheduler,
+                data_dir=data_dir,
+                get_bots=get_bots,
+                knowledge_store=knowledge_store,
+                memory_store=memory_store,
+                profile_service=profile_service,
+                memory_curator=memory_curator,
+                background_intelligence=background_intelligence,
+                qq_outbound_ledger=qq_outbound_ledger,
+            )
+            for tool in extension_tools:
+                if candidate_registry.get(tool.name) is None:
+                    candidate_registry.register(tool)
         yaml_response_processor = build_yaml_response_processor(
             get_current_time=get_current_local_time,
             format_time_context=format_time_context,
@@ -665,18 +789,26 @@ def build_plugin_runtime(
             knowledge_store=knowledge_store,
             inner_state_updater=inner_state_updater,
             favorability_service=favorability_service,
+            user_policy_gate=qq_user_policy_gate,
+            qq_outbound_ledger=qq_outbound_ledger,
         )
+        if tool_registry is not None and candidate_registry is not None and registry_version is not None:
+            tool_registry.replace_all(candidate_registry.all(), expected_version=registry_version)
         reply_processor_deps.runtime.process_yaml_response_logic = yaml_response_processor
         reply_processor_deps.runtime.agent_tool_caller = new_agent_tool_caller
         reply_processor_deps.runtime.lite_tool_caller = new_lite_tool_caller
         reply_processor_deps.runtime.vision_caller = new_vision_caller
         reply_processor_deps.runtime.review_call_ai_api = response_review_call_ai_api
+        policy_classifier.caller = new_lite_tool_caller or new_agent_tool_caller
         if persona_store is not None:
             try:
-                persona_store.tool_caller = build_routed_tool_caller(
+                refreshed_persona_caller = build_routed_tool_caller(
                     plugin_config=plugin_config,
                     logger=logger,
                 )
+                persona_store.tool_caller = refreshed_persona_caller
+                if scoped_profile_service is not None:
+                    scoped_profile_service.tool_caller = refreshed_persona_caller
             except Exception as exc:
                 logger.warning(f"personification: rebuild persona tool caller failed: {exc}")
         logger.info("personification: runtime services reloaded from current config")
@@ -729,7 +861,11 @@ def build_plugin_runtime(
         persona_store=persona_store,
         memory_store=memory_store,
         profile_service=profile_service,
+        scoped_profile_service=scoped_profile_service,
         memory_curator=memory_curator,
         memory_decay_scheduler=memory_decay_scheduler,
         background_intelligence=background_intelligence,
+        user_policy_service=user_policy_service,
+        qq_user_policy_gate=qq_user_policy_gate,
+        qq_outbound_ledger=qq_outbound_ledger,
     )

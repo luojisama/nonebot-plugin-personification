@@ -74,3 +74,15 @@ def test_field_guide_singleton_constant() -> None:
     # 字段总数：原 4 个 + 新增 7 个 = 11 段
     field_count = guide.count("【")
     assert field_count >= 10, f"字段引导应包含至少 10 个【...】，实际 {field_count}"
+
+
+def test_persona_prompt_uses_avatar_only_as_weak_evidence() -> None:
+    prompt = persona_service.build_persona_prompt(
+        ["最近在补番"],
+        previous=None,
+        avatar_context="类型：acg_character；中性摘要：蓝发动画角色；ACG 候选：角色甲",
+    )
+    assert "头像长期弱证据" in prompt
+    assert "ACG 候选：角色甲" in prompt
+    assert "只能辅助理解头像审美或 ACG 偏好候选" in prompt
+    assert "不得替代聊天证据推断真实身份、性别、年龄" in prompt

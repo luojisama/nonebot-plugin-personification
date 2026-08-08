@@ -39,6 +39,15 @@ def test_probe_response_matches_expected_color_order() -> None:
     assert visual_capabilities._probe_response_matches_expected("ok") is False
 
 
+def test_video_support_requires_an_official_fullmodal_contract() -> None:
+    assert visual_capabilities.heuristic_supports_video("gemini", "gemini-2.5-pro") is True
+    assert visual_capabilities.heuristic_supports_video("openai", "qwen3.5-omni-plus") is True
+    assert visual_capabilities.heuristic_supports_video("openai", "mimo-v2.5") is True
+    assert visual_capabilities.heuristic_supports_video("openai", "gpt-5.4") is False
+    assert visual_capabilities.heuristic_supports_video("anthropic", "claude-opus-4-7") is False
+    assert visual_capabilities.heuristic_supports_video("openai", "deepseek-chat") is False
+
+
 def test_mimo_v25_models_are_treated_as_multimodal_except_audio_embedding_variants() -> None:
     assert visual_capabilities.heuristic_supports_vision("openai", "mimo-v2.5") is True
     assert visual_capabilities.heuristic_supports_vision("openai", "mimo2.5") is True

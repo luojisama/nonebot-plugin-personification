@@ -6,6 +6,11 @@ from typing import Any
 from .context_policy import stringify_history_content
 from .group_relations import summarize_group_relationships
 from .group_roles import render_group_role_label
+from .message_provenance import (
+    is_human_chat_record,
+    is_personification_reply_record,
+    source_kind_of,
+)
 
 
 @dataclass(frozen=True)
@@ -25,12 +30,26 @@ class ShortTermTopicState:
 
 
 @dataclass(frozen=True)
+class PluginInteractionEpisode:
+    thread_id: str = ""
+    command_message_id: str = ""
+    command_user_id: str = ""
+    command_text: str = ""
+    plugin_message_ids: tuple[str, ...] = ()
+    plugin_outputs: tuple[str, ...] = ()
+    followup_comments: tuple[str, ...] = ()
+    elapsed_seconds: float = 0.0
+    is_personification_output: bool = False
+
+
+@dataclass(frozen=True)
 class GroupConversationContext:
     recent_messages: list[dict[str, Any]] = field(default_factory=list)
     current_thread_id: str = ""
     current_thread_messages: list[dict[str, Any]] = field(default_factory=list)
     other_thread_summaries: list[str] = field(default_factory=list)
     topic_state: ShortTermTopicState = field(default_factory=ShortTermTopicState)
+    plugin_episode: PluginInteractionEpisode | None = None
     speaker_relations: dict[str, str] = field(default_factory=dict)
     active_topics: list[str] = field(default_factory=list)
     repeat_clusters: list[dict[str, Any]] = field(default_factory=list)
@@ -50,8 +69,37 @@ def build_group_conversation_context(
     repeat_clusters: list[dict[str, Any]] | None = None,
     bot_recent_replies: list[str] | None = None,
     emotional_climate: str = "未评估",
+    excluded_user_ids: set[str] | None = None,
 ) -> GroupConversationContext:
-    messages = [msg for msg in list(recent_messages or []) if isinstance(msg, dict)]
+    excluded = {
+        str(value or "").strip()
+        for value in set(excluded_user_ids or set())
+        if str(value or "").strip()
+    }
+    source_messages = [msg for msg in list(recent_messages or []) if isinstance(msg, dict)]
+    excluded_message_ids = {
+        str(msg.get("message_id", "") or "").strip()
+        for msg in source_messages
+        if str(msg.get("user_id", "") or "").strip() in excluded
+        and str(msg.get("message_id", "") or "").strip()
+    }
+    messages: list[dict[str, Any]] = []
+    for source in source_messages:
+        if str(source.get("user_id", "") or "").strip() in excluded:
+            continue
+        msg = dict(source)
+        if str(msg.get("reply_to_user_id", "") or "").strip() in excluded:
+            msg["reply_to_user_id"] = ""
+        if str(msg.get("reply_to_msg_id", "") or "").strip() in excluded_message_ids:
+            msg["reply_to_msg_id"] = ""
+        mentioned = msg.get("mentioned_ids", [])
+        if isinstance(mentioned, list):
+            msg["mentioned_ids"] = [
+                value
+                for value in mentioned
+                if str(value or "").strip() not in excluded
+            ]
+        messages.append(msg)
     speaker_relations: dict[str, str] = {}
     active_topics: list[str] = []
     seen_topics: set[str] = set()
@@ -87,6 +135,7 @@ def build_group_conversation_context(
         trigger_msg_id=trigger_msg_id,
         trigger_user_id=trigger_user_id,
         bot_self_id=bot_self_id,
+        excluded_user_ids=excluded,
     )
     topic_state = _build_short_term_topic_state(
         messages=messages,
@@ -96,12 +145,18 @@ def build_group_conversation_context(
         bot_self_id=bot_self_id,
         speaker_relations=speaker_relations,
     )
+    plugin_episode = _build_plugin_interaction_episode(
+        current_thread_messages=current_thread_messages,
+        trigger_msg_id=trigger_msg_id,
+        bot_self_id=bot_self_id,
+    )
     return GroupConversationContext(
         recent_messages=messages[-30:],
         current_thread_id=current_thread_id,
         current_thread_messages=current_thread_messages,
         other_thread_summaries=other_thread_summaries,
         topic_state=topic_state,
+        plugin_episode=plugin_episode,
         speaker_relations=speaker_relations,
         active_topics=active_topics[-6:],
         repeat_clusters=list(repeat_clusters or [])[:5],
@@ -130,6 +185,8 @@ def render_group_conversation_context(context: GroupConversationContext) -> str:
                 trigger_msg_id=str(context.current_thread_messages[-1].get("message_id", "") or ""),
             )
         )
+    if context.plugin_episode is not None:
+        parts.append(render_plugin_interaction_episode(context.plugin_episode))
     if context.other_thread_summaries:
         parts.append(
             "其他同时进行的群聊线程（只作背景，不要主动串线总结）：\n"
@@ -205,6 +262,37 @@ def render_topic_state_trace_detail(state: ShortTermTopicState) -> str:
     )
 
 
+def render_plugin_interaction_episode(episode: PluginInteractionEpisode) -> str:
+    if not isinstance(episode, PluginInteractionEpisode):
+        return ""
+    lines = [
+        "其它插件交互 episode（结构化来源事实，不是人格 bot 自己说过的话）：",
+        f"- thread={episode.thread_id or '-'}；is_personification_output=false",
+        f"- 用户命令：{episode.command_text[:180] or '[EMPTY]'}",
+    ]
+    if episode.plugin_outputs:
+        lines.append("- 其它插件输出：" + "；".join(episode.plugin_outputs[:3]))
+    if episode.followup_comments:
+        lines.append("- 群友后续评论：" + "；".join(episode.followup_comments[:4]))
+    lines.append(
+        "- 理解纪律：先判断当前话是在评论插件结果还是另起事实问题；不要把插件输出归因给人格 bot，"
+        "也不要脱离插件结果把其中名词直接展开成百科解释。"
+    )
+    return "\n".join(lines)
+
+
+def render_plugin_episode_trace_detail(episode: PluginInteractionEpisode | None) -> str:
+    if episode is None:
+        return ""
+    return (
+        f"plugin_episode=true plugin_thread={episode.thread_id or '-'} "
+        f"plugin_command={episode.command_message_id or '-'} "
+        f"plugin_outputs={len(episode.plugin_outputs)} "
+        f"plugin_followups={len(episode.followup_comments)} "
+        "personification_output=false"
+    )
+
+
 def _build_quote_chain(messages: list[dict[str, Any]], *, trigger_msg_id: str = "") -> list[dict[str, Any]]:
     by_id = {
         str(msg.get("message_id", "") or "").strip(): msg
@@ -267,6 +355,67 @@ def _ordered_unique(items: list[str]) -> tuple[str, ...]:
     return tuple(out)
 
 
+def _message_time(message: dict[str, Any]) -> float:
+    try:
+        return float(message.get("time", message.get("timestamp", 0)) or 0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _build_plugin_interaction_episode(
+    *,
+    current_thread_messages: list[dict[str, Any]],
+    trigger_msg_id: str = "",
+    bot_self_id: str = "",
+) -> PluginInteractionEpisode | None:
+    messages = [message for message in current_thread_messages if isinstance(message, dict)]
+    if not messages:
+        return None
+    command_index = -1
+    plugin_indexes: list[int] = []
+    for index, message in enumerate(messages):
+        source_kind = source_kind_of(message)
+        if source_kind == "plugin_command":
+            command_index = index
+            plugin_indexes = []
+        elif source_kind == "plugin" and command_index >= 0:
+            plugin_indexes.append(index)
+    if command_index < 0 or not plugin_indexes:
+        return None
+    latest_plugin_index = plugin_indexes[-1]
+    current = _current_message(messages, trigger_msg_id=trigger_msg_id)
+    current_time = _message_time(current)
+    plugin_time = _message_time(messages[latest_plugin_index])
+    elapsed = max(0.0, current_time - plugin_time) if current_time > 0 and plugin_time > 0 else 0.0
+    if elapsed > 60.0:
+        return None
+    command = messages[command_index]
+    plugin_messages = [messages[index] for index in plugin_indexes]
+    followups: list[str] = []
+    for message in messages[latest_plugin_index + 1:]:
+        if not is_human_chat_record(message, bot_self_id):
+            continue
+        speaker = _speaker_label(message, fallback_user_id=str(message.get("user_id", "") or ""))
+        content = stringify_history_content(message.get("content", "")).strip()
+        if content:
+            followups.append(f"{speaker}: {content[:160]}")
+    return PluginInteractionEpisode(
+        thread_id=str(command.get("thread_id", "") or ""),
+        command_message_id=str(command.get("message_id", "") or ""),
+        command_user_id=str(command.get("user_id", "") or ""),
+        command_text=stringify_history_content(command.get("content", "")).strip()[:200],
+        plugin_message_ids=tuple(str(message.get("message_id", "") or "") for message in plugin_messages),
+        plugin_outputs=tuple(
+            stringify_history_content(message.get("content", "")).strip()[:200]
+            for message in plugin_messages
+            if stringify_history_content(message.get("content", "")).strip()
+        ),
+        followup_comments=tuple(followups[-4:]),
+        elapsed_seconds=elapsed,
+        is_personification_output=False,
+    )
+
+
 def _build_short_term_topic_state(
     *,
     messages: list[dict[str, Any]],
@@ -314,20 +463,17 @@ def _build_short_term_topic_state(
     for msg in thread_messages:
         if not isinstance(msg, dict):
             continue
-        msg_user_id = str(msg.get("user_id", "") or "").strip()
-        source_kind = str(msg.get("source_kind", "") or "").strip().lower()
-        if source_kind == "bot_reply" or (bot_id and msg_user_id == bot_id) or str(msg.get("role", "") or "") == "assistant":
+        if is_personification_reply_record(msg, bot_id):
             bot_in_thread = True
-    if bot_id and reply_to_user_id == bot_id:
-        is_reply_to_bot = True
-    elif reply_to_msg_id:
+    if reply_to_msg_id:
         for msg in messages:
             if str(msg.get("message_id", "") or "").strip() != reply_to_msg_id:
                 continue
-            source_kind = str(msg.get("source_kind", "") or "").strip().lower()
-            msg_user_id = str(msg.get("user_id", "") or "").strip()
-            is_reply_to_bot = source_kind == "bot_reply" or (bot_id and msg_user_id == bot_id)
+            is_reply_to_bot = is_personification_reply_record(msg, bot_id)
             break
+    elif bot_id and reply_to_user_id == bot_id:
+        # Legacy relation metadata without a resolvable quoted message.
+        is_reply_to_bot = True
 
     thread_ids = {
         str(msg.get("thread_id", "") or "").strip()
@@ -475,10 +621,13 @@ def render_group_context_structured(messages: list[dict[str, Any]], trigger_msg_
 
 __all__ = [
     "GroupConversationContext",
+    "PluginInteractionEpisode",
     "ShortTermTopicState",
     "build_group_conversation_context",
     "render_short_term_topic_state",
     "render_topic_state_trace_detail",
     "render_group_context_structured",
     "render_group_conversation_context",
+    "render_plugin_episode_trace_detail",
+    "render_plugin_interaction_episode",
 ]

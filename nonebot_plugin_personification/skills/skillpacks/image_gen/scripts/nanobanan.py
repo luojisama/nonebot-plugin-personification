@@ -1,12 +1,14 @@
 from __future__ import annotations
 
+import importlib
+import uuid
 from typing import Any
 
 import httpx
 
 from plugin.personification.core.image_refs import normalize_image_refs
 
-from .impl import normalize_image_generation_size
+from .impl import _ok_image, normalize_image_generation_size
 
 
 def _first_gemini_cli_caller(tool_caller: Any) -> Any:
@@ -66,6 +68,7 @@ async def generate_image_nanobanan(
     timeout: float | None = None,
     images: list[str] | None = None,
     image_urls: list[str] | None = None,
+    reference_mode: str = "auto",
 ) -> dict[str, str]:
     """Call Nano Banana (Gemini 3 image) via Gemini/Antigravity CLI OAuth credentials."""
     prompt_text = str(prompt or "").strip()
@@ -78,7 +81,8 @@ async def generate_image_nanobanan(
     access_token, _auth_file = await caller._get_access_token()
     project = await caller._resolve_project(access_token)
 
-    raw_refs = list(images or []) + list(image_urls or [])
+    mode = str(reference_mode or "auto").strip().lower()
+    raw_refs = [] if mode in {"off", "vision_prompt"} else list(images or []) + list(image_urls or [])
     reference_images, reference_problems = normalize_image_refs(raw_refs, limit=3)
 
     parts: list[dict[str, Any]] = [{"text": prompt_text}]
@@ -95,39 +99,38 @@ async def generate_image_nanobanan(
         "contents": [{"role": "user", "parts": parts}],
         "generationConfig": {"responseModalities": ["IMAGE"]},
     }
-    envelope = {
+    envelope: dict[str, Any] = {
         "model": str(image_model or "gemini-3-pro-image-preview").strip() or "gemini-3-pro-image-preview",
         "project": project,
         "request": request_obj,
     }
+    caller_module = importlib.import_module(caller.__class__.__module__)
+    is_antigravity = caller.__class__.__name__ == "AntigravityCliToolCaller"
+    if is_antigravity:
+        endpoint = str(getattr(caller_module, "_ANTIGRAVITY_CLI_GENERATE_ENDPOINT"))
+        envelope.update({"userAgent": "antigravity", "requestId": uuid.uuid4().hex})
+    else:
+        endpoint = str(getattr(caller_module, "_GEMINI_CLI_GENERATE_ENDPOINT"))
     timeout_value = float(timeout if timeout is not None else getattr(caller, "timeout", 180.0) or 180.0)
-    headers = {
-        "Authorization": f"Bearer {access_token}",
-        "Content-Type": "application/json",
-    }
+    headers = caller._headers(access_token)
+    client_kwargs = caller._http_client_kwargs(connect_timeout=15.0)
+    client_kwargs["timeout"] = httpx.Timeout(timeout_value, connect=15.0)
     try:
-        async with httpx.AsyncClient(timeout=httpx.Timeout(timeout_value, connect=15.0)) as client:
+        async with httpx.AsyncClient(**client_kwargs) as client:
             response = await client.post(
-                "https://cloudcode-pa.googleapis.com/v1internal:generateContent",
+                endpoint,
                 json=envelope,
                 headers=headers,
             )
             response.raise_for_status()
             data = response.json()
     except httpx.HTTPStatusError as exc:
-        body = ""
-        try:
-            body = exc.response.text[:240]
-        except Exception:
-            pass
-        return {"error": f"nanobanan HTTP {exc.response.status_code}: {body}"}
-    except Exception as exc:
-        return {"error": f"nanobanan request failed: {exc}"}
+        return {"error": f"image provider HTTP {exc.response.status_code}"}
+    except Exception:
+        return {"error": "image provider request failed"}
 
     b64, _mime = _extract_inline_image(data)
-    if not b64:
-        return {"error": "empty image response"}
-    result: dict[str, str] = {"b64_json": b64}
+    result = _ok_image(b64, _mime)
     if reference_problems:
         result["warning"] = "some reference images were ignored: " + ", ".join(reference_problems[:3])
     return result

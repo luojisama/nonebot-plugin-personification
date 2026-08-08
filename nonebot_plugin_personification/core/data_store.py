@@ -30,6 +30,22 @@ class DataStore:
             self._async_locks[name] = asyncio.Lock()
         return self._async_locks[name]
 
+    async def _run_locked_thread(self, func: Callable[..., Any], *args: Any) -> Any:
+        worker = asyncio.create_task(asyncio.to_thread(func, *args))
+        try:
+            return await asyncio.shield(worker)
+        except asyncio.CancelledError:
+            while not worker.done():
+                try:
+                    await asyncio.shield(worker)
+                except asyncio.CancelledError:
+                    continue
+            try:
+                worker.result()
+            except Exception:
+                pass
+            raise asyncio.CancelledError
+
     def _read(self, name: str) -> Any:
         with connect_sync() as conn:
             row = conn.execute(
@@ -65,12 +81,42 @@ class DataStore:
         self._write(name, data)
 
     def mutate_sync(self, name: str, mutator: Callable[[Any], Any]) -> Any:
-        current = self._read(name)
-        updated = mutator(current)
-        if updated is None:
-            updated = current
-        self._write(name, updated)
-        return updated
+        with connect_sync() as conn:
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                row = conn.execute(
+                    "SELECT value FROM kv_store WHERE namespace=? AND key=?",
+                    (name, _ROOT_KEY),
+                ).fetchone()
+                if row is None:
+                    current = {}
+                else:
+                    try:
+                        raw = row["value"]
+                    except (KeyError, TypeError, IndexError):
+                        raw = row[0]
+                    try:
+                        current = json.loads(raw)
+                    except Exception:
+                        current = {}
+                updated = mutator(current)
+                if updated is None:
+                    updated = current
+                payload = json.dumps(updated, ensure_ascii=False)
+                conn.execute(
+                    """
+                    INSERT INTO kv_store(namespace, key, value, updated_at)
+                    VALUES (?, ?, ?, unixepoch('now'))
+                    ON CONFLICT(namespace, key)
+                    DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at
+                    """,
+                    (name, _ROOT_KEY, payload),
+                )
+                conn.commit()
+                return updated
+            except Exception:
+                conn.rollback()
+                raise
 
     def update_sync(self, name: str, patch: dict[str, Any]) -> dict[str, Any]:
         def _mutate(current: Any) -> dict[str, Any]:
@@ -87,11 +133,15 @@ class DataStore:
 
     async def save(self, name: str, data: Any) -> None:
         async with self._alock(name):
-            await asyncio.to_thread(self.save_sync, name, data)
+            await self._run_locked_thread(self.save_sync, name, data)
+
+    async def mutate(self, name: str, mutator: Callable[[Any], Any]) -> Any:
+        async with self._alock(name):
+            return await self._run_locked_thread(self.mutate_sync, name, mutator)
 
     async def update(self, name: str, patch: dict[str, Any]) -> dict[str, Any]:
         async with self._alock(name):
-            return await asyncio.to_thread(self.update_sync, name, patch)
+            return await self._run_locked_thread(self.update_sync, name, patch)
 
 
 _store: Optional[DataStore] = None

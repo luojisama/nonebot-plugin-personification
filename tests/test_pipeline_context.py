@@ -86,3 +86,16 @@ def test_confidence_style_instruction_low_group() -> None:
     text = pipeline_context.build_confidence_style_instruction(0.35, is_group=True)
 
     assert "[NO_REPLY]" in text
+
+
+def test_agent_time_budget_uses_shared_absolute_deadline(monkeypatch) -> None:  # noqa: ANN001
+    monkeypatch.setattr(pipeline_context.time, "monotonic", lambda: 100.0)
+
+    budget = pipeline_context.compute_agent_time_budget(
+        started_at=95.0,
+        total_timeout_seconds=180.0,
+        reserve_seconds=30.0,
+        response_deadline=160.0,
+    )
+
+    assert budget == 30.0

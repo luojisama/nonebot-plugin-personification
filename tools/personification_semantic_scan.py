@@ -10,13 +10,13 @@ from typing import Iterable, Sequence
 
 
 DEFAULT_TARGETS = (
-    "nonebot_plugin_personification/agent/runtime/runner.py",
-    "nonebot_plugin_personification/core/chat_intent.py",
-    "nonebot_plugin_personification/core/evolves.py",
-    "nonebot_plugin_personification/core/target_inference.py",
-    "nonebot_plugin_personification/agent/runtime/planner.py",
-    "nonebot_plugin_personification/handlers/reply_pipeline/pipeline_emotion.py",
-    "nonebot_plugin_personification/handlers/yaml_pipeline/processor.py",
+    "plugin/personification/agent/runtime/runner.py",
+    "plugin/personification/core/chat_intent.py",
+    "plugin/personification/core/evolves.py",
+    "plugin/personification/core/target_inference.py",
+    "plugin/personification/agent/runtime/planner.py",
+    "plugin/personification/handlers/reply_pipeline/pipeline_emotion.py",
+    "plugin/personification/handlers/yaml_pipeline/processor.py",
 )
 
 _TEXT_NAME_RE = re.compile(

@@ -192,6 +192,15 @@ _COMMANDS: list[CommandHelpEntry] = [
         scope="global",
     ),
     CommandHelpEntry(
+        path=("withdraw",),
+        category="withdraw",
+        summary="撤回命令所在当前 QQ 会话里最近一次可安全撤回的 Bot 输出。",
+        usage="拟人 撤回",
+        examples=("拟人 撤回", "/persona withdraw"),
+        permission="管理员",
+        scope="当前群/私聊会话",
+    ),
+    CommandHelpEntry(
         path=("model", "list"),
         category="model",
         summary="查看当前模型路由、覆盖项和已配置模型。",

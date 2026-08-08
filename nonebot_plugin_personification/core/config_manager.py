@@ -15,6 +15,7 @@ from .paths import get_data_dir
 _ENV_CONFIG_INFO_ATTR = "_personification_env_config_info"
 _ASYNC_LOCKS: dict[str, asyncio.Lock] = {}
 _SYNC_LOCKS: dict[str, threading.RLock] = {}
+_DEPRECATED_MANAGED_PREFIXES = ("personification_qwen_web_",)
 
 
 def get_env_config_path(plugin_config: Any) -> Path:
@@ -95,6 +96,7 @@ def _new_load_info(path: Path) -> dict[str, Any]:
         "path": str(path),
         "applied_fields": [],
         "imported_fields": [],
+        "removed_fields": [],
         "skipped_fields": [],
         "errors": [],
         "loaded": False,
@@ -207,6 +209,13 @@ class ConfigManager:
                 payload = {}
 
         managed_fields = set(_managed_field_names())
+        removed_fields = sorted(
+            field_name
+            for field_name in payload
+            if any(field_name.startswith(prefix) for prefix in _DEPRECATED_MANAGED_PREFIXES)
+        )
+        for field_name in removed_fields:
+            payload.pop(field_name, None)
         imported_fields: list[str] = []
         for field_name in sorted(_collect_explicit_env_fields(self.plugin_config)):
             if field_name not in managed_fields or field_name in payload:
@@ -216,14 +225,14 @@ class ConfigManager:
             payload[field_name] = getattr(self.plugin_config, field_name, None)
             imported_fields.append(field_name)
 
-        if imported_fields:
+        if imported_fields or removed_fields:
             try:
                 _write_payload_atomic(self.path, payload)
             except Exception as exc:
-                info["errors"].append(f"bootstrap import save failed: {exc}")
+                info["errors"].append(f"managed config migration save failed: {exc}")
                 if self.logger is not None:
                     self.logger.warning(
-                        f"personification: import env fields to env.json failed path={self.path}: {exc}"
+                        f"personification: migrate env.json failed path={self.path}: {exc}"
                     )
 
         if not had_file and not imported_fields:
@@ -240,12 +249,18 @@ class ConfigManager:
                 continue
             info["applied_fields"].append(field_name)
         info["imported_fields"] = imported_fields
+        info["removed_fields"] = removed_fields
         info["loaded"] = True
         _set_env_config_info(self.plugin_config, info)
         if imported_fields and self.logger is not None:
             self.logger.info(
                 "personification: imported initial .env fields into env.json; fields="
                 + ", ".join(imported_fields)
+            )
+        if removed_fields and self.logger is not None:
+            self.logger.info(
+                "personification: removed deprecated managed config fields; fields="
+                + ", ".join(removed_fields)
             )
         if had_file and self.logger is not None:
             env_shadowed = sorted(set(info["applied_fields"]) & _collect_explicit_env_fields(self.plugin_config))

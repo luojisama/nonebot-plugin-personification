@@ -47,7 +47,11 @@ def normalize_isolation_config(
         mode = "inprocess" if trusted else "process"
 
     timeout = int(block.get("timeout", default_timeout) or default_timeout)
-    python_executable = str(block.get("python") or block.get("python_executable") or "").strip()
+    python_executable = (
+        str(block.get("python") or block.get("python_executable") or "").strip()
+        if trusted
+        else ""
+    )
     cwd = str(block.get("cwd") or "").strip()
     inherit_env = bool(block.get("inherit_env", trusted))
     env_raw = block.get("env")
@@ -119,8 +123,23 @@ async def run_skill_in_subprocess(
         inherit_env=inherit_env,
         extra_env=dict(isolation_cfg.get("env") or {}),
     )
+    allowed_root = (container_root if container_root is not None else skill_dir).resolve()
+    resolved_script = script_path.resolve()
+    resolved_skill_dir = skill_dir.resolve()
+
+    def _inside_allowed(path: Path) -> bool:
+        try:
+            return os.path.commonpath([str(allowed_root), str(path.resolve())]) == str(allowed_root)
+        except Exception:
+            return False
+
+    if not _inside_allowed(resolved_script) or not _inside_allowed(resolved_skill_dir):
+        raise ValueError("isolated skill path escapes approved root")
     cwd_raw = str(isolation_cfg.get("cwd") or "").strip()
-    cwd = str((skill_dir / cwd_raw).resolve()) if cwd_raw else str(skill_dir.resolve())
+    cwd_path = (skill_dir / cwd_raw).resolve() if cwd_raw else resolved_skill_dir
+    if not _inside_allowed(cwd_path):
+        raise ValueError("isolated skill cwd escapes approved root")
+    cwd = str(cwd_path)
 
     sys_paths: list[str] = []
     for path in [
@@ -131,7 +150,10 @@ async def run_skill_in_subprocess(
     ]:
         if path is None:
             continue
-        candidate = str(Path(path).resolve())
+        resolved_path = Path(path).resolve()
+        if not _inside_allowed(resolved_path):
+            raise ValueError("isolated skill python path escapes approved root")
+        candidate = str(resolved_path)
         if candidate not in sys_paths:
             sys_paths.append(candidate)
 

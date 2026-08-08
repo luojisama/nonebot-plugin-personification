@@ -6,6 +6,8 @@ from typing import Any, Callable, Dict, Optional, Union
 
 import yaml
 
+from .context_policy import ensure_prompt_injection_guard
+
 
 AGENT_GUIDANCE_TEMPLATE = """=== 轻量工具约束（对用户不可见）===
 
@@ -149,7 +151,14 @@ def _append_core_values(
 def _append_prompt_guidance(
     content: Union[str, Dict[str, Any], None], plugin_config: Any
 ) -> Union[str, Dict[str, Any], None]:
-    return _append_agent_guidance(_append_core_values(content, plugin_config), plugin_config)
+    guided = _append_agent_guidance(_append_core_values(content, plugin_config), plugin_config)
+    if isinstance(guided, str):
+        return ensure_prompt_injection_guard(guided)
+    if isinstance(guided, dict):
+        copied = dict(guided)
+        copied["system"] = ensure_prompt_injection_guard(copied.get("system", ""))
+        return copied
+    return guided
 
 
 def load_prompt(

@@ -22,7 +22,7 @@
 - `expected_frame`：当时记录的 TurnSemanticFrame / TurnPlan 关键字段（chat_intent / speech_act / ambiguity_level / recommend_silence / output_mode 等）
 - `metadata`：is_private / is_random_chat / is_direct_mention / has_images / message_target 等元数据
 - `reply_boundary`：期望回复边界，例如 `no_reply`、`concrete_participation`、`action_silence_after_send`、`ask_concrete_followup`
-- `quality_tags`：坏回复或质量风险标签，例如 `empty_agreement`、`echo_rephrase`、`observer_posture`、`transcript_summary`
+- `quality_tags`：坏回复或质量风险标签，例如 `empty_agreement`、`echo_rephrase`、`observer_posture`、`transcript_summary`、`empty_evidence_self_report`
 - `bad_reply_examples`：本场景不该出现的候选回复示例，记录 `label` / `text` / `why`；只用于回放评估和人工审查，不进入生产聊天语义
 
 ## 脱敏要求
@@ -55,6 +55,6 @@ python plugin/personification/scripts/replay_corpus.py --input plugin/personific
 - `sample_group_banter.jsonl` 群聊接梗场景示例（12 段）
 - `sample_private.jsonl` 私聊场景示例（4 段）
 - `sample_qzone.jsonl` QZone 评论链场景示例（3 段）
-- `bad_reply_quality.jsonl` 坏回复质量样例（8 段），覆盖附和、回声复述、转述聊天、旁白式观望、外发后废话、媒体过度讲解、不该插话和含糊延后
+- `bad_reply_quality.jsonl` 坏回复质量样例（13 段），覆盖附和、回声复述、转述聊天、旁白式观望、外发后废话、媒体过度讲解、不该插话、含糊延后、视觉社会关系误判，以及空证据状态播报
 
-目标：补到 ≥100 段（群聊 70 + 私聊 20 + QZone 10）。当前 27 段为冷启动样本。
+目标：补到 ≥100 段（群聊 70 + 私聊 20 + QZone 10）。当前 32 段为冷启动样本。

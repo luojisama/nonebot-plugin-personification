@@ -24,6 +24,7 @@ _REQUIRED_BAD_REPLY_TAGS = {
     "media_overexplaining",
     "wrong_topic_interjection",
     "vague_deferred_lookup",
+    "empty_evidence_self_report",
 }
 
 
@@ -32,10 +33,7 @@ def _load_planner():
 
 
 def _load_replay_script():
-    repo_root = Path(__file__).resolve().parent.parent
-    package_root = repo_root / "nonebot_plugin_personification"
-    script_root = package_root if package_root.exists() else repo_root
-    script_path = script_root / "scripts" / "replay_corpus.py"
+    script_path = Path(__file__).resolve().parent.parent / "scripts" / "replay_corpus.py"
     spec = importlib.util.spec_from_file_location("personification_replay_corpus_script", script_path)
     if spec is None or spec.loader is None:
         raise ImportError(f"cannot load replay_corpus script from {script_path}")

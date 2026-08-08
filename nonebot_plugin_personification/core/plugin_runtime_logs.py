@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import json
-import re
+import queue
+import threading
 import time
 from typing import Any
 
 from .db import connect_sync
+from .sensitive_data import sanitize_object, sanitize_text
 
 
 _LEVEL_ORDER = {
@@ -22,12 +24,18 @@ _LEVEL_ORDER = {
 _DEFAULT_RETENTION_DAYS = 7
 _DEFAULT_MAX_ENTRIES = 10000
 _LAST_PRUNE_AT = 0.0
+_WRITE_QUEUE_MAXSIZE = 4096
+_WRITE_BATCH_SIZE = 100
+_WRITE_QUEUE: queue.Queue[Any] = queue.Queue(maxsize=_WRITE_QUEUE_MAXSIZE)
+_WRITER_LOCK = threading.Lock()
+_DROP_LOCK = threading.Lock()
+_WRITER_THREAD: threading.Thread | None = None
+_DROPPED_ENTRIES = 0
 
-_SECRET_PATTERNS = (
-    re.compile(r"(?i)(api[_-]?key|authorization|cookie|token|csrf|refresh[_-]?token|access[_-]?token)(\s*[:=]\s*)([^\s,;\"']+)"),
-    re.compile(r"(?i)(bearer\s+)[a-z0-9._~+/=-]{12,}"),
-    re.compile(r"(?i)(sk-[a-z0-9_-]{8})[a-z0-9_-]+"),
-)
+
+class _FlushRequest:
+    def __init__(self) -> None:
+        self.done = threading.Event()
 
 
 def _level_value(level: Any) -> int:
@@ -42,44 +50,6 @@ def _normalize_level(level: Any) -> str:
     if text == "EXCEPTION":
         return "ERROR"
     return text if text in _LEVEL_ORDER else "INFO"
-
-
-def _limit_text(text: Any, limit: int = 4000) -> str:
-    value = str(text or "")
-    if len(value) <= limit:
-        return value
-    return value[: max(0, limit - 12)] + "...<truncated>"
-
-
-def sanitize_text(value: Any) -> str:
-    text = _limit_text(value)
-    for pattern in _SECRET_PATTERNS:
-        if pattern.pattern.lower().startswith("(?i)(bearer"):
-            text = pattern.sub(r"\1***", text)
-        elif "sk-" in pattern.pattern:
-            text = pattern.sub(r"\1***", text)
-        else:
-            text = pattern.sub(r"\1\2***", text)
-    return text
-
-
-def _sanitize_obj(value: Any, depth: int = 0) -> Any:
-    if depth > 3:
-        return "<nested>"
-    if isinstance(value, dict):
-        out: dict[str, Any] = {}
-        for key, item in list(value.items())[:40]:
-            key_text = str(key or "")[:80]
-            if re.search(r"(?i)(key|token|secret|cookie|authorization|csrf)", key_text):
-                out[key_text] = "***"
-            else:
-                out[key_text] = _sanitize_obj(item, depth + 1)
-        return out
-    if isinstance(value, (list, tuple)):
-        return [_sanitize_obj(item, depth + 1) for item in list(value)[:40]]
-    if isinstance(value, (int, float, bool)) or value is None:
-        return value
-    return sanitize_text(value)
 
 
 def _config_int(config: Any, name: str, default: int, *, minimum: int = 1) -> int:
@@ -111,38 +81,111 @@ def record(
     trace_id: str = "",
     min_level: str = "INFO",
 ) -> None:
+    global _DROPPED_ENTRIES
     if _level_value(level) < _level_value(min_level):
         return
     try:
-        payload = json.dumps(_sanitize_obj(context or {}), ensure_ascii=False, separators=(",", ":"))
-        with connect_sync() as conn:
-            conn.execute(
-                """
-                INSERT INTO plugin_runtime_logs(ts, level, source, message, context, trace_id)
-                VALUES (?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    time.time(),
-                    _normalize_level(level)[:16],
-                    sanitize_text(source)[:96],
-                    sanitize_text(message),
-                    payload[:4000],
-                    str(trace_id or "")[:64],
-                ),
-            )
-            conn.commit()
+        payload = json.dumps(sanitize_object(context or {}), ensure_ascii=False, separators=(",", ":"))
+        entry = (
+            time.time(),
+            _normalize_level(level)[:16],
+            sanitize_text(source)[:96],
+            sanitize_text(message),
+            payload[:4000],
+            sanitize_text(trace_id, limit=64),
+        )
+        _ensure_writer()
+        _WRITE_QUEUE.put_nowait(entry)
+    except queue.Full:
+        with _DROP_LOCK:
+            _DROPPED_ENTRIES += 1
     except Exception:
         return
 
 
-def query_recent(
+def _ensure_writer() -> None:
+    global _WRITER_THREAD
+    with _WRITER_LOCK:
+        if _WRITER_THREAD is not None and _WRITER_THREAD.is_alive():
+            return
+        _WRITER_THREAD = threading.Thread(
+            target=_writer_loop,
+            name="personification-log-writer",
+            daemon=True,
+        )
+        _WRITER_THREAD.start()
+
+
+def _writer_loop() -> None:
+    global _DROPPED_ENTRIES
+    while True:
+        first = _WRITE_QUEUE.get()
+        items = [first]
+        while len(items) < _WRITE_BATCH_SIZE:
+            try:
+                items.append(_WRITE_QUEUE.get_nowait())
+            except queue.Empty:
+                break
+
+        entries = [item for item in items if not isinstance(item, _FlushRequest)]
+        failed = 0
+        if entries:
+            try:
+                with connect_sync() as conn:
+                    conn.executemany(
+                        """
+                        INSERT INTO plugin_runtime_logs(ts, level, source, message, context, trace_id)
+                        VALUES (?, ?, ?, ?, ?, ?)
+                        """,
+                        entries,
+                    )
+                    conn.commit()
+            except Exception:
+                failed = len(entries)
+
+        if failed:
+            with _DROP_LOCK:
+                _DROPPED_ENTRIES += failed
+        for item in items:
+            _WRITE_QUEUE.task_done()
+            if isinstance(item, _FlushRequest):
+                item.done.set()
+
+
+def flush_pending(*, timeout: float = 3.0) -> bool:
+    _ensure_writer()
+    request = _FlushRequest()
+    try:
+        _WRITE_QUEUE.put(request, timeout=max(0.1, float(timeout)))
+    except queue.Full:
+        return False
+    return request.done.wait(timeout=max(0.1, float(timeout)))
+
+
+def writer_status() -> dict[str, Any]:
+    with _DROP_LOCK:
+        dropped = _DROPPED_ENTRIES
+    return {
+        "pending": _WRITE_QUEUE.qsize(),
+        "dropped": dropped,
+        "capacity": _WRITE_QUEUE_MAXSIZE,
+        "alive": bool(_WRITER_THREAD is not None and _WRITER_THREAD.is_alive()),
+    }
+
+
+def _escape_like(value: str) -> str:
+    return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
+def query_page(
     *,
     limit: int = 200,
     level: str = "",
     q: str = "",
     cursor: int = 0,
     trace_id: str = "",
-) -> list[dict[str, Any]]:
+) -> dict[str, Any]:
+    flush_pending()
     clauses = ["1=1"]
     params: list[Any] = []
     normalized_level = _normalize_level(level) if level else ""
@@ -152,17 +195,22 @@ def query_recent(
         placeholders = ",".join("?" for _ in allowed)
         clauses.append(f"level IN ({placeholders})")
         params.extend(allowed)
-    if q:
-        clauses.append("(message LIKE ? OR source LIKE ? OR trace_id LIKE ?)")
-        like = f"%{str(q)[:120]}%"
-        params.extend([like, like, like])
+    normalized_query = str(q or "").strip()[:120]
+    if normalized_query:
+        clauses.append(
+            "(message LIKE ? ESCAPE '\\' OR source LIKE ? ESCAPE '\\' "
+            "OR trace_id LIKE ? ESCAPE '\\' OR context LIKE ? ESCAPE '\\')"
+        )
+        like = f"%{_escape_like(normalized_query)}%"
+        params.extend([like, like, like, like])
     if trace_id:
         clauses.append("trace_id = ?")
         params.append(str(trace_id)[:64])
     if cursor > 0:
         clauses.append("id < ?")
         params.append(int(cursor))
-    params.append(max(1, min(int(limit or 200), 500)))
+    page_limit = max(1, min(int(limit or 200), 500))
+    params.append(page_limit + 1)
     with connect_sync() as conn:
         rows = conn.execute(
             f"""
@@ -174,8 +222,9 @@ def query_recent(
             """,
             tuple(params),
         ).fetchall()
+    has_more = len(rows) > page_limit
     out: list[dict[str, Any]] = []
-    for row in rows:
+    for row in rows[:page_limit]:
         try:
             context = json.loads(row["context"] or "{}")
         except Exception:
@@ -191,10 +240,32 @@ def query_recent(
                 "trace_id": str(row["trace_id"] or ""),
             }
         )
-    return out
+    return {
+        "entries": out,
+        "has_more": has_more,
+        "next_cursor": out[-1]["id"] if has_more and out else 0,
+        "limit": page_limit,
+        "filters": {
+            "level": normalized_level,
+            "q": normalized_query,
+            "trace_id": str(trace_id or "")[:64],
+        },
+    }
+
+
+def query_recent(
+    *,
+    limit: int = 200,
+    level: str = "",
+    q: str = "",
+    cursor: int = 0,
+    trace_id: str = "",
+) -> list[dict[str, Any]]:
+    return query_page(limit=limit, level=level, q=q, cursor=cursor, trace_id=trace_id)["entries"]
 
 
 def prune_old_entries(*, retention_days: int = _DEFAULT_RETENTION_DAYS, max_entries: int = _DEFAULT_MAX_ENTRIES) -> int:
+    flush_pending()
     cutoff = time.time() - max(1, int(retention_days or _DEFAULT_RETENTION_DAYS)) * 86400
     max_keep = max(100, int(max_entries or _DEFAULT_MAX_ENTRIES))
     deleted = 0
@@ -231,10 +302,39 @@ def maybe_prune(*, config: Any = None, force: bool = False) -> int:
 
 
 def clear_all() -> int:
+    flush_pending()
     with connect_sync() as conn:
         cursor = conn.execute("DELETE FROM plugin_runtime_logs")
         conn.commit()
     return int(cursor.rowcount or 0)
+
+
+def scrub_sensitive_entries() -> int:
+    flush_pending()
+    updated = 0
+    with connect_sync() as conn:
+        rows = conn.execute("SELECT id, source, message, context, trace_id FROM plugin_runtime_logs").fetchall()
+        for row in rows:
+            try:
+                context = json.loads(row["context"] or "{}")
+            except Exception:
+                context = {}
+            values = (
+                sanitize_text(row["source"], limit=96),
+                sanitize_text(row["message"]),
+                json.dumps(sanitize_object(context), ensure_ascii=False, separators=(",", ":"))[:4000],
+                sanitize_text(row["trace_id"], limit=64),
+            )
+            original = tuple(str(row[key] or "") for key in ("source", "message", "context", "trace_id"))
+            if values == original:
+                continue
+            conn.execute(
+                "UPDATE plugin_runtime_logs SET source=?, message=?, context=?, trace_id=? WHERE id=?",
+                (*values, int(row["id"])),
+            )
+            updated += 1
+        conn.commit()
+    return updated
 
 
 def _format_message(message: Any, args: tuple[Any, ...]) -> str:
@@ -335,12 +435,16 @@ def wrap_logger(logger: Any, *, config: Any = None, source: str = "personificati
 __all__ = [
     "PluginRuntimeLogger",
     "clear_all",
+    "flush_pending",
     "max_entries_from_config",
     "maybe_prune",
     "prune_old_entries",
+    "query_page",
     "query_recent",
     "record",
     "retention_days_from_config",
     "sanitize_text",
+    "scrub_sensitive_entries",
     "wrap_logger",
+    "writer_status",
 ]

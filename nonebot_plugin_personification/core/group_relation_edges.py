@@ -275,6 +275,7 @@ def summarize_relation_edges(
     trigger_user_id: str = "",
     bot_self_id: str = "",
     limit: int = 3,
+    excluded_user_ids: set[str] | None = None,
 ) -> str:
     if not str(group_id or "").strip():
         return ""
@@ -311,12 +312,19 @@ def summarize_relation_edges(
                 names[user_id] = nickname
 
     bot_id = _normalize_user_id(bot_self_id)
+    excluded = {
+        _normalize_user_id(value)
+        for value in set(excluded_user_ids or set())
+        if _normalize_user_id(value)
+    }
     strongest: list[tuple[float, str, str, str]] = []
     trigger_targets: dict[str, float] = {}
     for row in rows:
         src = _normalize_user_id(row["src_user_id"] if hasattr(row, "__getitem__") else "")
         dst = _normalize_user_id(row["dst_user_id"] if hasattr(row, "__getitem__") else "")
         if not src or not dst:
+            continue
+        if src in excluded or dst in excluded:
             continue
         if bot_id and (src == bot_id or dst == bot_id):
             continue

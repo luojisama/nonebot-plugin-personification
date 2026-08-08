@@ -85,13 +85,6 @@ def _mark_repeat_follow(group_id: str, text: str, *, now_ts: float | None = None
         _RECENT_REPEAT_FOLLOW[_repeat_follow_cache_key(group_id, text)] = float(now_ts or time.time())
 
 
-def _build_repeat_fallback_text(text: str) -> str:
-    plain = str(text or "").strip()
-    if len(plain) <= _REPEAT_MAX_CHARS:
-        return plain
-    return plain[:_REPEAT_MAX_CHARS].rstrip()
-
-
 def _looks_like_existing_repeat(reply_text: str, repeat_text: str) -> bool:
     lhs = _normalize_repeat_key(reply_text)
     rhs = _normalize_repeat_key(repeat_text)
@@ -146,8 +139,6 @@ async def maybe_follow_repeat_cluster(
             elif not _is_repeat_text_allowed(candidate):
                 candidate = ""
 
-    if not candidate:
-        candidate = _build_repeat_fallback_text(cluster_text)
     if not candidate:
         return original, False
 

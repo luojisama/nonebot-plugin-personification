@@ -137,6 +137,32 @@ def test_write_env_json_creates_and_merges(tmp_path: Path) -> None:
     assert data2["personification_agent_max_steps"] == 7
 
 
+def test_write_many_merges_all_fields_in_one_atomic_payload(tmp_path: Path, monkeypatch) -> None:  # noqa: ANN001
+    cfg = _make_plugin_config(tmp_path)
+    env_writer.write_env_json("personification_existing", "keep", cfg)
+    writes: list[dict] = []
+    original = env_writer._write_payload_atomic
+
+    def _capture(path, payload):  # noqa: ANN001, ANN202
+        writes.append(dict(payload))
+        return original(path, payload)
+
+    monkeypatch.setattr(env_writer, "_write_payload_atomic", _capture)
+    result = env_writer.write_many(
+        {
+            "personification_video_route_mode": "hybrid",
+            "personification_video_max_bytes": 320 * 1024 * 1024,
+        },
+        cfg,
+    )
+
+    assert result["errors"] == []
+    assert len(writes) == 1
+    assert writes[0]["personification_existing"] == "keep"
+    assert writes[0]["personification_video_route_mode"] == "hybrid"
+    assert writes[0]["personification_video_max_bytes"] == 320 * 1024 * 1024
+
+
 def test_write_both_keeps_env_file_read_only_when_key_exists(tmp_path: Path) -> None:
     # WebUI 保存只写 env.json；.env.prod 中已有同名字段也不再被改写。
     env_file = tmp_path / ".env.prod"

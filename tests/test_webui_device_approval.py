@@ -29,7 +29,7 @@ def _login(client, ctx, qq: str = "10001", label: str = "dev"):
     return res
 
 
-def test_first_device_auto_approved_then_new_device_pending(_runtime_context) -> None:
+def test_admin_code_approves_every_new_device_without_second_approval(_runtime_context) -> None:
     _runtime_context.plugin_config.personification_webui_require_device_approval = True
 
     # 首个设备：无任何已批准设备 → 自动批准（防锁死）
@@ -39,27 +39,13 @@ def test_first_device_auto_approved_then_new_device_pending(_runtime_context) ->
     assert r1.json().get("pending") is False
     assert c1.get("/personification/api/auth/me").status_code == 200
 
-    # 第二个设备：已存在已批准设备 → 待审批
+    # 第二个设备：管理员验证码通过后直接批准，不再等待旧设备二次确认
     c2 = _build_client(_runtime_context)
     r2 = _login(c2, _runtime_context, label="second")
     assert r2.status_code == 200
-    assert r2.json().get("pending") is True
-    # 待审批设备访问受保护接口被拒，detail 可识别
-    me2 = c2.get("/personification/api/auth/me")
-    assert me2.status_code == 403
-    assert me2.json().get("detail") == "DEVICE_PENDING"
-
-    # 已批准设备能看到待审批列表并批准
-    pend = c1.get("/personification/api/auth/pending-devices")
-    assert pend.status_code == 200
-    devices = pend.json()["devices"]
-    assert len(devices) == 1 and devices[0]["label"] == "second"
-    approve = c1.post(f"/personification/api/auth/devices/{devices[0]['id']}/approve")
-    assert approve.status_code == 200 and approve.json()["success"] is True
-
-    # 批准后第二个设备可正常访问
+    assert r2.json().get("pending") is False
     assert c2.get("/personification/api/auth/me").status_code == 200
-    # 待审批列表清空
+    # 新流程不产生待审批记录
     assert c1.get("/personification/api/auth/pending-devices").json()["devices"] == []
 
 

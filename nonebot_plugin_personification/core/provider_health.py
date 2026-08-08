@@ -35,7 +35,7 @@ def classify_error(exc: Exception | str) -> str:
     """把异常归类成有限的 kind 标签。"""
     if exc is None:
         return ""
-    text = str(exc).lower()
+    text = f"{type(exc).__name__} {exc}".lower()
     if "timeout" in text or "timed out" in text:
         return "timeout"
     if "connect" in text or "tls" in text:

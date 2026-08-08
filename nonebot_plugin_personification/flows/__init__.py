@@ -53,6 +53,7 @@ class FlowSetupDeps:
     get_whitelisted_groups: Any = None
     record_group_msg: Any = None
     build_grounding_context: Any = None
+    qq_outbound_ledger: Any = None
 
 
 def setup_flows(*, deps: FlowSetupDeps) -> Dict[str, Any]:
@@ -77,6 +78,7 @@ def setup_flows(*, deps: FlowSetupDeps) -> Dict[str, Any]:
         agent_max_steps=deps.agent_max_steps,
         agent_data_dir=deps.agent_data_dir,
         persona_store=deps.persona_store,
+        qq_outbound_ledger=deps.qq_outbound_ledger,
     )
     check_group_idle_topic = build_group_idle_checker(
         plugin_config=deps.plugin_config,
@@ -98,6 +100,7 @@ def setup_flows(*, deps: FlowSetupDeps) -> Dict[str, Any]:
         superusers=deps.superusers,
         get_user_data=deps.get_user_data,
         build_grounding_context=deps.build_grounding_context,
+        qq_outbound_ledger=deps.qq_outbound_ledger,
     )
     return {
         "check_proactive_messaging": check_proactive_messaging,

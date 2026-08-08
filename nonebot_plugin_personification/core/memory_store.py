@@ -4,11 +4,12 @@ import json
 import hashlib
 import sqlite3
 import struct
+import threading
 import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from .embedding_index import EMBED_MODEL_VERSION, cosine_similarity, embed_text, normalize_text, tokenize
 from .entity_index import extract_entities
@@ -30,6 +31,38 @@ SEARCH_STATS_RETENTION_DAYS = 30
 SEARCH_STATS_PRUNE_INTERVAL_SECONDS = 3600
 VECTOR_CHUNK_MODEL_VERSION = EMBED_MODEL_VERSION
 VECTOR_CHUNK_TEXT_LIMIT = 900
+
+_MAINTENANCE_LOCKS: dict[str, threading.RLock] = {}
+_MAINTENANCE_LOCKS_GUARD = threading.Lock()
+_PROFILE_GENERATIONS: dict[str, int] = {}
+
+
+class LocalProfileRevisionConflict(ValueError):
+    code = "stale_revision"
+
+    def __init__(self, *, expected_revision: int, current_revision: int) -> None:
+        self.expected_revision = expected_revision
+        self.current_revision = current_revision
+        super().__init__(
+            f"{self.code}: expected revision {expected_revision}, got {current_revision}"
+        )
+
+
+class ProfileGenerationConflict(ValueError):
+    code = "profile_generation_changed"
+
+    def __init__(self, *, expected_generation: int, current_generation: int) -> None:
+        self.expected_generation = expected_generation
+        self.current_generation = current_generation
+        super().__init__(
+            f"{self.code}: expected generation {expected_generation}, got {current_generation}"
+        )
+
+
+def _shared_maintenance_lock(root: Path) -> threading.RLock:
+    key = str(root.resolve())
+    with _MAINTENANCE_LOCKS_GUARD:
+        return _MAINTENANCE_LOCKS.setdefault(key, threading.RLock())
 
 
 def _plugin_data_dir(plugin_config: Any | None = None) -> Path:
@@ -152,6 +185,10 @@ class MemoryStore:
         self.shared_dir = self.grouped_memory_dir / "shared"
         self.memory_palace_dir = self.root_dir / "memory_palace"
         self.recycle_bin_dir = self.root_dir / "_legacy_recycle_bin"
+        self.maintenance_lock = _shared_maintenance_lock(self.root_dir)
+        self._profile_generation_key = str(self.root_dir.resolve())
+        with self.maintenance_lock:
+            _PROFILE_GENERATIONS.setdefault(self._profile_generation_key, 0)
         self._fts_available = False
         self._last_search_stats_prune_ts = 0.0
 
@@ -268,6 +305,22 @@ class MemoryStore:
         profile_text: str,
         profile_json: dict[str, Any] | None = None,
     ) -> None:
+        with self.maintenance_lock:
+            self._upsert_local_profile_unlocked(
+                group_id=group_id,
+                user_id=user_id,
+                profile_text=profile_text,
+                profile_json=profile_json,
+            )
+
+    def _upsert_local_profile_unlocked(
+        self,
+        *,
+        group_id: str,
+        user_id: str,
+        profile_text: str,
+        profile_json: dict[str, Any] | None = None,
+    ) -> None:
         group_dir = self.ensure_group_space(group_id)
         payload = json.dumps(profile_json or {}, ensure_ascii=False)
         with _connect(group_dir / "local_user_profiles.db") as conn:
@@ -284,12 +337,102 @@ class MemoryStore:
             )
             conn.commit()
 
+    def atomic_patch_local_profile(
+        self,
+        *,
+        group_id: str,
+        user_id: str,
+        patcher: Callable[[dict[str, Any]], dict[str, Any]],
+        profile_text: str | None = None,
+        expected_revision: int | None = None,
+        expected_generation: int | None = None,
+    ) -> dict[str, Any]:
+        """Atomically patch one group-local profile and advance its revision."""
+        gid = str(group_id or "").strip()
+        uid = str(user_id or "").strip()
+        if not gid:
+            raise ValueError("group_id is required")
+        if not uid:
+            raise ValueError("user_id is required")
+
+        with self.maintenance_lock:
+            self._check_profile_generation_unlocked(expected_generation)
+            group_dir = self.ensure_group_space(gid)
+            with _connect(group_dir / "local_user_profiles.db") as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                row = conn.execute(
+                    "SELECT profile_text, profile_json FROM profiles WHERE user_id=?",
+                    (uid,),
+                ).fetchone()
+                current_json = _json_loads(row["profile_json"] if row else "{}", {})
+                if not isinstance(current_json, dict):
+                    current_json = {}
+                try:
+                    current_revision = max(0, int(current_json.get("revision", 0) or 0))
+                except (TypeError, ValueError):
+                    current_revision = 0
+                if expected_revision is not None:
+                    try:
+                        normalized_expected_revision = int(expected_revision)
+                    except (TypeError, ValueError):
+                        conn.rollback()
+                        raise ValueError("expected_revision must be an integer") from None
+                    if normalized_expected_revision != current_revision:
+                        conn.rollback()
+                        raise LocalProfileRevisionConflict(
+                            expected_revision=normalized_expected_revision,
+                            current_revision=current_revision,
+                        )
+
+                patch_input = dict(current_json)
+                patch_input["revision"] = current_revision
+                patched_json = patcher(patch_input)
+                if not isinstance(patched_json, dict):
+                    conn.rollback()
+                    raise TypeError("profile patcher must return a dict")
+                patched_json = dict(patched_json)
+                patched_json["revision"] = current_revision + 1
+                next_text = (
+                    str(profile_text)
+                    if profile_text is not None
+                    else str(row["profile_text"] or "") if row else ""
+                )
+                updated_at = time.time()
+                conn.execute(
+                    """
+                    INSERT INTO profiles(user_id, profile_text, profile_json, updated_at)
+                    VALUES (?, ?, ?, ?)
+                    ON CONFLICT(user_id) DO UPDATE SET
+                        profile_text=excluded.profile_text,
+                        profile_json=excluded.profile_json,
+                        updated_at=excluded.updated_at
+                    """,
+                    (
+                        uid,
+                        next_text,
+                        json.dumps(patched_json, ensure_ascii=False),
+                        updated_at,
+                    ),
+                )
+                conn.commit()
+        return {
+            "profile_text": next_text,
+            "profile_json": patched_json,
+            "updated_at": updated_at,
+        }
+
     def get_local_profile(self, *, group_id: str, user_id: str) -> dict[str, Any] | None:
-        group_dir = self.ensure_group_space(group_id)
-        with _connect(group_dir / "local_user_profiles.db") as conn:
+        gid = str(group_id or "").strip()
+        uid = str(user_id or "").strip()
+        if not gid or not uid:
+            return None
+        path = self.groups_dir / gid / "local_user_profiles.db"
+        if not path.is_file():
+            return None
+        with _connect(path) as conn:
             row = conn.execute(
                 "SELECT profile_text, profile_json, updated_at FROM profiles WHERE user_id=?",
-                (str(user_id or ""),),
+                (uid,),
             ).fetchone()
         if not row:
             return None
@@ -303,6 +446,24 @@ class MemoryStore:
             "updated_at": float(row["updated_at"] or 0),
         }
 
+    def delete_local_profile(self, *, group_id: str, user_id: str) -> bool:
+        gid = str(group_id or "").strip()
+        uid = str(user_id or "").strip()
+        if not gid:
+            raise ValueError("group_id is required")
+        if not uid:
+            raise ValueError("user_id is required")
+        with self.maintenance_lock:
+            self._advance_profile_generation_unlocked()
+            path = self.groups_dir / gid / "local_user_profiles.db"
+            if not path.is_file():
+                return False
+            with _connect(path) as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                cursor = conn.execute("DELETE FROM profiles WHERE user_id=?", (uid,))
+                conn.commit()
+        return cursor.rowcount > 0
+
     def upsert_core_profile(
         self,
         *,
@@ -311,21 +472,86 @@ class MemoryStore:
         profile_json: dict[str, Any] | None = None,
         source: str = "persona_service",
     ) -> None:
-        payload = json.dumps(profile_json or {}, ensure_ascii=False)
-        with _connect(self.shared_dir / "core_user_profiles.db") as conn:
-            conn.execute(
-                """
-                INSERT INTO profiles(user_id, profile_text, profile_json, source, updated_at)
-                VALUES (?, ?, ?, ?, ?)
-                ON CONFLICT(user_id) DO UPDATE SET
-                    profile_text=excluded.profile_text,
-                    profile_json=excluded.profile_json,
-                    source=excluded.source,
-                    updated_at=excluded.updated_at
-                """,
-                (str(user_id or ""), str(profile_text or ""), payload, str(source or ""), time.time()),
-            )
-            conn.commit()
+        with self.maintenance_lock:
+            payload = json.dumps(profile_json or {}, ensure_ascii=False)
+            with _connect(self.shared_dir / "core_user_profiles.db") as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                conn.execute(
+                    """
+                    INSERT INTO profiles(user_id, profile_text, profile_json, source, updated_at)
+                    VALUES (?, ?, ?, ?, ?)
+                    ON CONFLICT(user_id) DO UPDATE SET
+                        profile_text=excluded.profile_text,
+                        profile_json=excluded.profile_json,
+                        source=excluded.source,
+                        updated_at=excluded.updated_at
+                    """,
+                    (str(user_id or ""), str(profile_text or ""), payload, str(source or ""), time.time()),
+                )
+                conn.commit()
+
+    def atomic_patch_core_profile(
+        self,
+        *,
+        user_id: str,
+        patcher: Callable[[dict[str, Any]], dict[str, Any]],
+        profile_text: str | None = None,
+        source: str = "",
+        source_if_missing: str = "profile_patch",
+        expected_generation: int | None = None,
+    ) -> dict[str, Any]:
+        """Patch one core profile without overwriting concurrent JSON fields."""
+        uid = str(user_id or "").strip()
+        if not uid:
+            raise ValueError("user_id is required")
+        with self.maintenance_lock:
+            self._check_profile_generation_unlocked(expected_generation)
+            with _connect(self.shared_dir / "core_user_profiles.db") as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                row = conn.execute(
+                    "SELECT profile_text, profile_json, source FROM profiles WHERE user_id=?",
+                    (uid,),
+                ).fetchone()
+                current_json = _json_loads(row["profile_json"] if row else "{}", {})
+                if not isinstance(current_json, dict):
+                    current_json = {}
+                patched_json = patcher(dict(current_json))
+                if not isinstance(patched_json, dict):
+                    conn.rollback()
+                    raise TypeError("profile patcher must return a dict")
+                next_text = str(profile_text) if profile_text is not None else str(row["profile_text"] or "") if row else ""
+                existing_source = str(row["source"] or "") if row else ""
+                next_source = (
+                    str(source or "").strip()
+                    or existing_source
+                    or str(source_if_missing or "profile_patch")
+                )
+                updated_at = time.time()
+                conn.execute(
+                    """
+                    INSERT INTO profiles(user_id, profile_text, profile_json, source, updated_at)
+                    VALUES (?, ?, ?, ?, ?)
+                    ON CONFLICT(user_id) DO UPDATE SET
+                        profile_text=excluded.profile_text,
+                        profile_json=excluded.profile_json,
+                        source=excluded.source,
+                        updated_at=excluded.updated_at
+                    """,
+                    (
+                        uid,
+                        next_text,
+                        json.dumps(patched_json, ensure_ascii=False),
+                        next_source,
+                        updated_at,
+                    ),
+                )
+                conn.commit()
+        return {
+            "profile_text": next_text,
+            "profile_json": patched_json,
+            "source": next_source,
+            "updated_at": updated_at,
+        }
 
     def get_core_profile(self, user_id: str) -> dict[str, Any] | None:
         with _connect(self.shared_dir / "core_user_profiles.db") as conn:
@@ -345,6 +571,21 @@ class MemoryStore:
             "source": str(row["source"] or ""),
             "updated_at": float(row["updated_at"] or 0),
         }
+
+    def delete_core_profile(self, user_id: str) -> bool:
+        uid = str(user_id or "").strip()
+        if not uid:
+            raise ValueError("user_id is required")
+        path = self.shared_dir / "core_user_profiles.db"
+        with self.maintenance_lock:
+            self._advance_profile_generation_unlocked()
+            if not path.is_file():
+                return False
+            with _connect(path) as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                cursor = conn.execute("DELETE FROM profiles WHERE user_id=?", (uid,))
+                conn.commit()
+        return cursor.rowcount > 0
 
     def list_groups(self) -> list[str]:
         """枚举 groups_dir 下所有已建立空间的 group_id。"""
@@ -412,7 +653,116 @@ class MemoryStore:
             )
         return out
 
+    def clear_all_profiles(self) -> dict[str, int]:
+        counts = {"core_profiles": 0, "local_profiles": 0}
+        with self.maintenance_lock:
+            self._advance_profile_generation_unlocked()
+            core_path = self.shared_dir / "core_user_profiles.db"
+            if core_path.is_file():
+                with _connect(core_path) as conn:
+                    conn.execute("BEGIN IMMEDIATE")
+                    cursor = conn.execute("DELETE FROM profiles")
+                    counts["core_profiles"] = max(0, cursor.rowcount)
+                    conn.commit()
+
+            for group_id in self.list_groups():
+                local_path = self.groups_dir / group_id / "local_user_profiles.db"
+                if not local_path.is_file():
+                    continue
+                with _connect(local_path) as conn:
+                    conn.execute("BEGIN IMMEDIATE")
+                    cursor = conn.execute("DELETE FROM profiles")
+                    counts["local_profiles"] += max(0, cursor.rowcount)
+                    conn.commit()
+        return counts
+
+    def purge_user_profile_data(self, user_id: str) -> dict[str, int]:
+        """Irreversibly remove one user's profiles and memory-palace items.
+
+        The shared maintenance lock and generation fence ensure an in-flight scoped
+        profile write cannot resurrect data after this operation completes.
+        """
+
+        uid = str(user_id or "").strip()
+        if not uid:
+            raise ValueError("user_id is required")
+        counts = {
+            "core_profiles": 0,
+            "local_profiles": 0,
+            "memory_items": 0,
+        }
+        with self.maintenance_lock:
+            self._advance_profile_generation_unlocked()
+            core_path = self.shared_dir / "core_user_profiles.db"
+            if core_path.is_file():
+                with _connect(core_path) as conn:
+                    conn.execute("BEGIN IMMEDIATE")
+                    cursor = conn.execute("DELETE FROM profiles WHERE user_id=?", (uid,))
+                    counts["core_profiles"] = max(0, int(cursor.rowcount or 0))
+                    conn.commit()
+
+            for group_id in self.list_groups():
+                local_path = self.groups_dir / group_id / "local_user_profiles.db"
+                if not local_path.is_file():
+                    continue
+                with _connect(local_path) as conn:
+                    conn.execute("BEGIN IMMEDIATE")
+                    cursor = conn.execute("DELETE FROM profiles WHERE user_id=?", (uid,))
+                    counts["local_profiles"] += max(0, int(cursor.rowcount or 0))
+                    conn.commit()
+
+            palace_path = self.memory_palace_dir / "memory_palace.db"
+            if palace_path.is_file():
+                with _connect(palace_path) as conn:
+                    conn.execute("BEGIN IMMEDIATE")
+                    rows = conn.execute(
+                        "SELECT memory_id FROM memory_items WHERE user_id=?",
+                        (uid,),
+                    ).fetchall()
+                    memory_ids = [str(row["memory_id"] or "") for row in rows]
+                    for memory_id in memory_ids:
+                        conn.execute(
+                            "DELETE FROM memory_relations WHERE source_memory_id=? OR target_ref=?",
+                            (memory_id, memory_id),
+                        )
+                        conn.execute("DELETE FROM memory_entities WHERE memory_id=?", (memory_id,))
+                        conn.execute("DELETE FROM memory_embeddings WHERE memory_id=?", (memory_id,))
+                        conn.execute("DELETE FROM memory_vector_chunks WHERE memory_id=?", (memory_id,))
+                        if self._fts_available:
+                            conn.execute("DELETE FROM memory_fts WHERE memory_id=?", (memory_id,))
+                    cursor = conn.execute("DELETE FROM memory_items WHERE user_id=?", (uid,))
+                    counts["memory_items"] = max(0, int(cursor.rowcount or 0))
+                    conn.commit()
+        return counts
+
+    def get_profile_generation(self) -> int:
+        with self.maintenance_lock:
+            return _PROFILE_GENERATIONS.get(self._profile_generation_key, 0)
+
+    def advance_profile_generation(self) -> int:
+        with self.maintenance_lock:
+            return self._advance_profile_generation_unlocked()
+
+    def _advance_profile_generation_unlocked(self) -> int:
+        next_generation = _PROFILE_GENERATIONS.get(self._profile_generation_key, 0) + 1
+        _PROFILE_GENERATIONS[self._profile_generation_key] = next_generation
+        return next_generation
+
+    def _check_profile_generation_unlocked(self, expected_generation: int | None) -> None:
+        if expected_generation is None:
+            return
+        current_generation = _PROFILE_GENERATIONS.get(self._profile_generation_key, 0)
+        if int(expected_generation) != current_generation:
+            raise ProfileGenerationConflict(
+                expected_generation=int(expected_generation),
+                current_generation=current_generation,
+            )
+
     def write_memory_item(self, item: dict[str, Any]) -> str:
+        with self.maintenance_lock:
+            return self._write_memory_item_unlocked(item)
+
+    def _write_memory_item_unlocked(self, item: dict[str, Any]) -> str:
         payload = self._normalize_memory_item(item)
         memory_id = str(payload["memory_id"])
         searchable_text = self._build_searchable_text(payload)
@@ -1441,6 +1791,16 @@ class MemoryStore:
         group_id: str,
         user_id: str,
     ) -> bool:
+        # Expiration is a storage-level visibility rule, not merely a ranking
+        # penalty.  This keeps stale social summaries out of both hybrid and
+        # fallback recall paths while leaving explicit permission handling below
+        # unchanged for private/direct memory tools.
+        try:
+            expires_at = float(payload.get("expires_at", 0) or 0)
+        except (TypeError, ValueError):
+            expires_at = 0.0
+        if expires_at > 0 and expires_at <= time.time():
+            return False
         requested_group_id = str(group_id or "")
         requested_user_id = str(user_id or "")
         payload_group_id = str(payload.get("group_id") or "")

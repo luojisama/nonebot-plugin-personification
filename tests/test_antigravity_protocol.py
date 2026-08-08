@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import os
 import pathlib
@@ -15,6 +16,7 @@ import pytest
 impl = load_personification_module(
     "plugin.personification.skills.skillpacks.tool_caller.scripts.impl"
 )
+llm_context = load_personification_module("plugin.personification.core.llm_context")
 
 
 @pytest.fixture(autouse=True)
@@ -74,6 +76,121 @@ def test_model_candidates_unknown_user_model_keeps_first_with_fallback() -> None
     cs = impl._antigravity_cli_model_candidates("some-future-model-x")
     assert cs[0] == "some-future-model-x"
     assert "gemini-3.5-flash-low" in cs
+
+
+def test_single_attempt_reuses_model_selected_by_normal_probe(monkeypatch) -> None:  # noqa: ANN001
+    caller = impl.AntigravityCliToolCaller(
+        model="auto-gemini-3",
+        auth_path="",
+        project="fake-project-id",
+        thinking_mode="none",
+        timeout=30.0,
+    )
+    requested_models: list[str] = []
+
+    class _Client:
+        async def post(self, url, *, json, headers):  # noqa: ANN001, ANN202
+            requested_models.append(json["model"])
+            request = impl.httpx.Request("POST", url)
+            if json["model"] == "gemini-3.5-flash-low":
+                return impl.httpx.Response(404, request=request, text="not found")
+            return impl.httpx.Response(
+                200,
+                request=request,
+                text='data: {"response":{"candidates":[{"content":{"parts":[{"text":"ok"}]}}]}}\n\n',
+            )
+
+    async def _get_access_token(*, force_refresh=False):  # noqa: ANN001
+        return "fake-token", pathlib.Path("/tmp/fake_auth.json")
+
+    async def _get_client(*_args, **_kwargs):  # noqa: ANN001, ANN202
+        return _Client()
+
+    monkeypatch.setattr(caller, "_get_access_token", _get_access_token)
+    monkeypatch.setattr(impl, "_get_pooled_http_client", _get_client)
+
+    probe = asyncio.run(caller.chat_with_tools([{"role": "user", "content": "hi"}], [], False))
+    assert probe.model_used == "gemini-3-flash-agent"
+    assert requested_models == ["gemini-3.5-flash-low", "gemini-3-flash-agent"]
+
+    requested_models.clear()
+    token = llm_context.set_llm_context(
+        purpose="qzone_generation",
+        retry_policy=llm_context.LLM_RETRY_POLICY_SINGLE_ATTEMPT,
+    )
+    try:
+        qzone = asyncio.run(caller.chat_with_tools([{"role": "user", "content": "hi"}], [], False))
+    finally:
+        llm_context.reset_llm_context(token)
+
+    assert qzone.model_used == "gemini-3-flash-agent"
+    assert requested_models == ["gemini-3-flash-agent"]
+
+
+def test_single_attempt_rotates_404_candidate_without_probe_state(monkeypatch) -> None:  # noqa: ANN001
+    caller = impl.AntigravityCliToolCaller(
+        model="auto-gemini-3",
+        auth_path="",
+        project="fake-project-id",
+        thinking_mode="none",
+        timeout=30.0,
+    )
+    requested_models: list[str] = []
+
+    class _Client:
+        async def post(self, url, *, json, headers):  # noqa: ANN001, ANN202
+            requested_models.append(json["model"])
+            request = impl.httpx.Request("POST", url)
+            if json["model"] == "gemini-3.5-flash-low":
+                return impl.httpx.Response(404, request=request, text="not found")
+            return impl.httpx.Response(
+                200,
+                request=request,
+                text='data: {"response":{"candidates":[{"content":{"parts":[{"text":"ok"}]}}]}}\n\n',
+            )
+
+    async def _get_access_token(*, force_refresh=False):  # noqa: ANN001
+        return "fake-token", pathlib.Path("/tmp/fake_auth.json")
+
+    async def _get_client(*_args, **_kwargs):  # noqa: ANN001, ANN202
+        return _Client()
+
+    monkeypatch.setattr(caller, "_get_access_token", _get_access_token)
+    monkeypatch.setattr(impl, "_get_pooled_http_client", _get_client)
+    probe_token = llm_context.set_llm_context(
+        purpose="qzone_provider_probe",
+        retry_policy=llm_context.LLM_RETRY_POLICY_SINGLE_ATTEMPT,
+    )
+    try:
+        with pytest.raises(impl.httpx.HTTPStatusError):
+            asyncio.run(caller.chat_with_tools([{"role": "user", "content": "hi"}], [], False))
+    finally:
+        llm_context.reset_llm_context(probe_token)
+    assert getattr(caller, "_preferred_concrete_model", "") == ""
+    assert requested_models == ["gemini-3.5-flash-low"]
+
+    token = llm_context.set_llm_context(
+        purpose="qzone_generation",
+        retry_policy=llm_context.LLM_RETRY_POLICY_SINGLE_ATTEMPT,
+    )
+    try:
+        with pytest.raises(impl.httpx.HTTPStatusError) as caught:
+            asyncio.run(caller.chat_with_tools([{"role": "user", "content": "hi"}], [], False))
+        assert getattr(caught.value, "code", "") == "provider_model_candidate_unavailable"
+        assert getattr(caught.value, "concrete_model", "") == "gemini-3.5-flash-low"
+        assert getattr(caught.value, "next_model", "") == "gemini-3-flash-agent"
+        assert requested_models == ["gemini-3.5-flash-low", "gemini-3.5-flash-low"]
+
+        result = asyncio.run(caller.chat_with_tools([{"role": "user", "content": "hi"}], [], False))
+    finally:
+        llm_context.reset_llm_context(token)
+
+    assert result.model_used == "gemini-3-flash-agent"
+    assert requested_models == [
+        "gemini-3.5-flash-low",
+        "gemini-3.5-flash-low",
+        "gemini-3-flash-agent",
+    ]
 
 
 # ====== 协议端到端测试（mock httpx） ======
@@ -308,7 +425,26 @@ def test_read_keyring_token_returns_none_when_missing() -> None:
             sys.modules["keyring"] = saved
 
 
-def test_sync_keyring_writes_file_with_full_scope(tmp_path_root: Any = None) -> None:
+def test_antigravity_gemini_parts_accept_video_and_audio_files(tmp_path) -> None:  # noqa: ANN001
+    video = tmp_path / "clip.mp4"
+    audio = tmp_path / "voice.wav"
+    video.write_bytes(b"video-bytes")
+    audio.write_bytes(b"audio-bytes")
+
+    video_part = impl._gemini_part_from_dict(
+        {"type": "video_file", "video_file": {"path": str(video)}}
+    )
+    audio_part = impl._gemini_part_from_dict(
+        {"type": "audio_file", "audio_file": {"path": str(audio)}}
+    )
+
+    assert video_part["inlineData"]["mimeType"] == "video/mp4"
+    assert base64.b64decode(video_part["inlineData"]["data"]) == b"video-bytes"
+    assert audio_part["inlineData"]["mimeType"] in {"audio/x-wav", "audio/wav"}
+    assert base64.b64decode(audio_part["inlineData"]["data"]) == b"audio-bytes"
+
+
+def test_keyring_credentials_are_used_in_memory_without_plaintext_copy(tmp_path_root: Any = None) -> None:
     raw_json = json.dumps({
         "token": {
             "access_token": "ya29.fake-AT",
@@ -328,15 +464,11 @@ def test_sync_keyring_writes_file_with_full_scope(tmp_path_root: Any = None) -> 
     saved_home = impl._Path.home
     impl._Path.home = staticmethod(lambda: tmp_home)
     try:
-        target = impl._sync_antigravity_keyring_to_file()
-        assert target is not None
-        assert target.exists()
-        d = json.loads(target.read_text(encoding="utf-8"))
-        assert d["access_token"] == "ya29.fake-AT"
-        assert d["refresh_token"] == "1//rf"
-        assert "cclog" in d["scope"]
-        assert "experimentsandconfigs" in d["scope"]
-        assert d["expiry_date"] > 0
+        caller = impl.AntigravityCliToolCaller(model="gemini-test")
+        token, project_hint = asyncio.run(caller._get_access_token())
+        assert token == "ya29.fake-AT"
+        assert project_hint.name == "settings.json"
+        assert not (tmp_home / ".gemini" / "antigravity-cli" / "oauth_creds.json").exists()
     finally:
         if saved_kr is None:
             sys.modules.pop("keyring", None)

@@ -12,19 +12,35 @@ from ...agent.loop import run_agent
 from ...agent.query_rewriter import QueryRewriteContext
 from ...agent.tool_registry import ToolRegistry
 
-from ...core.context_policy import build_prompt_injection_guard
+from ...core.context_policy import ensure_prompt_injection_guard
+from ...core.current_group_context_tool import register_current_group_context_tool
 from ...core.error_utils import log_exception
 from ...core.image_input import provider_supports_vision
+from ...core.image_result_cache import image_fingerprint
 from ...core.memory_defaults import DEFAULT_PRIVATE_HISTORY_TURNS, MAX_PRIVATE_HISTORY_TURNS
+from ...core.memory_recall_gate import gate_memory_candidates
 from ...core.message_parts import build_user_message_content
 from ...core.message_relations import build_event_relation_metadata
 from ...core.persona_profile import load_persona_profile, render_persona_snapshot
 from ...core.prompt_loader import pick_ack_phrase
-from ...core.qq_expression_tools import qq_action_history_text, register_send_qq_expression_tools
+from ...core.qq_outbound import QQOutboundLedger, SendReceipt, build_outbound_context
+from ...core.qq_recall import register_qq_recall_tool
+from ...core.qq_expression_tools import register_send_qq_expression_tools
 from ...core.gemini_profile import build_gemini_route_policy_prompt
+from ...core.group_member_avatar_insight import register_group_member_avatar_insight_tool
 from ...core.reply_text_policy import normalize_visible_reply_text
 from ...core.reply_style_policy import build_reply_style_policy_prompt
+from ...core.visible_output import guard_visible_text
+from ..reply_commit import (
+    acquire_reply_commit,
+    mark_reply_phase,
+    mark_reply_delivery_confirmed,
+    mark_reply_delivery_started,
+    release_reply_commit,
+)
 from ...core.visual_capabilities import VISUAL_ROUTE_REPLY_PLAIN
+from ...core.user_avatar_insight import register_current_user_avatar_tool
+from ...core.user_avatar_pair_insight import register_group_user_avatar_pair_insight_tool
 from ...skill_runtime.runtime_api import SkillRuntime
 from ...skills.skillpacks.friend_request_tool.scripts.main import build_friend_request_tool_for_runtime
 from ...skills.skillpacks.group_info_tool.scripts.main import build_group_info_tool_for_runtime
@@ -40,9 +56,58 @@ _DEFAULT_RESPONSE_TIMEOUT_SECONDS = 180.0
 _AGENT_TIME_BUDGET_RESERVE_SECONDS = 30.0
 
 
+def build_reply_operation_id(*, bot: Any, event: Any, reply_trace_id: str = "") -> str:
+    trace_id = str(reply_trace_id or "").strip()
+    if trace_id:
+        return trace_id
+    bot_id = str(getattr(bot, "self_id", "") or getattr(event, "self_id", "") or "").strip()
+    message_id = str(getattr(event, "message_id", "") or "").strip()
+    event_identity = message_id or f"event-{id(event)}"
+    return f"qq-reply:{bot_id}:{event_identity}"
+
+
+async def dispatch_reply_part(
+    *,
+    bot: Any,
+    event: Any,
+    payload: Any,
+    ledger: QQOutboundLedger | None,
+    surface: str,
+    reply_trace_id: str = "",
+) -> Any:
+    if ledger is None:
+        return await bot.send(event, payload)
+    context = build_outbound_context(
+        bot=bot,
+        event=event,
+        surface=surface,
+        operation_id=build_reply_operation_id(
+            bot=bot,
+            event=event,
+            reply_trace_id=reply_trace_id,
+        ),
+        user_target=str(getattr(event, "user_id", "") or ""),
+    )
+    return await ledger.dispatch(
+        context,
+        payload,
+        lambda: bot.send(event, payload),
+    )
+
+
+def guard_reply_ack_text(text: Any, *, fallback: str, logger: Any) -> str:
+    return guard_visible_text(
+        str(text or "").strip() or fallback,
+        logger=logger,
+        surface="reply_ack",
+        allow_direct_media=False,
+        allow_control=False,
+    )
+
+
 @dataclass(frozen=True)
 class IncomingImageClassification:
-    kind: str = "sticker"
+    kind: str = "unknown"
     confidence: float = 0.0
     reason: str = ""
     source: str = "fallback"
@@ -53,7 +118,11 @@ class IncomingImageClassification:
 
     @property
     def text_label(self) -> str:
-        return "[图片·表情包]" if self.is_sticker_like else "[图片·照片]"
+        if self.kind == "photo":
+            return "[图片·照片]"
+        if self.kind == "sticker":
+            return "[图片·表情包]"
+        return "[图片]"
 
 
 def _parse_image_classifier_payload(raw: Any) -> IncomingImageClassification | None:
@@ -156,15 +225,42 @@ async def _recall_agent_candidate_memories(
     user_id = str(getattr(event, "user_id", "") or "").strip()
     mode = "deep" if memory_need == "deep" else "auto"
     try:
-        return await asyncio.to_thread(
+        candidates = await asyncio.to_thread(
             memory_store.recall_memories,
             query=query,
             scope="auto",
             user_id=user_id,
             group_id=group_id,
-            limit=12,
+            # Broad candidate pool; the second-stage gate below owns the
+            # automatic-context limit and never exposes all candidates.
+            limit=24,
             mode=mode,
             context_type="group" if group_id else "private",
+        )
+        caller = getattr(runtime, "lite_tool_caller", None) or getattr(runtime, "agent_tool_caller", None)
+        max_inject = max(
+            0,
+            min(3, int(getattr(runtime.plugin_config, "personification_social_memory_auto_inject_top_k", 3) or 3)),
+        )
+        minimum_score = max(
+            0.0,
+            min(1.0, float(getattr(runtime.plugin_config, "personification_social_memory_auto_min_score", 0.72) or 0.72)),
+        )
+        gate_timeout = max(
+            0.2,
+            min(10.0, float(getattr(runtime.plugin_config, "personification_social_memory_semantic_gate_timeout", 1.5) or 1.5)),
+        )
+        return await gate_memory_candidates(
+            candidates=candidates,
+            query=query,
+            turn_plan=turn_plan,
+            tool_caller=caller,
+            maximum=max_inject,
+            minimum_score=minimum_score,
+            timeout_seconds=gate_timeout,
+            on_diagnostic=lambda code, detail: runtime.logger.debug(
+                f"[memory] {code} {detail}"
+            ),
         )
     except Exception as exc:
         runtime.logger.debug(f"[agent] evidence memory recall failed: {exc}")
@@ -269,21 +365,17 @@ async def classify_incoming_image(
             reason="gif_short_circuit",
             source="rule",
         )
-    if image_width == 0 and image_height == 0:
-        return IncomingImageClassification(
-            kind="sticker",
-            confidence=1.0,
-            reason="missing_size_short_circuit",
-            source="rule",
-        )
-
-    cache_key = str(file_id or "").strip() or f"{image_width}x{image_height}"
+    normalized_file_id = str(file_id or "").strip()
+    ref_fingerprint = image_fingerprint(str(image_url or "")) if str(image_url or "").strip() else ""
+    cache_key = f"file:{normalized_file_id}" if normalized_file_id else (
+        f"ref:{ref_fingerprint}" if ref_fingerprint else ""
+    )
     cached = _get_cached_image_classification(cache_key)
     if cached is not None:
         return cached
 
     conservative_fallback = IncomingImageClassification(
-        kind="sticker",
+        kind="unknown",
         confidence=0.0,
         reason="classifier_fallback",
         source="fallback",
@@ -341,6 +433,17 @@ async def classify_incoming_image(
 
     if attempted_vision_classify:
         return _remember_image_classification(cache_key, conservative_fallback)
+
+    if image_width == 0 and image_height == 0:
+        return _remember_image_classification(
+            cache_key,
+            IncomingImageClassification(
+                kind="unknown",
+                confidence=0.0,
+                reason="missing_size_fallback",
+                source="fallback",
+            ),
+        )
 
     size_based_kind = "sticker" if max(image_width, image_height) <= 1280 else "photo"
     return _remember_image_classification(
@@ -620,7 +723,10 @@ def compute_agent_time_budget(
     started_at: float | None,
     total_timeout_seconds: float = _DEFAULT_RESPONSE_TIMEOUT_SECONDS,
     reserve_seconds: float = _AGENT_TIME_BUDGET_RESERVE_SECONDS,
+    response_deadline: float | None = None,
 ) -> float | None:
+    if response_deadline is not None:
+        return max(0.0, float(response_deadline) - time.monotonic() - float(reserve_seconds))
     available = float(total_timeout_seconds) - float(reserve_seconds)
     if started_at is not None:
         available -= max(0.0, time.monotonic() - float(started_at))
@@ -678,18 +784,85 @@ async def run_agent_if_enabled(
     turn_plan: Any = None,
     started_at: float | None = None,
     is_direct_mention: bool = False,
+    reply_required: bool = False,
     response_timeout_seconds: float = _DEFAULT_RESPONSE_TIMEOUT_SECONDS,
+    response_deadline: float | None = None,
     task_exc_logger: Callable[[str, Any], Any] | None = None,
-) -> tuple[str | None, bool, bool]:
+    reply_commit_state: dict[str, Any] | None = None,
+    turn_media_context: list[Any] | None = None,
+    avatar_pair_candidates: list[dict[str, str]] | None = None,
+) -> tuple[str | None, bool, bool, Any | None, list[dict[str, Any]], str, bool, bool, str]:
     if not (
         getattr(runtime.plugin_config, "personification_agent_enabled", True)
         and runtime.tool_registry
         and runtime.agent_tool_caller
     ):
-        return None, False, False
+        return None, False, False, None, [], "", False, False, ""
 
-    executor = ActionExecutor(bot, event, runtime.plugin_config, runtime.logger)
+    commit_state = reply_commit_state if isinstance(reply_commit_state, dict) else {}
+    executor = ActionExecutor(
+        bot,
+        event,
+        runtime.plugin_config,
+        runtime.logger,
+        qq_outbound_ledger=getattr(runtime, "qq_outbound_ledger", None),
+        operation_id=build_reply_operation_id(
+            bot=bot,
+            event=event,
+            reply_trace_id=str(commit_state.get("reply_trace_id", "") or ""),
+        ),
+        user_target=str(getattr(event, "user_id", "") or ""),
+        recall_cutoff=float(commit_state.get("received_wall_at", 0.0) or time.time()),
+    )
     runtime_registry = clone_tool_registry(runtime.tool_registry)
+    register_qq_recall_tool(
+        runtime_registry,
+        executor=executor,
+        bot=bot,
+        event=event,
+        cutoff=float(commit_state.get("received_wall_at", 0.0) or time.time()),
+    )
+    register_current_user_avatar_tool(
+        runtime_registry,
+        getattr(runtime, "profile_service", None),
+        str(getattr(event, "user_id", "") or ""),
+    )
+    register_current_group_context_tool(
+        runtime_registry,
+        bot=bot,
+        event=event,
+        plugin_config=runtime.plugin_config,
+        logger=runtime.logger,
+        policy_authorizer=(
+            runtime.user_policy_gate.current_authorization
+            if getattr(runtime, "user_policy_gate", None) is not None
+            else None
+        ),
+    )
+    register_group_user_avatar_pair_insight_tool(
+        runtime_registry,
+        runtime=runtime,
+        bot=bot,
+        event=event,
+        candidates=list(avatar_pair_candidates or []),
+        policy_authorizer=(
+            runtime.user_policy_gate.current_authorization
+            if getattr(runtime, "user_policy_gate", None) is not None
+            else None
+        ),
+    )
+    register_group_member_avatar_insight_tool(
+        runtime_registry,
+        runtime=runtime,
+        bot=bot,
+        event=event,
+        candidates=list(avatar_pair_candidates or []),
+        policy_authorizer=(
+            runtime.user_policy_gate.current_authorization
+            if getattr(runtime, "user_policy_gate", None) is not None
+            else None
+        ),
+    )
     register_send_qq_expression_tools(
         runtime_registry,
         executor=executor,
@@ -770,7 +943,35 @@ async def run_agent_if_enabled(
     ack_sender = None
     if ack_phrase:
         async def _ack_sender(text: str, *, _phrase: str = ack_phrase) -> None:
-            await bot.send(event, str(text or "").strip() or _phrase)
+            visible_ack = guard_reply_ack_text(
+                text,
+                fallback=_phrase,
+                logger=runtime.logger,
+            )
+            if not visible_ack:
+                return
+            commit_state = reply_commit_state if isinstance(reply_commit_state, dict) else {}
+            mark_reply_phase(commit_state, "delivery_commit_wait")
+            await acquire_reply_commit(commit_state)
+            mark_reply_phase(commit_state, "delivery")
+            try:
+                # dispatch_reply_part keeps the legacy await bot.send(...) fallback without a ledger.
+                if getattr(runtime, "user_policy_gate", None) is not None:
+                    await runtime.user_policy_gate.ensure_current(event)
+                mark_reply_delivery_started(commit_state)
+                send_result = await dispatch_reply_part(
+                    bot=bot,
+                    event=event,
+                    payload=visible_ack,
+                    ledger=getattr(runtime, "qq_outbound_ledger", None),
+                    surface="reply_ack",
+                    reply_trace_id=str(commit_state.get("reply_trace_id", "") or ""),
+                )
+                if not isinstance(send_result, SendReceipt) or send_result.status == "sent":
+                    mark_reply_delivery_confirmed(commit_state)
+            finally:
+                release_reply_commit(commit_state)
+                mark_reply_phase(commit_state, "agent_after_ack")
         ack_sender = _ack_sender
     candidate_memories = await _recall_agent_candidate_memories(
         runtime=runtime,
@@ -778,17 +979,6 @@ async def run_agent_if_enabled(
         messages=messages,
         turn_plan=turn_plan,
     )
-    try:
-        profile_service = getattr(runtime, "profile_service", None)
-        if profile_service is not None:
-            _gid = str(getattr(event, "group_id", "") or "")
-            _uid = str(getattr(event, "user_id", "") or "")
-            if _uid:
-                _block = profile_service.build_prompt_block(user_id=_uid, group_id=_gid)
-                if _block:
-                    messages.append({"role": "system", "content": _block})
-    except Exception:
-        pass
     # 注入群风格摘要（最近一次 group_style_autobuild 产出）
     try:
         _gid = str(getattr(event, "group_id", "") or "")
@@ -807,6 +997,10 @@ async def run_agent_if_enabled(
         messages=messages,
         registry=runtime_registry,
         tool_caller=runtime.agent_tool_caller,
+        quality_tool_caller=(
+            getattr(runtime, "lite_tool_caller", None)
+            or runtime.agent_tool_caller
+        ),
         executor=executor,
         plugin_config=runtime.plugin_config,
         logger=runtime.logger,
@@ -823,21 +1017,68 @@ async def run_agent_if_enabled(
         precomputed_intent=precomputed_intent,
         turn_plan=turn_plan,
         candidate_memories=candidate_memories,
+        memory_store=getattr(runtime, "memory_store", None),
+        memory_curator=getattr(runtime, "memory_curator", None),
         time_budget_seconds=compute_agent_time_budget(
             started_at=started_at,
             total_timeout_seconds=response_timeout_seconds,
+            response_deadline=response_deadline,
         ),
         ack_sender=ack_sender,
+        is_group=hasattr(event, "group_id") and not str(getattr(event, "group_id", "")).startswith("private_"),
+        is_direct_mention=is_direct_mention,
+        reply_required=reply_required,
+        turn_media_context=turn_media_context,
     )
-    action_history_parts: list[str] = []
-    for action in result.pending_actions:
-        await executor.execute(action["type"], action["params"])
-        history_text = qq_action_history_text(action)
-        if history_text:
-            action_history_parts.append(history_text)
-    if action_history_parts:
-        setattr(event, "_personification_pending_action_history_text", " ".join(action_history_parts))
-    return result.text, True, bool(getattr(result, "bypass_length_limits", False))
+    social_coverage = dict(getattr(result, "social_coverage", {}) or {})
+    if isinstance(commit_state, dict):
+        commit_state["agent_social_evidence"] = [
+            dict(item)
+            for item in list(getattr(result, "social_evidence", []) or [])[:10]
+            if isinstance(item, dict)
+        ]
+        commit_state["agent_social_coverage"] = dict(social_coverage)
+        commit_state["agent_evidence_delivery_required"] = bool(
+            getattr(result, "evidence_delivery_required", False)
+        )
+        commit_state["agent_evidence_delivery_status"] = str(
+            getattr(result, "evidence_delivery_status", "not_required") or "not_required"
+        )
+        commit_state["agent_evidence_recovered"] = bool(
+            getattr(result, "evidence_recovered", False)
+        )
+        commit_state["agent_citation_mode"] = str(
+            getattr(result, "citation_mode", getattr(turn_plan, "citation_mode", "none"))
+            or "none"
+        )
+        commit_state["agent_social_coverage_status"] = str(
+            social_coverage.get("coverage_status", "") or ""
+        )
+        commit_state["agent_social_tool_execution"] = (
+            "partial" if bool(social_coverage.get("partial", False)) else "ok"
+            if bool(getattr(result, "social_evidence", None))
+            else "not_used"
+        )
+        evidence_unavailable = (
+            str(getattr(result, "quality_context", "") or "")
+            == "evidence_unavailable"
+        )
+        commit_state["agent_evidence_unavailable"] = evidence_unavailable
+        commit_state["agent_tool_calls"] = bool(getattr(result, "tool_calls_made", False))
+        commit_state["agent_tool_execution"] = (
+            "empty" if evidence_unavailable else "not_used"
+        )
+    return (
+        result.text,
+        True,
+        bool(getattr(result, "bypass_length_limits", False)),
+        executor,
+        list(result.pending_actions),
+        str(getattr(result, "failure_code", "") or ""),
+        bool(getattr(result, "suppress_reply_recovery", False)),
+        bool(getattr(result, "direct_output", False)),
+        str(getattr(result, "quality_context", "") or ""),
+    )
 
 
 def stale_reply_abort_reason(state: Dict[str, Any]) -> str:
@@ -963,7 +1204,6 @@ def build_base_system_prompt(
     )
     if gemini_policy:
         parts.append(gemini_policy)
-    parts.append(build_prompt_injection_guard())
     parts.extend(chunk for chunk in context_chunks if chunk)
     parts.append(
         "## 核心行动准则\n"
@@ -986,7 +1226,7 @@ def build_base_system_prompt(
         "但绝不展开成长篇命题作文，也不要为此出戏、扮演成别的角色或换成别的说话风格。"
     )
     parts.extend(chunk for chunk in postlude_chunks if chunk)
-    return "\n\n".join(part for part in parts if part)
+    return ensure_prompt_injection_guard("\n\n".join(part for part in parts if part))
 
 
 def build_confidence_style_instruction(confidence: float, *, is_group: bool = False) -> str:
@@ -1062,12 +1302,15 @@ __all__ = [
     "clear_image_classify_cache",
     "classify_incoming_image",
     "clone_tool_registry",
+    "build_reply_operation_id",
     "compute_agent_time_budget",
     "count_user_interactions",
+    "dispatch_reply_part",
     "extract_reply_sender_meta",
     "fold_consecutive_sticker_placeholders",
     "get_cached_friend_ids",
     "get_primary_provider_signature",
+    "guard_reply_ack_text",
     "IncomingImageClassification",
     "looks_like_photo_message",
     "looks_like_sticker_message",

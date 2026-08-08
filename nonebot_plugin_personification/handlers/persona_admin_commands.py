@@ -73,6 +73,9 @@ _COMMAND_ALIASES = {
     "迁移": "migrate",
     "recall": "recall",
     "召回": "recall",
+    "withdraw": "withdraw",
+    "撤回": "withdraw",
+    "撤消息": "withdraw",
     "model": "model",
     "模型": "model",
     "scheduler": "scheduler",
@@ -264,6 +267,7 @@ def _root_help_text() -> str:
         "- 拟人 管理员 列表|添加|删除：管理插件管理员。",
         "- 拟人 迁移 状态|执行：查看或执行旧数据迁移。",
         "- 拟人 召回 统计：查看长期记忆召回统计。",
+        "- 拟人 撤回：撤回当前 QQ 会话里最近一次可安全撤回的 Bot 输出。",
         "- 拟人 模型 列表|路由|使用|设置|重置：QQ 内热更新主 provider 和各阶段模型。",
         "- 拟人 定时 状态：查看定时任务注册状态、下次运行时间和功能开关。",
         "- 拟人 空间 状态|测试 <QQ号/@用户>：查看空间任务状态，或对指定好友空间执行一次测试互动扫描。",
@@ -282,7 +286,7 @@ def _root_help_text() -> str:
         "- 清除记忆 / 完全清除记忆：清理会话与记忆数据。",
         "- 申请白名单 / 同意白名单 / 拒绝白名单 / 添加白名单 / 移除白名单：管理群准入。",
         "",
-        "继续查看：拟人 帮助 配置 / 记忆 / 管理员 / 迁移 / 召回 / 某个配置项名",
+        "继续查看：拟人 帮助 配置 / 记忆 / 管理员 / 迁移 / 召回 / 撤回 / 某个配置项名",
         "兼容写法：拟人 配置列表 / 配置查看 / 配置设置 / 配置重置 / 记忆状态 / 召回统计",
         "前缀：拟人 / 人格 / /persona",
     ]
@@ -336,6 +340,7 @@ def _format_category_help(category: str) -> str:
         "help": "帮助",
         "status": "状态",
         "recall": "召回",
+        "withdraw": "QQ 撤回",
         "model": "模型",
         "scheduler": "定时任务",
         "qzone": "QQ 空间",
@@ -837,6 +842,41 @@ async def dispatch_persona_admin_command(
             await matcher.finish(_admin_error())
         await matcher.finish(handle_recall_command(bundle, tokens=rest))
 
+    if command == "withdraw":
+        if not can_manage_sensitive_action(event=event, superusers=bundle.superusers):
+            await matcher.finish(_admin_error())
+        if rest:
+            await matcher.finish("用法：拟人 撤回（不接受消息 ID、群号或 QQ 号）")
+        from ..core.qq_recall import QQRecallService
+
+        ledger = getattr(bundle, "qq_outbound_ledger", None)
+        if ledger is None or bot is None:
+            await matcher.finish("QQ 撤回能力当前不可用。")
+        result = await QQRecallService(
+            ledger,
+            plugin_config=bundle.plugin_config,
+            logger=bundle.logger,
+        ).recall_latest(
+            bot=bot,
+            event=event,
+            requester_user_id=str(getattr(event, "user_id", "") or ""),
+            actor_kind="admin",
+            cutoff=time.time(),
+        )
+        if result.status == "succeeded":
+            await matcher.finish(f"已撤回当前会话最近一次 Bot 输出（{result.recalled_count} 条）。")
+        if result.status == "partial":
+            await matcher.finish(
+                f"仅撤回 {result.recalled_count}/{result.total_count} 条；其余结果未成功，不会自动重试。"
+            )
+        if result.status == "unknown":
+            await matcher.finish("撤回结果未知，为避免重复操作不会自动重试。")
+        if result.code == "already_attempted":
+            await matcher.finish("当前会话最近一次 Bot 输出已经尝试过撤回，不会重复操作。")
+        if result.status == "definite_failure":
+            await matcher.finish(f"撤回失败：{result.code}。")
+        await matcher.finish("当前会话近 5 分钟没有可安全撤回的 Bot 输出。")
+
     if command == "model":
         if not can_manage_sensitive_action(event=event, superusers=bundle.superusers):
             await matcher.finish(_admin_error())
@@ -897,7 +937,7 @@ def render_help(bundle: Any, *, event: Any, tokens: list[str]) -> str:
         entry = find_command_help(tuple(normalized[:2]))
         if entry is not None:
             return _format_command_help(entry.path)
-    if normalized[0] in {"config", "admin", "memory", "migrate", "help", "status", "recall", "model", "scheduler", "qzone", "template", "update"}:
+    if normalized[0] in {"config", "admin", "memory", "migrate", "help", "status", "recall", "withdraw", "model", "scheduler", "qzone", "template", "update"}:
         return _format_category_help(normalized[0])
     config_entry = resolve_config_entry(" ".join(tokens))
     if config_entry is None:

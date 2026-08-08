@@ -26,6 +26,18 @@ class _FakeCaller:
         )
 
 
+class _SequenceCaller:
+    def __init__(self, contents: list[str]) -> None:
+        self._contents = list(contents)
+        self.calls = 0
+
+    async def chat_with_tools(self, messages, tools, use_builtin_search):  # noqa: ANN001
+        del messages, tools, use_builtin_search
+        content = self._contents[self.calls]
+        self.calls += 1
+        return SimpleNamespace(content=content, vision_unavailable=False)
+
+
 def _build_runtime(
     lite_caller: object | None = None,
     *,
@@ -68,7 +80,7 @@ def test_classify_incoming_image_mface_short_circuit() -> None:
     assert result.source == "rule"
 
 
-def test_classify_incoming_image_missing_size_short_circuit() -> None:
+def test_classify_incoming_image_missing_size_is_unknown_without_vision() -> None:
     pipeline_context.clear_image_classify_cache()
     runtime = _build_runtime()
 
@@ -82,8 +94,9 @@ def test_classify_incoming_image_missing_size_short_circuit() -> None:
         )
     )
 
-    assert result.kind == "sticker"
-    assert result.reason == "missing_size_short_circuit"
+    assert result.kind == "unknown"
+    assert result.reason == "missing_size_fallback"
+    assert result.confidence == 0.0
 
 
 def test_classify_incoming_image_gif_short_circuit() -> None:
@@ -137,7 +150,7 @@ def test_classify_incoming_image_uses_llm_and_hits_file_cache() -> None:
     assert lite_caller.calls == 1
 
 
-def test_classify_incoming_image_falls_back_to_conservative_sticker_on_llm_failure() -> None:
+def test_classify_incoming_image_falls_back_to_unknown_on_llm_failure() -> None:
     pipeline_context.clear_image_classify_cache()
     runtime = _build_runtime(_FakeCaller(should_fail=True))
 
@@ -152,8 +165,37 @@ def test_classify_incoming_image_falls_back_to_conservative_sticker_on_llm_failu
         )
     )
 
-    assert result.kind == "sticker"
+    assert result.kind == "unknown"
     assert result.source == "fallback"
+
+
+def test_classify_incoming_image_same_dimensions_do_not_share_cache() -> None:
+    pipeline_context.clear_image_classify_cache()
+    caller = _SequenceCaller(["photo", "sticker"])
+    runtime = _build_runtime(caller)
+
+    first = asyncio.run(
+        pipeline_context.classify_incoming_image(
+            runtime=runtime,
+            image_url="data:image/png;base64,first-image",
+            source_kind="image",
+            width=640,
+            height=640,
+        )
+    )
+    second = asyncio.run(
+        pipeline_context.classify_incoming_image(
+            runtime=runtime,
+            image_url="data:image/png;base64,second-image",
+            source_kind="image",
+            width=640,
+            height=640,
+        )
+    )
+
+    assert first.kind == "photo"
+    assert second.kind == "sticker"
+    assert caller.calls == 2
 
 
 def test_classify_incoming_image_uses_size_fallback_when_no_vision_route() -> None:

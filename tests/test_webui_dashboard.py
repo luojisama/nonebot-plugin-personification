@@ -229,6 +229,50 @@ def test_dashboard_metrics_returns_token_summary(_runtime_with_data) -> None:
     assert overview_purposes["persona_template_synthesis"]["percent"] > 0
 
 
+def test_dashboard_query_bundle_deduplicates_caches_and_invalidates(monkeypatch, tmp_path) -> None:
+    metrics_routes = load_personification_module("plugin.personification.webui.routes.metrics_routes")
+    metrics_routes._reset_dashboard_cache_for_testing()
+    generation = {"value": 7}
+    calls = {"summary": [], "provider": 0, "total": 0}
+
+    monkeypatch.setattr(metrics_routes, "get_db_path", lambda: tmp_path / "personification.db")
+    monkeypatch.setattr(
+        metrics_routes.token_ledger,
+        "ledger_generation",
+        lambda: generation["value"],
+    )
+
+    def _summary(window: str) -> dict:
+        calls["summary"].append(window)
+        return {"window": window, "total": {"total_tokens": 1}, "series": []}
+
+    def _provider(window: str) -> dict:
+        calls["provider"] += 1
+        return {"window": window, "providers": []}
+
+    def _total() -> dict:
+        calls["total"] += 1
+        return {"total": {"total_tokens": 1}}
+
+    monkeypatch.setattr(metrics_routes.token_ledger, "query_summary", _summary)
+    monkeypatch.setattr(metrics_routes.token_ledger, "query_provider_summary", _provider)
+    monkeypatch.setattr(metrics_routes.token_ledger, "query_total_consumption", _total)
+
+    first = metrics_routes._query_dashboard_bundle("month")
+    first["selected"]["mutated"] = True
+    second = metrics_routes._query_dashboard_bundle("month")
+    assert calls == {"summary": ["day", "week", "month"], "provider": 1, "total": 1}
+    assert "mutated" not in second["selected"]
+
+    generation["value"] += 1
+    metrics_routes._query_dashboard_bundle("month")
+    assert calls == {
+        "summary": ["day", "week", "month", "day", "week", "month"],
+        "provider": 2,
+        "total": 2,
+    }
+
+
 def test_dashboard_group_rows_never_emit_fake_unnamed_label() -> None:
     metrics_routes = load_personification_module("plugin.personification.webui.routes.metrics_routes")
     runtime = SimpleNamespace(runtime_bundle=SimpleNamespace(get_bots=lambda: {"1": SimpleNamespace()}))
@@ -249,10 +293,8 @@ def test_dashboard_window_validation(_runtime_with_data) -> None:
 
 
 def test_dashboard_frontend_charts_have_detail_affordances() -> None:
-    repo_root = Path(__file__).resolve().parent.parent
-    package_root = repo_root / "nonebot_plugin_personification"
-    root = package_root if package_root.exists() else repo_root
-    app_js = (root / "webui" / "static" / "app-admin.js").read_text(encoding="utf-8")
+    root = Path(__file__).resolve().parent.parent
+    app_js = (root / "webui" / "static" / "app-dashboard.js").read_text(encoding="utf-8")
     style_css = (root / "webui" / "static" / "style.css").read_text(encoding="utf-8")
 
     assert "function dashboardTooltipAttr" in app_js
@@ -364,6 +406,31 @@ def test_groups_list_and_detail(_runtime_with_data) -> None:
     assert "晚上更活跃" in saved_schedule.json()["schedule_prompt"]
 
 
+def test_group_switch_writes_authoritative_group_config(_runtime_with_data) -> None:
+    client = _build_client(_runtime_with_data)
+    _login(client)
+    utils = load_personification_module("plugin.personification.utils")
+    _runtime_with_data.plugin_config.personification_whitelist = ["static-group"]
+    utils.save_whitelist(["dynamic-group"])
+
+    disabled = client.delete("/personification/api/groups/static-group/whitelist")
+    assert disabled.status_code == 200
+    assert utils.get_group_config("static-group")["enabled"] is False
+    assert utils.is_group_whitelisted("static-group", ["static-group"]) is False
+
+    enabled = client.post("/personification/api/groups/dynamic-group/whitelist")
+    assert enabled.status_code == 200
+    assert utils.get_group_config("dynamic-group")["enabled"] is True
+    utils.save_whitelist([])
+    assert utils.is_group_whitelisted("dynamic-group", []) is True
+
+    listed = client.get("/personification/api/groups/whitelist")
+    static = next(item for item in listed.json()["groups"] if item["group_id"] == "static-group")
+    assert static["enabled"] is False
+    assert static["source"] == "group_config"
+    assert static["static_config_readonly"] is True
+
+
 def test_profile_service_prompt_block(_runtime_with_data) -> None:
     svc = _runtime_with_data.runtime_bundle.profile_service
     current = svc.get_core_profile("u_alpha")
@@ -376,13 +443,13 @@ def test_profile_service_prompt_block(_runtime_with_data) -> None:
     svc.upsert_core_profile(user_id="u_alpha", profile_text="全局画像 Alpha", profile_json=profile_json)
     block = svc.build_prompt_block(user_id="u_alpha", group_id="g1")
     assert "## 用户档案" in block
-    assert "[头像URL]" in block
+    assert "[头像URL]" not in block
     assert "[主页] https://user.qzone.qq.com/u_alpha" in block
     assert "[个性签名] 这里是 Alpha 的签名" in block
-    assert "[人物轮廓] Alpha 是群里的常驻成员" in block
+    assert "人物轮廓: Alpha 是群里的常驻成员" in block
     assert "称呼偏好: 可以叫阿尔法" in block
     assert "互动建议: 像熟人一样自然插话" in block
-    assert "全局画像 Alpha" in block
+    assert "全局画像 Alpha" not in block
     assert "g1 中是常驻成员" in block
 
     block2 = svc.build_prompt_block(user_id="u_missing")
@@ -390,10 +457,9 @@ def test_profile_service_prompt_block(_runtime_with_data) -> None:
 
 
 def test_group_relation_graph_frontend_present() -> None:
-    repo_root = Path(__file__).resolve().parents[1]
-    package_root = repo_root / "nonebot_plugin_personification"
-    root = package_root if package_root.exists() else repo_root
-    app_admin_js = (root / "webui" / "static" / "app-admin.js").read_text(encoding="utf-8")
+    app_admin_js = (Path(__file__).resolve().parents[1] / "webui" / "static" / "app-groups.js").read_text(
+        encoding="utf-8"
+    )
     assert "renderGroupRelationGraph" in app_admin_js
     assert "群员关系图" in app_admin_js
     assert "relation-node" in app_admin_js

@@ -96,6 +96,11 @@ def write_dotenv(field_name: str, value: Any, *, backup: bool = True, target: Pa
 
 def write_env_json(field_name: str, value: Any, plugin_config: Any) -> Path:
     """写入插件 env.json 覆盖层。"""
+    return write_env_json_values({field_name: value}, plugin_config)
+
+
+def write_env_json_values(values: dict[str, Any], plugin_config: Any) -> Path:
+    """一次原子写入多个插件配置字段，避免表单保存产生中间状态。"""
     path = get_env_config_path(plugin_config)
     payload: dict[str, Any] = {}
     if path.exists():
@@ -106,7 +111,7 @@ def write_env_json(field_name: str, value: Any, plugin_config: Any) -> Path:
                 payload = data
         except Exception:
             payload = {}
-    payload[field_name] = value
+    payload.update(dict(values or {}))
     _write_payload_atomic(path, payload)
     return path
 
@@ -128,6 +133,24 @@ def write_both(field_name: str, value: Any, plugin_config: Any) -> dict[str, Any
     # env.json：权威运行时层，始终写
     try:
         json_path = write_env_json(field_name, value, plugin_config)
+        result["env_json_path"] = str(json_path)
+    except Exception as exc:
+        result["errors"].append(f"env.json write failed: {exc}")
+    return result
+
+
+def write_many(values: dict[str, Any], plugin_config: Any) -> dict[str, Any]:
+    """批量持久化 WebUI 表单，只写一次权威 env.json。"""
+    normalized_values = dict(values or {})
+    result: dict[str, Any] = {
+        "field_names": list(normalized_values),
+        "values": normalized_values,
+        "dotenv_path": None,
+        "env_json_path": None,
+        "errors": [],
+    }
+    try:
+        json_path = write_env_json_values(normalized_values, plugin_config)
         result["env_json_path"] = str(json_path)
     except Exception as exc:
         result["errors"].append(f"env.json write failed: {exc}")
@@ -180,6 +203,8 @@ def resolve_value_sources(field_name: str, plugin_config: Any) -> dict[str, Any]
 __all__ = [
     "write_dotenv",
     "write_env_json",
+    "write_env_json_values",
     "write_both",
+    "write_many",
     "resolve_value_sources",
 ]

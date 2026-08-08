@@ -7,7 +7,9 @@ from typing import Any, Awaitable, Callable, Dict, List, Optional
 
 import httpx
 
+from plugin.personification.core.gemini_transport import raise_for_gemini_status, request_with_gemini_auth
 from plugin.personification.core.image_refs import normalize_image_ref
+from plugin.personification.core.llm_context import use_single_attempt_retry_policy
 from plugin.personification.core.time_ctx import build_current_time_context_block
 
 
@@ -231,10 +233,12 @@ class GeminiVisionCaller(VisionCaller):
         api_key: str,
         base_url: str,
         model: str,
+        auth_mode: str = "auto",
     ) -> None:
         self.api_key = api_key
         self.base_url = (base_url or "").strip()
         self.model = model
+        self.auth_mode = str(auth_mode or "auto")
         self.timeout = 60.0
 
     def _request_url(self) -> str:
@@ -251,11 +255,7 @@ class GeminiVisionCaller(VisionCaller):
         return f"{base}/models/{self.model}:generateContent"
 
     def _headers(self) -> Dict[str, str]:
-        return {
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {self.api_key}",
-            "x-goog-api-key": self.api_key,
-        }
+        return {"Content-Type": "application/json"}
 
     def _gemini_image_part(self, image_url: str) -> Dict[str, Any]:
         normalized_image_url, problem = normalize_image_ref(image_url)
@@ -285,13 +285,31 @@ class GeminiVisionCaller(VisionCaller):
 
     async def _generate_content(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         url = self._request_url()
-        async with httpx.AsyncClient(timeout=httpx.Timeout(self.timeout, connect=10.0)) as client:
-            response = await client.post(
-                url,
-                headers=self._headers(),
-                json=payload,
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(self.timeout, connect=10.0),
+            follow_redirects=False,
+        ) as client:
+            async def _send(auth):  # noqa: ANN001, ANN202
+                return await client.post(
+                    url,
+                    headers={**self._headers(), **auth.headers},
+                    params=auth.params,
+                    json=payload,
+                )
+
+            auth_result = await request_with_gemini_auth(
+                endpoint=url.rsplit("/models/", 1)[0],
+                api_key=self.api_key,
+                auth_mode=self.auth_mode,
+                send=_send,
+                allow_negotiation=not use_single_attempt_retry_policy(),
             )
-            response.raise_for_status()
+            response = auth_result.response
+            raise_for_gemini_status(
+                response,
+                auth_mode=auth_result.mode,
+                request_count=auth_result.request_count,
+            )
             return dict(response.json() or {})
 
     async def describe(self, prompt: str, image_url: str) -> str:
@@ -360,25 +378,23 @@ class GeminiVisionCaller(VisionCaller):
             )
             if not callable(tool_handler):
                 return latest_text
+            response_parts: List[dict[str, Any]] = []
             for call in tool_calls:
                 tool_result = ""
                 try:
                     tool_result = await tool_handler(call.name, dict(call.arguments or {}))
                 except Exception:
                     tool_result = ""
-                contents.append(
-                    {
-                        "role": "user",
-                        "parts": [
-                            {
-                                "functionResponse": {
-                                    "name": call.name,
-                                    "response": {"result": str(tool_result or "")},
-                                }
-                            }
-                        ],
-                    }
-                )
+                function_response: dict[str, Any] = {
+                    "name": call.name,
+                    "response": {"result": str(tool_result or "")},
+                }
+                provider_call_id = str(getattr(call, "provider_call_id", "") or "").strip()
+                if provider_call_id:
+                    function_response["id"] = provider_call_id
+                response_parts.append({"functionResponse": function_response})
+            if response_parts:
+                contents.append({"role": "user", "parts": response_parts})
         return latest_text
 
 
@@ -672,6 +688,7 @@ def build_vision_caller(config: Any) -> Optional[VisionCaller]:
                 api_key=api_key,
                 base_url=api_url,
                 model=resolved_model,
+                auth_mode=str(getattr(config, "personification_gemini_auth_mode", "auto") or "auto"),
             )
         return OpenAIVisionCaller(
             api_key=api_key,

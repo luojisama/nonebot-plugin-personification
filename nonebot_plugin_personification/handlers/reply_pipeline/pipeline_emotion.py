@@ -32,12 +32,14 @@ from ...core.response_review import (
     extract_recent_bot_reply_texts,
 )
 from ...core.target_inference import normalize_message_target_for_plan, normalize_message_target_for_review
+from ...core.user_avatar_insight import add_current_user_avatar_planner_metadata
 from .pipeline_context import batch_has_newer_messages
 
 _EMOTIONAL_SUPPORT_HINT = load_prompt("emotional_support_hint")
 _DEFAULT_SEMANTIC_FRAME_TIMEOUT_SECONDS = 8.0
 _MIN_SEMANTIC_FRAME_TIMEOUT_SECONDS = 1.0
 _MAX_SEMANTIC_FRAME_TIMEOUT_SECONDS = 60.0
+_REPLY_STATE_LOAD_TIMEOUT_SECONDS = 2.0
 
 
 def _record_reply_trace_stage(
@@ -60,6 +62,59 @@ def _record_reply_trace_stage(
         )
     except Exception:
         pass
+
+
+async def load_reply_states_with_timeout(
+    data_dir: Any,
+    logger: Any,
+    *,
+    trace_key: str = "reply_state_load",
+    trace_label: str = "回复状态加载",
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    inner_state = dict(DEFAULT_INNER_STATE)
+    emotion_state: dict[str, Any] = {}
+    state_load_started_at = time.monotonic()
+    state_load_timed_out = False
+    try:
+        inner_result, emotion_result = await asyncio.wait_for(
+            asyncio.gather(
+                load_inner_state(data_dir),
+                load_emotion_state(data_dir),
+                return_exceptions=True,
+            ),
+            timeout=_REPLY_STATE_LOAD_TIMEOUT_SECONDS,
+        )
+    except asyncio.TimeoutError:
+        state_load_timed_out = True
+        inner_result = asyncio.TimeoutError("inner_state_load_timeout")
+        emotion_result = asyncio.TimeoutError("emotion_state_load_timeout")
+    state_load_elapsed_ms = int((time.monotonic() - state_load_started_at) * 1000)
+    if isinstance(inner_result, BaseException):
+        logger.debug(f"[emotion] load inner_state failed: {inner_result}")
+    elif isinstance(inner_result, dict):
+        inner_state.update(inner_result)
+    if isinstance(emotion_result, BaseException):
+        logger.debug(f"[emotion] load emotion_state failed: {emotion_result}")
+    elif isinstance(emotion_result, dict):
+        emotion_state = emotion_result
+    state_load_failed = (
+        state_load_timed_out
+        or isinstance(inner_result, BaseException)
+        or isinstance(emotion_result, BaseException)
+    )
+    _record_reply_trace_stage(
+        key=trace_key,
+        label=trace_label,
+        status="warn" if state_load_failed else "ok",
+        detail=(
+            f"elapsed_ms={state_load_elapsed_ms} "
+            f"inner={'fallback' if isinstance(inner_result, BaseException) else 'ok'} "
+            f"emotion={'fallback' if isinstance(emotion_result, BaseException) else 'ok'} "
+            f"timeout={str(state_load_timed_out).lower()}"
+        ),
+        hint="状态读取超时后使用默认值继续回复，不等待后台 inner-state LLM" if state_load_failed else "",
+    )
+    return inner_state, emotion_state
 
 
 def semantic_frame_timeout_seconds(plugin_config: Any) -> float:
@@ -138,6 +193,8 @@ async def infer_turn_semantic_frame_with_timeout(
     plugin_config: Any,
     is_group: bool = False,
     is_random_chat: bool = False,
+    is_direct_mention: bool = False,
+    message_target: str = "",
     tool_caller: Any = None,
     recent_context: str = "",
     relationship_hint: str = "",
@@ -147,6 +204,7 @@ async def infer_turn_semantic_frame_with_timeout(
     fallback_tool_caller: Any = None,
     logger: Any = None,
     metric_scene: str = "group",
+    media_grounding: str = "",
 ) -> tuple[Any, float, str, float, str]:
     timeout_s = semantic_frame_timeout_seconds(plugin_config)
     started_at = time.monotonic()
@@ -166,12 +224,15 @@ async def infer_turn_semantic_frame_with_timeout(
                     text,
                     is_group=is_group,
                     is_random_chat=is_random_chat,
+                    is_direct_mention=is_direct_mention,
+                    message_target=message_target,
                     tool_caller=caller,
                     recent_context=recent_context,
                     relationship_hint=relationship_hint,
                     repeat_clusters=repeat_clusters,
                     current_inner_state=current_inner_state,
                     current_emotion_state=current_emotion_state,
+                    media_grounding=media_grounding,
                 ),
                 timeout=max(0.1, timeout),
             )
@@ -231,6 +292,7 @@ async def plan_turn_with_timeout(
     fallback_tool_caller: Any = None,
     logger: Any = None,
     metric_mode: str = "enabled",
+    media_grounding: str = "",
 ) -> tuple[Any, float, str, float, str]:
     timeout_s = semantic_frame_timeout_seconds(plugin_config)
     started_at = time.monotonic()
@@ -267,6 +329,7 @@ async def plan_turn_with_timeout(
                     current_emotion_state=current_emotion_state,
                     available_tools=available_tools,
                     group_knowledge_hint=group_knowledge_hint,
+                    media_grounding=media_grounding,
                 ),
                 timeout=max(0.1, timeout),
             )
@@ -363,24 +426,14 @@ async def prepare_reply_semantics(
     message_target: str,
     solo_speaker_follow: bool,
     has_images: bool = False,
+    media_grounding: str = "",
 ) -> PreparedReplySemantics:
     recent_bot_replies = extract_recent_bot_reply_texts(recent_window if not is_private_session else [])
     data_dir = get_personification_data_dir(runtime.plugin_config)
-    inner_state = dict(DEFAULT_INNER_STATE)
-    emotion_state = {}
-    _is_result, _es_result = await asyncio.gather(
-        load_inner_state(data_dir),
-        load_emotion_state(data_dir),
-        return_exceptions=True,
+    inner_state, emotion_state = await load_reply_states_with_timeout(
+        data_dir,
+        runtime.logger,
     )
-    if isinstance(_is_result, BaseException):
-        runtime.logger.debug(f"[emotion] load inner_state failed: {_is_result}")
-    else:
-        inner_state.update(_is_result)
-    if isinstance(_es_result, BaseException):
-        runtime.logger.debug(f"[emotion] load emotion_state failed: {_es_result}")
-    else:
-        emotion_state = _es_result
     emotion_memory_hint = render_emotion_memory_hint(
         emotion_state,
         user_id=user_id,
@@ -394,6 +447,11 @@ async def prepare_reply_semantics(
     if planner_enabled or planner_shadow_enabled:
         try:
             planner_available_tools = registry_planner_metadata(runtime.tool_registry)
+            planner_available_tools = add_current_user_avatar_planner_metadata(
+                planner_available_tools,
+                getattr(runtime, "profile_service", None),
+                user_id,
+            )
         except Exception:
             planner_available_tools = []
 
@@ -430,6 +488,7 @@ async def prepare_reply_semantics(
             current_emotion_state=emotion_memory_hint,
             available_tools=planner_available_tools,
             group_knowledge_hint=group_knowledge_hint,
+            media_grounding=media_grounding,
             logger=runtime.logger,
             metric_mode="enabled",
         )
@@ -479,6 +538,8 @@ async def prepare_reply_semantics(
                 plugin_config=runtime.plugin_config,
                 is_group=not is_private_session,
                 is_random_chat=is_random_chat,
+                is_direct_mention=is_direct_mention,
+                message_target=message_target,
                 tool_caller=runtime.lite_tool_caller or runtime.agent_tool_caller,
                 fallback_tool_caller=runtime.agent_tool_caller,
                 recent_context=recent_context_hint,
@@ -486,6 +547,7 @@ async def prepare_reply_semantics(
                 repeat_clusters=repeat_clusters,
                 current_inner_state=render_inner_state_hint(inner_state),
                 current_emotion_state=emotion_memory_hint,
+                media_grounding=media_grounding,
                 logger=runtime.logger,
                 metric_scene="private" if is_private_session else "group",
             )
@@ -552,6 +614,7 @@ async def prepare_reply_semantics(
                 current_emotion_state=emotion_memory_hint,
                 available_tools=planner_available_tools,
                 group_knowledge_hint=group_knowledge_hint,
+                media_grounding=media_grounding,
                 logger=runtime.logger,
                 metric_mode="shadow",
             )
@@ -709,6 +772,7 @@ __all__ = [
     "attach_turn_plan_to_semantic_frame",
     "compose_reply_emotion_block",
     "infer_turn_semantic_frame_with_timeout",
+    "load_reply_states_with_timeout",
     "plan_turn_with_timeout",
     "persist_reply_emotion_state",
     "prepare_reply_semantics",

@@ -42,8 +42,7 @@ try:
 except Exception as e:
     raise RuntimeError(
         'Cannot load required plugin "nonebot_plugin_apscheduler". '
-        'Install it in the active venv first, for example: '
-        '"F:\\bot\\shirotest\\.venv\\Scripts\\python.exe -m pip install nonebot-plugin-apscheduler".'
+        'Install it in the active venv first.'
     ) from e
 
 try:
@@ -51,8 +50,7 @@ try:
 except Exception as e:
     raise RuntimeError(
         'Cannot load required plugin "nonebot_plugin_localstore". '
-        'Install it in the active venv first, for example: '
-        '"F:\\bot\\shirotest\\.venv\\Scripts\\python.exe -m pip install nonebot-plugin-localstore".'
+        'Install it in the active venv first.'
     ) from e
 
 try:
@@ -73,6 +71,8 @@ from .core.plugin_meta import build_plugin_metadata
 from .core.plugin_runtime import build_plugin_runtime
 from .core.qzone_startup import refresh_qzone_cookie_on_available_bot
 from .core.runtime_state import close_shared_http_client
+from .core.runtime_performance import sample_event_loop_lag
+from .core.runtime_task_supervisor import runtime_task_supervisor
 from .core.ai_routes import (
     build_routed_tool_caller,
     format_provider_summary,
@@ -107,9 +107,6 @@ __plugin_meta__ = build_plugin_metadata(Config)
 
 _sticker_labeler_observer = None
 _knowledge_build_task: asyncio.Task | None = None
-_visual_probe_task: asyncio.Task | None = None
-_llm_warmup_task: asyncio.Task | None = None
-_qzone_cookie_refresh_task: asyncio.Task | None = None
 runtime_bundle = None
 flow_handles: dict[str, object] = {}
 job_handles: dict[str, object] = {}
@@ -203,18 +200,7 @@ async def _run_visual_probe_background() -> None:
 
 
 def _start_visual_probe_background() -> None:
-    global _visual_probe_task
-    if _visual_probe_task is not None and not _visual_probe_task.done():
-        return
-    task = asyncio.create_task(_run_visual_probe_background())
-    _visual_probe_task = task
-
-    def _clear_probe_task(done_task: asyncio.Task) -> None:
-        global _visual_probe_task
-        if _visual_probe_task is done_task:
-            _visual_probe_task = None
-
-    task.add_done_callback(_clear_probe_task)
+    runtime_task_supervisor.start("startup.visual_probe", _run_visual_probe_background)
 
 
 async def _warmup_llm_connection() -> None:
@@ -240,18 +226,7 @@ async def _warmup_llm_connection() -> None:
 
 
 def _start_llm_warmup_background() -> None:
-    global _llm_warmup_task
-    if _llm_warmup_task is not None and not _llm_warmup_task.done():
-        return
-    task = asyncio.create_task(_warmup_llm_connection())
-    _llm_warmup_task = task
-
-    def _clear_warmup_task(done_task: asyncio.Task) -> None:
-        global _llm_warmup_task
-        if _llm_warmup_task is done_task:
-            _llm_warmup_task = None
-
-    task.add_done_callback(_clear_warmup_task)
+    runtime_task_supervisor.start("startup.llm_warmup", _warmup_llm_connection)
 
 
 async def _refresh_qzone_cookie_background() -> None:
@@ -265,18 +240,7 @@ async def _refresh_qzone_cookie_background() -> None:
 
 
 def _start_qzone_cookie_refresh_background() -> None:
-    global _qzone_cookie_refresh_task
-    if _qzone_cookie_refresh_task is not None and not _qzone_cookie_refresh_task.done():
-        return
-    task = asyncio.create_task(_refresh_qzone_cookie_background())
-    _qzone_cookie_refresh_task = task
-
-    def _clear_qzone_cookie_refresh_task(done_task: asyncio.Task) -> None:
-        global _qzone_cookie_refresh_task
-        if _qzone_cookie_refresh_task is done_task:
-            _qzone_cookie_refresh_task = None
-
-    task.add_done_callback(_clear_qzone_cookie_refresh_task)
+    runtime_task_supervisor.start("startup.qzone_cookie_refresh", _refresh_qzone_cookie_background)
 
 
 @get_driver().on_startup
@@ -288,6 +252,8 @@ async def _init_personification_runtime() -> None:
     if runtime_bundle is not None:
         return
 
+    runtime_task_supervisor.configure(logger=logger)
+    runtime_task_supervisor.start("runtime.event_loop_lag", sample_event_loop_lag)
     runtime_bundle = build_plugin_runtime(
         plugin_config=plugin_config,
         superusers=superusers,
@@ -488,11 +454,17 @@ async def _install_personification_webui() -> None:
         return
     # 启动期清理过期设备 token 与旧审计日志
     try:
-        from .core import webui_audit_log, webui_auth_store
+        from .core import plugin_runtime_logs, webui_audit_log, webui_auth_store
 
         pruned = webui_auth_store.prune_expired_devices()
         if pruned:
             logger.info(f"[webui] 启动期清理过期设备 token: {pruned} 条")
+        scrubbed = webui_audit_log.scrub_sensitive_details()
+        if scrubbed:
+            logger.warning(f"[webui] 启动期清洗历史审计敏感字段: {scrubbed} 条")
+        scrubbed_logs = plugin_runtime_logs.scrub_sensitive_entries()
+        if scrubbed_logs:
+            logger.warning(f"[webui] 启动期清洗历史运行日志敏感字段: {scrubbed_logs} 条")
         webui_audit_log.prune_old_entries()
     except Exception as exc:
         logger.warning(f"[webui] 启动期清理失败：{exc}")
@@ -508,8 +480,7 @@ async def _install_personification_webui() -> None:
                 superusers=set(superusers or set()), get_bots=get_bots, logger=logger,
             )
 
-        _t = asyncio.create_task(_warm_health())
-        _t.add_done_callback(lambda _t: None)
+        runtime_task_supervisor.start("startup.health_warmup", _warm_health)
     except Exception as exc:
         logger.debug(f"[webui] 体检预热调度失败：{exc}")
 
@@ -541,7 +512,11 @@ async def _install_personification_webui() -> None:
 @get_driver().on_startup
 async def _restore_user_tasks() -> None:
     from .core.tasks_service import restore_tasks_on_startup
+    from .core.qq_outbound import build_outbound_context
+    from .core.services.agent_runtime import guard_scheduled_user_task_message
 
+    bundle = _require_runtime_bundle()
+    qq_outbound_ledger = bundle.qq_outbound_ledger
     data_dir = get_personification_data_dir(plugin_config)
 
     async def _bot_caller(task: dict) -> None:
@@ -557,6 +532,9 @@ async def _restore_user_tasks() -> None:
             message = str(params.get("message", "") or "")
         if not message and isinstance(task, dict):
             message = str(task.get("message", "") or "")
+        if not message:
+            return
+        message = guard_scheduled_user_task_message(task, message, logger=logger)
         if not message:
             return
 
@@ -576,12 +554,28 @@ async def _restore_user_tasks() -> None:
                 if friend_ids and str(user_id) not in friend_ids:
                     logger.warning(f"[user_tasks] 用户 {user_id} 不在好友列表，跳过发送确认")
                     continue
-                await bot.send_private_msg(user_id=int(user_id), message=message)
-                task["last_status"] = "sent"
+                if qq_outbound_ledger is None:
+                    await bot.send_private_msg(user_id=int(user_id), message=message)
+                    task["last_status"] = "sent"
+                else:
+                    outbound_context = build_outbound_context(
+                        bot=bot,
+                        event=types.SimpleNamespace(user_id=user_id),
+                        surface="scheduled_user_task",
+                        user_target=str(user_id),
+                    )
+                    receipt = await qq_outbound_ledger.dispatch(
+                        outbound_context,
+                        message,
+                        lambda: bot.send_private_msg(user_id=int(user_id), message=message),
+                    )
+                    task["last_status"] = receipt.status
                 return
             except Exception as e:
-                task["last_status"] = "failed"
+                task["last_status"] = "unknown" if qq_outbound_ledger is not None else "failed"
                 logger.warning(f"[user_tasks] 任务消息发送失败 user={user_id}: {e}")
+                if qq_outbound_ledger is not None:
+                    return
                 continue
 
     restore_tasks_on_startup(scheduler, data_dir, _bot_caller)
@@ -657,6 +651,13 @@ async def _load_custom_skills() -> None:
         )
     except Exception as exc:
         logger.warning(f"[tool_health] 启动工具巡检失败：{exc}")
+    try:
+        from .core.mcp_management import get_mcp_manager
+        from .webui.app import get_runtime_context
+
+        await get_mcp_manager(get_runtime_context()).reload()
+    except Exception as exc:
+        logger.warning(f"[mcp] 托管安装恢复失败：{type(exc).__name__}")
 
 
 @get_driver().on_startup
@@ -739,8 +740,10 @@ async def _setup_social_intelligence() -> None:
             persona_store=bundle.persona_store,
             data_dir=get_personification_data_dir(plugin_config),
             get_now=get_current_local_time,
+            load_prompt=bundle.load_prompt,
             tool_registry=bundle.reply_processor_deps.runtime.tool_registry,
             agent_max_steps=int(getattr(plugin_config, "personification_agent_max_steps", 10)),
+            qq_outbound_ledger=bundle.qq_outbound_ledger,
         )
         registered = setup_social_intelligence_jobs(scheduler=scheduler, ctx=ctx)
         if registered > 0:
@@ -753,25 +756,30 @@ async def _setup_social_intelligence() -> None:
 
 @get_driver().on_shutdown
 async def _close_personification_runtime() -> None:
-    global _sticker_labeler_observer, _knowledge_build_task, _visual_probe_task, _qzone_cookie_refresh_task, runtime_bundle
+    global _sticker_labeler_observer, _knowledge_build_task, runtime_bundle
+    if runtime_bundle is not None:
+        scoped_profile_service = getattr(runtime_bundle, "scoped_profile_service", None)
+        if scoped_profile_service is not None:
+            try:
+                await scoped_profile_service.close()
+            except Exception as exc:
+                logger.debug(f"[scoped_profile] shutdown cleanup failed: {exc}")
     if _sticker_labeler_observer is not None:
         _sticker_labeler_observer.stop()
         _sticker_labeler_observer.join()
         _sticker_labeler_observer = None
-    if _visual_probe_task is not None and not _visual_probe_task.done():
-        _visual_probe_task.cancel()
-        try:
-            await _visual_probe_task
-        except asyncio.CancelledError:
-            pass
-    _visual_probe_task = None
-    if _qzone_cookie_refresh_task is not None and not _qzone_cookie_refresh_task.done():
-        _qzone_cookie_refresh_task.cancel()
-        try:
-            await _qzone_cookie_refresh_task
-        except asyncio.CancelledError:
-            pass
-    _qzone_cookie_refresh_task = None
+    await runtime_task_supervisor.shutdown(timeout=5.0)
+    from .core.qzone_auth import qzone_login_manager
+
+    await qzone_login_manager.shutdown()
+    from .core.mcp_management import shutdown_mcp_managers
+
+    await shutdown_mcp_managers()
+    from .core.gemini_web_service import shutdown_gemini_web_services
+    from .core.mimo_web_asr_service import shutdown_mimo_web_asr_services
+
+    await shutdown_gemini_web_services()
+    await shutdown_mimo_web_asr_services()
     await stop_plugin_knowledge_builder(
         logger=logger,
         knowledge_store=(

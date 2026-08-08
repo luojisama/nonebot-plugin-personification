@@ -10,14 +10,23 @@ from typing import Any, Callable, Dict, List
 import httpx
 from nonebot.exception import FinishedException
 
+from ...core.ai_routes import summarize_provider_route_attempts
 from ...core.chat_intent import looks_like_explanatory_output
 from ...core.error_utils import log_exception
+from ...core.favorability_turn import (
+    build_favorability_context_block,
+    build_favorability_turn_id,
+    commit_favorability_turn,
+    extract_legacy_favorability_markers,
+    signals_from_semantic_frame,
+)
 from ...core.image_input import (
     is_image_input_unsupported_error,
     normalize_image_detail,
     normalize_image_input_mode,
 )
 from ...core.metrics import record_counter, record_timing
+from ...core.meme_reply_policy import format_meme_turn_prompt, prepare_meme_turn_context
 from ...core.message_parts import build_user_message_content, clone_messages_with_text_suffix
 from ...core.message_relations import extract_send_message_id
 from ...core.context_policy import (
@@ -39,25 +48,66 @@ from ...agent.runtime.responder import (
     parse_persona_response,
     with_persona_responder_instruction,
 )
+from ...agent.runtime.reply_quality import finalize_social_evidence_delivery_boundary
 from ...core.prompt_hooks import HookContext, get_hook_registry
 from ...core.group_context import (
     build_group_conversation_context,
     render_group_conversation_context,
+    render_plugin_episode_trace_detail,
     render_topic_state_trace_detail,
 )
 from ...core.group_mute import refresh_bot_group_mute_state
 from ...core.group_roles import extract_sender_role
-from ...core.target_inference import TARGET_OTHERS, TARGET_UNCLEAR, infer_message_target
+from ...core.target_inference import (
+    MessageTargetDecision,
+    TARGET_OTHERS,
+    TARGET_UNCLEAR,
+    infer_message_target,
+)
 from ...core.tts_service import extract_persona_tts_config
+from ...core.turn_media import (
+    attach_safe_visual_summary,
+    coerce_turn_media,
+    extract_turn_media_from_event,
+    media_from_batched_events,
+    media_summary_timeout_seconds,
+    normalize_safe_visual_summary,
+    render_turn_media_grounding,
+    resolve_onebot_media_refs,
+    serialize_turn_media,
+    summarize_media_resolution,
+)
+from ...core.user_avatar_insight import schedule_user_avatar_analysis
+from ...core.user_avatar_pair_insight import (
+    build_avatar_pair_candidates,
+    filter_avatar_candidates_by_policy,
+)
 from ...core.repeat_follow import maybe_follow_repeat_cluster
-from ...core.reply_style_policy import build_direct_visual_identity_guard, build_speech_act_policy_prompt
+from ...core.reply_style_policy import (
+    build_direct_visual_identity_guard,
+    build_directed_exchange_policy_prompt,
+    build_plugin_interaction_policy_prompt,
+    build_speech_act_policy_prompt,
+)
+from ...core.role_integrity import detect_persona_identity_leak
 from ...core.response_review import (
     is_agent_reply_ooc,
     make_passthrough_review_decision,
+    needs_uncertain_visible_reply_review,
+    required_reply_needs_recovery,
+    resolve_uncertain_visible_reply,
     rewrite_agent_reply_ooc,
     review_response_text,
 )
+from ...core.send_outcome import is_likely_delivered_send_timeout
 from ...core.reply_text_policy import normalize_visible_reply_text
+from ...core.reply_completion_contract import resolve_sent_reply_completion
+from ...core.reply_length_policy import (
+    render_reply_length_prompt_hint,
+    render_reply_length_trace,
+    resolve_reply_length_policy,
+    truncate_reply_text,
+)
 from ...core.visual_capabilities import VISUAL_ROUTE_AGENT, VISUAL_ROUTE_REPLY_PLAIN
 from ...skills.skillpacks.sticker_tool.scripts.impl import (
     reset_current_image_context,
@@ -73,6 +123,8 @@ from ...core.qq_expression_library import (
     render_qq_expression_message,
     semantic_text_for_qq_expression_segment,
 )
+from ...core.qq_user_policy import QQ_POLICY_DIRECT_CLOSURE, QQPolicyBlockedDuringTurn
+from ...core.qq_outbound import QQOutboundLedger, SendReceipt
 from ...core.sticker_feedback import (
     build_sticker_feedback_scene_key,
     mark_pending_sticker_reaction,
@@ -87,6 +139,16 @@ from ..event_rules import (
     _render_plugin_command_interaction,
     split_segment_if_long,
 )
+from ..reply_commit import (
+    acquire_reply_commit,
+    begin_reply_lifecycle,
+    execute_pending_actions,
+    mark_reply_phase,
+    mark_reply_delivery_complete,
+    mark_reply_delivery_confirmed,
+    mark_reply_delivery_started,
+    release_reply_commit,
+)
 from .pipeline_context import (
     batch_has_newer_messages as _batch_has_newer_messages,
     build_base_system_prompt as _build_base_system_prompt,
@@ -96,6 +158,7 @@ from .pipeline_context import (
     build_group_session_relation_metadata as _build_group_session_relation_metadata,
     build_tts_user_hint as _build_tts_user_hint,
     count_user_interactions as _count_user_interactions,
+    dispatch_reply_part as _dispatch_reply_part,
     extract_reply_sender_meta as _extract_reply_sender_meta,
     fold_consecutive_sticker_placeholders as _fold_consecutive_sticker_placeholders,
     get_primary_provider_signature as _get_primary_provider_signature,
@@ -108,7 +171,6 @@ from .pipeline_context import (
     should_use_agent_for_reply as _should_use_agent_for_reply,
     stale_reply_abort_reason as _stale_reply_abort_reason,
     strip_injected_visual_summary as _strip_injected_visual_summary,
-    truncate_at_punctuation as _truncate_at_punctuation,
 )
 from .pipeline_emotion import (
     persist_reply_emotion_state,
@@ -139,13 +201,33 @@ def _task_exc_logger(label: str, logger: Any) -> Any:
     return _cb
 
 
-_FALLBACK_REPLIES = [
-    "啊，我突然脑子有点空白...等一下再问我？",
-    "这个问题我需要想想，稍后回你",
-    "哦，刚才走神了，你刚说什么来着",
-]
-
 _IMAGE_B64_RE = re.compile(r"\[IMAGE_B64\]([A-Za-z0-9+/=\r\n]+)\[/IMAGE_B64\]")
+_SAFE_PROVIDER_DIAGNOSIS_CODES = {
+    "provider_auth_failed",
+    "provider_call_failed",
+    "provider_caller_unavailable",
+    "provider_invalid_response",
+    "provider_model_candidate_unavailable",
+    "provider_model_unavailable",
+    "provider_network_failed",
+    "provider_permission_denied",
+    "provider_request_rejected",
+    "provider_safety_block",
+    "provider_timeout",
+    "providers_exhausted",
+}
+
+
+def _provider_diagnosis_code(exc: BaseException) -> str:
+    current: BaseException | None = exc
+    seen: set[int] = set()
+    while current is not None and id(current) not in seen and len(seen) < 6:
+        seen.add(id(current))
+        code = str(getattr(current, "code", "") or "").strip().lower()
+        if code in _SAFE_PROVIDER_DIAGNOSIS_CODES:
+            return code
+        current = current.__cause__ or current.__context__
+    return ""
 
 
 def _extract_image_b64_markers(text: str) -> tuple[str, list[str]]:
@@ -291,6 +373,8 @@ class RuntimeDeps:
     profile_service: Any = None
     memory_curator: Any = None
     background_intelligence: Any = None
+    user_policy_gate: Any = None
+    qq_outbound_ledger: QQOutboundLedger | None = None
 
 
 @dataclass
@@ -326,17 +410,135 @@ def _should_regenerate_for_banter(
     return str(message_intent or "").strip() == "banter"
 
 
+def _policy_direct_closure_text(policy_decision: dict[str, Any]) -> str:
+    return "这个话题我不参与，我们换个话题吧。"
+
+
+async def _send_policy_direct_closure(
+    bot: Any,
+    event: Any,
+    state: Dict[str, Any],
+    deps: ReplyProcessorDeps,
+    policy_decision: dict[str, Any],
+) -> None:
+    """Send the one-shot policy closure without entering Agent/history/memory."""
+    runtime = deps.runtime
+    trace_mod = None
+    trace_id = ""
+    reason_code = str(policy_decision.get("reason_code", "") or "policy_boundary")
+    try:
+        plugin_config = getattr(runtime, "plugin_config", None)
+        if bool(getattr(plugin_config, "personification_turn_trace_enabled", True)):
+            from ...core import reply_turn_trace as trace_mod  # type: ignore[assignment]
+
+            group_id = str(getattr(event, "group_id", "") or "")
+            user_id = str(getattr(event, "user_id", "") or "")
+            trace_id = trace_mod.start_trace(
+                session_type="group" if group_id else "private",
+                group_id=group_id,
+                user_id=user_id,
+                detail={
+                    "source": "user_policy_direct_closure",
+                    "message_id": str(getattr(event, "message_id", "") or ""),
+                },
+            )
+            state["reply_trace_id"] = trace_id
+            trace_mod.record_stage(
+                trace_id=trace_id,
+                key="policy_ingress",
+                label="用户策略入口",
+                status="warn",
+                detail=f"disposition=direct_closure reason={reason_code}",
+            )
+    except Exception:
+        trace_mod = None
+        trace_id = ""
+
+    if reason_code == "classifier_unavailable":
+        if trace_mod is not None and trace_id:
+            trace_mod.record_stage(
+                trace_id=trace_id,
+                key="policy_no_reply",
+                label="策略分类器不可用",
+                status="warn",
+                detail="fail_closed=true outbound=false history=false memory=false",
+            )
+            trace_mod.finish_trace(
+                trace_id=trace_id,
+                outcome="no_reply",
+                diagnosis_code="policy_classifier_unavailable",
+                detail={"reason": "classifier_unavailable"},
+            )
+        return
+
+    try:
+        result = await _dispatch_reply_part(
+            bot=bot,
+            event=event,
+            payload=_policy_direct_closure_text(policy_decision),
+            ledger=getattr(runtime, "qq_outbound_ledger", None),
+            surface="policy_direct_closure",
+            reply_trace_id=trace_id,
+        )
+    except Exception as exc:
+        logger = getattr(runtime, "logger", None)
+        if logger is not None:
+            logger.warning(
+                f"[user_policy] direct closure send failed: {type(exc).__name__}"
+            )
+        if trace_mod is not None and trace_id:
+            trace_mod.record_stage(
+                trace_id=trace_id,
+                key="policy_closure_send",
+                label="策略提示发送",
+                status="error",
+                detail=f"type={type(exc).__name__}",
+            )
+            trace_mod.finish_trace(
+                trace_id=trace_id,
+                outcome="failed",
+                diagnosis_code="policy_closure_send_failed",
+            )
+        return
+
+    sent = not isinstance(result, SendReceipt) or result.status == "sent"
+    if trace_mod is not None and trace_id:
+        trace_mod.record_stage(
+            trace_id=trace_id,
+            key="policy_closure_send",
+            label="策略提示发送",
+            status="ok" if sent else "error",
+            detail="固定非模型提示已发送" if sent else f"ledger_status={result.status}",
+        )
+        trace_mod.finish_trace(
+            trace_id=trace_id,
+            outcome="ok" if sent else "failed",
+            diagnosis_code="policy_direct_closure" if sent else "outbound_send_failed",
+        )
+
+
 async def process_response_logic(bot: Any, event: Any, state: Dict[str, Any], deps: ReplyProcessorDeps) -> None:
     # plugin_invoker 代为执行其它插件命令时会用 handle_event 重新分发合成事件，
     # 这里直接短路，确保合成事件永远不会再次进入拟人回复/Agent 流程（防递归）。
     if getattr(event, "_personification_synthetic", False):
         return
+    user_policy_gate = getattr(deps.runtime, "user_policy_gate", None)
+    policy_decision = state.get("user_policy_decision")
+    if isinstance(policy_decision, dict) and policy_decision.get("disposition") != "allow":
+        if policy_decision.get("disposition") == QQ_POLICY_DIRECT_CLOSURE:
+            if user_policy_gate is None or await user_policy_gate.allows_current(event):
+                await _send_policy_direct_closure(bot, event, state, deps, policy_decision)
+        return
+    if user_policy_gate is not None and not await user_policy_gate.allows_current(event):
+        return
+    begin_reply_lifecycle(state)
 
     token = None
     reset_llm_context = None
     trace_id = ""
     trace_token = None
     trace_mod = None
+    cancelled = False
     try:
         from ...core.llm_context import reset_llm_context, set_llm_context
 
@@ -352,6 +554,16 @@ async def process_response_logic(bot: Any, event: Any, state: Dict[str, Any], de
 
         runtime = deps.runtime
         if bool(getattr(runtime.plugin_config, "personification_turn_trace_enabled", True)):
+            policy_disposition = str(
+                policy_decision.get("disposition", "")
+                if isinstance(policy_decision, dict)
+                else ""
+            ).strip()
+            policy_reason_code = str(
+                policy_decision.get("reason_code", "")
+                if isinstance(policy_decision, dict)
+                else ""
+            ).strip()
             trace_id = trace_mod.current_trace_id()
             session_type = "group" if hasattr(event, "group_id") else "private"
             group_id = str(getattr(event, "group_id", "") or "")
@@ -361,15 +573,24 @@ async def process_response_logic(bot: Any, event: Any, state: Dict[str, Any], de
                 session_type=session_type,
                 group_id=group_id,
                 user_id=user_id,
-                detail={"source": "reply_pipeline", "message_id": str(getattr(event, "message_id", "") or "")},
+                detail={
+                    "source": "reply_pipeline",
+                    "message_id": str(getattr(event, "message_id", "") or ""),
+                    "policy_disposition": policy_disposition,
+                    "policy_reason_code": policy_reason_code,
+                },
             )
+            state["reply_trace_id"] = trace_id
             trace_token = trace_mod.set_current_trace_id(trace_id)
             trace_mod.record_stage(
                 trace_id=trace_id,
                 key="ingress",
                 label="进入回复链路",
-                status="info",
-                detail=f"session={session_type} user={user_id} group={group_id or '-'}",
+                status="warn" if policy_reason_code == "classifier_unavailable" else "info",
+                detail=(
+                    f"session={session_type} user={user_id} group={group_id or '-'} "
+                    f"policy={policy_disposition or '-'} reason={policy_reason_code or '-'}"
+                ),
             )
     except Exception:
         trace_id = ""
@@ -377,23 +598,46 @@ async def process_response_logic(bot: Any, event: Any, state: Dict[str, Any], de
         trace_mod = None
     try:
         await _process_response_logic_impl(bot, event, state, deps)
+    except asyncio.CancelledError:
+        cancelled = True
+        raise
     except FinishedException:
-        if trace_mod is not None and trace_id:
+        if trace_mod is not None and trace_id and not cancelled:
             trace_mod.finish_trace(trace_id=trace_id, outcome="finished", diagnosis_code="finished_exception")
         raise
     except Exception as exc:
-        if trace_mod is not None and trace_id:
+        if trace_mod is not None and trace_id and not cancelled:
+            provider_code = _provider_diagnosis_code(exc)
+            is_provider_failure = bool(provider_code)
+            route_summary = summarize_provider_route_attempts(exc) if is_provider_failure else ""
             trace_mod.record_stage(
                 trace_id=trace_id,
-                key="unhandled_exception",
-                label="链路异常",
+                key="provider_failure" if is_provider_failure else "unhandled_exception",
+                label="Provider 调用失败" if is_provider_failure else "链路异常",
                 status="error",
-                detail=str(exc)[:500],
+                detail=(
+                    " ".join(
+                        part
+                        for part in (
+                            f"code={provider_code}",
+                            f"type={type(exc).__name__}",
+                            route_summary,
+                        )
+                        if part
+                    )
+                    if is_provider_failure
+                    else f"type={type(exc).__name__}"
+                ),
             )
-            trace_mod.finish_trace(trace_id=trace_id, outcome="failed", diagnosis_code="internal_exception")
+            trace_mod.finish_trace(
+                trace_id=trace_id,
+                outcome="failed",
+                diagnosis_code=provider_code if is_provider_failure else "internal_exception",
+            )
         raise
     finally:
-        if trace_mod is not None and trace_id:
+        release_reply_commit(state)
+        if trace_mod is not None and trace_id and not cancelled:
             try:
                 last_trace = trace_mod.get_trace(trace_id) or {}
                 if not str(last_trace.get("outcome", "") or ""):
@@ -452,6 +696,42 @@ def _build_image_only_context_message(
     )
 
 
+def _batch_media_owner_matches_selected_user(
+    batched_events: List[Dict[str, Any]],
+    selected_user_id: str,
+) -> bool:
+    media_owners = {
+        str(media.get("owner_user_id", "") or "").strip()
+        for item in batched_events
+        if isinstance(item, dict)
+        for media in list(item.get("media") or [])
+        if isinstance(media, dict) and str(media.get("owner_user_id", "") or "").strip()
+    }
+    return not media_owners or media_owners == {str(selected_user_id or "").strip()}
+
+
+def _has_turn_media_input(
+    image_urls: List[str],
+    turn_media_context: List[Any],
+) -> bool:
+    """Return whether the turn contains media that can drive Agent processing.
+
+    Images already have a separate URL pipeline. Video/audio refs live only in
+    ``turn_media_context`` until their lazy OneBot resolution happens, so a
+    video-only message must not be treated as an empty-text turn and discarded.
+    """
+
+    if image_urls:
+        return True
+    return any(
+        str(
+            item.get("kind", "") if isinstance(item, dict) else getattr(item, "kind", "")
+        ).strip().lower()
+        in {"video", "audio"}
+        for item in list(turn_media_context or [])
+    )
+
+
 async def _capture_user_protocol_profile(
     *,
     runtime: Any,
@@ -461,8 +741,22 @@ async def _capture_user_protocol_profile(
     source: str,
 ) -> None:
     profile_service = getattr(runtime, "profile_service", None)
-    if profile_service is None or not str(user_id or "").strip():
+    persona_enabled = lambda: bool(
+        getattr(
+            getattr(runtime, "plugin_config", None),
+            "personification_persona_enabled",
+            True,
+        )
+    )
+    if (
+        profile_service is None
+        or not str(user_id or "").strip()
+        or not persona_enabled()
+    ):
         return
+    memory_store = getattr(profile_service, "memory_store", None)
+    generation_getter = getattr(memory_store, "get_profile_generation", None)
+    profile_generation = int(generation_getter()) if callable(generation_getter) else None
     try:
         from ...core.onebot_cache import get_user_profile
         from ...core.user_profile_meta import build_user_profile_meta
@@ -474,12 +768,15 @@ async def _capture_user_protocol_profile(
             stranger_info=protocol_profile,
             source=source,
         )
-        if meta:
-            profile_service.upsert_user_profile_meta(
+        if meta and persona_enabled():
+            saved = profile_service.upsert_user_profile_meta(
                 user_id=str(user_id),
                 meta=meta,
                 source=source,
+                expected_generation=profile_generation,
             )
+            if saved is not None:
+                schedule_user_avatar_analysis(runtime, str(user_id))
     except Exception as exc:
         logger = getattr(runtime, "logger", None)
         if logger is not None:
@@ -519,6 +816,12 @@ async def _process_response_logic_impl(bot: Any, event: Any, state: Dict[str, An
     batch_trigger = dict(state.get("batch_trigger") or {})
     repeat_clusters = list(state.get("repeat_clusters") or [])
     batch_event_count = int(state.get("batch_event_count", 1) or 1)
+    turn_media_context = coerce_turn_media(state.get("turn_media_context") or [])
+    if not turn_media_context:
+        turn_media_context = media_from_batched_events(batched_events)
+    if not turn_media_context and isinstance(event, types.message_event_cls):
+        turn_media_context = extract_turn_media_from_event(event, current_origin="current")
+    state["turn_media_context"] = serialize_turn_media(turn_media_context)
 
     is_random_chat = state.get("is_random_chat", False)
     force_mode = state.get("force_mode", None)
@@ -549,9 +852,20 @@ async def _process_response_logic_impl(bot: Any, event: Any, state: Dict[str, An
         message_content = "[你被对方戳了戳，你感到有点疑惑和好奇，想知道对方要做什么]"
         sender_name = "戳戳怪"
         runtime.logger.info(f"拟人插件：检测到来自 {user_id} 的戳一戳")
-        poke_back_task = asyncio.create_task(
-            maybe_poke_back(bot, runtime, group_id=group_id, user_id=user_id)
-        )
+        async def _poke_back_after_commit_gate() -> None:
+            if (
+                getattr(runtime, "user_policy_gate", None) is not None
+                and not await runtime.user_policy_gate.allows_current(event)
+            ):
+                return
+            commit_lock = state.get("reply_commit_lock")
+            if isinstance(commit_lock, asyncio.Lock):
+                async with commit_lock:
+                    await maybe_poke_back(bot, runtime, group_id=group_id, user_id=user_id)
+                return
+            await maybe_poke_back(bot, runtime, group_id=group_id, user_id=user_id)
+
+        poke_back_task = asyncio.create_task(_poke_back_after_commit_gate())
         poke_back_task.add_done_callback(_task_exc_logger("humanize_poke_back", runtime.logger))
     elif isinstance(event, types.message_event_cls):
         user_id = str(event.user_id)
@@ -870,15 +1184,33 @@ async def _process_response_logic_impl(bot: Any, event: Any, state: Dict[str, An
 
     if not runtime.get_configured_api_providers():
         runtime.logger.warning("拟人插件：未配置可用的 API provider，跳过回复")
-        if is_direct_mention:
-            try:
-                await bot.send(event, "在呢")
-            except Exception as exc:
-                log_exception(runtime.logger, "[reply_processor] fallback presence reply failed", exc, level="debug")
+        try:
+            from ...core import reply_turn_trace
+
+            reply_turn_trace.record_stage(
+                key="provider_failure",
+                label="Provider 不可用",
+                status="error",
+                detail="code=provider_caller_unavailable delivery_state=not_started silent=true",
+            )
+            reply_turn_trace.finish_trace(
+                outcome="failed",
+                diagnosis_code="provider_caller_unavailable",
+                detail={
+                    "silent": True,
+                    "delivery_state": "not_started",
+                    "reply_required": bool(state.get("reply_required", False)),
+                },
+            )
+        except Exception:
+            pass
         return
 
     user_name = sender_name
-    if not message_content and not is_poke and not image_urls:
+    if not message_content and not is_poke and not _has_turn_media_input(
+        image_urls,
+        turn_media_context,
+    ):
         return
 
     if (
@@ -901,10 +1233,15 @@ async def _process_response_logic_impl(bot: Any, event: Any, state: Dict[str, An
         )
 
     is_private_session = str(group_id).startswith(session.private_session_prefix)
+    reply_required = bool(state.get("reply_required", False) or is_private_session or is_direct_mention)
+    response_deadline = state.get("response_deadline")
 
     async def _maybe_silence_reaction() -> None:
         """NO_REPLY 沉默前的轻量回应（贴表情/拍一拍），never-raise。"""
         try:
+            if getattr(runtime, "user_policy_gate", None) is not None:
+                await runtime.user_policy_gate.ensure_current(event)
+            await acquire_reply_commit(state)
             favorability = 0.0
             try:
                 favorability = float(persona.get_user_data(user_id).get("favorability", 0.0) or 0.0)
@@ -914,7 +1251,11 @@ async def _process_response_logic_impl(bot: Any, event: Any, state: Dict[str, An
                 bot,
                 runtime,
                 event=event,
-                message_text=raw_message_text or message_text or message_content,
+                mood_hint=str(
+                    getattr(semantic_frame, "sticker_mood_hint", "")
+                    or getattr(semantic_frame, "bot_emotion", "")
+                    or ""
+                ),
                 group_id=str(group_id),
                 user_id=user_id,
                 is_private=is_private_session,
@@ -931,11 +1272,20 @@ async def _process_response_logic_impl(bot: Any, event: Any, state: Dict[str, An
     recent_group_msgs: List[Dict[str, Any]] = []
     if isinstance(event, types.group_message_event_cls) and not state.get("message_target"):
         recent_group_msgs = get_recent_group_msgs(str(group_id), limit=8, expire_hours=0)
-        state["message_target"] = infer_message_target(
+        if getattr(runtime, "user_policy_gate", None) is not None:
+            recent_group_msgs, _ = await runtime.user_policy_gate.filter_context_messages(
+                recent_group_msgs,
+                bot_self_id=str(getattr(bot, "self_id", "") or ""),
+            )
+        target_decision = infer_message_target(
             event,
             bot_self_id=str(getattr(bot, "self_id", "") or ""),
             recent_group_msgs=recent_group_msgs,
         )
+        if isinstance(target_decision, MessageTargetDecision):
+            state.update(target_decision.trace_fields())
+        else:
+            state["message_target"] = str(target_decision or "")
     try:
         from ...core import reply_turn_trace
 
@@ -945,7 +1295,10 @@ async def _process_response_logic_impl(bot: Any, event: Any, state: Dict[str, An
             status="info",
             detail=(
                 f"private={is_private_session} random={bool(is_random_chat)} "
-                f"direct={bool(is_direct_mention)} target={state.get('message_target') or '-'}"
+                f"direct={bool(is_direct_mention)} target={state.get('message_target') or '-'} "
+                f"reason={state.get('message_target_reason') or '-'} "
+                f"anchor={state.get('message_target_anchor_id') or '-'} "
+                f"participants={len(state.get('message_target_participants') or [])}"
             ),
         )
     except Exception:
@@ -960,18 +1313,30 @@ async def _process_response_logic_impl(bot: Any, event: Any, state: Dict[str, An
 
     if persona.sign_in_available:
         try:
+            current_attitudes = getattr(
+                runtime.plugin_config,
+                "personification_favorability_attitudes",
+                None,
+            ) or persona.favorability_attitudes
             user_data = persona.get_user_data(user_id)
             favorability = user_data.get("favorability", 0.0)
             level_name = persona.get_level_name(favorability)
-            attitude_desc = persona.favorability_attitudes.get(level_name, attitude_desc)
+            attitude_desc = current_attitudes.get(level_name, attitude_desc)
 
             group_key = f"group_{group_id}"
             group_data = persona.get_user_data(group_key)
-            group_favorability = group_data.get("favorability", 100.0)
+            group_favorability = group_data.get("favorability", 35.0)
             group_level = persona.get_level_name(group_favorability)
-            group_attitude = persona.favorability_attitudes.get(group_level, "")
+            group_attitude = current_attitudes.get(group_level, "")
         except Exception as e:
             runtime.logger.error(f"获取好感度数据失败: {e}")
+
+    favorability_context_block = build_favorability_context_block(
+        user_level=level_name,
+        user_attitude=attitude_desc,
+        group_attitude=group_attitude,
+        is_private=is_private_session,
+    )
 
     now = runtime.get_current_time()
     week_days = ["星期一", "星期二", "星期三", "星期四", "星期五", "星期六", "星期日"]
@@ -1012,8 +1377,29 @@ async def _process_response_logic_impl(bot: Any, event: Any, state: Dict[str, An
             source="reply_pipeline",
         )
 
+    user_profile_block = ""
+    try:
+        profile_service = getattr(runtime, "profile_service", None)
+        if profile_service is not None:
+            user_profile_block = profile_service.build_prompt_block(
+                user_id=user_id,
+                group_id="" if is_private_session else str(group_id),
+            )
+    except Exception:
+        user_profile_block = ""
+
     tool_image_urls = list(image_urls)
-    # 真实照片（不含表情包），仅这部分允许走文本摘要降级；表情包不打标。
+    tool_video_urls = [
+        item.ref
+        for item in turn_media_context
+        if item.kind == "video" and str(item.ref or "").strip()
+    ][:1]
+    tool_audio_urls = [
+        item.ref
+        for item in turn_media_context
+        if item.kind == "audio" and str(item.ref or "").strip()
+    ][:1]
+    # 分类为真实照片的 refs 继续用于 provider 图片输入不兼容时的旧 fallback。
     photo_image_urls = list(image_urls)
     image_input_mode = normalize_image_input_mode(
         getattr(runtime.plugin_config, "personification_image_input_mode", "auto")
@@ -1040,7 +1426,8 @@ async def _process_response_logic_impl(bot: Any, event: Any, state: Dict[str, An
                 status="ok" if (direct_image_input or agent_direct_image_input) else "warn",
                 detail=(
                     f"mode={image_input_mode} plain_direct={direct_image_input} "
-                    f"agent_direct={agent_direct_image_input} images={len(image_urls)} stickers={len(sticker_image_urls)}"
+                    f"agent_direct={agent_direct_image_input} images={len(image_urls)} "
+                    f"stickers={len(sticker_image_urls)} elapsed_ms=0"
                 ),
                 hint="" if (direct_image_input or agent_direct_image_input) else "将尝试视觉摘要 fallback 或文本占位",
             )
@@ -1048,13 +1435,10 @@ async def _process_response_logic_impl(bot: Any, event: Any, state: Dict[str, An
             pass
     image_summary_suffix = ""
     image_urls_for_text_model = list(image_urls)
-    _needs_image_summary = False
     if image_urls:
         if image_input_mode == "disabled":
             image_urls_for_text_model = []
         else:
-            if image_input_mode in {"auto", "summary"} and (not direct_image_input or not agent_direct_image_input):
-                _needs_image_summary = True
             if not direct_image_input:
                 image_urls_for_text_model = []
 
@@ -1111,6 +1495,7 @@ async def _process_response_logic_impl(bot: Any, event: Any, state: Dict[str, An
         runtime=runtime,
         bot=bot,
         event=event,
+        user_profile_block=user_profile_block,
     )
     await get_hook_registry().run_all(hook_ctx, phase="preprocess")
     message_content = hook_ctx.message_content
@@ -1123,18 +1508,28 @@ async def _process_response_logic_impl(bot: Any, event: Any, state: Dict[str, An
     relationship_hint = ""
     recent_context_hint = ""
     recent_window: list[dict[str, Any]] = []
+    conversation_context = None
     if not is_private_session and recent_group_msgs:
         recent_window = build_group_context_window(
             str(group_id),
             limit=8,
             include_message_ids=[incoming_relation_metadata.get("reply_to_msg_id")],
         )
+        excluded_context_user_ids: set[str] = set()
+        if getattr(runtime, "user_policy_gate", None) is not None:
+            recent_window, excluded_context_user_ids = (
+                await runtime.user_policy_gate.filter_context_messages(
+                    recent_window,
+                    bot_self_id=bot_self_id,
+                )
+            )
         conversation_context = build_group_conversation_context(
             recent_messages=recent_window,
             trigger_msg_id=str(incoming_relation_metadata.get("message_id", "") or ""),
             trigger_user_id=user_id,
             bot_self_id=bot_self_id,
             repeat_clusters=repeat_clusters,
+            excluded_user_ids=excluded_context_user_ids,
         )
         recent_context_hint = render_group_conversation_context(conversation_context)
         relationship_hint = conversation_context.relationship_hint
@@ -1150,29 +1545,57 @@ async def _process_response_logic_impl(bot: Any, event: Any, state: Dict[str, An
                     detail=topic_detail,
                     hint="结构化线索用于判断当前消息接谁的话，不替代 LLM 语义判断",
                 )
+            plugin_detail = render_plugin_episode_trace_detail(conversation_context.plugin_episode)
+            if plugin_detail:
+                reply_turn_trace.record_stage(
+                    key="plugin_episode",
+                    label="其它插件交互",
+                    status="info",
+                    detail=plugin_detail,
+                    hint="其它插件输出仅作为带来源的群聊上下文，不等同于人格回复",
+                )
         except Exception:
             pass
+    avatar_pair_candidates = build_avatar_pair_candidates(
+        event=event,
+        current_user_id=user_id,
+        current_user_label=user_name,
+        bot_self_id=bot_self_id,
+        batched_events=batched_events,
+        recent_messages=recent_window,
+    )
+    avatar_pair_candidates = await filter_avatar_candidates_by_policy(
+        avatar_pair_candidates,
+        (
+            runtime.user_policy_gate.current_authorization
+            if getattr(runtime, "user_policy_gate", None) is not None
+            else None
+        ),
+    )
     if not is_private_session and sticker_candidates:
-        _spawn_auto_collect_stickers(
-            runtime=runtime,
-            group_id=str(group_id),
-            user_id=user_id,
-            candidates=sticker_candidates,
-            task_exc_logger=_task_exc_logger,
-        )
+        if _batch_media_owner_matches_selected_user(batched_events, user_id):
+            _spawn_auto_collect_stickers(
+                runtime=runtime,
+                group_id=str(group_id),
+                user_id=user_id,
+                candidates=sticker_candidates,
+                task_exc_logger=_task_exc_logger,
+            )
+        else:
+            record_counter("sticker.collect_skipped", reason="ambiguous_batch_owner")
+            runtime.logger.debug("拟人插件：多用户 batch 的贴图候选无法可靠回绑 owner，本轮跳过自动收藏。")
     async def _image_summary_task() -> str:
-        # 仅对真实照片做文本摘要降级；表情包不在回复路径打标（打标只服务于收集入库）。
-        if not _needs_image_summary or not photo_image_urls:
+        if image_input_mode == "disabled" or not tool_image_urls:
             return ""
         return await _build_image_summary_suffix(
             runtime=runtime,
-            image_urls=photo_image_urls,
+            image_urls=tool_image_urls,
             sticker_like=False,
         )
 
-    image_summary_suffix, prepared_semantics = await asyncio.gather(
-        _image_summary_task(),
-        prepare_reply_semantics(
+    async def _prepare_semantics_timed() -> tuple[Any, int]:
+        semantic_started_at = time.monotonic()
+        prepared = await prepare_reply_semantics(
             runtime=runtime,
             recent_window=recent_window,
             group_id=str(group_id),
@@ -1188,8 +1611,37 @@ async def _process_response_logic_impl(bot: Any, event: Any, state: Dict[str, An
             message_target=str(state.get("message_target", "") or ""),
             solo_speaker_follow=is_solo_speaker_follow,
             has_images=bool(tool_image_urls),
-        ),
+            media_grounding=media_grounding,
+        )
+        return prepared, int((time.monotonic() - semantic_started_at) * 1000)
+
+    summary_timeout = media_summary_timeout_seconds(
+        response_deadline if isinstance(response_deadline, (int, float)) else None,
+        now=time.monotonic(),
     )
+    image_summary_suffix = ""
+    if summary_timeout > 0.05:
+        try:
+            image_summary_suffix = await asyncio.wait_for(
+                _image_summary_task(),
+                timeout=summary_timeout,
+            )
+        except asyncio.TimeoutError:
+            runtime.logger.warning(
+                f"拟人插件：视觉摘要超过本轮前置预算 {summary_timeout:.1f}s，继续使用 provenance 进入语义判断。"
+            )
+    safe_visual_summary = normalize_safe_visual_summary(image_summary_suffix)
+    turn_media_context = attach_safe_visual_summary(
+        turn_media_context,
+        safe_visual_summary,
+        confidence=0.65,
+    )
+    state["turn_media_context"] = serialize_turn_media(turn_media_context)
+    media_grounding = render_turn_media_grounding(
+        turn_media_context,
+        summary=safe_visual_summary,
+    )
+    prepared_semantics, semantic_prepare_elapsed_ms = await _prepare_semantics_timed()
     if image_summary_suffix and tool_image_urls:
         if not direct_image_input:
             current_text_message_content = (
@@ -1208,6 +1660,16 @@ async def _process_response_logic_impl(bot: Any, event: Any, state: Dict[str, An
     inner_state = prepared_semantics.inner_state
     emotion_state = prepared_semantics.emotion_state
     semantic_frame = prepared_semantics.semantic_frame
+    favorability_signals = signals_from_semantic_frame(
+        semantic_frame,
+        is_private=is_private_session,
+    )
+    favorability_turn_id = build_favorability_turn_id(
+        trace_id=state.get("reply_trace_id", ""),
+        message_id=getattr(event, "message_id", ""),
+        group_id=group_id,
+        user_id=user_id,
+    )
     intent_decision = prepared_semantics.intent_decision
     message_intent = prepared_semantics.message_intent
     arbitration = prepared_semantics.arbitration
@@ -1225,7 +1687,8 @@ async def _process_response_logic_impl(bot: Any, event: Any, state: Dict[str, An
                 f"address_mode={getattr(semantic_frame, 'address_mode', '-') or '-'} "
                 f"emotion={getattr(semantic_frame, 'bot_emotion', '')} "
                 f"output={getattr(semantic_frame, 'output_mode', '') or '-'} "
-                f"elapsed_ms={int((time.monotonic() - started_at) * 1000)}"
+                f"elapsed_ms={semantic_prepare_elapsed_ms} "
+                f"turn_age_ms={int((time.monotonic() - started_at) * 1000)}"
             ),
         )
     except Exception:
@@ -1270,6 +1733,25 @@ async def _process_response_logic_impl(bot: Any, event: Any, state: Dict[str, An
             except Exception:
                 pass
             return
+
+    meme_turn_prompt = ""
+    try:
+        meme_turn_context = prepare_meme_turn_context(
+            group_id="" if is_private_session else str(group_id),
+            message_text=raw_message_text or current_agent_message_content,
+            recent_context=recent_context_hint,
+            probability=float(getattr(runtime.plugin_config, "personification_meme_reply_probability", 0.18) or 0.0),
+            semantic_frame=semantic_frame,
+            rng=random.random,
+        )
+        meme_turn_prompt = format_meme_turn_prompt(meme_turn_context)
+        record_counter(
+            "reply.meme_turn_total",
+            allowed=str(bool(meme_turn_context.get("active_use_allowed"))).lower(),
+            understood=len(meme_turn_context.get("understanding_senses") or []),
+        )
+    except Exception as exc:
+        runtime.logger.debug(f"拟人插件：本轮黑话上下文不可用，按无词典提示继续: {type(exc).__name__}")
 
     current_user_content = build_user_message_content(
         text=f"{msg_prefix}{current_text_message_content}",
@@ -1354,6 +1836,11 @@ async def _process_response_logic_impl(bot: Any, event: Any, state: Dict[str, An
 
     base_prompt = persona.load_prompt(str(group_id))
     if isinstance(base_prompt, dict):
+        from ...core.builtin_hooks import schedule_pending_topic_extraction
+
+        hook_ctx.session_messages = session_messages_for_model
+        hook_ctx.semantic_frame = semantic_frame
+        await schedule_pending_topic_extraction(hook_ctx)
         try:
             from ...core import reply_turn_trace
 
@@ -1392,29 +1879,36 @@ async def _process_response_logic_impl(bot: Any, event: Any, state: Dict[str, An
             intent_recommend_silence=intent_decision.recommend_silence,
             recent_context_hint=recent_context_hint,
             relationship_hint=relationship_hint,
+            plugin_episode=(
+                conversation_context.plugin_episode
+                if conversation_context is not None
+                else None
+            ),
             semantic_frame=semantic_frame,
             has_newer_batch=_batch_has_newer_messages(state),
             batch_runtime_ref=state.get("batch_runtime_ref"),
+            reply_commit_state=state,
             solo_speaker_follow=is_solo_speaker_follow,
             favorability_service=persona.favorability_service,
+            reply_required=reply_required,
+            response_deadline=response_deadline,
+            prepared_inner_state=prepared_semantics.inner_state,
+            prepared_emotion_state=prepared_semantics.emotion_state,
+            turn_media_context=serialize_turn_media(turn_media_context),
+            media_grounding=media_grounding,
+            precomputed_image_summary_suffix=image_summary_suffix,
+            user_profile_block=user_profile_block,
+            profile_service=getattr(runtime, "profile_service", None),
+            favorability_context_block=favorability_context_block,
+            favorability_turn_id=favorability_turn_id,
+            avatar_pair_candidates=avatar_pair_candidates,
+            avatar_pair_runtime=runtime,
+            qq_outbound_ledger=getattr(runtime, "qq_outbound_ledger", None),
+            reply_trace_id=str(state.get("reply_trace_id", "") or ""),
         )
         return
 
-    attitude_desc = attitude_desc or "态度普通，像平常一样交流。"
-    relation_style = "用自然平衡语气回应。"
-    preferred_length = "默认回复 1-2 句。"
-    if level_name in {"挚友", "亲密"}:
-        relation_style = "适度使用更亲近的称呼或语气词，体现熟悉感。"
-        preferred_length = "可以扩展到 2-4 句，增加情感反馈。"
-    elif level_name in {"陌生", "路人"}:
-        relation_style = "保持礼貌和边界感，避免过度亲昵。"
-        preferred_length = "优先 1-2 句，直接回答重点。"
-    if is_private_session:
-        relation_style += " 私聊场景可更自然连续，不必强调围观感。"
-
-    combined_attitude = f"你对该用户的个人态度是：{attitude_desc}\n关系表达策略：{relation_style}\n长度偏好：{preferred_length}"
-    if group_attitude:
-        combined_attitude += f"\n当前群聊整体氛围带给你的感受是：{group_attitude}"
+    combined_attitude = favorability_context_block
     emotion_block = prepared_semantics.emotion_block
 
     hook_ctx.session_messages = session_messages_for_model
@@ -1455,6 +1949,12 @@ async def _process_response_logic_impl(bot: Any, event: Any, state: Dict[str, An
             get_configured_api_providers=runtime.get_configured_api_providers,
         ),
     )
+    if user_profile_block:
+        system_prompt += f"\n\n{user_profile_block}"
+    if media_grounding:
+        system_prompt += f"\n\n{media_grounding}"
+    if meme_turn_prompt:
+        system_prompt += f"\n\n{meme_turn_prompt}"
     turn_plan = getattr(semantic_frame, "turn_plan", None)
     system_prompt += "\n\n" + build_speech_act_policy_prompt(
         speech_act=str(getattr(turn_plan, "speech_act", getattr(semantic_frame, "speech_act", "")) or ""),
@@ -1462,6 +1962,65 @@ async def _process_response_logic_impl(bot: Any, event: Any, state: Dict[str, An
         session_goal=str(getattr(turn_plan, "session_goal", getattr(semantic_frame, "session_goal", "")) or ""),
         is_group=not is_private_session,
     )
+    directed_exchange_prompt = build_directed_exchange_policy_prompt(
+        is_direct_mention=is_direct_mention,
+        is_group=not is_private_session,
+        speech_act=str(getattr(turn_plan, "speech_act", getattr(semantic_frame, "speech_act", "")) or ""),
+        output_mode=str(getattr(turn_plan, "output_mode", getattr(semantic_frame, "output_mode", "")) or ""),
+    )
+    if directed_exchange_prompt:
+        system_prompt += "\n\n" + directed_exchange_prompt
+    if conversation_context is not None and conversation_context.plugin_episode is not None:
+        system_prompt += "\n\n" + build_plugin_interaction_policy_prompt(
+            is_direct_mention=is_direct_mention,
+        )
+
+    async def _resolve_operational_empty_reply(reason_code: str) -> str:
+        timeout = 8.0
+        if isinstance(response_deadline, (int, float)):
+            timeout = min(timeout, max(0.0, float(response_deadline) - time.monotonic()))
+        decision = await resolve_uncertain_visible_reply(
+            runtime.review_call_ai_api or runtime.lite_call_ai_api or runtime.call_ai_api,
+            candidate_text="",
+            raw_message_text=raw_message_text or message_text or message_content,
+            persona_system=system_prompt,
+            turn_plan=turn_plan,
+            reply_required=reply_required,
+            is_private=is_private_session,
+            evidence_unavailable=True,
+            timeout=timeout,
+        )
+        if decision.action == "request_context" and decision.text:
+            try:
+                from ...core import reply_turn_trace
+
+                reply_turn_trace.record_stage(
+                    key="actionable_context_requested",
+                    label="索取必要上下文",
+                    status="ok",
+                    detail=f"source={reason_code} one_condition=true",
+                )
+            except Exception:
+                pass
+            return decision.text.strip()
+        try:
+            from ...core import reply_turn_trace
+
+            reply_turn_trace.record_stage(
+                key=reason_code,
+                label="可见回复收口",
+                status="warn",
+                detail="outbound=false actionable_context=false",
+            )
+            reply_turn_trace.finish_trace(
+                outcome="no_reply",
+                diagnosis_code=reason_code,
+                detail={"reason": decision.reason or reason_code},
+            )
+        except Exception:
+            pass
+        return ""
+
     _msg_target = state.get("message_target")
     if _msg_target in (TARGET_OTHERS, TARGET_UNCLEAR):
         system_prompt += (
@@ -1488,7 +2047,8 @@ async def _process_response_logic_impl(bot: Any, event: Any, state: Dict[str, An
     if intent_decision.ambiguity_level == "high":
         system_prompt += (
             "\n[系统提示] 当前最新名词/对象存在较高歧义。"
-            "如果上下文和现有证据不足，请优先承认不确定；群聊里若没人明确在 cue 你，且这轮明显会打断别人时，也可以输出 [NO_REPLY]。"
+            "如果上下文和现有证据不足，非强交互直接输出 [NO_REPLY]；"
+            "强交互只索取一个明确且对方能提供的必要条件，不要播报无法确认或查证无结果。"
         )
     system_prompt += _build_confidence_style_instruction(
         float(getattr(semantic_frame, "confidence", 0.0) or 0.0),
@@ -1526,11 +2086,18 @@ async def _process_response_logic_impl(bot: Any, event: Any, state: Dict[str, An
         str(getattr(runtime.plugin_config, "personification_humanize_fragment_style", "prompt") or "off").strip().lower()
         == "prompt"
     ):
-        system_prompt += (
-            "\n[输出风格] 像 QQ 群友聊天那样说话：需要多句时拆成 1-3 条短消息，"
-            "条与条之间用空行分隔；单条尽量不超过 40 字，口语化，可以只接半句，"
-            "不要写成完整段落或书面文。"
-        )
+        if is_direct_mention:
+            system_prompt += (
+                "\n[输出风格] 这是明确叫到你的群聊回合。普通回答保持 1-2 条；"
+                "只有调侃、自辩或情绪确实在递进时才拆成 2-4 条短消息。"
+                "条与条之间用空行分隔，单条尽量不超过 40 字，每条都要有独立作用。"
+            )
+        else:
+            system_prompt += (
+                "\n[输出风格] 像 QQ 群友聊天那样说话：需要多句时拆成 1-3 条短消息，"
+                "条与条之间用空行分隔；单条尽量不超过 40 字，口语化，可以只接半句，"
+                "不要写成完整段落或书面文。"
+            )
 
     available_stickers: List[str] = []
     group_config = persona.get_group_config(str(group_id))
@@ -1613,11 +2180,20 @@ async def _process_response_logic_impl(bot: Any, event: Any, state: Dict[str, An
             messages_to_use,
             semantic_frame=semantic_frame,
             is_direct_mention=is_direct_mention,
+            reply_required=reply_required,
             relationship_hint=relationship_hint,
             recent_bot_replies=recent_bot_replies,
             message_text=raw_message_text or message_text or message_content,
             lorebook_enabled=bool(getattr(runtime.plugin_config, "personification_lorebook_enabled", False)),
             memory_store=getattr(runtime, "memory_store", None),
+            reply_length_hint=render_reply_length_prompt_hint(
+                resolve_reply_length_policy(
+                    runtime.plugin_config,
+                    turn_plan=turn_plan,
+                    media_context=turn_media_context,
+                    tool_calls=state.get("agent_tool_calls"),
+                )
+            ),
         )
         raw = await _call_text_model_with_retry(json_messages)
         parsed = parse_persona_response(raw)
@@ -1643,6 +2219,122 @@ async def _process_response_logic_impl(bot: Any, event: Any, state: Dict[str, An
         reply_content = None
         used_agent = False
         bypass_length_limits = False
+        pending_action_executor = None
+        pending_actions: list[dict[str, Any]] = []
+        agent_failure_code = ""
+        agent_suppress_reply_recovery = False
+        agent_direct_output = False
+        agent_quality_context = ""
+        favorability_committed = False
+
+        def _commit_favorability_if_confirmed() -> None:
+            nonlocal favorability_committed
+            if favorability_committed or not bool(state.get("reply_delivery_confirmed", False)):
+                return
+            favorability_committed = True
+            try:
+                commit_favorability_turn(
+                    service=getattr(persona, "favorability_service", None),
+                    user_id=user_id,
+                    group_id=str(group_id),
+                    is_private=is_private_session,
+                    is_direct=bool(is_direct_mention or not is_random_chat or is_active_followup),
+                    is_random_chat=bool(is_random_chat),
+                    signals=favorability_signals,
+                    turn_id=favorability_turn_id,
+                    now=runtime.get_current_time(),
+                )
+            except Exception as exc:
+                runtime.logger.debug(f"拟人插件：提交回复好感事件失败: {exc}")
+
+        def _confirm_reply_delivery() -> None:
+            mark_reply_delivery_confirmed(state)
+            _commit_favorability_if_confirmed()
+
+        async def _send_reply(payload: Any) -> Any:
+            if getattr(runtime, "user_policy_gate", None) is not None:
+                await runtime.user_policy_gate.ensure_current(event)
+            mark_reply_delivery_started(state)
+            result = await _dispatch_reply_part(
+                bot=bot,
+                event=event,
+                payload=payload,
+                ledger=getattr(runtime, "qq_outbound_ledger", None),
+                surface="normal_reply",
+                reply_trace_id=str(state.get("reply_trace_id", "") or ""),
+            )
+            if not isinstance(result, SendReceipt) or result.status == "sent":
+                _confirm_reply_delivery()
+            return result
+
+        def _message_id_from_send_result(send_result: Any) -> str:
+            if isinstance(send_result, SendReceipt):
+                return str(send_result.message_id or "")
+            return extract_send_message_id(send_result)
+
+        def _finish_action_only_trace() -> None:
+            try:
+                from ...core import reply_turn_trace
+
+                reply_turn_trace.finish_trace(
+                    outcome="ok",
+                    diagnosis_code="ok",
+                    detail={"action_only": True},
+                )
+            except Exception:
+                pass
+
+        def _finish_suppressed_reply_trace() -> None:
+            try:
+                from ...core import reply_turn_trace
+
+                if agent_quality_context == "evidence_unavailable":
+                    reply_turn_trace.finish_trace(
+                        outcome="no_reply",
+                        diagnosis_code="evidence_unavailable",
+                        detail={"silent": True, "evidence_unavailable": True},
+                    )
+                    return
+                if agent_quality_context == "uncertain_reply":
+                    reply_turn_trace.finish_trace(
+                        outcome="no_reply",
+                        diagnosis_code="uncertain_reply_silenced",
+                        detail={"silent": True, "uncertain_reply": True},
+                    )
+                    return
+                reply_turn_trace.finish_trace(
+                    outcome="no_reply",
+                    diagnosis_code="background_action_pending",
+                    detail={"silent": True, "background_action": True},
+                )
+            except Exception:
+                pass
+
+        async def _commit_pending_actions() -> None:
+            if not pending_actions:
+                return
+            if getattr(runtime, "user_policy_gate", None) is not None:
+                await runtime.user_policy_gate.ensure_current(event)
+            mark_reply_phase(state, "delivery_commit_wait")
+            await acquire_reply_commit(state)
+            mark_reply_phase(state, "delivery")
+            stale_reason = _stale_reply_abort_reason(state)
+            if stale_reason:
+                runtime.logger.info(f"拟人插件：{stale_reason}")
+                pending_actions.clear()
+                return
+            history_parts = await execute_pending_actions(
+                pending_action_executor,
+                pending_actions,
+                state=state,
+            )
+            _commit_favorability_if_confirmed()
+            if history_parts:
+                setattr(
+                    event,
+                    "_personification_pending_action_history_text",
+                    " ".join(history_parts),
+                )
         if _should_use_agent_for_reply(
             plugin_config=runtime.plugin_config,
             tool_registry=runtime.tool_registry,
@@ -1650,9 +2342,56 @@ async def _process_response_logic_impl(bot: Any, event: Any, state: Dict[str, An
             message_intent=message_intent,
             ambiguity_level=intent_decision.ambiguity_level,
             is_direct_mention=is_direct_mention,
-            has_image_input=bool(tool_image_urls),
+            has_image_input=bool(tool_image_urls or tool_video_urls or tool_audio_urls),
         ):
-            image_ctx_token = set_current_image_context(tool_image_urls, message_content)
+            turn_media_context = await resolve_onebot_media_refs(
+                turn_media_context,
+                bot,
+                video_timeout_seconds=float(
+                    getattr(runtime.plugin_config, "personification_video_analysis_timeout", 180.0)
+                    or 180.0
+                ),
+            )
+            state["turn_media_context"] = serialize_turn_media(turn_media_context)
+            media_resolution = summarize_media_resolution(turn_media_context)
+            if media_resolution["videos"] or media_resolution["audios"]:
+                try:
+                    from ...core import reply_turn_trace
+
+                    reply_turn_trace.record_stage(
+                        key="turn_media_materialized",
+                        label="媒体文件就绪",
+                        status="warn" if media_resolution["video_failed"] else "ok",
+                        detail=(
+                            f"videos={media_resolution['videos']} "
+                            f"video_usable={media_resolution['video_usable']} "
+                            f"video_failed={media_resolution['video_failed']} "
+                            f"audios={media_resolution['audios']} "
+                            "routes="
+                            + (",".join(media_resolution["resolution_codes"]) or "direct")
+                        ),
+                        hint="仅记录媒体就绪计数与稳定路由码，不记录文件标识、路径或下载地址",
+                    )
+                except Exception:
+                    pass
+            tool_video_urls = [
+                item.ref
+                for item in turn_media_context
+                if item.kind == "video" and str(item.ref or "").strip()
+            ][:1]
+            tool_audio_urls = [
+                item.ref
+                for item in turn_media_context
+                if item.kind == "audio" and str(item.ref or "").strip()
+            ][:1]
+            if getattr(runtime, "user_policy_gate", None) is not None:
+                await runtime.user_policy_gate.ensure_current(event)
+            image_ctx_token = set_current_image_context(
+                tool_image_urls,
+                message_content,
+                tool_video_urls,
+                tool_audio_urls,
+            )
             try:
                 try:
                     try:
@@ -1663,15 +2402,26 @@ async def _process_response_logic_impl(bot: Any, event: Any, state: Dict[str, An
                             label="Agent 主循环",
                             status="info",
                             detail=(
-                                f"intent={message_intent} images={len(tool_image_urls)} "
+                                f"intent={message_intent} images={len(tool_image_urls)} videos={len(tool_video_urls)} "
+                                f"audios={len(tool_audio_urls)} "
                                 f"direct_image={agent_direct_image_input} "
-                                f"elapsed_ms={int((time.monotonic() - started_at) * 1000)}"
+                                f"elapsed_ms=0 turn_age_ms={int((time.monotonic() - started_at) * 1000)}"
                             ),
                         )
                     except Exception:
                         pass
                     agent_started_at = time.monotonic()
-                    reply_content, used_agent, bypass_length_limits = await _run_agent_if_enabled(
+                    (
+                        reply_content,
+                        used_agent,
+                        bypass_length_limits,
+                        pending_action_executor,
+                        pending_actions,
+                        agent_failure_code,
+                        agent_suppress_reply_recovery,
+                        agent_direct_output,
+                        agent_quality_context,
+                    ) = await _run_agent_if_enabled(
                         bot=bot,
                         event=event,
                         messages=agent_messages,
@@ -1688,10 +2438,15 @@ async def _process_response_logic_impl(bot: Any, event: Any, state: Dict[str, An
                         turn_plan=getattr(semantic_frame, "turn_plan", None),
                         started_at=started_at,
                         is_direct_mention=is_direct_mention,
+                        reply_required=reply_required,
                         response_timeout_seconds=float(
                             getattr(runtime.plugin_config, "personification_response_timeout", 180) or 180
                         ),
+                        response_deadline=response_deadline,
                         task_exc_logger=_task_exc_logger,
+                        reply_commit_state=state,
+                        turn_media_context=turn_media_context,
+                        avatar_pair_candidates=avatar_pair_candidates,
                     )
                     try:
                         from ...core import reply_turn_trace
@@ -1722,6 +2477,56 @@ async def _process_response_logic_impl(bot: Any, event: Any, state: Dict[str, An
                     bypass_length_limits = False
             finally:
                 reset_current_image_context(image_ctx_token)
+        if used_agent and agent_failure_code:
+            pending_actions.clear()
+            delivery_started = bool(state.get("reply_delivery_started", False))
+            delivery_confirmed = bool(state.get("reply_delivery_confirmed", False))
+            if delivery_confirmed:
+                delivery_state = "partial"
+                trace_outcome = "partial"
+                diagnosis_code = f"partial_{agent_failure_code}"
+            elif delivery_started:
+                delivery_state = "dispatching"
+                trace_outcome = "failed"
+                diagnosis_code = "outbound_send_failed"
+            else:
+                delivery_state = "not_started"
+                trace_outcome = "failed"
+                diagnosis_code = agent_failure_code
+            runtime.logger.warning(
+                f"拟人插件：Agent 基础设施失败，保持静默: code={agent_failure_code} "
+                f"delivery_state={delivery_state}"
+            )
+            try:
+                from ...core import reply_turn_trace
+
+                reply_turn_trace.record_stage(
+                    key="agent_operational_failure",
+                    label="Agent 基础设施失败",
+                    status="warn" if delivery_confirmed else "error",
+                    detail=f"code={agent_failure_code} delivery_state={delivery_state} silent=true",
+                )
+                reply_turn_trace.finish_trace(
+                    outcome=trace_outcome,
+                    diagnosis_code=diagnosis_code,
+                    detail={
+                        "silent": True,
+                        "delivery_state": delivery_state,
+                        "failure_code": agent_failure_code,
+                    },
+                )
+            except Exception:
+                pass
+            return
+        if used_agent and required_reply_needs_recovery(
+            reply_content,
+            reply_required=reply_required,
+            pending_actions=pending_actions,
+            direct_output=bool(agent_direct_output or agent_suppress_reply_recovery),
+        ):
+            runtime.logger.warning("拟人插件：强交互 Agent 返回静默，改走基础模型恢复。")
+            reply_content = ""
+            used_agent = False
         if used_agent and reply_content in ("[NO_REPLY]", "<NO_REPLY>"):
             runtime.logger.info("拟人插件：Agent 返回 NO_REPLY，保持沉默。")
             try:
@@ -1770,8 +2575,10 @@ async def _process_response_logic_impl(bot: Any, event: Any, state: Dict[str, An
             bypass_length_limits = False
             if not reply_content:
                 runtime.logger.warning("拟人插件：未能获取到 AI 回复内容")
-                if is_direct_mention:
-                    reply_content = random.choice(_FALLBACK_REPLIES)
+                if reply_required:
+                    reply_content = await _resolve_operational_empty_reply("model_empty")
+                    if not reply_content:
+                        return
                 else:
                     try:
                         from ...core import reply_turn_trace
@@ -1787,12 +2594,72 @@ async def _process_response_logic_impl(bot: Any, event: Any, state: Dict[str, An
                     except Exception:
                         pass
                     return
-        elif is_agent_reply_ooc(reply_content):
+            if needs_uncertain_visible_reply_review(
+                ambiguity_level=getattr(intent_decision, "ambiguity_level", ""),
+                persona_response_info_added=getattr(
+                    semantic_frame,
+                    "persona_response_info_added",
+                    "",
+                ),
+            ):
+                uncertain_started_at = time.monotonic()
+                uncertain_timeout = 8.0
+                if isinstance(response_deadline, (int, float)):
+                    uncertain_timeout = min(
+                        uncertain_timeout,
+                        max(0.0, float(response_deadline) - time.monotonic()),
+                    )
+                uncertain_decision = await resolve_uncertain_visible_reply(
+                    runtime.review_call_ai_api or runtime.lite_call_ai_api or runtime.call_ai_api,
+                    candidate_text=reply_content,
+                    raw_message_text=raw_message_text or message_text or message_content,
+                    persona_system=system_prompt,
+                    turn_plan=turn_plan,
+                    reply_required=reply_required,
+                    is_private=is_private_session,
+                    evidence_unavailable=False,
+                    timeout=uncertain_timeout,
+                )
+                if uncertain_decision.action == "request_context" and uncertain_decision.text:
+                    reply_content = uncertain_decision.text.strip()
+                elif uncertain_decision.action == "silence":
+                    reply_content = "[SILENCE]"
+                    agent_suppress_reply_recovery = True
+                    agent_quality_context = "uncertain_reply"
+                try:
+                    from ...core import reply_turn_trace
+
+                    reply_turn_trace.record_stage(
+                        key="uncertain_reply_review",
+                        label="高歧义回复收口",
+                        status="ok" if uncertain_decision.action in {"accept", "request_context"} else "warn",
+                        detail=(
+                            f"action={uncertain_decision.action} "
+                            f"flags={','.join(uncertain_decision.flags) or '-'} "
+                            f"elapsed_ms={int((time.monotonic() - uncertain_started_at) * 1000)}"
+                        ),
+                    )
+                except Exception:
+                    pass
+        elif not agent_direct_output and is_agent_reply_ooc(reply_content):
             rewritten_ooc = await rewrite_agent_reply_ooc(
                 tool_caller=runtime.lite_tool_caller or runtime.agent_tool_caller,
                 original_text=reply_content,
                 persona_system=system_prompt,
                 output_mode=str(getattr(semantic_frame, "output_mode", "chat_short") or "chat_short"),
+                avoid_questions=not is_private_session,
+                allow_rhetorical_banter=bool(
+                    is_direct_mention
+                    and str(getattr(turn_plan, "speech_act", "") or "") in {"", "participate", "tease"}
+                ),
+                max_chars_override=resolve_reply_length_policy(
+                    runtime.plugin_config,
+                    turn_plan=turn_plan,
+                    media_context=turn_media_context,
+                    tool_calls=state.get("agent_tool_calls"),
+                    evidence_delivery_required=bool(state.get("agent_evidence_delivery_required", False)),
+                    bypass_length_limits=bool(bypass_length_limits),
+                ).max_chars,
             )
             if rewritten_ooc:
                 reply_content = rewritten_ooc
@@ -1860,16 +2727,42 @@ async def _process_response_logic_impl(bot: Any, event: Any, state: Dict[str, An
                     reply_content = regenerated.strip()
             except Exception as e:
                 runtime.logger.debug(f"[reply_processor] banter regenerate skipped: {e}")
+        if required_reply_needs_recovery(
+            reply_content,
+            reply_required=reply_required,
+            pending_actions=pending_actions,
+            direct_output=bool(agent_direct_output or agent_suppress_reply_recovery),
+        ):
+            reply_content = await _resolve_operational_empty_reply("evidence_unavailable")
+            if not reply_content:
+                return
+        reply_content, legacy_favorability_signals = extract_legacy_favorability_markers(reply_content)
+        favorability_signals.merge(legacy_favorability_signals)
         has_block_marker = "[BLOCK]" in reply_content or "<BLOCK>" in reply_content
         if has_block_marker:
             reply_content = reply_content.replace("[BLOCK]", "").replace("<BLOCK>", "").strip()
 
         has_silence_marker = has_silence_control_marker(reply_content)
         if has_silence_marker:
+            await _commit_pending_actions()
             if _record_pending_action_history_if_any():
                 runtime.logger.info("拟人插件：Agent 静默动作已写入会话历史。")
             runtime.logger.info(f"AI 决定结束与群 {group_id} 中 {user_name}({user_id}) 的对话 (SILENCE)")
-            return
+            if bool(state.get("reply_delivery_confirmed", False)):
+                mark_reply_delivery_complete(state)
+                release_reply_commit(state)
+                mark_reply_phase(state, "reply_complete")
+                _finish_action_only_trace()
+                return
+            if agent_suppress_reply_recovery:
+                _finish_suppressed_reply_trace()
+                return
+            if reply_required:
+                reply_content = await _resolve_operational_empty_reply("evidence_unavailable")
+                if not reply_content:
+                    return
+            else:
+                return
 
         if used_agent and has_silence_control_marker(reply_content):
             runtime.logger.info("拟人插件：Agent 文本含 NO_REPLY 标记，保持沉默。")
@@ -1905,7 +2798,11 @@ async def _process_response_logic_impl(bot: Any, event: Any, state: Dict[str, An
 
                 _t = asyncio.create_task(_notify_superusers())
                 _t.add_done_callback(_task_exc_logger("notify_superusers", runtime.logger))
-            return
+            if reply_required:
+                reply_content = "这个我不能接。"
+                has_block_marker = False
+            else:
+                return
 
         if not used_agent and ("[NO_REPLY]" in reply_content or "<NO_REPLY>" in reply_content):
             runtime.logger.info(
@@ -1914,104 +2811,7 @@ async def _process_response_logic_impl(bot: Any, event: Any, state: Dict[str, An
             await _maybe_silence_reaction()
             return
 
-        has_good_atmosphere = "[氛围好]" in reply_content or "<氛围好>" in reply_content
-        if has_good_atmosphere:
-            reply_content = reply_content.replace("[氛围好]", "").replace("<氛围好>", "").strip()
-            if persona.sign_in_available:
-                try:
-                    is_private_context = str(group_id).startswith("private_")
-                    if not is_private_context:
-                        service = getattr(persona, "favorability_service", None)
-                        if service is not None and hasattr(service, "apply_group_good_atmosphere"):
-                            result = service.apply_group_good_atmosphere(
-                                str(group_id),
-                                now=runtime.get_current_time(),
-                            )
-                            delta = float(result.get("delta", 0.0) or 0.0)
-                            if delta > 0:
-                                runtime.logger.info(
-                                    f"AI 觉得群 {group_id} 氛围良好，好感度 +{delta:.2f} "
-                                    f"(今日已加: {float(result.get('daily_used', 0.0) or 0.0):.2f}/"
-                                    f"{float(result.get('daily_cap', 0.0) or 0.0):.2f})"
-                                )
-                        else:
-                            group_key = f"group_{group_id}"
-                            group_data = persona.get_user_data(group_key)
-
-                            today = runtime.get_current_time().strftime("%Y-%m-%d")
-                            last_update = group_data.get("last_update", "")
-                            daily_count = group_data.get("daily_fav_count", 0.0)
-
-                            if last_update != today:
-                                daily_count = 0.0
-
-                            if daily_count < 10.0:
-                                g_current_fav = float(group_data.get("favorability", 100.0))
-                                g_new_fav = round(g_current_fav + 0.1, 2)
-                                daily_count = round(float(daily_count) + 0.1, 2)
-                                persona.update_user_data(
-                                    group_key,
-                                    favorability=g_new_fav,
-                                    daily_fav_count=daily_count,
-                                    last_update=today,
-                                )
-                                runtime.logger.info(
-                                    f"AI 觉得群 {group_id} 氛围良好，好感度 +0.10 "
-                                    f"(今日已加: {daily_count:.2f}/10.00)"
-                                )
-                except Exception as e:
-                    runtime.logger.error(f"增加群聊好感度失败: {e}")
-
-        has_interesting = "[有趣]" in reply_content
-        if has_interesting:
-            reply_content = reply_content.replace("[有趣]", "").strip()
-            if persona.sign_in_available:
-                try:
-                    service = getattr(persona, "favorability_service", None)
-                    if service is not None and hasattr(service, "apply_user_interesting_chat"):
-                        result = service.apply_user_interesting_chat(
-                            user_id,
-                            now=runtime.get_current_time(),
-                            group_id="" if is_private_session else str(group_id),
-                        )
-                        delta = float(result.get("delta", 0.0) or 0.0)
-                        if delta > 0:
-                            runtime.logger.info(
-                                f"AI 觉得与 {user_name}({user_id}) 聊天有趣，"
-                                f"好感度 +{delta:.2f} "
-                                f"(今日已加: {float(result.get('daily_used', 0.0) or 0.0):.2f}/"
-                                f"{float(result.get('daily_cap', 0.0) or 0.0):.1f})"
-                            )
-                    else:
-                        user_data = persona.get_user_data(user_id)
-                        today = runtime.get_current_time().strftime("%Y-%m-%d")
-
-                        last_fav_date = user_data.get("last_interesting_date", "")
-                        daily_interesting_count = float(user_data.get("daily_interesting_count", 0.0))
-                        if last_fav_date != today:
-                            daily_interesting_count = 0.0
-
-                        DAILY_LIMIT = 5.0
-                        INCREMENT = 0.05
-
-                        if daily_interesting_count < DAILY_LIMIT:
-                            current_fav = float(user_data.get("favorability", 0.0))
-                            new_fav = round(current_fav + INCREMENT, 2)
-                            daily_interesting_count = round(daily_interesting_count + INCREMENT, 2)
-                            persona.update_user_data(
-                                user_id,
-                                favorability=new_fav,
-                                daily_interesting_count=daily_interesting_count,
-                                last_interesting_date=today,
-                            )
-                            runtime.logger.info(
-                                f"AI 觉得与 {user_name}({user_id}) 聊天有趣，"
-                                f"好感度 +{INCREMENT} (今日已加: {daily_interesting_count:.2f}/{DAILY_LIMIT:.1f})"
-                            )
-                except Exception as e:
-                    runtime.logger.error(f"增加用户好感度失败: {e}")
-
-        if not is_private_session and message_intent == "banter":
+        if not agent_direct_output and not is_private_session and message_intent == "banter":
             async def _rewrite_for_repeat(cluster_text: str, original_reply: str) -> str:
                 rewrite_messages = list(messages) + [
                     {
@@ -2047,13 +2847,32 @@ async def _process_response_logic_impl(bot: Any, event: Any, state: Dict[str, An
                 rewrite_reply=_rewrite_for_repeat,
             )
 
-        should_review_agent_reply = bool(used_agent and tool_image_urls and not _IMAGE_B64_RE.search(reply_content or ""))
-        if used_agent and not should_review_agent_reply:
+        care_review_required = bool(
+            getattr(semantic_frame, "requires_emotional_care", False)
+            or getattr(getattr(semantic_frame, "emotional_support", None), "needed", False)
+        )
+        should_review_visual_reply = bool(turn_media_context and not _IMAGE_B64_RE.search(reply_content or ""))
+        should_review_agent_reply = bool(used_agent and should_review_visual_reply)
+        plugin_episode = conversation_context.plugin_episode if conversation_context is not None else None
+        protected_review_required = bool(
+            plugin_episode is not None or detect_persona_identity_leak(reply_content)
+        )
+        if agent_direct_output and not protected_review_required:
+            review_decision = make_passthrough_review_decision(
+                reply_content,
+                reason="safe_direct_output",
+            )
+        elif used_agent and not should_review_agent_reply and not care_review_required and not protected_review_required:
             review_decision = make_passthrough_review_decision(
                 reply_content,
                 reason="agent_passthrough",
             )
-        elif not bool(getattr(runtime.plugin_config, "personification_response_review_enabled", False)):
+        elif (
+            not care_review_required
+            and not should_review_visual_reply
+            and not protected_review_required
+            and not bool(getattr(runtime.plugin_config, "personification_response_review_enabled", False))
+        ):
             review_decision = make_passthrough_review_decision(
                 reply_content,
                 reason="review_disabled",
@@ -2071,7 +2890,10 @@ async def _process_response_logic_impl(bot: Any, event: Any, state: Dict[str, An
                 is_private=is_private_session,
                 is_random_chat=is_random_chat,
                 is_direct_mention=is_direct_mention,
+                reply_required=reply_required,
                 semantic_frame=semantic_frame,
+                turn_media_context=turn_media_context,
+                plugin_episode=plugin_episode,
             )
         if review_decision.action == "no_reply":
             runtime.logger.info(f"拟人插件：回复审阅后选择沉默，group={group_id} user={user_id}")
@@ -2079,13 +2901,40 @@ async def _process_response_logic_impl(bot: Any, event: Any, state: Dict[str, An
         if review_decision.action == "rewrite" and review_decision.text:
             reply_content = review_decision.text.strip()
 
+        reply_content, reviewed_favorability_signals = extract_legacy_favorability_markers(reply_content)
+        favorability_signals.merge(reviewed_favorability_signals)
+
+        if (
+            has_silence_control_marker(reply_content)
+            and reply_required
+            and not pending_actions
+            and not agent_suppress_reply_recovery
+        ):
+            reply_content = await _resolve_operational_empty_reply("evidence_unavailable")
+            if not reply_content:
+                return
         if has_silence_control_marker(reply_content):
+            await _commit_pending_actions()
             if _record_pending_action_history_if_any():
                 runtime.logger.info("拟人插件：静默动作已写入会话历史。")
             runtime.logger.info(
                 f"拟人插件：最终回复含沉默控制标记，group={group_id} user={user_id}"
             )
-            return
+            if bool(state.get("reply_delivery_confirmed", False)):
+                mark_reply_delivery_complete(state)
+                release_reply_commit(state)
+                mark_reply_phase(state, "reply_complete")
+                _finish_action_only_trace()
+                return
+            if agent_suppress_reply_recovery:
+                _finish_suppressed_reply_trace()
+                return
+            if reply_required:
+                reply_content = await _resolve_operational_empty_reply("evidence_unavailable")
+                if not reply_content:
+                    return
+            else:
+                return
         # 兼容 yaml_pipeline prompt 的 <output><message>...</message></output> 思维链结构：
         # 若 LLM 把回复包在 <message> 里（多条），用 \n\n 串接保留分段，下游 _split_segments 会再拆。
         try:
@@ -2103,7 +2952,14 @@ async def _process_response_logic_impl(bot: Any, event: Any, state: Dict[str, An
         reply_content = strip_response_control_markers(reply_content)
         reply_content = normalize_visible_reply_text(reply_content)
         if not reply_content and not _IMAGE_B64_RE.search(str(reply_content or "")):
-            return
+            if agent_suppress_reply_recovery:
+                _finish_suppressed_reply_trace()
+                return
+            if not reply_required:
+                return
+            reply_content = await _resolve_operational_empty_reply("model_empty")
+            if not reply_content:
+                return
 
         stale_reason = _stale_reply_abort_reason(state)
         if stale_reason:
@@ -2139,6 +2995,87 @@ async def _process_response_logic_impl(bot: Any, event: Any, state: Dict[str, An
             except Exception as exc:
                 log_exception(runtime.logger, "[reply_processor] get_group_member_info failed", exc, level="debug")
         final_reply = normalize_visible_reply_text(reply_content)
+
+        def _record_final_social_evidence_trace(**kwargs: Any) -> None:
+            try:
+                from ...core import reply_turn_trace
+
+                reply_turn_trace.record_stage(**kwargs)
+            except Exception:
+                pass
+
+        final_evidence = finalize_social_evidence_delivery_boundary(
+            final_reply,
+            sources=list(state.get("agent_social_evidence") or []),
+            coverage=dict(state.get("agent_social_coverage") or {}),
+            evidence_delivery_required=bool(
+                state.get("agent_evidence_delivery_required", False)
+            ),
+            previous_status=str(
+                state.get("agent_evidence_delivery_status", "not_required") or "not_required"
+            ),
+            previous_recovered=bool(state.get("agent_evidence_recovered", False)),
+            record_trace=_record_final_social_evidence_trace,
+            citation_mode=str(
+                state.get(
+                    "agent_citation_mode",
+                    getattr(turn_plan, "citation_mode", "none"),
+                )
+                or "none"
+            ),
+        )
+        final_reply = str(final_evidence.text or "").strip()
+        state["agent_evidence_delivery_status"] = str(
+            final_evidence.evidence_delivery_status or "not_required"
+        )
+        state["agent_evidence_recovered"] = bool(final_evidence.evidence_recovered)
+        state["agent_evidence_delivery_required"] = bool(final_evidence.evidence_delivery_required)
+        if final_evidence.failure_code:
+            try:
+                from ...core import reply_turn_trace
+
+                reply_turn_trace.finish_trace(
+                    outcome="failed",
+                    diagnosis_code=final_evidence.failure_code,
+                    detail={"silent": True, "evidence_delivery": "failed"},
+                )
+            except Exception:
+                pass
+            return
+        from ...core.visible_output import guard_visible_text
+
+        final_reply = guard_visible_text(final_reply, logger=runtime.logger, surface="normal_reply")
+        if not final_reply and not _IMAGE_B64_RE.search(str(reply_content or "")):
+            return
+        length_policy = resolve_reply_length_policy(
+            runtime.plugin_config,
+            turn_plan=turn_plan,
+            media_context=turn_media_context,
+            tool_calls=state.get("agent_tool_calls"),
+            evidence_delivery_required=bool(state.get("agent_evidence_delivery_required", False)),
+            bypass_length_limits=bypass_length_limits,
+        )
+        max_chars = length_policy.max_chars
+        final_reply, image_b64_payloads = _extract_image_b64_markers(final_reply)
+        before_length_chars = len(final_reply)
+        if max_chars and max_chars > 0 and len(final_reply) > max_chars:
+            final_reply = truncate_reply_text(final_reply, max_chars)
+        try:
+            from ...core import reply_turn_trace
+
+            reply_turn_trace.record_stage(
+                key="reply_length_policy",
+                label="回复字数策略",
+                status="info",
+                detail=render_reply_length_trace(
+                    length_policy,
+                    before_chars=before_length_chars,
+                    after_chars=len(final_reply),
+                ),
+                hint="按结构化语义、工具和媒体状态选择日常或证据回复上限",
+            )
+        except Exception:
+            pass
         qq_auto_marker = maybe_choose_auto_qq_expression_marker(
             plugin_config=runtime.plugin_config,
             semantic_frame=semantic_frame,
@@ -2157,10 +3094,6 @@ async def _process_response_logic_impl(bot: Any, event: Any, state: Dict[str, An
                 final_reply = qq_auto_marker
             else:
                 final_reply = f"{final_reply}{qq_auto_marker}".strip()
-        max_chars = 0 if bypass_length_limits else getattr(runtime.plugin_config, "personification_max_output_chars", 0)
-        final_reply, image_b64_payloads = _extract_image_b64_markers(final_reply)
-        if max_chars and max_chars > 0 and len(final_reply) > max_chars:
-            final_reply = _truncate_at_punctuation(final_reply, max_chars)
         # session/history 只记录最终对用户生效的文本，避免原始长回复与实际可见内容漂移。
         final_visible_reply_text = _build_final_visible_reply_text(
             history_text_for_qq_expression(final_reply) or ("[发送了一张图片]" if image_b64_payloads else ""),
@@ -2169,15 +3102,33 @@ async def _process_response_logic_impl(bot: Any, event: Any, state: Dict[str, An
         )
         sent_message_id = ""
         sent_as_tts = False
+        delivery_partial = False
+        delivery_unknown = False
+
+        def _mark_tts_delivery_unknown() -> None:
+            nonlocal delivery_unknown
+            delivery_unknown = True
         tts_service = getattr(runtime, "tts_service", None)
         stale_reason = _stale_reply_abort_reason(state)
         if stale_reason:
             runtime.logger.info(f"拟人插件：{stale_reason}")
             return
+        mark_reply_phase(state, "delivery_commit_wait")
+        await acquire_reply_commit(state)
+        delivery_started_at = time.monotonic()
+        mark_reply_phase(state, "delivery")
+        stale_reason = _stale_reply_abort_reason(state)
+        if stale_reason:
+            runtime.logger.info(f"拟人插件：{stale_reason}")
+            return
+        if getattr(runtime, "user_policy_gate", None) is not None:
+            await runtime.user_policy_gate.ensure_current(event)
+        await _commit_pending_actions()
         if (
             final_reply
             and not sticker_segment
             and not contains_qq_expression_marker(final_reply)
+            and not bool(state.get("agent_evidence_delivery_required", False))
             and tts_service is not None
         ):
             try:
@@ -2213,9 +3164,21 @@ async def _process_response_logic_impl(bot: Any, event: Any, state: Dict[str, An
                         group_style=group_style,
                         persona_tts=persona_tts,
                         pause_range=(1.2, 2.0),
+                        on_delivery_started=lambda: mark_reply_delivery_started(state),
+                        on_delivery_confirmed=_confirm_reply_delivery,
+                        on_delivery_unknown=_mark_tts_delivery_unknown,
+                        operation_id=str(state.get("reply_trace_id", "") or ""),
+                        user_target=user_id,
                     )
             except Exception as e:
-                runtime.logger.warning(f"[tts] 自动语音发送失败，回退文字: {e}")
+                likely_delivered = is_likely_delivered_send_timeout(e)
+                if bool(state.get("reply_delivery_confirmed", False)) or likely_delivered:
+                    sent_as_tts = True
+                    delivery_unknown = likely_delivered
+                    delivery_partial = not likely_delivered
+                    runtime.logger.warning(f"[tts] 自动语音发送结果不完整，不重复发送完整文字: {e}")
+                else:
+                    runtime.logger.warning(f"[tts] 自动语音发送失败，回退文字: {e}")
         if final_reply:
             if not sent_as_tts:
                 segments = runtime.split_text_into_segments(final_reply)
@@ -2263,7 +3226,7 @@ async def _process_response_logic_impl(bot: Any, event: Any, state: Dict[str, An
                             f"address_mode={address_plan.get('mode') or 'none'} "
                             f"source={address_plan.get('source') or '-'} "
                             f"quote={bool(quote_message_id)} at={bool(at_target)} "
-                            f"target={str(at_target or '-')}"
+                            f"target={str(at_target or '-')} elapsed_ms=0"
                         ),
                     )
                 except Exception:
@@ -2347,9 +3310,9 @@ async def _process_response_logic_impl(bot: Any, event: Any, state: Dict[str, An
                             )
                         except Exception:
                             outgoing = rendered_seg.message
-                    send_result = await bot.send(event, outgoing)
+                    send_result = await _send_reply(outgoing)
                     if not sent_message_id:
-                        sent_message_id = extract_send_message_id(send_result)
+                        sent_message_id = _message_id_from_send_result(send_result)
                     if i < len(segments) - 1 or sticker_segment:
                         if humanize_typing and i < len(segments) - 1:
                             await asyncio.sleep(
@@ -2363,7 +3326,7 @@ async def _process_response_logic_impl(bot: Any, event: Any, state: Dict[str, An
                 if typo_correction and not _stale_reply_abort_reason(state):
                     await asyncio.sleep(random.uniform(1.0, 2.0))
                     try:
-                        await bot.send(event, typo_correction)
+                        await _send_reply(typo_correction)
                     except Exception as exc:
                         runtime.logger.debug(f"[humanize] 修正消息发送失败: {exc}")
 
@@ -2372,9 +3335,9 @@ async def _process_response_logic_impl(bot: Any, event: Any, state: Dict[str, An
             if stale_reason:
                 runtime.logger.info(f"拟人插件：{stale_reason}")
                 return
-            send_result = await bot.send(event, runtime.message_segment_cls.image(f"base64://{image_b64}"))
+            send_result = await _send_reply(runtime.message_segment_cls.image(f"base64://{image_b64}"))
             if not sent_message_id:
-                sent_message_id = extract_send_message_id(send_result)
+                sent_message_id = _message_id_from_send_result(send_result)
             if sticker_segment:
                 await asyncio.sleep(random.uniform(0.8, 1.6))
 
@@ -2383,11 +3346,10 @@ async def _process_response_logic_impl(bot: Any, event: Any, state: Dict[str, An
             if stale_reason:
                 runtime.logger.info(f"拟人插件：{stale_reason}")
                 return
-            send_result = await bot.send(event, sticker_segment)
+            send_result = await _send_reply(sticker_segment)
             if not sent_message_id:
-                sent_message_id = extract_send_message_id(send_result)
+                sent_message_id = _message_id_from_send_result(send_result)
             if sticker_name:
-                await record_sticker_sent(sticker_name)
                 mark_pending_sticker_reaction(
                     build_sticker_feedback_scene_key(
                         group_id=str(group_id),
@@ -2397,6 +3359,11 @@ async def _process_response_logic_impl(bot: Any, event: Any, state: Dict[str, An
                     sticker_name,
                 )
 
+        if not delivery_partial and not delivery_unknown:
+            mark_reply_delivery_complete(state)
+        if getattr(runtime, "user_policy_gate", None) is not None:
+            await runtime.user_policy_gate.ensure_current(event)
+        mark_reply_phase(state, "delivery_history_commit")
         assistant_metadata = {
             "scene": "reply",
             "sticker_sent": sticker_name if sticker_name else None,
@@ -2404,6 +3371,64 @@ async def _process_response_logic_impl(bot: Any, event: Any, state: Dict[str, An
             "user_id": bot_self_id or None,
             "source_kind": "bot_reply",
         }
+        if isinstance(event, types.group_message_event_cls):
+            assistant_metadata.update(
+                {
+                    "group_id": str(event.group_id),
+                    "message_id": sent_message_id or None,
+                    "reply_to_msg_id": incoming_relation_metadata.get("message_id"),
+                    "reply_to_user_id": user_id,
+                    "mentioned_ids": [str(at_target)] if at_target else [],
+                    "is_at_bot": False,
+                }
+            )
+        session.append_session_message(
+            session_id,
+            "assistant",
+            final_visible_reply_text,
+            legacy_session_id=legacy_session_id,
+            **assistant_metadata,
+        )
+        if isinstance(event, types.group_message_event_cls):
+            runtime.record_group_msg(
+                str(event.group_id),
+                bot_nickname,
+                final_visible_reply_text,
+                is_bot=True,
+                user_id=bot_self_id,
+                message_id=sent_message_id or None,
+                reply_to_msg_id=incoming_relation_metadata.get("message_id"),
+                reply_to_user_id=user_id,
+                source_kind="bot_reply",
+            )
+        release_reply_commit(state)
+        delivery_elapsed_ms = int((time.monotonic() - delivery_started_at) * 1000)
+        mark_reply_phase(state, "post_send_bookkeeping")
+        bookkeeping_started_at = time.monotonic()
+        try:
+            from ...core import reply_turn_trace
+
+            reply_turn_trace.record_stage(
+                key="delivery_complete",
+                label="交付完成",
+                status="warn" if delivery_partial or delivery_unknown else "ok",
+                detail=(
+                    f"elapsed_ms={delivery_elapsed_ms} "
+                    f"confirmed={bool(state.get('reply_delivery_confirmed', False))} "
+                    f"complete={bool(state.get('reply_delivery_complete', False))}"
+                ),
+            )
+            reply_turn_trace.record_stage(
+                key="outgoing_message",
+                label="发送消息",
+                status="ok",
+                detail=str(final_visible_reply_text or "")[:500],
+                elapsed_ms=0,
+            )
+        except Exception:
+            pass
+        if sticker_name:
+            await record_sticker_sent(sticker_name)
         await persist_reply_emotion_state(
             runtime=runtime,
             data_dir=data_dir,
@@ -2413,25 +3438,6 @@ async def _process_response_logic_impl(bot: Any, event: Any, state: Dict[str, An
             assistant_text=final_visible_reply_text,
             is_private=is_private_session,
         )
-        try:
-            service = getattr(persona, "favorability_service", None)
-            if service is not None and hasattr(service, "apply_user_reply_interaction"):
-                result = service.apply_user_reply_interaction(
-                    user_id,
-                    now=runtime.get_current_time(),
-                    group_id="" if is_private_session else str(group_id),
-                    is_direct=bool(is_direct_mention or not is_random_chat or is_active_followup),
-                    is_random_chat=bool(is_random_chat),
-                )
-                delta = float(result.get("delta", 0.0) or 0.0)
-                if delta > 0:
-                    runtime.logger.debug(
-                        f"拟人插件：记录与 {user_name}({user_id}) 的成功回复互动，好感度 +{delta:.2f} "
-                        f"(今日已加: {float(result.get('daily_used', 0.0) or 0.0):.2f}/"
-                        f"{float(result.get('daily_cap', 0.0) or 0.0):.2f})"
-                    )
-        except Exception as exc:
-            runtime.logger.debug(f"拟人插件：记录成功回复互动好感事件失败: {exc}")
         schedule_inner_state_update_after_reply(
             runtime=runtime,
             user_text=raw_message_text or message_text or message_content,
@@ -2467,24 +3473,6 @@ async def _process_response_logic_impl(bot: Any, event: Any, state: Dict[str, An
                     pass
             asyncio.create_task(_spawn_relation_evolution())
 
-        if isinstance(event, types.group_message_event_cls):
-            assistant_metadata.update(
-                {
-                    "group_id": str(event.group_id),
-                    "message_id": sent_message_id or None,
-                    "reply_to_msg_id": incoming_relation_metadata.get("message_id"),
-                    "reply_to_user_id": user_id,
-                    "mentioned_ids": [str(at_target)] if at_target else [],
-                    "is_at_bot": False,
-                }
-            )
-        session.append_session_message(
-            session_id,
-            "assistant",
-            final_visible_reply_text,
-            legacy_session_id=legacy_session_id,
-            **assistant_metadata,
-        )
         if getattr(runtime, "memory_curator", None) is not None:
             memory_group_id = "" if is_private_session else str(group_id)
             if hasattr(runtime.memory_curator, "schedule_turn_capture"):
@@ -2506,17 +3494,6 @@ async def _process_response_logic_impl(bot: Any, event: Any, state: Dict[str, An
                 )
 
         if isinstance(event, types.group_message_event_cls):
-            runtime.record_group_msg(
-                str(event.group_id),
-                bot_nickname,
-                final_visible_reply_text,
-                is_bot=True,
-                user_id=bot_self_id,
-                message_id=sent_message_id or None,
-                reply_to_msg_id=incoming_relation_metadata.get("message_id"),
-                reply_to_user_id=user_id,
-                source_kind="bot_reply",
-            )
             try:
                 update_group_chat_active(
                     str(event.group_id),
@@ -2534,6 +3511,8 @@ async def _process_response_logic_impl(bot: Any, event: Any, state: Dict[str, An
             via="tts" if sent_as_tts else "text",
             sticker=bool(sticker_name),
         )
+        bookkeeping_elapsed_ms = int((time.monotonic() - bookkeeping_started_at) * 1000)
+        mark_reply_phase(state, "reply_complete")
         record_timing(
             "reply_processor.total_ms",
             (time.monotonic() - started_at) * 1000.0,
@@ -2543,27 +3522,57 @@ async def _process_response_logic_impl(bot: Any, event: Any, state: Dict[str, An
             from ...core import reply_turn_trace
 
             reply_turn_trace.record_stage(
-                key="outgoing_message",
-                label="发送消息",
+                key="post_send_bookkeeping",
+                label="发送后状态写入",
                 status="ok",
-                detail=str(final_visible_reply_text or "")[:500],
+                detail=f"elapsed_ms={bookkeeping_elapsed_ms}",
+            )
+            completion = resolve_sent_reply_completion(
+                state=state,
+                visible_text=final_visible_reply_text,
+                delivery_partial=delivery_partial,
+                delivery_unknown=delivery_unknown,
             )
             reply_turn_trace.record_stage(
                 key="reply_success",
                 label="回复完成",
-                status="ok",
-                detail=f"chars={len(final_visible_reply_text)} tts={bool(sent_as_tts)} sticker={bool(sticker_name)}",
+                status="ok" if completion["outcome"] == "ok" else "warn",
+                detail=(
+                    f"chars={len(final_visible_reply_text)} tts={bool(sent_as_tts)} "
+                    f"sticker={bool(sticker_name)} tool_execution={completion['tool_execution']} "
+                    f"evidence_delivery={completion['evidence_delivery']} "
+                    f"outbound_delivery={completion['outbound_delivery']}"
+                ),
             )
             reply_turn_trace.finish_trace(
-                outcome="ok",
-                diagnosis_code="ok",
+                outcome=completion["outcome"],
+                diagnosis_code=completion["diagnosis_code"],
                 detail={
                     "reply_chars": len(final_visible_reply_text),
                     "tts": bool(sent_as_tts),
                     "sticker": bool(sticker_name),
+                    "delivery_partial": delivery_partial,
+                    "delivery_unknown": delivery_unknown,
+                    "tool_execution": completion["tool_execution"],
+                    "evidence_delivery": completion["evidence_delivery"],
+                    "outbound_delivery": completion["outbound_delivery"],
+                    "social_coverage_status": completion["coverage_status"],
+                    "evidence_recovered": completion["evidence_recovered"],
                     "incoming_text": str(raw_message_text or message_text or message_content or "")[:500],
                     "outgoing_text": str(final_visible_reply_text or "")[:500],
                 },
+            )
+        except Exception:
+            pass
+    except QQPolicyBlockedDuringTurn:
+        runtime.logger.info(f"拟人插件：用户 {user_id or '-'} policy 状态已变化，本轮立即静默终止。")
+        try:
+            from ...core import reply_turn_trace
+
+            reply_turn_trace.finish_trace(
+                outcome="no_reply",
+                diagnosis_code="user_policy_blocked",
+                detail={"silent": True},
             )
         except Exception:
             pass
@@ -2571,21 +3580,60 @@ async def _process_response_logic_impl(bot: Any, event: Any, state: Dict[str, An
         raise
     except Exception as e:
         record_counter("reply_processor.error_total")
-        runtime.logger.error(f"拟人插件 API 调用失败: {e}")
+        provider_code = _provider_diagnosis_code(e)
+        delivery_started = bool(state.get("reply_delivery_started", False))
+        delivery_confirmed = bool(state.get("reply_delivery_confirmed", False))
+        delivery_complete = bool(state.get("reply_delivery_complete", False))
+        if delivery_complete:
+            delivery_state = "complete"
+            trace_outcome = "ok"
+            diagnosis_code = "post_send_provider_failure" if provider_code else "post_send_internal_exception"
+        elif delivery_confirmed:
+            delivery_state = "partial"
+            trace_outcome = "partial"
+            diagnosis_code = "partial_provider_failure" if provider_code else "partial_internal_exception"
+        elif delivery_started:
+            delivery_state = "dispatching"
+            trace_outcome = "failed"
+            diagnosis_code = "outbound_send_failed"
+        else:
+            delivery_state = "not_started"
+            trace_outcome = "failed"
+            diagnosis_code = provider_code or "internal_exception"
+        error_summary = (
+            " ".join(
+                part
+                for part in (
+                    f"code={provider_code}",
+                    f"type={type(e).__name__}",
+                    summarize_provider_route_attempts(e),
+                )
+                if part
+            )
+            if provider_code
+            else f"type={type(e).__name__}"
+        )
+        runtime.logger.error(f"拟人插件 API 调用失败: {error_summary}")
         try:
             from ...core import reply_turn_trace
 
             reply_turn_trace.record_stage(
-                key="reply_failed",
-                label="回复异常",
-                status="error",
-                detail=str(e)[:500],
+                key="provider_failure" if provider_code else "reply_failed",
+                label="Provider 调用失败" if provider_code else "回复异常",
+                status="warn" if delivery_confirmed else "error",
+                detail=f"{error_summary} delivery_state={delivery_state} silent=true",
             )
-            reply_turn_trace.finish_trace(outcome="failed", diagnosis_code="internal_exception", detail={"error": str(e)[:500]})
+            reply_turn_trace.finish_trace(
+                outcome=trace_outcome,
+                diagnosis_code=diagnosis_code,
+                detail={
+                    "error": error_summary,
+                    "silent": True,
+                    "delivery_state": delivery_state,
+                    "delivery_started": delivery_started,
+                    "delivery_confirmed": delivery_confirmed,
+                    "delivery_complete": delivery_complete,
+                },
+            )
         except Exception:
             pass
-        if is_direct_mention:
-            try:
-                await bot.send(event, random.choice(_FALLBACK_REPLIES))
-            except Exception as exc:
-                log_exception(runtime.logger, "[reply_processor] fallback direct mention send failed", exc, level="debug")

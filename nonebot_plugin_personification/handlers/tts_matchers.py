@@ -7,6 +7,7 @@ from nonebot.adapters.onebot.v11 import Bot, GroupMessageEvent, Message, Message
 from nonebot.params import CommandArg
 
 from ..core.tts_service import extract_persona_tts_config
+from ..core.visible_output import guard_visible_text
 
 
 def _parse_tts_command_args(raw_text: str) -> tuple[dict[str, str | None], str | None]:
@@ -25,8 +26,8 @@ def _parse_tts_command_args(raw_text: str) -> tuple[dict[str, str | None], str |
         return empty, None
     try:
         tokens = shlex.split(text)
-    except ValueError as e:
-        return empty, f"参数解析失败: {e}"
+    except ValueError:
+        return empty, "参数没解析明白，检查一下引号吧。"
 
     options = dict(empty)
     content_parts: list[str] = []
@@ -137,11 +138,19 @@ def register_tts_matchers(
         if tts_decision is None:
             await tts_cmd.finish("语音审查暂时失败，先不合成语音。")
         if tts_decision.action != "voice":
+            planner_message = str(tts_decision.visible_message or "").strip()
             fallback_message = (
-                tts_decision.visible_message
+                planner_message
                 or ("这段内容不适合合成语音。" if tts_decision.action == "block" else "这段我先不发语音。")
             )
-            await tts_cmd.finish(fallback_message)
+            visible_message = guard_visible_text(
+                fallback_message,
+                logger=logger,
+                surface="tts_command_visible_message",
+                allow_direct_media=False,
+                allow_control=False,
+            )
+            await tts_cmd.finish(visible_message or "这段先不读啦。")
 
         try:
             sent = await tts_service.send_tts(
@@ -163,7 +172,7 @@ def register_tts_matchers(
             )
         except Exception as e:
             logger.warning(f"[tts] 命令合成失败: {e}")
-            await tts_cmd.finish(f"TTS 合成失败: {e}")
+            await tts_cmd.finish("这次没读出来。")
 
         if not sent:
             await tts_cmd.finish("没有可发送的语音内容。")

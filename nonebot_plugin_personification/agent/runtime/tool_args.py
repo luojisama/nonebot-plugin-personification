@@ -5,12 +5,9 @@ from typing import Any
 
 from ..query_rewriter import ContextualQueryRewrite
 from ..tool_registry import ToolRegistry
-from .constants import MAX_LOOKUP_QUERY_VARIANTS
 from .intent import compact_lookup_query
 
-_RETRYABLE_LOOKUP_TOOLS = frozenset(
-    {"web_search", "search_web", "wiki_lookup", "resolve_acg_entity", "collect_resources", "search_images", "search_and_send_images"}
-)
+
 def _parse_json_tool_result(text: str) -> dict[str, Any] | None:
     raw = str(text or "").strip()
     if not raw or not raw.startswith("{"):
@@ -60,23 +57,30 @@ def query_variants_for_tool(
     rewritten_query: ContextualQueryRewrite | None,
     previous_tool_name: str = "",
     previous_tool_result_text: str = "",
+    max_variants: int = 1,
 ) -> list[str]:
     candidates: list[str] = []
     if rewritten_query is not None:
-        for query in [rewritten_query.primary_query, *(rewritten_query.query_candidates or [])]:
-            cleaned = compact_lookup_query(query)
-            if cleaned and cleaned not in candidates:
-                candidates.append(cleaned)
+        primary_query = compact_lookup_query(rewritten_query.primary_query)
+        if primary_query:
+            candidates.append(primary_query)
     provided_query = compact_lookup_query(str((tool_args or {}).get("query", "") or ""))
     if provided_query and provided_query not in candidates:
         candidates.append(provided_query)
+    if rewritten_query is not None:
+        for query in rewritten_query.query_candidates or []:
+            cleaned = compact_lookup_query(query)
+            if cleaned and cleaned not in candidates:
+                candidates.append(cleaned)
     if previous_tool_name and previous_tool_result_text:
         refined = compact_lookup_query(previous_tool_result_text)
         if refined and refined not in candidates:
             candidates.append(refined)
-    if tool_name not in _RETRYABLE_LOOKUP_TOOLS:
-        return candidates[:1]
-    return candidates[:MAX_LOOKUP_QUERY_VARIANTS]
+    try:
+        limit = max(1, int(max_variants))
+    except (TypeError, ValueError):
+        limit = 1
+    return candidates[:limit]
 
 
 def rewrite_tool_args(
@@ -98,10 +102,15 @@ def rewrite_tool_args(
             tool_args=tool_args,
         )
     user_images = list(user_images or [])
+    social_search = tool_name in {"social_content_search", "research_game_slang"}
 
     allows_query = registry is None or tool_allows_parameter(registry, tool_name, "query")
     if allows_query:
         current_query = compact_lookup_query(str(args.get("query", "") or ""))
+        if social_search and rewritten_query is not None:
+            # 社交搜索的主查询由上下文规划器确定；模型传入的宽泛 query 只能作为候选，
+            # 避免群聊里刚好出现一个实体名就把无关来源刷进回复。
+            current_query = compact_lookup_query(rewritten_query.primary_query)
         if not current_query:
             variants = query_variants_for_tool(
                 tool_name=tool_name,
@@ -114,6 +123,23 @@ def rewrite_tool_args(
                 current_query = variants[0]
         if current_query:
             args["query"] = current_query
+
+    if social_search and rewritten_query is not None:
+        allows_context = registry is None or tool_allows_parameter(registry, tool_name, "context")
+        if allows_context:
+            clues = [
+                str(item or "").strip()
+                for item in list(rewritten_query.context_clues or [])[:5]
+                if str(item or "").strip()
+            ]
+            plan = [
+                str(item or "").strip()
+                for item in list(rewritten_query.search_plan or [])[:3]
+                if str(item or "").strip()
+            ]
+            context_parts = [*clues, *plan]
+            if context_parts:
+                args["context"] = "；".join(context_parts)[:1000]
 
     if user_images:
         for key in ("images", "image_urls"):

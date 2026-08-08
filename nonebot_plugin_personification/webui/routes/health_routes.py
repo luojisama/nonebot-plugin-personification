@@ -1,13 +1,24 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import random
 import re
+import shutil
 import time
+import uuid
+from pathlib import Path
 from typing import Any
 
-from fastapi import APIRouter, Body, Depends, HTTPException, Query
+from fastapi import APIRouter, Body, Depends, HTTPException, Query, Request
 
+from ...core.admin_acl import is_plugin_admin, is_superuser
+from ...core.operation_diagnostics import (
+    detail as operation_detail,
+    diagnostic as operation_diagnostic,
+    exception_diagnostic as operation_exception_diagnostic,
+    step as operation_step,
+)
 from ..deps import AdminIdentity, require_admin
 
 _INTERACTION_WAIT_SECONDS = 45
@@ -20,6 +31,142 @@ _STAGE_LOG_LEVEL = {
     "ok": "INFO",
     "info": "INFO",
 }
+_HEALTH_VIDEO_MAX_UPLOAD_BYTES = 256 * 1024 * 1024
+_HEALTH_VIDEO_MIME_SUFFIXES = {
+    "video/mp4": ".mp4",
+    "video/quicktime": ".mov",
+    "video/webm": ".webm",
+    "video/x-matroska": ".mkv",
+    "video/x-msvideo": ".avi",
+    "video/x-m4v": ".m4v",
+}
+
+
+def _health_video_upload_report(
+    *,
+    code: str,
+    title: str,
+    message: str,
+    suggestion: str,
+    operation_id: str,
+    details: tuple = (),
+    steps: tuple = (),
+) -> dict[str, Any]:
+    return operation_diagnostic(
+        ok=False,
+        code=code,
+        phase="video_probe_upload",
+        title=title,
+        message=message,
+        details=details,
+        steps=steps,
+        suggestion=suggestion,
+        retryable=True,
+        operation_id=operation_id,
+    )
+
+
+def _diagnostic_step_status(status: Any) -> str:
+    normalized = str(status or "").strip().lower()
+    if normalized in {"ok", "warn", "error", "unknown", "pending", "running", "skipped"}:
+        return normalized
+    if normalized in {"warning"}:
+        return "warn"
+    if normalized in {"info", "disabled"}:
+        return "ok" if normalized == "info" else "skipped"
+    return "unknown"
+
+
+def _steps_from_stages(stages: list[dict[str, Any]]) -> tuple:
+    return tuple(
+        operation_step(
+            str(item.get("key") or "stage"),
+            str(item.get("label") or "阶段"),
+            _diagnostic_step_status(item.get("status")),
+            str(item.get("detail") or ""),
+            details=(operation_detail("建议", item.get("hint"), "warn"),) if item.get("hint") else (),
+        )
+        for item in stages
+        if isinstance(item, dict)
+    )
+
+
+def _unexpected_diagnostic(
+    runtime: Any,
+    exc: BaseException,
+    *,
+    code: str,
+    phase: str,
+    title: str,
+    message: str,
+    suggestion: str,
+    steps: tuple = (),
+    details: tuple = (),
+    operation_id: str = "",
+    trace_id: str = "",
+    retryable: bool = True,
+    outcome_unknown: bool = False,
+) -> dict[str, Any]:
+    report = operation_exception_diagnostic(
+        exc,
+        phase=phase,
+        title=title,
+        message=message,
+        suggestion=suggestion,
+        operation_id=operation_id,
+        trace_id=trace_id,
+        retryable=retryable,
+    )
+    report["code"] = code
+    report["steps"] = [item.to_dict() for item in steps]
+    report["details"] = [item.to_dict() for item in details] + list(report.get("details") or [])
+    report["outcome_unknown"] = bool(outcome_unknown)
+    logger = getattr(runtime, "logger", None)
+    if logger is not None:
+        logger.warning(
+            f"[webui.health] code={code} phase={phase} exception={type(exc).__name__} "
+            f"trace={report.get('trace_id', '')}"
+        )
+    return report
+
+
+def _health_check_diagnostic(result: dict[str, Any], *, only: str) -> dict[str, Any]:
+    summary = result.get("summary") if isinstance(result.get("summary"), dict) else {}
+    categories = result.get("categories") if isinstance(result.get("categories"), list) else []
+    category_steps = []
+    for category in categories:
+        if not isinstance(category, dict):
+            continue
+        checks = category.get("checks") if isinstance(category.get("checks"), list) else []
+        statuses = {str(item.get("status") or "info") for item in checks if isinstance(item, dict)}
+        status = "error" if "error" in statuses else "warn" if "warn" in statuses else "ok"
+        category_steps.append(
+            operation_step(
+                f"health_{len(category_steps) + 1}",
+                str(category.get("name") or "体检分类"),
+                status,
+                f"完成 {len(checks)} 项真实探测。",
+            )
+        )
+    partial = bool(only)
+    report = operation_diagnostic(
+        ok=True,
+        code="health_category_rechecked" if partial else "health_refresh_completed",
+        phase="health_recheck" if partial else "health_refresh",
+        title=f"“{only}”重测已完成" if partial else "功能体检已重新检测",
+        message="真实探测已完成；异常项表示被测能力状态，不表示重测请求本身失败。",
+        details=(
+            operation_detail("总体状态", result.get("overall") or "unknown", "warn" if result.get("overall") != "ok" else "ok"),
+            operation_detail("正常", int(summary.get("ok", 0) or 0), "ok"),
+            operation_detail("注意", int(summary.get("warn", 0) or 0), "warn" if summary.get("warn") else "info"),
+            operation_detail("异常", int(summary.get("error", 0) or 0), "error" if summary.get("error") else "info"),
+        ),
+        steps=tuple(category_steps),
+        suggestion="按异常分类展开检查详情；修复后只重测对应分类即可。" if result.get("overall") != "ok" else "",
+        retryable=False,
+        partial=partial,
+    )
+    return {**result, **report, "cached": False}
 
 
 def _response_timeout_seconds(cfg: Any) -> float:
@@ -105,6 +252,36 @@ def _record_qzone_forward_test_audit(
         pass
 
 
+def _record_interaction_test_audit(
+    *,
+    admin: AdminIdentity,
+    target_user_id: str,
+    target_group_id: str,
+    trace_id: str,
+    outcome: str,
+    diagnosis_code: str,
+) -> None:
+    try:
+        from ...core import webui_audit_log
+
+        webui_audit_log.record(
+            action="health_interaction_test",
+            qq=admin.qq,
+            device_id=admin.device_id,
+            target=str(target_group_id or target_user_id or ""),
+            detail={
+                "operator_qq": str(admin.qq or ""),
+                "target_qq": str(target_user_id or ""),
+                "target_group": str(target_group_id or ""),
+                "trace_id": str(trace_id or ""),
+                "diagnosis_code": str(diagnosis_code or ""),
+            },
+            outcome=outcome,
+        )
+    except Exception:
+        pass
+
+
 # 这些 OneBot 动作都是"对外发消息"，交互测试需要全部捕获，
 # 否则拟人化发送层若走 send_group_msg / 转发消息 / call_api 等非 bot.send 路径，
 # 测试会误判为"未回复"，而真实聊天里 bot 其实已经发言。
@@ -154,9 +331,9 @@ class _CapturingBot:
             )
         else:
             reply_turn_trace.record_stage(
-                trace_id=self.trace_id, key="send_failed", label="发送失败",
-                status="error", detail=str(detail)[:500],
-                hint="检查协议端发送权限、好友/群关系、账号风控或消息格式",
+                trace_id=self.trace_id, key="send_outcome_unknown", label="发送结果未知",
+                status="unknown", detail=f"发送接口异常类型：{str(detail)[:120]}；平台是否接收消息尚未确认",
+                hint="先检查 QQ 中是否已经发出，再决定是否重新测试，避免重复发送",
             )
 
     def _capture(self, message: Any) -> None:
@@ -172,7 +349,7 @@ class _CapturingBot:
         try:
             result = await self._real.send(event, message, **kwargs)
         except Exception as exc:
-            self._record_outcome(ok=False, detail=str(exc))
+            self._record_outcome(ok=False, detail=type(exc).__name__)
             raise
         self._capture(message)
         self._record_outcome(ok=True, detail=result)
@@ -186,7 +363,7 @@ class _CapturingBot:
             result = await self._real.call_api(api, **data)
         except Exception as exc:
             if action in _SEND_API_ACTIONS:
-                self._record_outcome(ok=False, detail=str(exc))
+                self._record_outcome(ok=False, detail=type(exc).__name__)
             raise
         if action in _SEND_API_ACTIONS:
             self._capture(data.get("message", ""))
@@ -198,7 +375,7 @@ class _CapturingBot:
         try:
             result = await getattr(self._real, action)(message=message, **data)
         except Exception as exc:
-            self._record_outcome(ok=False, detail=str(exc))
+            self._record_outcome(ok=False, detail=type(exc).__name__)
             raise
         self._capture(message)
         self._record_outcome(ok=True, detail=result)
@@ -366,7 +543,7 @@ async def _dispatch_via_plugin_path(
             "plugin_path_unavailable",
             "插件直连链路",
             "warn",
-            f"导入插件回复链路失败：{exc}；回退 nonebot.message.handle_event",
+            f"导入插件回复链路失败（{type(exc).__name__}）；回退 nonebot.message.handle_event",
         )
         return None
 
@@ -380,7 +557,7 @@ async def _dispatch_via_plugin_path(
             "rule_match",
             "规则匹配",
             "error",
-            f"personification_rule 异常：{exc}",
+            f"personification_rule 异常类型：{type(exc).__name__}",
             "查看插件日志中同 trace_id 的异常",
             started_at=started,
         )
@@ -389,7 +566,7 @@ async def _dispatch_via_plugin_path(
             stages=stages,
             replied=False,
             target=target_label,
-            detail=f"规则匹配阶段异常：{exc}",
+            detail="规则匹配阶段发生内部异常，原始异常内容未向 WebUI 返回。",
             diagnosis_code="rule_exception",
             duration_ms=int((time.monotonic() - started) * 1000),
             target_detail=target_detail,
@@ -469,7 +646,7 @@ async def _dispatch_via_plugin_path(
             "buffer_dispatch",
             "缓冲分发",
             "error",
-            f"handle_reply_event 异常：{exc}",
+            f"handle_reply_event 异常类型：{type(exc).__name__}",
             "查看插件日志中同 trace_id 的异常",
             started_at=started,
         )
@@ -478,7 +655,7 @@ async def _dispatch_via_plugin_path(
             stages=stages,
             replied=False,
             target=target_label,
-            detail=f"缓冲分发失败：{exc}",
+            detail="缓冲分发阶段发生内部异常，原始异常内容未向 WebUI 返回。",
             diagnosis_code="buffer_exception",
             duration_ms=int((time.monotonic() - started) * 1000),
             target_detail=target_detail,
@@ -514,7 +691,7 @@ async def _dispatch_via_plugin_path(
                     "buffer_task_failed",
                     "缓冲任务",
                     "error",
-                    str(exc)[:500],
+                    f"缓冲任务异常类型：{type(exc).__name__}",
                     "查看插件日志中同 trace_id 的异常",
                     started_at=started,
                 )
@@ -592,7 +769,7 @@ def _finish_payload(
 
     if replied:
         outcome = "ok"
-    elif diagnosis_code in {"no_reply", "model_empty", "stale_reply", "capture_timeout"}:
+    elif diagnosis_code in {"no_reply", "model_empty", "stale_reply"}:
         outcome = "no_reply"
     else:
         outcome = "failed"
@@ -608,7 +785,50 @@ def _finish_payload(
         raw_stages = last_trace.get("stages")
         if isinstance(raw_stages, list):
             trace_stages = raw_stages
-    return {
+    final_stages = trace_stages or stages
+    unknown_send = any(
+        isinstance(item, dict)
+        and (str(item.get("status") or "").lower() == "unknown" or item.get("key") == "send_outcome_unknown")
+        for item in final_stages
+    )
+    retryable = diagnosis_code in {
+        "capture_timeout",
+        "reply_timeout",
+        "model_empty",
+        "no_reply",
+        "internal_exception",
+        "rule_exception",
+        "buffer_exception",
+        "event_build_failed",
+    } and not unknown_send
+    suggestion = ""
+    for item in reversed(final_stages):
+        if isinstance(item, dict) and item.get("hint"):
+            suggestion = str(item.get("hint") or "")
+            break
+    if unknown_send:
+        suggestion = "先在目标群或私聊中确认是否已经发出消息；确认状态前不要直接重测，避免重复发送。"
+    report = operation_diagnostic(
+        ok=replied,
+        code="health_interaction_replied" if replied else f"health_interaction_{diagnosis_code or 'failed'}",
+        phase="interaction_outcome",
+        title=("群交互测试已收到回复" if target == "group" else "私聊交互测试已收到回复")
+        if replied
+        else ("交互发送结果未知" if unknown_send else "实际交互测试未收到回复"),
+        message=detail,
+        details=(
+            operation_detail("测试目标", target, "info"),
+            operation_detail("是否捕获回复", replied, "ok" if replied else "error"),
+            operation_detail("耗时（ms）", duration_ms, "info"),
+            operation_detail("诊断码", diagnosis_code, "ok" if replied else "error"),
+        ),
+        steps=_steps_from_stages(final_stages),
+        suggestion=suggestion,
+        retryable=retryable,
+        outcome_unknown=unknown_send,
+        trace_id=trace_id,
+    )
+    payload = {
         "replied": replied,
         "duration_ms": duration_ms,
         "target": target,
@@ -616,10 +836,15 @@ def _finish_payload(
         "detail": detail,
         "trace_id": trace_id,
         "diagnosis_code": diagnosis_code,
-        "stages": trace_stages or stages,
+        "stages": final_stages,
         "target_detail": target_detail or {},
-        "last_trace": last_trace,
+        "last_trace": {
+            key: last_trace.get(key)
+            for key in ("trace_id", "outcome", "diagnosis_code", "session_type", "group_id", "user_id")
+            if isinstance(last_trace, dict) and key in last_trace
+        },
     }
+    return {**payload, **report}
 
 
 def build_health_router(*, runtime) -> APIRouter:
@@ -638,15 +863,155 @@ def build_health_router(*, runtime) -> APIRouter:
             cached = get_cached_diagnostics()
             if cached is not None:
                 return {**cached, "cached": True}
-        result = await run_diagnostics(
-            plugin_config=getattr(runtime, "plugin_config", None),
-            bundle=getattr(runtime, "runtime_bundle", None),
-            superusers=getattr(runtime, "superusers", set()),
-            get_bots=getattr(runtime, "get_bots", None),
-            logger=getattr(runtime, "logger", None),
-            only=only.strip(),
-        )
-        return {**result, "cached": False}
+        category = only.strip()
+        try:
+            result = await run_diagnostics(
+                plugin_config=getattr(runtime, "plugin_config", None),
+                bundle=getattr(runtime, "runtime_bundle", None),
+                superusers=getattr(runtime, "superusers", set()),
+                get_bots=getattr(runtime, "get_bots", None),
+                logger=getattr(runtime, "logger", None),
+                only=category,
+                probe_video=category == "视频理解",
+            )
+        except Exception as exc:
+            report = _unexpected_diagnostic(
+                runtime,
+                exc,
+                code="health_recheck_failed" if category else "health_refresh_failed",
+                phase="health_recheck" if category else "health_refresh",
+                title=f"“{category}”重测未完成" if category else "功能体检刷新未完成",
+                message="真实探测流程发生内部异常，原始异常内容未向 WebUI 返回。",
+                suggestion="根据 Trace ID 查看脱敏日志，修复探测依赖后再试。",
+                steps=(operation_step("run_diagnostics", "执行真实探测", "error", "探测流程异常中断。"),),
+                details=(operation_detail("重测分类", category or "全部", "info"),),
+            )
+            raise HTTPException(status_code=500, detail=report) from exc
+        return _health_check_diagnostic(result, only=category)
+
+    @router.post("/video-probe")
+    async def video_probe(
+        request: Request,
+        _: AdminIdentity = Depends(require_admin),
+    ) -> dict:
+        """接收管理员选择的视频并执行一次真实的视频理解体检。
+
+        这里故意读取原始请求流，而不是使用 ``UploadFile``：Starlette 的
+        multipart 解析可能把大文件 spool 到系统临时目录（用户机器上的 C 盘）。
+        文件只会落到 ``_video_probe_root`` 返回的插件/配置数据目录，并在
+        ``finally`` 中删除。
+        """
+        from ...core.diagnostics import _video_probe_root, run_diagnostics
+        from ...core.media_refs import is_supported_video_filename
+
+        cfg = getattr(runtime, "plugin_config", None)
+        operation_id = uuid.uuid4().hex
+        original_name = str(request.headers.get("x-personification-video-filename", "") or "").strip()
+        content_type = str(request.headers.get("content-type", "") or "").split(";", 1)[0].strip().lower()
+        safe_name = Path(original_name).name if original_name else ""
+        suffix = Path(safe_name).suffix.lower() if safe_name == original_name else ""
+        if not is_supported_video_filename(safe_name):
+            suffix = _HEALTH_VIDEO_MIME_SUFFIXES.get(content_type, "")
+        if suffix not in _HEALTH_VIDEO_MIME_SUFFIXES.values():
+            report = _health_video_upload_report(
+                code="video_probe_invalid_type",
+                title="视频文件类型不受支持",
+                message="未识别到支持的视频格式，未写入文件，也未调用模型。",
+                suggestion="选择 MP4、MOV、M4V、WEBM、MKV 或 AVI 视频后重试。",
+                operation_id=operation_id,
+                details=(operation_detail("输入校验", "文件扩展名或 MIME 类型不受支持", "error"),),
+                steps=(operation_step("validate_video", "校验视频格式", "error", "未通过格式校验。"),),
+            )
+            raise HTTPException(status_code=400, detail=report)
+
+        max_bytes = _HEALTH_VIDEO_MAX_UPLOAD_BYTES
+        try:
+            configured_max = int(getattr(cfg, "personification_health_probe_max_upload_bytes", 0) or 0)
+        except Exception:
+            configured_max = 0
+        if configured_max > 0:
+            max_bytes = min(max_bytes, configured_max)
+        content_length = str(request.headers.get("content-length", "") or "").strip()
+        if content_length.isdigit() and int(content_length) > max_bytes:
+            report = _health_video_upload_report(
+                code="video_probe_payload_too_large",
+                title="视频文件过大",
+                message="视频超过体检接口允许的大小，未调用模型。",
+                suggestion=f"选择不超过 {max_bytes // (1024 * 1024)} MB 的视频后重试。",
+                operation_id=operation_id,
+                details=(operation_detail("大小校验", f"超过 {max_bytes // (1024 * 1024)} MB", "error"),),
+                steps=(operation_step("validate_size", "校验视频大小", "error", "请求体超过上限。"),),
+            )
+            raise HTTPException(status_code=413, detail=report)
+
+        root = _video_probe_root(cfg).resolve()
+        probe_dir = root / f"upload-{operation_id}"
+        target = probe_dir / f"video{suffix}"
+        total = 0
+        try:
+            probe_dir.mkdir(parents=True, exist_ok=False)
+            with target.open("wb") as sink:
+                async for chunk in request.stream():
+                    if not chunk:
+                        continue
+                    total += len(chunk)
+                    if total > max_bytes:
+                        report = _health_video_upload_report(
+                            code="video_probe_payload_too_large",
+                            title="视频文件过大",
+                            message="视频超过体检接口允许的大小，未调用模型。",
+                            suggestion=f"选择不超过 {max_bytes // (1024 * 1024)} MB 的视频后重试。",
+                            operation_id=operation_id,
+                            details=(operation_detail("已接收大小", f"超过 {max_bytes // (1024 * 1024)} MB", "error"),),
+                            steps=(operation_step("stream_upload", "流式接收视频", "error", "接收过程中超过大小上限。"),),
+                        )
+                        raise HTTPException(status_code=413, detail=report)
+                    sink.write(chunk)
+            if total <= 0:
+                report = _health_video_upload_report(
+                    code="video_probe_empty_upload",
+                    title="没有收到视频内容",
+                    message="上传内容为空，未调用模型。",
+                    suggestion="重新选择视频后重试。",
+                    operation_id=operation_id,
+                    details=(operation_detail("已接收大小", "0 字节", "error"),),
+                    steps=(operation_step("stream_upload", "流式接收视频", "error", "请求体为空。"),),
+                )
+                raise HTTPException(status_code=400, detail=report)
+            result = await run_diagnostics(
+                plugin_config=cfg,
+                bundle=getattr(runtime, "runtime_bundle", None),
+                superusers=getattr(runtime, "superusers", set()),
+                get_bots=getattr(runtime, "get_bots", None),
+                logger=getattr(runtime, "logger", None),
+                only="视频理解",
+                probe_video=True,
+                video_path=target,
+            )
+            return _health_check_diagnostic(result, only="视频理解")
+        except HTTPException:
+            raise
+        except Exception as exc:
+            report = _unexpected_diagnostic(
+                runtime,
+                exc,
+                code="video_probe_upload_failed",
+                phase="video_probe_upload",
+                title="视频理解上传探测失败",
+                message="视频已接收，但探测流程未完成；原始异常内容未向 WebUI 返回。",
+                suggestion="根据 Trace ID 检查视频路线和模型配置后重试。",
+                steps=(operation_step("run_video_probe", "执行视频理解探测", "error", "探测流程异常中断。"),),
+                details=(operation_detail("已接收大小", f"{total} 字节", "info"),),
+                operation_id=operation_id,
+            )
+            raise HTTPException(status_code=500, detail=report) from exc
+        finally:
+            shutil.rmtree(probe_dir, ignore_errors=True)
+            try:
+                if root.exists() and not any(root.iterdir()):
+                    root.rmdir()
+            except Exception:
+                pass
 
     @router.post("/interaction-test")
     async def interaction_test(
@@ -661,28 +1026,126 @@ def build_health_router(*, runtime) -> APIRouter:
         group_id = str(getattr(cfg, "personification_webui_test_group_id", "") or "").strip()
         user_id = str(getattr(cfg, "personification_webui_test_user_id", "") or "").strip()
         text = str(body.get("text", "") or "").strip() or "你好呀，回我一句就好"
-        target_label = "group" if target == "group" else "private"
+        if target not in {"group", "private"}:
+            report = operation_diagnostic(
+                ok=False,
+                code="health_interaction_target_invalid",
+                phase="input_validation",
+                title="交互测试目标无效",
+                message="target 必须是 group 或 private。",
+                details=(operation_detail("target", target or "未填写", "error"),),
+                steps=(operation_step("validate_target", "校验测试目标", "error", "目标类型不受支持。"),),
+                suggestion="选择“测试群交互”或“测试私聊交互”后重试。",
+                retryable=False,
+            )
+            raise HTTPException(status_code=400, detail=report)
+        target_label = target
         stages: list[dict[str, Any]] = []
         interaction_wait_seconds = _interaction_wait_seconds(cfg)
         response_timeout_seconds = _response_timeout_seconds(cfg)
 
         if target == "group":
             if not group_id:
-                raise HTTPException(status_code=400, detail="未配置测试群（personification_webui_test_group_id）")
+                report = operation_diagnostic(
+                    ok=False,
+                    code="health_interaction_group_not_configured",
+                    phase="target_configuration",
+                    title="尚未配置测试群",
+                    message="缺少 personification_webui_test_group_id，未向 QQ 注入消息。",
+                    steps=(operation_step("target_config", "读取测试群配置", "error", "测试群为空。"),),
+                    suggestion="在“配置中心 → 运维”填写测试群，并确认该群已启用拟人回复。",
+                    retryable=False,
+                )
+                raise HTTPException(status_code=400, detail=report)
             probe_user = user_id or str(admin.qq)
             target_group, target_user = group_id, probe_user
         else:
             if not user_id:
-                raise HTTPException(status_code=400, detail="未配置测试私聊用户（personification_webui_test_user_id）")
+                report = operation_diagnostic(
+                    ok=False,
+                    code="health_interaction_user_not_configured",
+                    phase="target_configuration",
+                    title="尚未配置测试私聊用户",
+                    message="缺少 personification_webui_test_user_id，未向 QQ 注入消息。",
+                    steps=(operation_step("target_config", "读取测试私聊配置", "error", "测试用户为空。"),),
+                    suggestion="在“配置中心 → 运维”填写测试私聊用户 QQ。",
+                    retryable=False,
+                )
+                raise HTTPException(status_code=400, detail=report)
             target_group, target_user = "", user_id
 
         trace_id = reply_turn_trace.start_trace(
             session_type=target_label,
             group_id=target_group,
             user_id=target_user,
-            detail={"source": "webui_interaction_test", "text": text[:200]},
+            detail={
+                "source": "webui_interaction_test",
+                "operator_qq": str(admin.qq or ""),
+                "text_length": len(text),
+                "text_hash": hashlib.sha256(text.encode("utf-8")).hexdigest()[:16],
+            },
         )
         target_detail = {"group_id": target_group, "user_id": target_user}
+        superusers = set(getattr(runtime, "superusers", set()) or set())
+        operator_authorized = is_superuser(admin.qq, superusers) or is_plugin_admin(admin.qq)
+        target_authorized = is_superuser(target_user, superusers) or is_plugin_admin(target_user)
+        reply_turn_trace.record_stage(
+            trace_id=trace_id,
+            key="interaction_test_identity",
+            label="测试身份授权",
+            status="ok" if operator_authorized and target_authorized else "error",
+            detail=(
+                f"operator_authorized={str(operator_authorized).lower()} "
+                f"target_authorized={str(target_authorized).lower()}"
+            ),
+        )
+        if not operator_authorized or not target_authorized:
+            reply_turn_trace.finish_trace(
+                trace_id=trace_id,
+                outcome="failed",
+                diagnosis_code="health_interaction_test_identity_forbidden",
+                detail={"operator_authorized": operator_authorized, "target_authorized": target_authorized},
+            )
+            _record_interaction_test_audit(
+                admin=admin,
+                target_user_id=target_user,
+                target_group_id=target_group,
+                trace_id=trace_id,
+                outcome="forbidden",
+                diagnosis_code="health_interaction_test_identity_forbidden",
+            )
+            report = operation_diagnostic(
+                ok=False,
+                code="health_interaction_test_identity_forbidden",
+                phase="identity_authorization",
+                title="交互测试身份未获授权",
+                message="测试操作者和被注入 QQ 身份都必须是 Bot 超级管理员或插件管理员；未注入事件。",
+                details=(
+                    operation_detail("操作者授权", operator_authorized, "ok" if operator_authorized else "error"),
+                    operation_detail("测试身份授权", target_authorized, "ok" if target_authorized else "error"),
+                    operation_detail("目标群", target_group or "私聊", "info"),
+                ),
+                steps=(
+                    operation_step(
+                        "interaction_test_identity",
+                        "校验测试身份",
+                        "error",
+                        "授权失败，未构造或注入 QQ 事件。",
+                    ),
+                ),
+                suggestion="将 personification_webui_test_user_id 配置为 SUPERUSER 或插件管理员 QQ 后重试。",
+                retryable=False,
+                trace_id=trace_id,
+            )
+            raise HTTPException(status_code=403, detail=report)
+        _record_interaction_test_audit(
+            admin=admin,
+            target_user_id=target_user,
+            target_group_id=target_group,
+            trace_id=trace_id,
+            outcome="started",
+            diagnosis_code="authorized",
+        )
         _stage(stages, trace_id, "runtime_ready", "运行时", "ok" if cfg is not None else "error",
                "运行时配置已就绪" if cfg is not None else "运行时配置缺失")
         if cfg is None:
@@ -718,7 +1181,7 @@ def build_health_router(*, runtime) -> APIRouter:
                 enabled = is_group_whitelisted(str(target_group), list(getattr(cfg, "personification_whitelist", []) or []))
             except Exception as exc:
                 enabled = False
-                _stage(stages, trace_id, "group_whitelist", "群白名单", "warn", f"检查失败：{exc}",
+                _stage(stages, trace_id, "group_whitelist", "群白名单", "warn", f"检查异常类型：{type(exc).__name__}",
                        "检查 data_store / 群配置是否可读")
             else:
                 _stage(stages, trace_id, "group_whitelist", "群白名单", "ok" if enabled else "error",
@@ -740,7 +1203,7 @@ def build_health_router(*, runtime) -> APIRouter:
                 muted = await refresh_bot_group_mute_state(bot, str(target_group), logger=getattr(runtime, "logger", None))
             except Exception as exc:
                 muted = False
-                _stage(stages, trace_id, "group_mute", "Bot 禁言", "warn", f"禁言状态查询失败：{exc}",
+                _stage(stages, trace_id, "group_mute", "Bot 禁言", "warn", f"禁言状态查询异常类型：{type(exc).__name__}",
                        "协议端不支持 get_group_member_info 时会回退缓存")
             else:
                 _stage(stages, trace_id, "group_mute", "Bot 禁言", "error" if muted else "ok",
@@ -769,7 +1232,7 @@ def build_health_router(*, runtime) -> APIRouter:
                     else:
                         _stage(stages, trace_id, "friend_relation", "好友关系", "info", "协议端返回空好友列表")
                 except Exception as exc:
-                    _stage(stages, trace_id, "friend_relation", "好友关系", "warn", f"好友列表查询失败：{exc}",
+                    _stage(stages, trace_id, "friend_relation", "好友关系", "warn", f"好友列表查询异常类型：{type(exc).__name__}",
                            "协议端不支持 get_friend_list 时可忽略；若私聊失败则检查好友关系")
 
         try:
@@ -777,14 +1240,14 @@ def build_health_router(*, runtime) -> APIRouter:
 
             event = _build_probe_event(bot, group_id=target_group, user_id=target_user, text=text)
         except Exception as exc:
-            _stage(stages, trace_id, "event_build", "构造事件", "error", str(exc),
+            _stage(stages, trace_id, "event_build", "构造事件", "error", f"构造事件异常类型：{type(exc).__name__}",
                    "检查测试群号/QQ 是否为纯数字，以及 OneBot v11 依赖是否正常")
             return _finish_payload(
                 trace_id=trace_id,
                 stages=stages,
                 replied=False,
                 target=target_label,
-                detail=f"构造测试事件失败：{exc}",
+                detail="构造测试事件失败，原始异常内容未向 WebUI 返回。",
                 diagnosis_code="event_build_failed",
                 target_detail=target_detail,
             )
@@ -810,6 +1273,17 @@ def build_health_router(*, runtime) -> APIRouter:
                 response_timeout_seconds=response_timeout_seconds,
             )
             if direct_result is not None:
+                _record_interaction_test_audit(
+                    admin=admin,
+                    target_user_id=target_user,
+                    target_group_id=target_group,
+                    trace_id=trace_id,
+                    outcome=str(
+                        (direct_result.get("last_trace") or {}).get("outcome")
+                        or ("ok" if bool(direct_result.get("replied")) else "failed")
+                    ),
+                    diagnosis_code=str(direct_result.get("diagnosis_code") or ""),
+                )
                 return direct_result
 
             _stage(
@@ -828,7 +1302,7 @@ def build_health_router(*, runtime) -> APIRouter:
                    "通常是模型调用或回复链路较慢，继续等待 send 捕获",
                    started_at=started)
         except Exception as exc:
-            _stage(stages, trace_id, "dispatch_failed", "分发事件", "error", str(exc)[:500],
+            _stage(stages, trace_id, "dispatch_failed", "分发事件", "error", f"分发异常类型：{type(exc).__name__}",
                    "查看插件日志中同 trace_id 的异常",
                    started_at=started)
             reply_turn_trace.reset_current_trace_id(token)
@@ -837,7 +1311,7 @@ def build_health_router(*, runtime) -> APIRouter:
                 stages=stages,
                 replied=False,
                 target=target_label,
-                detail=f"分发事件失败：{exc}",
+                detail="分发事件失败，原始异常内容未向 WebUI 返回。",
                 diagnosis_code="internal_exception",
                 duration_ms=int((time.monotonic() - started) * 1000),
                 target_detail=target_detail,
@@ -864,7 +1338,7 @@ def build_health_router(*, runtime) -> APIRouter:
                 f"捕获 {len(proxy.captured)} 条 send",
                 started_at=started,
             )
-            return _finish_payload(
+            payload = _finish_payload(
                 trace_id=trace_id,
                 stages=stages,
                 replied=True,
@@ -875,6 +1349,15 @@ def build_health_router(*, runtime) -> APIRouter:
                 duration_ms=ms,
                 target_detail=target_detail,
             )
+            _record_interaction_test_audit(
+                admin=admin,
+                target_user_id=target_user,
+                target_group_id=target_group,
+                trace_id=trace_id,
+                outcome="ok",
+                diagnosis_code="ok",
+            )
+            return payload
         last_trace = reply_turn_trace.get_trace(trace_id) or {}
         diagnosis = str(last_trace.get("diagnosis_code") or "") or "capture_timeout"
         if diagnosis == "ok":
@@ -883,7 +1366,7 @@ def build_health_router(*, runtime) -> APIRouter:
                "未捕获到 bot.send",
                "查看上方阶段和插件日志；常见原因是 NO_REPLY、规则未进入、模型超时或发送失败",
                started_at=started)
-        return _finish_payload(
+        payload = _finish_payload(
             trace_id=trace_id,
             stages=stages,
             replied=False,
@@ -893,6 +1376,15 @@ def build_health_router(*, runtime) -> APIRouter:
             duration_ms=ms,
             target_detail=target_detail,
         )
+        _record_interaction_test_audit(
+            admin=admin,
+            target_user_id=target_user,
+            target_group_id=target_group,
+            trace_id=trace_id,
+            outcome=str((payload.get("last_trace") or {}).get("outcome") or "failed"),
+            diagnosis_code=diagnosis,
+        )
+        return payload
 
     @router.post("/qzone-forward-test")
     async def qzone_forward_test(
@@ -905,11 +1397,13 @@ def build_health_router(*, runtime) -> APIRouter:
         ``qzone_post_state`` 的月度额度。
         """
         from ...core.data_store import get_data_store
+        from ...core.qzone_service import get_qzone_auth_status
         from ...core.time_ctx import get_configured_now
-        from ...jobs.periodic_jobs import build_qzone_quota, record_qzone_post
+        from ...jobs.periodic_jobs import build_qzone_quota, coordinated_qzone_publish
 
         cfg = getattr(runtime, "plugin_config", None)
         logger = getattr(runtime, "logger", None)
+        operation_id = str(body.get("operation_id") or uuid.uuid4().hex)[:96]
         target_user_id = _extract_qzone_target_user_id(
             body.get("target_user_id") or body.get("target_uin") or body.get("target") or ""
         )
@@ -921,7 +1415,18 @@ def build_health_router(*, runtime) -> APIRouter:
                 outcome="bad_request",
                 detail={"error": "missing_target_user_id"},
             )
-            raise HTTPException(status_code=400, detail="请填写要转发的目标 QQ 号")
+            report = operation_diagnostic(
+                ok=False,
+                code="qzone_forward_target_missing",
+                phase="input_validation",
+                title="缺少 QZone 转发目标",
+                message="请填写要转发的目标 QQ 号，当前没有读取或发布任何动态。",
+                steps=(operation_step("validate_target", "校验目标 QQ", "error", "没有解析到有效 QQ 号。"),),
+                suggestion="填写 5-20 位 QQ 号或 [CQ:at] 后重试。",
+                retryable=False,
+                operation_id=operation_id,
+            )
+            raise HTTPException(status_code=400, detail=report)
 
         qzone_service = _bundle_attr(runtime, "qzone_social_service")
         forward_method = getattr(qzone_service, "forward_feed", None)
@@ -933,7 +1438,19 @@ def build_health_router(*, runtime) -> APIRouter:
                 outcome="unavailable",
                 detail={"error": "qzone_social_service_unavailable"},
             )
-            raise HTTPException(status_code=503, detail="QZone 转发能力未就绪（运行时未初始化或 qzone 未启用）")
+            report = operation_diagnostic(
+                ok=False,
+                code="qzone_forward_service_unavailable",
+                phase="runtime_check",
+                title="QZone 转发能力未就绪",
+                message="运行时未初始化 QZone 读取或转发能力，没有向腾讯发起写请求。",
+                details=(operation_detail("目标 QQ", target_user_id, "info"),),
+                steps=(operation_step("runtime", "检查 QZone runtime", "error", "fetch_user_feeds 或 forward_feed 不可用。"),),
+                suggestion="确认已启用 QZone 并重载插件运行时。",
+                retryable=False,
+                operation_id=operation_id,
+            )
+            raise HTTPException(status_code=503, detail=report)
 
         bot = _first_bot(runtime)
         if bot is None:
@@ -943,40 +1460,115 @@ def build_health_router(*, runtime) -> APIRouter:
                 outcome="unavailable",
                 detail={"error": "bot_not_connected"},
             )
-            raise HTTPException(status_code=503, detail="Bot 未连接")
+            report = operation_diagnostic(
+                ok=False,
+                code="qzone_forward_bot_not_connected",
+                phase="runtime_check",
+                title="Bot 未连接",
+                message="没有可用于 QZone 认证和转发的在线 Bot。",
+                details=(operation_detail("目标 QQ", target_user_id, "info"),),
+                steps=(operation_step("bot", "检查 Bot 连接", "error", "当前连接列表为空。"),),
+                suggestion="恢复 OneBot 连接后再试。",
+                retryable=True,
+                operation_id=operation_id,
+            )
+            raise HTTPException(status_code=503, detail=report)
 
-        now = get_configured_now()
-        state = get_data_store().load_sync("qzone_post_state")
-        if not isinstance(state, dict):
-            state = {}
-        monthly_limit = int(getattr(cfg, "personification_qzone_monthly_limit", 30) or 30)
+        monthly_limit = int(getattr(cfg, "personification_qzone_monthly_limit", 30))
         min_interval_hours = float(getattr(cfg, "personification_qzone_min_interval_hours", 12.0) or 0)
-        quota_before = build_qzone_quota(
-            state=state,
-            now=now,
-            monthly_limit=monthly_limit,
-            min_interval_hours=min_interval_hours,
-        )
+        try:
+            now = get_configured_now()
+            state = get_data_store().load_sync("qzone_post_state")
+            if not isinstance(state, dict):
+                state = {}
+            quota_before = build_qzone_quota(
+                state=state,
+                now=now,
+                monthly_limit=monthly_limit,
+                min_interval_hours=min_interval_hours,
+            )
+        except Exception as exc:
+            report = _unexpected_diagnostic(
+                runtime,
+                exc,
+                code="qzone_forward_quota_check_failed",
+                phase="quota_check",
+                title="无法读取 QZone 发布额度",
+                message="本地额度状态检查异常，尚未读取目标动态或向 QZone 发布。",
+                suggestion="根据 Trace ID 检查数据存储后再试。",
+                steps=(operation_step("quota", "检查月额度与发布间隔", "error", "额度状态不可用。"),),
+                details=(operation_detail("目标 QQ", target_user_id, "info"),),
+                operation_id=operation_id,
+            )
+            raise HTTPException(status_code=500, detail=report) from exc
+        operation_steps = [
+            operation_step(
+                "quota",
+                "检查月额度与发布间隔",
+                "ok",
+                f"本月已用 {int(quota_before.get('used', 0) or 0)}，剩余 {int(quota_before.get('remaining', 0) or 0)}。",
+            )
+        ]
         if int(quota_before.get("limit", 0) or 0) > 0 and int(quota_before.get("remaining", 0) or 0) <= 0:
+            operation_steps[-1] = operation_step("quota", "检查月额度与发布间隔", "error", "本月 QZone 额度已用完。")
             _record_qzone_forward_test_audit(
                 admin=admin,
                 target_user_id=target_user_id,
                 outcome="quota_blocked",
-                detail={"quota": quota_before},
+                detail={"quota": quota_before, "operation_id": operation_id},
             )
-            raise HTTPException(status_code=409, detail="本月 QQ 空间额度已用完，不能继续转发测试")
+            report = operation_diagnostic(
+                ok=False,
+                code="qzone_forward_quota_blocked",
+                phase="quota_check",
+                title="本月 QZone 额度已用完",
+                message="额度检查已阻止本次转发，没有读取或发布目标动态。",
+                details=(
+                    operation_detail("目标 QQ", target_user_id, "info"),
+                    operation_detail("额度", quota_before, "error"),
+                ),
+                steps=tuple(operation_steps),
+                suggestion="等待下月额度重置或调整额度配置；不要通过重复测试绕过限制。",
+                retryable=False,
+                operation_id=operation_id,
+            )
+            raise HTTPException(status_code=409, detail={**report, "stage": "quota", "target_user_id": target_user_id, "quota": quota_before})
 
         update_cookie = _bundle_attr(runtime, "update_qzone_cookie")
         cookie_result: dict[str, Any] = {"attempted": False}
+        warnings: list[str] = []
         if callable(update_cookie):
             cookie_result["attempted"] = True
             try:
-                cookie_ok, cookie_msg = await update_cookie(bot)
+                cookie_ok, _cookie_msg = await update_cookie(bot, force=True)
             except Exception as exc:
-                cookie_ok, cookie_msg = False, str(exc)
-            cookie_result.update({"ok": bool(cookie_ok), "message": str(cookie_msg or "")[:300]})
+                cookie_ok = False
+                cookie_result.update(
+                    {"ok": False, "status": "failed", "message": "Cookie 刷新发生内部异常", "exception_type": type(exc).__name__}
+                )
+            if cookie_ok:
+                cookie_result.update({"ok": True, "status": "refreshed", "message": "ok"})
+            else:
+                cookie_result.setdefault("ok", False)
+                cookie_result.setdefault("status", "failed")
+                cookie_result.setdefault("message", "Cookie 刷新未成功，继续尝试现有凭证")
+                warnings.append("QZone Cookie 刷新未成功，读取阶段将继续验证现有凭证。")
             if not cookie_ok and logger is not None:
-                logger.warning(f"[webui] QZone 转发体检刷新 Cookie 失败：{cookie_msg}")
+                logger.warning(
+                    f"[webui.health] QZone forward auth refresh failed status={cookie_result.get('status')} "
+                    f"exception={cookie_result.get('exception_type', '')}"
+                )
+            operation_steps.append(
+                operation_step(
+                    "auth",
+                    "刷新并验证 QZone 凭证",
+                    "ok" if cookie_ok else "warn",
+                    "Cookie 已刷新。" if cookie_ok else "刷新未成功，将由只读 feed 请求继续验证现有凭证。",
+                    details=(operation_detail("状态", cookie_result.get("status") or "failed", "ok" if cookie_ok else "warn"),),
+                )
+            )
+        else:
+            operation_steps.append(operation_step("auth", "刷新并验证 QZone 凭证", "skipped", "运行时未提供 Cookie 刷新函数。"))
 
         bot_id = str(getattr(bot, "self_id", "") or "")
         try:
@@ -987,103 +1579,288 @@ def build_health_router(*, runtime) -> APIRouter:
                 include_comments=False,
             )
         except Exception as exc:
+            operation_steps.append(operation_step("fetch", "读取目标第一条动态", "error", "读取函数发生内部异常。"))
+            report = _unexpected_diagnostic(
+                runtime,
+                exc,
+                code="qzone_forward_fetch_exception",
+                phase="qzone_fetch",
+                title="读取目标 QZone 动态时异常中断",
+                message="只读 feed 请求发生内部异常，尚未进入发布阶段。",
+                suggestion="根据 Trace ID 检查 QZone 认证和网络状态后重试。",
+                steps=tuple(operation_steps),
+                details=(operation_detail("目标 QQ", target_user_id, "info"),),
+                operation_id=operation_id,
+                retryable=True,
+            )
             _record_qzone_forward_test_audit(
                 admin=admin,
                 target_user_id=target_user_id,
                 outcome="fetch_error",
-                detail={"error": str(exc)[:500], "cookie": cookie_result},
+                detail={"code": report["code"], "trace_id": report["trace_id"], "exception_type": type(exc).__name__, "operation_id": operation_id},
             )
-            raise HTTPException(status_code=500, detail=f"读取目标空间失败：{exc}") from exc
+            raise HTTPException(
+                status_code=500,
+                detail={**report, "stage": "fetch", "target_user_id": target_user_id, "cookie": cookie_result, "quota": quota_before},
+            ) from exc
         if not fetch_ok:
+            try:
+                auth_status = get_qzone_auth_status(bot_id)
+            except Exception:
+                auth_status = {}
+            login_required = auth_status.get("status") == "login_required"
+            operation_steps.append(
+                operation_step(
+                    "fetch",
+                    "读取目标第一条动态",
+                    "error",
+                    "QZone 只读 feed 请求未成功。",
+                    details=(operation_detail("认证状态", auth_status.get("status") or "unknown", "error" if login_required else "warn"),),
+                )
+            )
             _record_qzone_forward_test_audit(
                 admin=admin,
                 target_user_id=target_user_id,
                 outcome="fetch_failed",
-                detail={"message": str(fetch_msg or "")[:500], "cookie": cookie_result},
+                detail={"auth_status": auth_status.get("status"), "cookie_status": cookie_result.get("status"), "operation_id": operation_id},
+            )
+            report = operation_diagnostic(
+                ok=False,
+                code="qzone_forward_login_required" if login_required else "qzone_forward_fetch_failed",
+                phase="qzone_auth" if login_required else "qzone_fetch",
+                title="QZone 登录凭证已失效" if login_required else "未能读取目标 QZone 动态",
+                message="腾讯要求重新登录，本次没有发布。" if login_required else "只读 feed 请求明确失败，本次没有进入发布阶段。",
+                details=(
+                    operation_detail("目标 QQ", target_user_id, "info"),
+                    operation_detail("认证状态", auth_status.get("status") or "unknown", "error" if login_required else "warn"),
+                ),
+                steps=tuple(operation_steps),
+                warnings=warnings,
+                suggestion="先在 QZone 认证恢复中完成扫码登录。" if login_required else "检查 QZone 网络与认证状态后重试。",
+                retryable=not login_required,
+                operation_id=operation_id,
             )
             return {
-                "ok": False,
                 "stage": "fetch",
                 "target_user_id": target_user_id,
-                "error": str(fetch_msg or "读取目标空间失败"),
                 "cookie": cookie_result,
                 "quota": quota_before,
+                **report,
             }
         if not feeds:
+            operation_steps.append(operation_step("fetch", "读取目标第一条动态", "error", "目标空间没有返回可转发动态。"))
             _record_qzone_forward_test_audit(
                 admin=admin,
                 target_user_id=target_user_id,
                 outcome="no_feed",
-                detail={"cookie": cookie_result},
+                detail={"cookie_status": cookie_result.get("status"), "operation_id": operation_id},
+            )
+            report = operation_diagnostic(
+                ok=False,
+                code="qzone_forward_feed_empty",
+                phase="qzone_fetch",
+                title="目标空间没有可转发动态",
+                message="读取请求已完成，但没有获得第一条可转发动态；没有进入发布阶段。",
+                details=(operation_detail("目标 QQ", target_user_id, "info"),),
+                steps=tuple(operation_steps),
+                warnings=warnings,
+                suggestion="确认目标空间对 Bot 可见且存在动态。",
+                retryable=False,
+                operation_id=operation_id,
             )
             return {
-                "ok": False,
                 "stage": "fetch",
                 "target_user_id": target_user_id,
-                "error": "目标用户空间没有可转发的动态",
                 "cookie": cookie_result,
                 "quota": quota_before,
+                **report,
             }
 
         feed = feeds[0]
+        operation_steps.append(operation_step("fetch", "读取目标第一条动态", "ok", "已取得第一条可转发动态。"))
         try:
-            forward_ok, forward_msg = await forward_method(
-                feed=feed,
+            published = await coordinated_qzone_publish(
+                operation_id=operation_id,
+                content=_format_qzone_forward_health_record(feed, forward_text),
                 bot_id=bot_id,
-                content=forward_text,
+                payload_identity={
+                    "owner_uin": str(feed.get("owner_uin") or ""),
+                    "feed_id": str(feed.get("feed_id") or ""),
+                    "topic_id": str(feed.get("topic_id") or ""),
+                    "appid": str(feed.get("appid") or ""),
+                },
+                now=get_configured_now(),
+                monthly_limit=monthly_limit,
+                min_interval_hours=min_interval_hours,
+                kind="forward",
+                publish=lambda: forward_method(feed=feed, bot_id=bot_id, content=forward_text),
             )
         except Exception as exc:
-            _record_qzone_forward_test_audit(
-                admin=admin,
-                target_user_id=target_user_id,
-                outcome="forward_error",
-                detail={"error": str(exc)[:500], "feed": _qzone_feed_summary(feed), "cookie": cookie_result},
+            operation_steps.append(operation_step("publish", "提交 QZone 转发", "unknown", "协调发布异常中断，远端结果无法确认。"))
+            report = _unexpected_diagnostic(
+                runtime,
+                exc,
+                code="qzone_forward_outcome_unknown",
+                phase="qzone_publish",
+                title="QZone 转发结果未知",
+                message="发布协调阶段异常中断，动态可能已经转发，也可能没有转发。",
+                suggestion="先打开 Bot 的 QQ 空间核对；确认状态前禁止直接重试，以免重复转发。",
+                steps=tuple(operation_steps),
+                details=(operation_detail("目标 QQ", target_user_id, "info"), operation_detail("动态 ID", feed.get("feed_id") or "", "info")),
+                operation_id=operation_id,
+                retryable=False,
+                outcome_unknown=True,
             )
-            raise HTTPException(status_code=500, detail=f"转发失败：{exc}") from exc
-        if not forward_ok:
             _record_qzone_forward_test_audit(
                 admin=admin,
                 target_user_id=target_user_id,
-                outcome="forward_failed",
-                detail={"message": str(forward_msg or "")[:500], "feed": _qzone_feed_summary(feed), "cookie": cookie_result},
+                outcome="unknown",
+                detail={"code": report["code"], "trace_id": report["trace_id"], "exception_type": type(exc).__name__, "operation_id": operation_id},
+            )
+            raise HTTPException(
+                status_code=500,
+                detail={
+                    **report,
+                    "stage": "forward",
+                    "target_user_id": target_user_id,
+                    "feed": _qzone_feed_summary(feed),
+                    "cookie": cookie_result,
+                    "quota": quota_before,
+                },
+            ) from exc
+        forward_ok = bool(published.get("success"))
+        publish_status = str(published.get("status") or "failed")
+        forward_msg = str(published.get("message") or publish_status or "")
+        if not forward_ok:
+            try:
+                auth_status = get_qzone_auth_status(bot_id)
+            except Exception:
+                auth_status = {}
+            outcome_unknown = publish_status in {"outcome_unknown", "unknown"}
+            if outcome_unknown:
+                code = "qzone_forward_outcome_unknown"
+                title = "QZone 转发结果未知"
+                message = "转发请求可能已经到达腾讯，但没有得到明确成功或失败结果。"
+                suggestion = "先打开 Bot 的 QQ 空间核对；确认状态前禁止直接重试，以免重复转发。"
+                retryable = False
+                step_status = "unknown"
+                audit_outcome = "unknown"
+            elif publish_status == "quota_blocked":
+                code = "qzone_forward_quota_blocked"
+                title = "QZone 发布额度已阻止转发"
+                message = "协调发布时发现月额度已被其它在途或已完成操作占满，没有向腾讯提交转发。"
+                suggestion = "刷新额度状态并等待可用额度，不要重复提交。"
+                retryable = False
+                step_status = "error"
+                audit_outcome = "quota_blocked"
+            elif publish_status == "interval_blocked":
+                code = "qzone_forward_interval_blocked"
+                title = "QZone 最小发布间隔尚未结束"
+                message = "协调发布阻止了本次转发，没有向腾讯提交写请求。"
+                suggestion = "等待 next eligible 时间后再试。"
+                retryable = False
+                step_status = "error"
+                audit_outcome = "interval_blocked"
+            elif publish_status in {"reserved", "dispatching"}:
+                code = "qzone_forward_in_progress"
+                title = "相同 QZone 转发仍在处理中"
+                message = "该 Operation ID 已存在未完成操作，本次没有重复向腾讯提交。"
+                suggestion = "等待原操作完成并核对空间，不要更换 Operation ID 重复提交。"
+                retryable = False
+                step_status = "running"
+                audit_outcome = "in_progress"
+            elif auth_status.get("status") == "login_required":
+                code = "qzone_forward_login_required"
+                title = "QZone 登录凭证已失效"
+                message = "发布层确认认证不可用，本次转发未成功。"
+                suggestion = "先在 QZone 认证恢复中完成扫码登录；确认未转发后再使用新 Operation ID。"
+                retryable = False
+                step_status = "error"
+                audit_outcome = "auth_failed"
+            else:
+                code = "qzone_forward_publish_failed"
+                title = "QZone 明确拒绝了转发"
+                message = "发布层返回明确失败状态，未记录额度。"
+                suggestion = "检查 QZone 认证、目标动态权限和发布限制后再试。"
+                retryable = True
+                step_status = "error"
+                audit_outcome = "forward_failed"
+            operation_steps.append(operation_step("publish", "提交 QZone 转发", step_status, message))
+            _record_qzone_forward_test_audit(
+                admin=admin,
+                target_user_id=target_user_id,
+                outcome=audit_outcome,
+                detail={"publish_status": publish_status, "feed": _qzone_feed_summary(feed), "cookie_status": cookie_result.get("status"), "operation_id": operation_id},
+            )
+            report = operation_diagnostic(
+                ok=False,
+                code=code,
+                phase="qzone_publish",
+                title=title,
+                message=message,
+                details=(
+                    operation_detail("目标 QQ", target_user_id, "info"),
+                    operation_detail("动态 ID", feed.get("feed_id") or "", "info"),
+                    operation_detail("协调状态", publish_status, "warn" if outcome_unknown else "error"),
+                    operation_detail("发布前额度", quota_before, "info"),
+                ),
+                steps=tuple(operation_steps),
+                warnings=warnings,
+                suggestion=suggestion,
+                retryable=retryable,
+                partial=True,
+                outcome_unknown=outcome_unknown,
+                operation_id=operation_id,
             )
             return {
-                "ok": False,
                 "stage": "forward",
                 "target_user_id": target_user_id,
-                "error": str(forward_msg or "转发失败"),
                 "feed": _qzone_feed_summary(feed),
                 "cookie": cookie_result,
                 "quota": quota_before,
+                **report,
             }
 
-        post_state = record_qzone_post(
-            _format_qzone_forward_health_record(feed, forward_text),
-            now=get_configured_now(),
-            kind="forward",
-        )
+        post_state = published.get("state") or get_data_store().load_sync("qzone_post_state")
         quota_after = build_qzone_quota(
             state=post_state,
             now=get_configured_now(),
             monthly_limit=monthly_limit,
             min_interval_hours=min_interval_hours,
         )
+        operation_steps.append(operation_step("publish", "提交 QZone 转发", "ok", "腾讯已明确返回成功并完成额度记账。"))
         if logger is not None:
             logger.info(f"[webui] 管理员 {admin.qq} 转发体检：target={target_user_id}")
         _record_qzone_forward_test_audit(
             admin=admin,
             target_user_id=target_user_id,
             outcome="ok",
-            detail={"feed": _qzone_feed_summary(feed), "forward_text": forward_text, "quota": quota_after},
+            detail={"feed": _qzone_feed_summary(feed), "forward_text": forward_text, "quota": quota_after, "operation_id": operation_id},
+        )
+        report = operation_diagnostic(
+            ok=True,
+            code="qzone_forward_published",
+            phase="qzone_publish",
+            title="QZone 首条动态已转发",
+            message=str(forward_msg or "ok"),
+            details=(
+                operation_detail("目标 QQ", target_user_id, "info"),
+                operation_detail("动态 ID", feed.get("feed_id") or "", "ok"),
+                operation_detail("额度", quota_after, "ok"),
+            ),
+            steps=tuple(operation_steps),
+            warnings=warnings,
+            suggestion="若 QQ 空间暂未显示，可稍后刷新确认；不要立即重复转发同一动态。",
+            retryable=False,
+            operation_id=operation_id,
         )
         return {
-            "ok": True,
             "target_user_id": target_user_id,
             "forward_text": forward_text,
-            "message": str(forward_msg or "ok"),
             "feed": _qzone_feed_summary(feed),
             "cookie": cookie_result,
             "quota": quota_after,
+            **report,
         }
 
     return router

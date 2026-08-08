@@ -108,6 +108,7 @@ class MatcherSetupDeps:
     sticker_chat_rule_core: Any
     process_response_logic_core: Any
     reply_processor_deps: ReplyProcessorDeps
+    user_policy_gate: Any
     handle_reply_event_core: Any
     run_buffer_timer_core: Any
     msg_buffer: Dict[str, Dict[str, Any]]
@@ -253,11 +254,15 @@ def setup_all_matchers(*, deps: MatcherSetupDeps) -> Dict[str, Any]:
         logger=deps.logger,
         plugin_config=deps.plugin_config,
         finished_exception_cls=deps.finished_exception_cls,
+        user_policy_gate=deps.user_policy_gate,
     )
     handle_reply = reply_matchers["handle_reply"]
 
     async def _record_msg_rule(event: Event) -> bool:
-        return await deps.record_msg_rule_core(event)
+        return await deps.record_msg_rule_core(
+            event,
+            user_policy_gate=deps.user_policy_gate,
+        )
 
     async def _sticker_chat_rule(event: Event) -> bool:
         return await deps.sticker_chat_rule_core(
@@ -265,6 +270,7 @@ def setup_all_matchers(*, deps: MatcherSetupDeps) -> Dict[str, Any]:
             is_group_whitelisted=deps.is_group_whitelisted,
             plugin_whitelist=deps.plugin_config.personification_whitelist,
             probability=deps.plugin_config.personification_sticker_probability,
+            user_policy_gate=deps.user_policy_gate,
         )
 
     async def _analyze_group_style(group_id: str) -> Any:
@@ -315,6 +321,12 @@ def setup_all_matchers(*, deps: MatcherSetupDeps) -> Dict[str, Any]:
         plugin_config=deps.plugin_config,
         message_segment_cls=deps.message_segment_cls,
         handle_reply=handle_reply,
+        user_policy_gate=deps.user_policy_gate,
+        create_scoped_profile_task=(
+            deps.runtime_bundle.scoped_profile_service.observe_group_message
+            if getattr(deps.runtime_bundle, "scoped_profile_service", None) is not None
+            else None
+        ),
     )
 
     whitelist_matchers = register_whitelist_matchers(

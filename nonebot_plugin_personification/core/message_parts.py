@@ -81,6 +81,38 @@ def normalize_message_part(item: Any) -> dict[str, Any] | None:
             normalized["alt_text"] = alt_text
         return normalized
 
+    if part_type in {"video_url", "audio_url"}:
+        value_key = part_type
+        media_value = item.get(value_key, {})
+        if isinstance(media_value, str):
+            media_value = {"url": media_value}
+        elif not isinstance(media_value, dict):
+            media_value = {}
+        url = str(media_value.get("url", "") or "").strip()
+        if not url:
+            return None
+        normalized = {"type": part_type, value_key: {"url": url}}
+        mime_type = str(item.get("mime_type", "") or media_value.get("mime_type", "") or "").strip()
+        if mime_type:
+            normalized["mime_type"] = mime_type
+        return normalized
+
+    if part_type in {"video_file", "audio_file"}:
+        value_key = part_type
+        media_value = item.get(value_key, {})
+        if isinstance(media_value, str):
+            media_value = {"path": media_value}
+        elif not isinstance(media_value, dict):
+            media_value = {}
+        path = str(media_value.get("path", "") or item.get("path", "") or "").strip()
+        if not path:
+            return None
+        normalized = {"type": part_type, value_key: {"path": path}}
+        mime_type = str(item.get("mime_type", "") or media_value.get("mime_type", "") or "").strip()
+        if mime_type:
+            normalized["mime_type"] = mime_type
+        return normalized
+
     if "text" in item:
         text = str(item.get("text", "") or "").strip()
         return {"type": "text", "text": text} if text else None
@@ -129,6 +161,10 @@ def build_user_message_content(
     text: str,
     image_urls: list[str] | None = None,
     image_files: list[str | Path] | None = None,
+    video_urls: list[str] | None = None,
+    video_files: list[str | Path] | None = None,
+    audio_urls: list[str] | None = None,
+    audio_files: list[str | Path] | None = None,
     image_detail: str = "auto",
     mime_type: str = "",
     alt_text: str = "",
@@ -159,6 +195,22 @@ def build_user_message_content(
         if alt_text:
             part["alt_text"] = alt_text
         parts.append(part)
+    for kind, values, value_key in (
+        ("video_url", video_urls or [], "video_url"),
+        ("audio_url", audio_urls or [], "audio_url"),
+    ):
+        for media_url in values:
+            url = str(media_url or "").strip()
+            if url:
+                parts.append({"type": kind, value_key: {"url": url}})
+    for kind, values, value_key in (
+        ("video_file", video_files or [], "video_file"),
+        ("audio_file", audio_files or [], "audio_file"),
+    ):
+        for media_file in values:
+            path = str(media_file or "").strip()
+            if path:
+                parts.append({"type": kind, value_key: {"path": path}})
     if not parts:
         return ""
     if len(parts) == 1 and parts[0].get("type") == "text":

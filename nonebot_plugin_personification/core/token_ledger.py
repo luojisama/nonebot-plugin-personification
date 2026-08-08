@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import time
+import threading
 from datetime import datetime, timedelta
 from typing import Any
 
@@ -15,6 +16,19 @@ _WINDOW_ALIASES = {
     "30d": "month",
     "month": "month",
 }
+_GENERATION_LOCK = threading.Lock()
+_LEDGER_GENERATION = 0
+
+
+def ledger_generation() -> int:
+    with _GENERATION_LOCK:
+        return _LEDGER_GENERATION
+
+
+def _advance_generation() -> None:
+    global _LEDGER_GENERATION
+    with _GENERATION_LOCK:
+        _LEDGER_GENERATION += 1
 
 
 def record_response_usage(
@@ -190,6 +204,7 @@ def record_llm_call(
              purpose_str, pt, ct, tt, now),
         )
         conn.commit()
+    _advance_generation()
 
 
 def query_provider_summary(window: str = "month") -> dict[str, Any]:
@@ -812,6 +827,7 @@ def _aggregate_purpose_rows(rows: list[Any]) -> list[dict[str, Any]]:
 
 
 __all__ = [
+    "ledger_generation",
     "record_llm_call",
     "query_summary",
     "query_group_detail",

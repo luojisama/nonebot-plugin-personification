@@ -13,7 +13,7 @@ class AgentBudgetProfile:
     source: str = "shadow"
 
 
-_LOOKUP_TOOL_INTENTS = {"lookup_web", "lookup_plugin", "memory", "vision"}
+_LOOKUP_TOOL_INTENTS = {"lookup_web", "lookup_plugin", "runtime_capability", "memory", "vision"}
 _BUDGET_MODE_ALIASES = {
     "": "shadow",
     "shadow": "shadow",

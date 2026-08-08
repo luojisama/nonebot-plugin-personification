@@ -109,6 +109,113 @@ def test_select_tool_schemas_uses_metadata_for_new_lookup_tools() -> None:
     assert "new_admin_tool" not in names
 
 
+def test_runtime_capability_exposes_only_safe_first_party_runtime_tools() -> None:
+    registry = tool_registry.ToolRegistry()
+    _register(registry, "list_plugins")
+    _register(
+        registry,
+        "inspect_current_user_avatar",
+        {
+            "intent_tags": ["runtime_capability", "current_user"],
+            "source_kind": "first_party_runtime",
+            "risk_level": "low",
+            "side_effect": "none",
+        },
+    )
+    _register(
+        registry,
+        "untrusted_runtime_probe",
+        {
+            "intent_tags": ["runtime_capability"],
+            "source_kind": "remote_mcp",
+            "side_effect": "none",
+        },
+    )
+    _register(
+        registry,
+        "runtime_write_probe",
+        {
+            "intent_tags": ["runtime_capability"],
+            "source_kind": "first_party_runtime",
+            "side_effect": "external",
+        },
+    )
+    _register(
+        registry,
+        "external_image_probe",
+        {
+            "requires_image": True,
+            "source_kind": "remote_mcp",
+            "side_effect": "external",
+        },
+    )
+
+    runtime_names = {
+        tool_catalog.schema_tool_name(schema)
+        for schema in tool_catalog.select_tool_schemas(
+            registry,
+            has_images=False,
+            chat_intent="plugin_question",
+            plugin_question_intent="runtime_capability",
+        )
+    }
+    static_capability_names = {
+        tool_catalog.schema_tool_name(schema)
+        for schema in tool_catalog.select_tool_schemas(
+            registry,
+            has_images=False,
+            chat_intent="plugin_question",
+            plugin_question_intent="capability",
+        )
+    }
+    runtime_names_with_images = {
+        tool_catalog.schema_tool_name(schema)
+        for schema in tool_catalog.select_tool_schemas(
+            registry,
+            has_images=True,
+            chat_intent="plugin_question",
+            plugin_question_intent="runtime_capability",
+        )
+    }
+
+    assert runtime_names == {"inspect_current_user_avatar"}
+    assert runtime_names_with_images == {"inspect_current_user_avatar"}
+    assert static_capability_names == {"list_plugins"}
+
+
+def test_conversation_action_is_visible_in_chat_profiles_but_not_runtime_capability() -> None:
+    registry = tool_registry.ToolRegistry()
+    _register(
+        registry,
+        "recall_latest_own_output",
+        {
+            "intent_tags": ["conversation_action", "runtime_capability"],
+            "side_effect": "message_recall",
+            "final_behavior": "silence_on_success",
+            "ack_behavior": "suppress",
+        },
+    )
+
+    def _selected(chat_intent: str, plugin_question_intent: str = "") -> set[str]:
+        return {
+            tool_catalog.schema_tool_name(schema)
+            for schema in tool_catalog.select_tool_schemas(
+                registry,
+                has_images=False,
+                chat_intent=chat_intent,
+                plugin_question_intent=plugin_question_intent,
+            )
+        }
+
+    assert "recall_latest_own_output" in _selected("banter")
+    assert "recall_latest_own_output" in _selected("expression")
+    assert "recall_latest_own_output" in _selected("explanation")
+    assert "recall_latest_own_output" not in _selected("plugin_question", "runtime_capability")
+
+    planner_metadata = tool_catalog.registry_planner_metadata(registry)[0]
+    assert planner_metadata["ack_behavior"] == "suppress"
+
+
 def test_registry_planner_metadata_applies_name_defaults() -> None:
     registry = tool_registry.ToolRegistry()
     _register(registry, "parallel_research")
@@ -121,6 +228,7 @@ def test_registry_planner_metadata_applies_name_defaults() -> None:
     assert by_name["parallel_research"]["retryable"] is True
     assert by_name["parallel_research"]["side_effect"] == "none"
     assert by_name["parallel_research"]["final_behavior"] == "continue"
+    assert by_name["parallel_research"]["ack_behavior"] == "send"
     assert by_name["vision_analyze"]["requires_image"] is True
     assert "vision" in by_name["vision_analyze"]["intent_tags"]
 
@@ -138,6 +246,7 @@ def test_action_tool_metadata_declares_side_effect_contract() -> None:
         assert by_name[name]["side_effect"] == "send_message"
         assert by_name[name]["final_behavior"] == "silence_on_success"
         assert by_name[name]["retryable"] is False
+    assert by_name["send_qq_face"]["ack_behavior"] == "suppress"
 
 
 def test_runtime_metadata_merges_custom_tool_contract() -> None:
@@ -171,6 +280,7 @@ def test_select_tool_schemas_banter_exposes_lightweight_lookup_tools() -> None:
         "recall_group_memory",
         "memory_recall",
         "get_user_persona",
+        "inspect_group_user_avatar_pair",
         "vision_analyze",
         "sticker_labeler",
     ):
@@ -200,6 +310,33 @@ def test_select_tool_schemas_banter_exposes_lightweight_lookup_tools() -> None:
         for s in tool_catalog.select_tool_schemas(registry, has_images=True, chat_intent="banter")
     }
     assert "web_search" in names_img and "vision_analyze" in names_img
+    assert "inspect_group_user_avatar_pair" in names_noimg
+
+
+def test_select_tool_schemas_banter_exposes_builtin_game_slang_research() -> None:
+    registry = tool_registry.ToolRegistry()
+    _register(
+        registry,
+        "research_game_slang",
+        {
+            "source_kind": "mcp_builtin",
+            "intent_tags": ["lookup", "game_slang", "social_research"],
+            "risk_level": "low",
+            "side_effect": "none",
+            "requires_network": True,
+        },
+    )
+
+    names = {
+        tool_catalog.schema_tool_name(schema)
+        for schema in tool_catalog.select_tool_schemas(
+            registry,
+            has_images=False,
+            chat_intent="banter",
+        )
+    }
+
+    assert "research_game_slang" in names
 
 
 def test_semantic_tool_guidance_requires_lookup_for_unknown_entities() -> None:
@@ -210,3 +347,8 @@ def test_semantic_tool_guidance_requires_lookup_for_unknown_entities() -> None:
     assert "不要直接在群里问" in guidance
     assert "专有名词" in guidance
     assert "resolve_acg_entity" in guidance
+    assert "research_game_slang" in guidance
+    assert "只读社交平台" in guidance
+    assert "inspect_group_user_avatar_pair" in guidance
+    assert "runtime_capability" in guidance
+    assert "绝不表示两位用户现实中是情侣、朋友、认识或同一人" in guidance

@@ -20,8 +20,26 @@ def extract_reply_message_id(event: Any) -> str:
         value = getattr(reply, "message_id", None)
         if value is None and isinstance(reply, dict):
             value = reply.get("message_id")
-        return str(value or "").strip()
-    return str(getattr(event, "reply_to_message_id", "") or "").strip()
+        normalized = str(value or "").strip()
+        if normalized:
+            return normalized
+    normalized = str(getattr(event, "reply_to_message_id", "") or "").strip()
+    if normalized:
+        return normalized
+    for segment in getattr(event, "message", []) or []:
+        segment_type = getattr(segment, "type", None)
+        segment_data = getattr(segment, "data", None)
+        if isinstance(segment, dict):
+            segment_type = segment.get("type", segment_type)
+            segment_data = segment.get("data", segment_data)
+        if str(segment_type or "").strip().lower() != "reply":
+            continue
+        data = segment_data if isinstance(segment_data, dict) else {}
+        for key in ("id", "message_id", "messageId"):
+            normalized = str(data.get(key, "") or "").strip()
+            if normalized:
+                return normalized
+    return ""
 
 
 def extract_event_message_id(event: Any) -> str:

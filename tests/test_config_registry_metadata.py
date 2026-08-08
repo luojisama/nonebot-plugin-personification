@@ -53,6 +53,23 @@ def test_group_routing() -> None:
     assert entries["global_enabled"].group == "核心开关"
     assert entries["response_review_enabled"].group == "回复审阅"
     assert entries["turn_planner_enabled"].group == "意图规划"
+    assert entries["meme_reply_probability"].group == "原生 MCP"
+
+
+def test_social_slang_learning_defaults_and_safety_floors() -> None:
+    cfg = config_mod.Config()
+    entries = {entry.key: entry for entry in config_registry.get_config_entries()}
+
+    assert cfg.personification_probability == 0.30
+    assert cfg.personification_meme_reply_probability == 0.18
+    assert cfg.personification_slang_max_claims == 20
+    assert entries["meme_reply_probability"].min_value == 0.0
+    assert entries["meme_reply_probability"].max_value == 1.0
+    assert entries["slang_max_claims"].min_value == 1
+    assert entries["slang_max_claims"].max_value == 50
+    assert entries["auto_understand_min_sources"].min_value == 2
+    assert entries["auto_use_min_sources"].min_value == 2
+    assert entries["auto_use_min_platforms"].min_value == 2
 
 
 def test_advanced_inference_from_field_name() -> None:
@@ -116,3 +133,47 @@ def test_secret_inference_for_key_and_auth_path_fields() -> None:
     assert entries["fallback_api_url"].secret is False
     # 普通 toggle 不 secret
     assert entries["tts_global_enabled"].secret is False
+
+
+def test_video_and_audio_presets_are_exposed_as_webui_selects() -> None:
+    cfg = config_mod.Config()
+    entries = {entry.key: entry for entry in config_registry.get_config_entries()}
+    assert cfg.personification_video_frame_preset == "balanced"
+    assert cfg.personification_video_custom_frame_budgets == {"15": 24, "60": 60, "180": 120, "600": 160}
+    assert cfg.personification_video_contact_sheet_frames == 8
+    assert cfg.personification_video_visual_soft_limit == 160
+    assert cfg.personification_video_visual_hard_limit == 192
+    assert cfg.personification_video_payload_max_bytes == 16 * 1024 * 1024
+    assert cfg.personification_video_max_bytes == 256 * 1024 * 1024
+    assert cfg.personification_video_download_timeout == 90.0
+    assert cfg.personification_video_analysis_timeout == 600.0
+    assert entries["video_frame_preset"].choices == ("economy", "balanced", "quality", "custom")
+    assert entries["video_visual_hard_limit"].max_value == 256
+    assert entries["video_max_bytes"].default == 256 * 1024 * 1024
+    assert entries["video_route_mode"].choices == (
+        "auto",
+        "primary",
+        "external",
+        "storyboard",
+        "native",
+        "hybrid",
+    )
+    assert entries["video_fallback_provider"].choices == (
+        "",
+        "auto",
+        "qwen_omni",
+        "gemini",
+        "disabled",
+    )
+    assert cfg.personification_video_fallback_workspace_id == ""
+    assert entries["video_fallback_workspace_id"].group == "视频理解"
+    assert entries["audio_transcription_provider"].choices == (
+        "auto",
+        "qwen_audio",
+        "paraformer",
+        "custom",
+        "disabled",
+    )
+    assert cfg.personification_audio_transcription_provider == "auto"
+    assert entries["audio_transcription_api_key"].secret is True
+    assert entries["audio_transcription_provider"].group == "视频理解"

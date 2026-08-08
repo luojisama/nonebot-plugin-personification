@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from typing import Any
 
 from ._loader import load_personification_module
@@ -90,3 +91,20 @@ def test_coerce_forecast_days_clamps_to_supported_range() -> None:
     assert weather_impl.coerce_forecast_days(0) == 1
     assert weather_impl.coerce_forecast_days("15") == 15
     assert weather_impl.coerce_forecast_days(30) == 16
+
+
+def test_weather_tool_returns_canonical_failure(monkeypatch) -> None:  # noqa: ANN001
+    async def _failed_fetch(*_args, **_kwargs):  # noqa: ANN001
+        raise RuntimeError("private upstream detail")
+
+    warnings: list[str] = []
+    monkeypatch.setattr(weather_impl, "fetch_weather", _failed_fetch)
+    tool = weather_impl.build_weather_tool(
+        None,
+        type("Logger", (), {"warning": lambda _self, message: warnings.append(message)})(),
+    )
+
+    result = asyncio.run(tool.handler(city="广州"))
+
+    assert json.loads(result) == {"error": "fetch_failed", "ok": False}
+    assert all("private upstream detail" not in message for message in warnings)

@@ -1,10 +1,13 @@
 from __future__ import annotations
 
-import json
 from typing import Any, Awaitable, Callable
 
-from .executor import _RETRYABLE_LOOKUP_TOOLS
-from .fallbacks import _tool_result_indicates_empty
+from .fallbacks import (
+    TOOL_RESULT_EMPTY_EVIDENCE,
+    TOOL_RESULT_OPERATIONAL_FAILURE,
+    _tool_result_outcome,
+    tool_signature,
+)
 
 
 _BUILTIN_SEARCH_CALLER_NAMES = frozenset(
@@ -47,20 +50,16 @@ def summarize_tool_response_raw(raw: Any) -> str:
     )
 
 
-def tool_signature(tool_name: str, tool_args: dict[str, Any]) -> str:
-    return (
-        f"{str(tool_name or '').strip()}:"
-        f"{json.dumps(tool_args or {}, ensure_ascii=False, sort_keys=True, separators=(',', ':'))}"
-    )
-
-
 def tool_result_trace_status(result: Any) -> str:
     text = str(result or "").strip()
     if not text:
         return "warn"
     if text.startswith("工具调用失败") or (text.startswith("工具 ") and text.endswith("不存在")):
         return "error"
-    if _tool_result_indicates_empty(text):
+    outcome = _tool_result_outcome(text)
+    if outcome == TOOL_RESULT_OPERATIONAL_FAILURE:
+        return "error"
+    if outcome == TOOL_RESULT_EMPTY_EVIDENCE:
         return "warn"
     return "ok"
 
@@ -103,7 +102,6 @@ def record_reply_trace_stage(
 
 
 __all__ = [
-    "_RETRYABLE_LOOKUP_TOOLS",
     "caller_supports_builtin_search",
     "record_reply_trace_stage",
     "safe_ack",

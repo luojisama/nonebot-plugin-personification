@@ -8,10 +8,13 @@ parameters:
   properties:
     topic:
       type: string
-      description: daily/trending/joke/history/epic/gold/baike/exchange
+      description: daily/ai_news/tech_news/trending/joke/history/epic/gold/baike/exchange
     platform:
       type: string
-      description: trending 模式的平台
+      description: trending 模式的平台，支持 微博/知乎/抖音/B站/百度/头条/小红书
+    source:
+      type: string
+      description: tech_news 模式的来源，支持 IT之家/Hacker News
     keyword:
       type: string
       description: baike 模式关键词

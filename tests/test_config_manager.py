@@ -206,3 +206,43 @@ def test_config_manager_async_update_persists_changes() -> None:
         assert cfg.personification_lite_model == "lite-from-update"
     finally:
         shutil.rmtree(temp_dir, ignore_errors=True)
+
+
+def test_config_manager_atomically_removes_deprecated_qwen_web_fields(monkeypatch) -> None:
+    temp_dir = _make_workspace_temp_dir("config-manager-qwen-removal-")
+    try:
+        cfg = _build_config(temp_dir)
+        cfg.personification_gemini_web_enabled = False
+        path = temp_dir / "env.json"
+        path.write_text(
+            json.dumps(
+                {
+                    "personification_global_enabled": True,
+                    "personification_gemini_web_enabled": False,
+                    "personification_qwen_web_enabled": True,
+                    "personification_qwen_web_priority": "before_api",
+                    "unrelated_external_key": "preserved",
+                }
+            ),
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(
+            config_manager,
+            "_managed_field_names",
+            lambda: ["personification_global_enabled", "personification_gemini_web_enabled"],
+        )
+
+        manager = config_manager.ConfigManager(plugin_config=cfg, logger=None)
+        manager.load()
+        stored = json.loads(path.read_text(encoding="utf-8"))
+        info = config_manager.get_env_config_load_info(cfg)
+
+        assert "personification_qwen_web_enabled" not in stored
+        assert "personification_qwen_web_priority" not in stored
+        assert stored["unrelated_external_key"] == "preserved"
+        assert info["removed_fields"] == [
+            "personification_qwen_web_enabled",
+            "personification_qwen_web_priority",
+        ]
+    finally:
+        shutil.rmtree(temp_dir, ignore_errors=True)

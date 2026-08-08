@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+from pathlib import Path
 from typing import Any
 
 _OK = "ok"
@@ -30,8 +31,19 @@ _PROBE_MESSAGES = [
 ]
 
 
-def _check(key: str, label: str, status: str, detail: str = "", hint: str = "") -> dict[str, Any]:
-    return {"key": key, "label": label, "status": status, "detail": detail, "hint": hint}
+def _check(
+    key: str,
+    label: str,
+    status: str,
+    detail: str = "",
+    hint: str = "",
+    *,
+    diagnostic_code: str = "",
+) -> dict[str, Any]:
+    result = {"key": key, "label": label, "status": status, "detail": detail, "hint": hint}
+    if diagnostic_code:
+        result["diagnostic_code"] = str(diagnostic_code)
+    return result
 
 
 def _get(cfg: Any, name: str, default: Any = None) -> Any:
@@ -297,6 +309,331 @@ async def _vision_checks(cfg: Any, bundle: Any, logger: Any) -> list[dict[str, A
     return checks
 
 
+def _video_probe_root(cfg: Any) -> Path:
+    configured = str(_get(cfg, "personification_health_probe_dir", "") or "").strip()
+    if configured:
+        return Path(configured)
+    data_dir = str(_get(cfg, "personification_data_dir", "") or "").strip()
+    if data_dir:
+        return Path(data_dir) / "health-probes"
+    # Do not fall back to tempfile.gettempdir(): this probe is deliberately
+    # kept beside the plugin data on the configured deployment drive.
+    return Path(__file__).resolve().parents[1] / "data" / "personification" / "health-probes"
+
+
+def _video_probe_runtime(runtime: Any, cfg: Any, providers: list[dict[str, Any]], logger: Any) -> Any:
+    class _ConfigProxy:
+        def __init__(self, real: Any) -> None:
+            self._real = real
+
+        def __getattr__(self, name: str) -> Any:
+            if name == "personification_video_route_mode":
+                return "primary"
+            if name == "personification_video_storyboard_fallback_enabled":
+                return False
+            if name == "personification_gemini_web_enabled":
+                return False
+            if name == "personification_gemini_web_risk_acknowledged":
+                return False
+            return getattr(self._real, name, None)
+
+    class _RuntimeProxy:
+        def __init__(self, real: Any) -> None:
+            self._real = real
+            self.plugin_config = _ConfigProxy(cfg)
+            self.logger = logger
+
+        def __getattr__(self, name: str) -> Any:
+            if self._real is not None:
+                return getattr(self._real, name)
+            raise AttributeError(name)
+
+        def get_configured_api_providers(self) -> list[dict[str, Any]]:
+            return list(providers)
+
+    return _RuntimeProxy(runtime)
+
+
+async def _probe_video_understanding(
+    cfg: Any,
+    *,
+    runtime: Any,
+    providers: list[dict[str, Any]],
+    logger: Any,
+    video_path: Path,
+) -> dict[str, Any]:
+    from .media_understanding import _media_result_has_evidence, analyze_videos_with_route_or_fallback
+    from .visual_capabilities import VISUAL_ROUTE_AGENT
+
+    root = _video_probe_root(cfg).resolve()
+    candidate = Path(video_path).resolve()
+    started = time.monotonic()
+    attempts: list[dict[str, Any]] = []
+    try:
+        candidate.relative_to(root)
+    except ValueError:
+        return _check(
+            "video_probe",
+            "视频理解真实探测",
+            _ERROR,
+            detail="video_probe_status=failed selected_route=unknown attempted_routes=unknown evidence=empty elapsed_ms=unknown diagnostic_code=video_probe_path_invalid",
+            hint="上传视频必须通过当前体检入口写入插件或配置数据目录。",
+            diagnostic_code="video_probe_path_invalid",
+        )
+    if not candidate.is_file() or candidate.stat().st_size <= 0:
+        return _check(
+            "video_probe",
+            "视频理解真实探测",
+            _ERROR,
+            detail="video_probe_status=failed selected_route=unknown attempted_routes=unknown evidence=empty elapsed_ms=unknown diagnostic_code=video_probe_media_missing",
+            hint="重新选择有效视频文件后再测。",
+            diagnostic_code="video_probe_media_missing",
+        )
+    try:
+        probe_runtime = _video_probe_runtime(runtime, cfg, providers, logger)
+        result, route = await asyncio.wait_for(
+            analyze_videos_with_route_or_fallback(
+                runtime=probe_runtime,
+                prompt=(
+                    "这是管理员上传的视频能力体检。请只返回 JSON，包含非空 scene_summary 和 visual_evidence，"
+                    "忠实描述这段视频看到的主要画面或动作。禁止 Markdown 标题、列表、加粗、代码围栏、"
+                    "XML 和解释性前后缀；JSON 字段值也使用纯文本，不要夹带 Markdown。"
+                ),
+                video_refs=[str(candidate)],
+                route_name=VISUAL_ROUTE_AGENT,
+                route_attempts=attempts,
+            ),
+            timeout=max(20.0, min(120.0, float(_get(cfg, "personification_video_analysis_timeout", 600.0) or 600.0))),
+        )
+        result_text = str(result or "").strip()
+        evidence = "structured" if _media_result_has_evidence(result_text) else ("opaque" if result_text else "empty")
+        elapsed_ms = int((time.monotonic() - started) * 1000)
+        if evidence == "structured":
+            attempt_names = ",".join(
+                str(item.get("route") or "unknown")
+                for item in attempts
+                if isinstance(item, dict)
+            ) or "none"
+            return _check(
+                "video_probe",
+                "视频理解真实探测",
+                _OK,
+                detail=(
+                    f"video_probe_status=ok selected_route={route or 'unknown'} "
+                    f"attempted_routes={attempt_names} evidence=structured elapsed_ms={elapsed_ms}"
+                ),
+                diagnostic_code="video_probe_ok",
+            )
+        diagnostic_code = "video_probe_empty_evidence" if evidence == "empty" else "video_probe_opaque_evidence"
+        attempt_names = ",".join(
+            str(item.get("route") or "unknown")
+            for item in attempts
+            if isinstance(item, dict)
+        ) or "none"
+        return _check(
+            "video_probe",
+            "视频理解真实探测",
+            _ERROR,
+            detail=(
+                f"video_probe_status=failed selected_route={route or 'unknown'} "
+                f"attempted_routes={attempt_names} evidence={evidence} elapsed_ms={elapsed_ms} "
+                f"diagnostic_code={diagnostic_code}"
+            ),
+            hint="检查视频模型是否真正接收了视频输入，并要求返回 scene_summary/visual_evidence。",
+            diagnostic_code=diagnostic_code,
+        )
+    except asyncio.TimeoutError:
+        return _check(
+            "video_probe",
+            "视频理解真实探测",
+            _ERROR,
+            detail="video_probe_status=failed selected_route=unknown attempted_routes=unknown evidence=empty elapsed_ms=unknown diagnostic_code=video_probe_timeout",
+            hint="检查视频模型、网络或视频分析总超时配置。",
+            diagnostic_code="video_probe_timeout",
+        )
+    except Exception as exc:
+        raw_code = str(exc or "").split(":", 1)[0].strip()
+        stable_code = raw_code if raw_code.startswith("video_") else "video_probe_failed"
+        return _check(
+            "video_probe",
+            "视频理解真实探测",
+            _ERROR,
+            detail=(
+                f"video_probe_status=failed selected_route=unknown attempted_routes=unknown "
+                f"evidence=empty elapsed_ms=unknown diagnostic_code={stable_code}"
+            ),
+            hint="检查视频 Provider、媒体协议和本地视频处理依赖。",
+            diagnostic_code=stable_code,
+        )
+async def _video_checks(
+    cfg: Any,
+    bundle: Any,
+    logger: Any,
+    *,
+    probe_video: bool = False,
+    video_path: Path | None = None,
+) -> list[dict[str, Any]]:
+    from .ai_routes import list_primary_providers
+    from .media_provider_adapters import MEDIA_PROTOCOL_ANTIGRAVITY, resolve_media_provider_adapter
+    from .media_understanding import normalize_video_route_mode
+
+    enabled = bool(_get(cfg, "personification_video_understanding_enabled", False))
+    providers = list_primary_providers(cfg, logger) or []
+    checks: list[dict[str, Any]] = [
+        _check(
+            "video_config",
+            "视频理解开关",
+            _OK if enabled else _DISABLED,
+            detail="已启用" if enabled else "未启用",
+            hint="在配置中心开启视频理解后再进行真实探测。" if not enabled else "",
+        )
+    ]
+    raw_route_mode = str(_get(cfg, "personification_video_route_mode", "auto") or "auto").strip().lower()
+    route_mode = normalize_video_route_mode(raw_route_mode)
+    if raw_route_mode in {"", route_mode, "direct", "native", "hybrid", "frames", "frame"}:
+        checks.append(_check("video_route_mode", "视频路线模式", _OK, detail=f"{route_mode}"))
+    else:
+        checks.append(
+            _check(
+                "video_route_mode",
+                "视频路线模式",
+                _WARN,
+                detail=f"配置值不可识别，当前会回退为 {route_mode}",
+                hint="使用 auto、primary、external 或 storyboard。",
+                diagnostic_code="video_route_mode_invalid",
+            )
+        )
+
+    video_providers: list[dict[str, Any]] = []
+    video_protocol_candidates: list[dict[str, Any]] = []
+    video_protocols: list[str] = []
+    for provider in providers:
+        try:
+            adapter = resolve_media_provider_adapter(provider)
+        except Exception:
+            continue
+        if bool(getattr(adapter, "supports_video", False)):
+            video_protocol_candidates.append(provider)
+            if adapter.protocol == MEDIA_PROTOCOL_ANTIGRAVITY or str(provider.get("api_key", "") or "").strip():
+                video_providers.append(provider)
+                video_protocols.append(str(getattr(adapter, "protocol", "") or "unknown"))
+    if not enabled:
+        checks.append(_check("video_route", "主视频路线", _DISABLED, detail="视频理解未启用，跳过路线检查"))
+    elif not providers:
+        checks.append(_check("video_route", "主视频路线", _ERROR, detail="未配置主 Provider，无法探测视频路线", diagnostic_code="video_provider_unconfigured"))
+    elif video_providers:
+        labels = [
+            f"{str(item.get('model') or item.get('name') or '未命名')[:60]}({protocol})"
+            for item, protocol in zip(video_providers[:3], video_protocols[:3])
+        ]
+        checks.append(_check("video_route", "主视频路线", _OK, detail=f"发现 {len(video_providers)} 个视频媒体路线：{', '.join(labels)}"))
+    elif video_protocol_candidates:
+        checks.append(
+            _check(
+                "video_route",
+                "主视频路线",
+                _WARN,
+                detail="发现视频媒体协议，但 Provider 凭证未配置",
+                hint="为视频 Provider 配置 API Key，或使用无需 Key 的本地 CLI 路线。",
+                diagnostic_code="video_provider_credentials_missing",
+            )
+        )
+    else:
+        checks.append(
+            _check(
+                "video_route",
+                "主视频路线",
+                _WARN,
+                detail="主 Provider 未声明可用的视频媒体协议",
+                hint="确认 Provider 的 media_protocol/model 配置，或配置独立视频兜底。",
+            )
+        )
+
+    external_enabled = bool(_get(cfg, "personification_fullmodal_provider_enabled", False))
+    external_protocol = str(_get(cfg, "personification_fullmodal_provider_protocol", "gemini_native") or "gemini_native").strip()
+    external_model = str(_get(cfg, "personification_fullmodal_provider_model", "") or "").strip()
+    external_key = str(_get(cfg, "personification_fullmodal_provider_api_key", "") or "").strip()
+    if not enabled:
+        checks.append(_check("video_external_fallback", "外部全模态兜底", _DISABLED, detail="视频理解未启用，跳过外部兜底检查"))
+    elif external_enabled and external_key and external_model:
+        checks.append(
+            _check(
+                "video_external_fallback",
+                "外部全模态兜底",
+                _OK,
+                detail=f"已配置（protocol={external_protocol}，model={external_model[:60]}）",
+            )
+        )
+    elif external_enabled:
+        checks.append(
+            _check(
+                "video_external_fallback",
+                "外部全模态兜底",
+                _WARN,
+                detail="已开启但缺少模型或凭证",
+                hint="补充外部全模态 Provider 的 model 和 API Key，或关闭该兜底。",
+                diagnostic_code="video_external_fallback_incomplete",
+            )
+        )
+    else:
+        checks.append(_check("video_external_fallback", "外部全模态兜底", _INFO, detail="未启用（不影响主视频路线）"))
+
+    storyboard_enabled = bool(_get(cfg, "personification_video_storyboard_fallback_enabled", True))
+    if not enabled:
+        checks.append(_check("video_storyboard_backend", "分镜处理后端", _DISABLED, detail="视频理解未启用，跳过分镜检查"))
+    elif not storyboard_enabled:
+        checks.append(_check("video_storyboard_backend", "分镜处理后端", _DISABLED, detail="分镜兜底已关闭"))
+    else:
+        try:
+            from .video_understanding import _ffmpeg_executable, _ffprobe_executable
+
+            ffmpeg = _ffmpeg_executable()
+            _ffprobe_executable(ffmpeg)
+            checks.append(_check("video_storyboard_backend", "分镜处理后端", _OK, detail="ffmpeg/ffprobe 可用"))
+        except Exception:
+            checks.append(
+                _check(
+                    "video_storyboard_backend",
+                    "分镜处理后端",
+                    _WARN,
+                    detail="未发现可用 ffmpeg/ffprobe；原生视频路线仍可独立工作",
+                    hint="安装 imageio-ffmpeg 或配置运维环境中的 ffmpeg/ffprobe。",
+                )
+            )
+
+    if probe_video:
+        if not enabled:
+            checks.append(_check("video_probe", "视频理解真实探测", _DISABLED, detail="视频理解未启用，跳过模型调用"))
+        elif not video_providers:
+            checks.append(_check("video_probe", "视频理解真实探测", _ERROR, detail="没有可用的视频媒体 Provider，未执行模型调用"))
+        elif video_path is None:
+            checks.append(
+                _check(
+                    "video_probe",
+                    "视频理解真实探测",
+                    _WARN,
+                    detail="未提供用户上传的视频，未执行模型调用",
+                    hint="点击“上传视频并重测”，选择一段本机视频后再进行真实探测。",
+                    diagnostic_code="video_probe_upload_required",
+                )
+            )
+        else:
+            runtime_inner = None
+            deps = getattr(bundle, "reply_processor_deps", None) if bundle is not None else None
+            if deps is not None:
+                runtime_inner = getattr(deps, "runtime", None)
+            checks.append(
+                await _probe_video_understanding(
+                    cfg,
+                    runtime=runtime_inner,
+                    providers=providers,
+                    logger=logger,
+                    video_path=video_path,
+                )
+            )
+    return checks
+
+
 def _db_checks(cfg: Any) -> list[dict[str, Any]]:
     started = time.monotonic()
     try:
@@ -377,9 +714,29 @@ async def _tts_checks(cfg: Any) -> list[dict[str, Any]]:
     if not url or not _truthy_str(cfg, "personification_tts_api_key"):
         return [_check("tts", "TTS 语音", _ERROR, detail="已启用但缺少 api_url / api_key")]
     ok, info = await _http_reachable(url)
-    return [_check("tts", "TTS 语音", _OK if ok else _ERROR,
-                   detail=f"接口连通（{info}）" if ok else f"接口不通：{info}",
-                   hint="" if ok else "检查 tts_api_url 与网络/代理")]
+    if not ok:
+        return [_check(
+            "tts",
+            "TTS 语音",
+            _ERROR,
+            detail=f"接口不通：{info}",
+            hint="检查 tts_api_url 与网络/代理",
+        )]
+    if info.startswith("HTTP 4") or info.startswith("HTTP 5"):
+        return [_check(
+            "tts",
+            "TTS 语音",
+            _WARN,
+            detail=f"服务可达，但探测地址返回 {info}；尚未验证语音合成",
+            hint="核对 tts_api_url、鉴权与模型；实际合成会调用 /chat/completions",
+        )]
+    return [_check(
+        "tts",
+        "TTS 语音",
+        _OK,
+        detail=f"服务可达（{info}）；本项仅验证传输连通性",
+        hint="完整功能仍需执行一次实际语音合成",
+    )]
 
 
 async def _qzone_checks(cfg: Any) -> list[dict[str, Any]]:
@@ -429,22 +786,36 @@ async def _search_checks(cfg: Any) -> list[dict[str, Any]]:
 def _skill_checks(cfg: Any, bundle: Any) -> list[dict[str, Any]]:
     checks: list[dict[str, Any]] = []
     registry = getattr(bundle, "tool_registry", None) if bundle is not None else None
+    registry_tools: list[Any] = []
     if registry is None:
         checks.append(_check("tools", "已加载工具", _WARN, detail="工具注册表未就绪"))
     else:
         try:
-            n = len(list(registry.all()))
+            registry_tools = list(registry.all())
+            n = len(registry_tools)
         except Exception:
             n = 0
         checks.append(_check("tools", "已加载工具", _OK if n else _WARN, detail=f"{n} 个工具已注册就绪"))
-    # MCP（仅 stdio）
+    # MCP 有 Legacy Skill stdio、managed 和原生 builtin 三条接入路径；服务进程
+    # 存活不代表工具已授权注册，因此体检只把当前 registry 中的工具算作生效。
     try:
         from ..skill_runtime.mcp_compat import _REGISTERED_MCP_TOOLS
 
-        mcp_n = len(_REGISTERED_MCP_TOOLS)
-        checks.append(_check("mcp", "MCP 工具", _OK if mcp_n else _INFO,
-                             detail=(f"已接入 {mcp_n} 个 MCP 工具（stdio）" if mcp_n
-                                     else "未接入 MCP 工具；当前仅支持 stdio transport")))
+        source_counts = {"mcp": 0, "mcp_managed": 0, "mcp_builtin": 0}
+        for tool in registry_tools:
+            metadata = getattr(tool, "metadata", None) or {}
+            source_kind = str(metadata.get("source_kind") or "").strip()
+            if source_kind in source_counts:
+                source_counts[source_kind] += 1
+        source_counts["mcp"] = max(source_counts["mcp"], len(_REGISTERED_MCP_TOOLS))
+        mcp_n = sum(source_counts.values())
+        detail = (
+            f"已生效 {mcp_n} 个 MCP 工具（原生 {source_counts['mcp_builtin']}，"
+            f"managed {source_counts['mcp_managed']}，Legacy stdio {source_counts['mcp']}）"
+            if mcp_n
+            else "当前没有已授权并注册的 MCP 工具；服务运行不等于工具已对 Agent 生效，请在「MCP 管理」核对逐工具授权"
+        )
+        checks.append(_check("mcp", "MCP 工具", _OK if mcp_n else _INFO, detail=detail))
     except Exception as exc:
         checks.append(_check("mcp", "MCP 工具", _INFO, detail=f"MCP 模块不可用：{str(exc)[:80]}"))
     # 远程 skill
@@ -507,12 +878,25 @@ async def _protocol_checks(get_bots: Any, cfg: Any, logger: Any) -> list[dict[st
 
 
 def _webui_checks(cfg: Any) -> list[dict[str, Any]]:
-    approval = bool(_get(cfg, "personification_webui_require_device_approval", True))
-    return [_check("device_approval", "新设备审批", _OK if approval else _WARN,
-                   detail="已开启" if approval else "已关闭：新设备直接放行")]
+    return [_check(
+        "device_approval",
+        "WebUI 登录授权",
+        _OK,
+        detail="管理员验证码通过后直接批准设备；有效 Session 内无需重复验证",
+    )]
 
 
-async def _run_category(name: str, *, cfg, bundle, su, get_bots, logger) -> list[dict[str, Any]]:
+async def _run_category(
+    name: str,
+    *,
+    cfg,
+    bundle,
+    su,
+    get_bots,
+    logger,
+    probe_video: bool = False,
+    video_path: Path | None = None,
+) -> list[dict[str, Any]]:
     if name == "核心":
         return _safe_list(lambda: _core_checks(cfg, su))
     if name == "模型调用":
@@ -521,6 +905,8 @@ async def _run_category(name: str, *, cfg, bundle, su, get_bots, logger) -> list
         return await _llm_subconfig_checks(cfg)
     if name == "视觉能力":
         return await _vision_checks(cfg, bundle, logger)
+    if name == "视频理解":
+        return await _video_checks(cfg, bundle, logger, probe_video=probe_video, video_path=video_path)
     if name == "存储":
         return _safe_list(lambda: _db_checks(cfg))
     if name == "记忆":
@@ -551,7 +937,7 @@ async def _run_category(name: str, *, cfg, bundle, su, get_bots, logger) -> list
 
 
 CATEGORY_NAMES: tuple[str, ...] = (
-    "核心", "模型调用", "LLM 子模型", "视觉能力", "存储", "记忆", "用户画像", "群聊", "表情包",
+    "核心", "模型调用", "LLM 子模型", "视觉能力", "视频理解", "存储", "记忆", "用户画像", "群聊", "表情包",
     "TTS 语音", "QQ 空间", "联网搜索", "Skill 扩展", "主动社交", "人设",
     "协议端", "WebUI 安全",
 )
@@ -572,13 +958,23 @@ async def run_diagnostics(
     get_bots: Any = None,
     logger: Any = None,
     only: str = "",
+    probe_video: bool = False,
+    video_path: Path | None = None,
 ) -> dict[str, Any]:
     """运行全部体检；only 指定单个分类名时只跑该项（逐项自检用）。"""
     cfg = plugin_config
     su = superusers or set()
     names = [only] if (only and only in CATEGORY_NAMES) else list(CATEGORY_NAMES)
 
-    kwargs = dict(cfg=cfg, bundle=bundle, su=su, get_bots=get_bots, logger=logger)
+    kwargs = dict(
+        cfg=cfg,
+        bundle=bundle,
+        su=su,
+        get_bots=get_bots,
+        logger=logger,
+        probe_video=bool(probe_video and only == "视频理解"),
+        video_path=video_path if only == "视频理解" else None,
+    )
     results = await asyncio.gather(*[_run_category(n, **kwargs) for n in names])
     categories = [{"name": n, "checks": r} for n, r in zip(names, results)]
 

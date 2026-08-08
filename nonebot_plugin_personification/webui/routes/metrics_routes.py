@@ -1,11 +1,18 @@
 from __future__ import annotations
 
+import asyncio
+import copy
+import threading
+import time
+from collections import OrderedDict
 from typing import Any
 
 from fastapi import APIRouter, Depends, Query
 
 from ...core import metrics, token_ledger
+from ...core.db import get_db_path
 from ...core.onebot_cache import get_group_name_map
+from ...core.runtime_performance import register_cache_reporter
 from ..deps import AdminIdentity, require_admin
 
 _WINDOW_PATTERN = "^(day|week|month|24h|7d|30d)$"
@@ -43,6 +50,30 @@ _PURPOSE_LABELS = {
     "persona_template_synthesis": "人设构建：模板生成",
     "persona_template_repair": "人设构建：模板修复",
 }
+_DASHBOARD_CACHE_TTL_SECONDS = 5.0
+_DASHBOARD_CACHE_MAX_SIZE = 8
+_DASHBOARD_CACHE: OrderedDict[tuple[str, int, str], tuple[float, dict[str, Any]]] = OrderedDict()
+_DASHBOARD_CACHE_LOCK = threading.RLock()
+_DASHBOARD_CACHE_EVICTIONS = 0
+
+
+def _dashboard_cache_snapshot() -> dict[str, int]:
+    with _DASHBOARD_CACHE_LOCK:
+        return {
+            "entries": len(_DASHBOARD_CACHE),
+            "limit": _DASHBOARD_CACHE_MAX_SIZE,
+            "evictions": _DASHBOARD_CACHE_EVICTIONS,
+        }
+
+
+register_cache_reporter("dashboard_query", _dashboard_cache_snapshot)
+
+
+def _reset_dashboard_cache_for_testing() -> None:
+    global _DASHBOARD_CACHE_EVICTIONS
+    with _DASHBOARD_CACHE_LOCK:
+        _DASHBOARD_CACHE.clear()
+        _DASHBOARD_CACHE_EVICTIONS = 0
 
 
 def _resolve_limit(plugin_config, provider: str) -> int:
@@ -55,8 +86,8 @@ def _resolve_limit(plugin_config, provider: str) -> int:
         return 0
 
 
-def _provider_usage(*, plugin_config, window: str) -> list[dict]:
-    data = token_ledger.query_provider_summary(window)
+def _provider_usage(*, plugin_config, window: str, data: dict[str, Any] | None = None) -> list[dict]:
+    data = data if isinstance(data, dict) else token_ledger.query_provider_summary(window)
     rows = list(data.get("providers", []) or [])
     items = []
     for provider_key in ("anthropic", "openai", "gemini", "codex"):
@@ -213,15 +244,10 @@ def _chart_from_summary(key: str, label: str, summary: dict) -> dict:
     }
 
 
-async def _dashboard_overview(runtime, total_consumption: dict) -> dict:
-    summaries = {
-        "day": token_ledger.query_summary("day"),
-        "week": token_ledger.query_summary("week"),
-        "month": token_ledger.query_summary("month"),
-    }
+def _dashboard_overview(total_consumption: dict, summaries: dict[str, dict[str, Any]]) -> dict:
     total = dict(total_consumption.get("total") or {})
     total_tokens = int(total.get("total_tokens", 0) or 0)
-    total_groups = await _annotate_group_rows(runtime, list(total_consumption.get("by_group") or []))
+    total_groups = list(total_consumption.get("by_group") or [])
     return {
         "charts": [
             _chart_from_summary("day", "24小时", summaries["day"]),
@@ -247,6 +273,39 @@ async def _dashboard_overview(runtime, total_consumption: dict) -> dict:
     }
 
 
+def _query_dashboard_bundle(window: str) -> dict[str, Any]:
+    global _DASHBOARD_CACHE_EVICTIONS
+    generation = token_ledger.ledger_generation()
+    cache_key = (window, generation, str(get_db_path()))
+    now = time.monotonic()
+    with _DASHBOARD_CACHE_LOCK:
+        cached = _DASHBOARD_CACHE.get(cache_key)
+        if cached is not None and now - cached[0] <= _DASHBOARD_CACHE_TTL_SECONDS:
+            _DASHBOARD_CACHE.move_to_end(cache_key)
+            return copy.deepcopy(cached[1])
+        if cached is not None:
+            _DASHBOARD_CACHE.pop(cache_key, None)
+            _DASHBOARD_CACHE_EVICTIONS += 1
+
+    summaries: dict[str, dict[str, Any]] = {}
+    for key in ("day", "week", "month", window):
+        if key not in summaries:
+            summaries[key] = token_ledger.query_summary(key)
+    result = {
+        "selected": summaries[window],
+        "summaries": summaries,
+        "provider": token_ledger.query_provider_summary(window),
+        "total_consumption": token_ledger.query_total_consumption(),
+    }
+    with _DASHBOARD_CACHE_LOCK:
+        _DASHBOARD_CACHE[cache_key] = (now, copy.deepcopy(result))
+        _DASHBOARD_CACHE.move_to_end(cache_key)
+        while len(_DASHBOARD_CACHE) > _DASHBOARD_CACHE_MAX_SIZE:
+            _DASHBOARD_CACHE.popitem(last=False)
+            _DASHBOARD_CACHE_EVICTIONS += 1
+    return result
+
+
 def build_metrics_router(*, runtime) -> APIRouter:
     router = APIRouter(prefix="/api/metrics", tags=["metrics"])
 
@@ -256,9 +315,14 @@ def build_metrics_router(*, runtime) -> APIRouter:
         _: AdminIdentity = Depends(require_admin),
     ) -> dict:
         window_key = token_ledger.normalize_window(window)
-        data = token_ledger.query_summary(window_key)
+        bundle = await asyncio.to_thread(_query_dashboard_bundle, window_key)
+        data = dict(bundle["selected"])
         plugin_config = getattr(runtime, "plugin_config", None)
-        provider_usage = _provider_usage(plugin_config=plugin_config, window=window_key)
+        provider_usage = _provider_usage(
+            plugin_config=plugin_config,
+            window=window_key,
+            data=bundle["provider"],
+        )
         data["by_group"] = await _annotate_group_rows(runtime, list(data.get("by_group") or []))
         data["by_purpose"] = _annotate_purpose_rows(
             list(data.get("by_purpose") or []),
@@ -266,7 +330,7 @@ def build_metrics_router(*, runtime) -> APIRouter:
         )
         data["provider_usage"] = provider_usage
         data["billing"] = _billing_summary(data, provider_usage)
-        total_consumption = token_ledger.query_total_consumption()
+        total_consumption = dict(bundle["total_consumption"])
         total_consumption["by_group"] = await _annotate_group_rows(
             runtime,
             list(total_consumption.get("by_group") or []),
@@ -276,7 +340,10 @@ def build_metrics_router(*, runtime) -> APIRouter:
             total_tokens=int((total_consumption.get("total") or {}).get("total_tokens", 0) or 0),
         )
         data["total_consumption"] = total_consumption
-        data["dashboard_overview"] = await _dashboard_overview(runtime, total_consumption)
+        data["dashboard_overview"] = _dashboard_overview(
+            total_consumption,
+            bundle["summaries"],
+        )
         return data
 
     @router.get("/group/{group_id}")
@@ -285,7 +352,11 @@ def build_metrics_router(*, runtime) -> APIRouter:
         window: str = Query(default="month", pattern=_WINDOW_PATTERN),
         _: AdminIdentity = Depends(require_admin),
     ) -> dict:
-        return token_ledger.query_group_detail(group_id, token_ledger.normalize_window(window))
+        return await asyncio.to_thread(
+            token_ledger.query_group_detail,
+            group_id,
+            token_ledger.normalize_window(window),
+        )
 
     @router.get("/runtime")
     async def runtime_snapshot(_: AdminIdentity = Depends(require_admin)) -> dict:

@@ -488,20 +488,39 @@ async def _search_image_payload(
         )
     limit = _normalize_limit(limit)
     url = _IMAGE_SEARCH_ENGINE["url"].format(query=quote_plus(_extract_search_core(search_query) or search_query))
+    diagnostics: dict[str, Any] = {
+        "engine": _IMAGE_SEARCH_ENGINE["name"],
+        "http_status": 0,
+        "content_type": "",
+        "response_bytes": 0,
+        "raw_item_count": 0,
+        "direct_image_count": 0,
+        "error_type": "",
+    }
     try:
         response = await http_client.get(url, headers=_HEADERS, timeout=_FETCH_TIMEOUT)
-        raw_items = _extract_bing_image_items(response.text)
+        response_text = str(getattr(response, "text", "") or "")
+        headers = getattr(response, "headers", {}) or {}
+        diagnostics["http_status"] = int(getattr(response, "status_code", 200) or 0)
+        diagnostics["content_type"] = str(headers.get("content-type", "") or "").split(";", 1)[0].strip().lower()[:80]
+        diagnostics["response_bytes"] = len(response_text.encode("utf-8", errors="replace"))
+        raw_items = _extract_bing_image_items(response_text)
+        diagnostics["raw_item_count"] = len(raw_items)
     except Exception as exc:
         logger.debug(f"[resource_collector] image search failed engine={_IMAGE_SEARCH_ENGINE['name']}: {exc}")
+        diagnostics["error_type"] = type(exc).__name__[:80]
         raw_items = []
     results = _normalize_image_search_results(raw_items, search_query, limit)
-    return _build_payload(
+    diagnostics["direct_image_count"] = len(results)
+    payload = _build_payload(
         ok=bool(results),
         query=search_query,
         source_type="image",
         results=results,
         error="" if results else "no_results",
     )
+    payload["image_search_diagnostics"] = diagnostics
+    return payload
 
 
 def _build_payload(
@@ -1077,6 +1096,7 @@ async def search_images(
         logger=logger,
     )
     if not payload.get("results"):
+        image_diagnostics = payload.get("image_search_diagnostics")
         payload = await _search_web_payload(
             query=query,
             limit=limit,
@@ -1085,6 +1105,8 @@ async def search_images(
             search_kind="image",
             resource_type="图片/壁纸",
         )
+        if isinstance(image_diagnostics, dict):
+            payload["image_search_diagnostics"] = image_diagnostics
     return dumps_json_payload(payload)
 
 

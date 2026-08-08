@@ -208,7 +208,7 @@ def looks_like_markdown_reply(text: Any) -> bool:
     )
 
 
-def looks_like_question_reply(text: Any) -> bool:
+def looks_like_question_reply(text: Any, *, allow_exclamatory_rhetorical: bool = False) -> bool:
     """Detect surface-form questions in final visible text.
 
     This is an output-style guard only; it does not infer user intent or route
@@ -218,6 +218,18 @@ def looks_like_question_reply(text: Any) -> bool:
     raw = re.sub(r"\s+", "", str(text or "").strip())
     if not raw:
         return False
+    if allow_exclamatory_rhetorical and "?" not in raw and "？" not in raw:
+        clauses = re.findall(r"[^。！？!?]+[。！？!?]*", raw)
+        kept: list[str] = []
+        for clause in clauses:
+            if clause.endswith(("!", "！")) and (
+                _QUESTION_TAIL_RE.search(clause) or _QUESTION_FRAGMENT_RE.search(clause)
+            ):
+                continue
+            kept.append(clause)
+        raw = "".join(kept)
+        if not raw:
+            return False
     return bool(
         _QUESTION_MARK_RE.search(raw)
         or _QUESTION_TAIL_RE.search(raw)
