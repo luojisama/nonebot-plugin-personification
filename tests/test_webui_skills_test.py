@@ -494,7 +494,7 @@ def test_skill_runtime_reload_failure_is_unknown_and_redacted(_runtime_context) 
 
 
 def test_skill_frontend_persists_and_renders_operation_diagnostics() -> None:
-    source = (Path(__file__).resolve().parents[1] / "webui" / "static" / "app-tools.js").read_text(encoding="utf-8")
+    source = (Path(__file__).resolve().parents[1] / "nonebot_plugin_personification" / "webui" / "static" / "app-tools.js").read_text(encoding="utf-8")
 
     assert "persistSkillOperationResult(result)" in source
     assert "operationDiagnosticFromError(e" in source

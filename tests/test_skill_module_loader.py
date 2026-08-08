@@ -25,7 +25,7 @@ def _write_skill(skill_dir: Path, *, value: str, fail: bool = False) -> Path:
 
 
 def test_production_skillpack_entries_load_with_shared_dependency() -> None:
-    skillpacks_root = Path(__file__).resolve().parents[1] / "skills" / "skillpacks"
+    skillpacks_root = Path(__file__).resolve().parents[1] / "nonebot_plugin_personification" / "skills" / "skillpacks"
 
     for skill_name in ("resource_collector", "web_search"):
         skill_dir = skillpacks_root / skill_name

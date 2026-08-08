@@ -16,7 +16,7 @@ schemas = load_personification_module("plugin.personification.webui.schemas")
 
 
 def test_group_frontend_persists_and_renders_operation_diagnostics() -> None:
-    root = Path(__file__).resolve().parents[1] / "webui" / "static"
+    root = Path(__file__).resolve().parents[1] / "nonebot_plugin_personification" / "webui" / "static"
     source = (root / "app-groups.js").read_text(encoding="utf-8") + (root / "app-admin-common.js").read_text(encoding="utf-8")
     assert 'rememberAdminOperation("group"' in source
     assert 'renderAdminOperations("group","群管理操作诊断")' in source

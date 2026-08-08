@@ -888,7 +888,7 @@ def test_data_transfer_create_route_preserves_result_and_returns_diagnostic(monk
 
 
 def test_data_transfer_frontend_renders_operation_diagnostics() -> None:
-    source = (Path(__file__).parents[1] / "webui" / "static" / "app-operations.js").read_text(encoding="utf-8")
+    source = (Path(__file__).parents[1] / "nonebot_plugin_personification" / "webui" / "static" / "app-operations.js").read_text(encoding="utf-8")
     assert "renderOperationHistory(items" in source
     assert source.count("operationDiagnosticFromError(") >= 6
     assert '"avatar_relation_evidence","meme_dictionary"' in source

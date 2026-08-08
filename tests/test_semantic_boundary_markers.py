@@ -3,7 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 
-_PLUGIN_ROOT = Path(__file__).resolve().parent.parent
+_PLUGIN_ROOT = Path(__file__).resolve().parent.parent / "nonebot_plugin_personification"
 
 
 def test_search_keyword_fallback_files_have_explicit_boundaries() -> None:

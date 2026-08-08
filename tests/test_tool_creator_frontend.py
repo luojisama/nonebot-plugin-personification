@@ -2,7 +2,7 @@ from pathlib import Path
 
 
 def test_tool_creator_view_is_lazy_loaded_and_stops_polling() -> None:
-    root = Path(__file__).resolve().parents[1]
+    root = Path(__file__).resolve().parents[1] / "nonebot_plugin_personification"
     core = (root / "webui" / "static" / "app-core.js").read_text(encoding="utf-8")
     app = (root / "webui" / "static" / "app-tool-creator.js").read_text(encoding="utf-8")
 

@@ -358,7 +358,7 @@ def test_rescan_filesystem_error_is_structured_and_redacted(_runtime_with_sticke
 
 
 def test_sticker_frontend_persists_and_renders_operation_diagnostics() -> None:
-    source = (Path(__file__).parents[1] / "webui" / "static" / "app-content.js").read_text(encoding="utf-8")
+    source = (Path(__file__).parents[1] / "nonebot_plugin_personification" / "webui" / "static" / "app-content.js").read_text(encoding="utf-8")
     assert "STICKER_DIAGNOSTICS_STORAGE_KEY" in source
     assert "sessionStorage.setItem(STICKER_DIAGNOSTICS_STORAGE_KEY" in source
     assert "renderOperationHistory(stickerDiagnostics()" in source

@@ -93,7 +93,7 @@ def build_plugin_metadata(config_cls: type) -> PluginMetadata:
         usage=build_plugin_usage_text(),
         config=config_cls,
         type="application",
-        homepage="https://github.com/luojisama/nonebot-plugin-shiro-personification",
+        homepage="https://github.com/luojisama/nonebot-plugin-personification",
         supported_adapters={"~onebot.v11"},
         extra={
             "help_commands": ["拟人帮助", "拟人命令", "拟人管理命令", "拟人 帮助", "/persona help"],

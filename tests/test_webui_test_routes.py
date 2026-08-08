@@ -873,7 +873,7 @@ def test_persona_prompt_read_failure_is_structured_and_redacted(_runtime_context
 
 
 def test_test_frontend_persists_and_renders_operation_diagnostics() -> None:
-    source = (Path(__file__).resolve().parents[1] / "webui" / "static" / "app-tools.js").read_text(encoding="utf-8")
+    source = (Path(__file__).resolve().parents[1] / "nonebot_plugin_personification" / "webui" / "static" / "app-tools.js").read_text(encoding="utf-8")
 
     assert "persistTestOperationResult(state.testResult)" in source
     assert "persistTestOperationResult(state.testAllResult)" in source

@@ -211,7 +211,7 @@ def test_qzone_generation_tasks_forward_user_policy_authorizer() -> None:
 
 
 def test_runtime_bundle_wires_current_caller_only_to_job_deps() -> None:
-    source_path = Path(__file__).resolve().parents[1] / "core" / "runtime_assembly.py"
+    source_path = Path(__file__).resolve().parents[1] / "nonebot_plugin_personification" / "core" / "runtime_assembly.py"
     tree = ast.parse(source_path.read_text(encoding="utf-8"))
     keywords_by_factory: dict[str, set[str]] = {}
     for node in ast.walk(tree):

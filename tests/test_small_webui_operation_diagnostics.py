@@ -260,7 +260,7 @@ def test_group_meme_write_diagnostics_preserve_entry_and_deleted(monkeypatch) ->
 
 
 def test_device_and_log_frontends_persist_diagnostic_cards() -> None:
-    root = Path(__file__).resolve().parents[1]
+    root = Path(__file__).resolve().parents[1] / "nonebot_plugin_personification"
     auth_source = (root / "webui" / "static" / "app-auth.js").read_text(encoding="utf-8")
     activity_source = (root / "webui" / "static" / "app-activity.js").read_text(encoding="utf-8")
 

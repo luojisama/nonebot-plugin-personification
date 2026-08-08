@@ -837,7 +837,7 @@ def test_group_refresh_requires_explicit_bot_and_full_membership_tuple(tmp_path:
 
 
 def test_webui_renders_avatar_state_buttons_and_persistent_diagnostics() -> None:
-    source = (Path(__file__).resolve().parents[1] / "webui" / "static" / "app-identity-policy.js").read_text(encoding="utf-8")
+    source = (Path(__file__).resolve().parents[1] / "nonebot_plugin_personification" / "webui" / "static" / "app-identity-policy.js").read_text(encoding="utf-8")
     assert "头像长期画像" in source
     assert "重新分析" in source
     assert "删除分析" in source
@@ -847,7 +847,7 @@ def test_webui_renders_avatar_state_buttons_and_persistent_diagnostics() -> None
 
 
 def test_webui_persona_detail_connects_scoped_profile_controls() -> None:
-    root = Path(__file__).resolve().parents[1]
+    root = Path(__file__).resolve().parents[1] / "nonebot_plugin_personification"
     admin_source = (root / "webui" / "static" / "app-identity-policy.js").read_text(encoding="utf-8")
     core_source = (root / "webui" / "static" / "app-core.js").read_text(encoding="utf-8")
 
@@ -859,7 +859,7 @@ def test_webui_persona_detail_connects_scoped_profile_controls() -> None:
 
 
 def test_profile_block_and_avatar_tool_have_normal_yaml_agent_parity() -> None:
-    root = Path(__file__).resolve().parents[1]
+    root = Path(__file__).resolve().parents[1] / "nonebot_plugin_personification"
     normal = (root / "handlers" / "reply_pipeline" / "processor.py").read_text(encoding="utf-8")
     pipeline = (root / "handlers" / "reply_pipeline" / "pipeline_context.py").read_text(encoding="utf-8")
     emotion = (root / "handlers" / "reply_pipeline" / "pipeline_emotion.py").read_text(encoding="utf-8")

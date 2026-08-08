@@ -565,3 +565,99 @@ personification_whitelist=["123456789","987654321"]
 | `personification_turn_trace_enabled` | `true` | 是否记录回复链路阶段 trace，供 WebUI 体检和日志排查使用。 |
 | `personification_webui_test_group_id` | `""` | 功能体检实际交互测试使用的目标群号；为空则跳过真实群聊发送。 |
 | `personification_webui_test_user_id` | `""` | 功能体检实际交互测试使用的目标 QQ；为空则跳过真实私聊发送。 |
+
+## 0.7.0 新增与校对字段
+
+下表由当前 `config.py` 与 Config/WebUI registry 对照生成；`scope` 为生效范围，`热更新` 为是否可通过配置中心即时生效。密钥、Cookie、Token、MCP profile 和设备凭据只填入运行期安全存储，不要写入本文档或提交到 Git。
+
+| 配置项 | 类型 | 默认值 | scope | 热更新 | 风险说明 | 说明 |
+| --- | --- | --- | --- | --- | --- | --- |
+| `personification_gemini_auth_mode` | `str` | `"auto"` | `global` | 是 | — | Gemini native API 认证方式。 |
+| `personification_media_protocol` | `str` | `"auto"` | `global` | 是 | — | 遗留单 Provider 的音视频输入契约；代理网关需显式选择真实协议。 |
+| `personification_reply_session_concurrency` | `int` | `3` | `global` | 是 | — | 同一群或私聊可同时生成的明确回复 turn 数。 |
+| `personification_reply_global_concurrency` | `int` | `12` | `global` | 是 | — | 所有 Bot 和会话合计可同时生成的明确回复 turn 数。 |
+| `personification_video_fallback_workspace_id` | `str` | `""` | `global` | 是 | — | Qwen-Omni 官方百炼业务空间 WorkspaceId。 |
+| `personification_meme_reply_probability` | `float` | `0.18` | `global` | 是 | — | 已决定回复后自然带入低风险梗的概率；不改变触发概率。 |
+| `personification_slang_max_claims` | `int` | `20` | `global` | 是 | — | 一次社交内容包最多提取的独立黑话 claim 数。 |
+| `personification_auto_understand_min_sources` | `int` | `2` | `global` | 是 | — | 一致词义进入 understand_only 所需的最少独立内容簇。 |
+| `personification_auto_use_min_sources` | `int` | `3` | `global` | 是 | — | 一致词义升级 verified 所需的最少独立内容簇。 |
+| `personification_auto_use_min_platforms` | `int` | `2` | `global` | 是 | — | 一致词义升级 verified 所需的平台覆盖数。 |
+| `personification_claim_min_confidence` | `float` | `0.72` | `global` | 是 | — | 低于该置信度的模型 claim 不进入自动确认状态机。 |
+| `personification_semantic_equivalence_min_confidence` | `float` | `0.8` | `global` | 是 | — | 语义等价判断达到该置信度才影响 sense 合并或冲突状态。 |
+| `personification_reverify_after_days` | `int` | `30` | `global` | 是 | — | verified sense 进入复核窗口的天数。 |
+| `personification_stale_after_days` | `int` | `90` | `global` | 是 | — | 没有新鲜证据后降为 stale 的天数。 |
+| `personification_chat_max_output_chars` | `int` | `60` | `global` | 是 | — | 无工具或媒体证据的日常交流单轮字数上限；0 不限制。 |
+| `personification_tool_max_output_chars` | `int` | `600` | `global` | 是 | — | 工具、检索或媒体理解单轮字数上限；0 不限制。 |
+| `personification_health_probe_dir` | `str` | `""` | `global` | 是 | — | 体检临时目录；留空使用插件数据目录下的 health-probes。 |
+| `personification_video_route_mode` | `str` | `"auto"` | `global` | 是 | — | 视频路线：auto、primary、external 或 storyboard。 |
+| `personification_video_frame_preset` | `str` | `"balanced"` | `global` | 是 | — | 视频抽帧预设：economy、balanced、quality 或 custom。 |
+| `personification_video_custom_frame_budgets` | `dict` | `{"15":24,"60":60,"180":120,"600":160}` | `global` | 是 | — | custom 预设按视频时长插值的目标帧数 JSON。 |
+| `personification_video_custom_scan_fps` | `float` | `5.0` | `global` | 是 | — | custom 预设第一遍低清扫描帧率。 |
+| `personification_video_visual_soft_limit` | `int` | `160` | `global` | 是 | — | 经济、均衡和自定义预设最多选择的帧数。 |
+| `personification_video_visual_hard_limit` | `int` | `192` | `global` | 是 | — | 所有预设最终允许选择的最大帧数。 |
+| `personification_video_max_scan_samples` | `int` | `1800` | `global` | 是 | — | 第一遍低分辨率场景/字幕差分最多检查的帧数。 |
+| `personification_video_contact_sheet_frames` | `int` | `8` | `global` | 是 | — | 每张分镜拼图包含的时间顺序关键帧数。 |
+| `personification_video_payload_max_bytes` | `int` | `16777216` | `global` | 是 | — | 交给视觉模型的分镜图 Base64 总字节预算。 |
+| `personification_video_max_bytes` | `int` | `268435456` | `global` | 是 | — | 远程视频安全下载允许的最大字节数。 |
+| `personification_video_download_timeout` | `float` | `90.0` | `global` | 是 | — | 远程视频安全下载超时秒数。 |
+| `personification_video_analysis_timeout` | `float` | `600.0` | `global` | 是 | — | 单视频全模态、抽帧和 ASR 共享的总超时预算。 |
+| `personification_video_storyboard_fallback_enabled` | `bool` | `true` | `global` | 是 | — | 其它媒体路线失败后是否允许分镜与字幕/ASR 兜底。 |
+| `personification_fullmodal_provider_enabled` | `bool` | `false` | `global` | 是 | — | 是否启用独立正式全模态 API。 |
+| `personification_fullmodal_provider_protocol` | `str` | `"gemini_native"` | `global` | 是 | — | 全模态协议：gemini_native、openai_qwen_omni、openai_mimo_v25 等。 |
+| `personification_fullmodal_provider_api_url` | `str` | `""` | `global` | 是 | — | 独立全模态 HTTPS Base URL。 |
+| `personification_fullmodal_provider_api_key` | `str` | `""` | `global` | 是 | 凭据，不得提交到 Git。 | 独立全模态 Provider 的认证密钥。 |
+| `personification_fullmodal_provider_model` | `str` | `""` | `global` | 是 | — | 全模态模型 ID；留空使用协议预设。 |
+| `personification_fullmodal_provider_workspace_id` | `str` | `""` | `global` | 是 | — | Qwen 百炼专属业务空间。 |
+| `personification_fullmodal_provider_auth_mode` | `str` | `"auto"` | `global` | 是 | — | 全模态鉴权方式。 |
+| `personification_fullmodal_provider_video_fps` | `float` | `2.0` | `global` | 是 | — | 支持 fps 参数的全模态协议采样率。 |
+| `personification_fullmodal_provider_media_resolution` | `str` | `"default"` | `global` | 是 | — | 可选媒体分辨率：default、low、medium、high。 |
+| `personification_fullmodal_provider_timeout` | `float` | `600.0` | `global` | 是 | — | 单次正式全模态 API 最大秒数。 |
+| `personification_fullmodal_provider_max_bytes` | `int` | `536870912` | `global` | 是 | — | 单个本地媒体进入正式 API 前的字节上限。 |
+| `personification_fullmodal_provider_stream` | `bool` | `false` | `global` | 是 | — | 严格 video_url 自定义协议是否要求流式。 |
+| `personification_gemini_web_enabled` | `bool` | `false` | `global` | 是 | 外部网页上传须人工确认风险。 | 是否启用 Gemini 消费者网页媒体路线。 |
+| `personification_gemini_web_risk_acknowledged` | `bool` | `false` | `global` | 是 | 外部账号历史、验证码或风控出现时必须停止。 | 是否确认 Gemini Web 第三方上传风险。 |
+| `personification_gemini_web_job_timeout` | `float` | `600.0` | `global` | 是 | — | Gemini Web 单次上传与生成等待上限。 |
+| `personification_gemini_web_idle_timeout` | `float` | `300.0` | `global` | 是 | — | 无任务时关闭 Chromium 的空闲秒数。 |
+| `personification_gemini_web_video_max_bytes` | `int` | `536870912` | `global` | 是 | 外部网页会接收媒体。 | 上传 Gemini Web 的单视频上限。 |
+| `personification_gemini_web_audio_max_bytes` | `int` | `104857600` | `global` | 是 | 外部网页会接收媒体。 | 上传 Gemini Web 的单音频上限。 |
+| `personification_gemini_web_output_max_chars` | `int` | `20000` | `global` | 是 | — | 读取当前任务最新回复的字符上限。 |
+| `personification_mimo_web_asr_enabled` | `bool` | `false` | `global` | 是 | 外部网页上传须人工确认风险。 | 是否启用 MiMo Studio Web ASR。 |
+| `personification_mimo_web_asr_risk_acknowledged` | `bool` | `false` | `global` | 是 | 出现登录或风控时必须停止，不绕过验证。 | 是否确认 MiMo Web ASR 第三方上传风险。 |
+| `personification_mimo_web_asr_job_timeout` | `float` | `300.0` | `global` | 是 | — | MiMo Web ASR 单次任务预算。 |
+| `personification_mimo_web_asr_idle_timeout` | `float` | `300.0` | `global` | 是 | — | 无任务时关闭 Chromium 的空闲秒数。 |
+| `personification_mimo_web_asr_audio_max_bytes` | `int` | `67108864` | `global` | 是 | 外部网页会接收媒体。 | MiMo Studio 单音频上限。 |
+| `personification_mimo_web_asr_output_max_chars` | `int` | `20000` | `global` | 是 | — | 单次转写返回给 Agent 的字符上限。 |
+| `personification_audio_transcription_enabled` | `bool` | `true` | `global` | 是 | — | 是否允许视频链路调用已配置的云端 ASR。 |
+| `personification_audio_transcription_provider` | `str` | `"auto"` | `global` | 是 | — | ASR 预设：auto、qwen_audio、paraformer、custom 或 disabled。 |
+| `personification_audio_transcription_workspace_id` | `str` | `""` | `global` | 是 | — | 百炼新版专属 WorkspaceId。 |
+| `personification_audio_transcription_api_url` | `str` | `""` | `global` | 是 | — | 自定义 ASR 完整 HTTPS 接口。 |
+| `personification_audio_transcription_api_key` | `str` | `""` | `global` | 是 | 凭据，不得提交到 Git。 | 百炼或自定义 ASR API Key。 |
+| `personification_audio_transcription_model` | `str` | `""` | `global` | 是 | — | ASR 模型覆盖；留空使用预设。 |
+| `personification_audio_transcription_custom_protocol` | `str` | `"dashscope_async_url"` | `global` | 是 | — | 自定义 ASR 协议：dashscope_async_url、openai_multipart 或 json_base64。 |
+| `personification_audio_transcription_language` | `str` | `"auto"` | `global` | 是 | — | 音频语言；auto 自动识别。 |
+| `personification_audio_transcription_prompt` | `str` | `""` | `global` | 是 | — | 固定补充给 ASR 的背景提示。 |
+| `personification_audio_transcription_hotwords` | `list` | `[]` | `global` | 是 | — | Qwen Audio 即时热词 JSON 数组。 |
+| `personification_audio_transcription_diarization_enabled` | `bool` | `false` | `global` | 是 | — | 是否请求说话人分离。 |
+| `personification_audio_transcription_speaker_count` | `int` | `0` | `global` | 是 | — | 预期说话人数；0 表示自动。 |
+| `personification_audio_transcription_timeout` | `float` | `180.0` | `global` | 是 | — | ASR 提交、轮询和结果下载总超时。 |
+| `personification_audio_transcription_poll_seconds` | `float` | `1.5` | `global` | 是 | — | 异步 ASR 状态轮询间隔。 |
+| `personification_audio_transcription_max_bytes` | `int` | `26214400` | `global` | 是 | — | 本地音频 multipart/base64 上传上限。 |
+| `personification_audio_transcription_max_chars` | `int` | `12000` | `global` | 是 | — | 注入视频提示的转写文本上限。 |
+| `personification_qzone_semantic_review_timeout` | `float` | `120.0` | `global` | 是 | QZone 外部写入前必须保留人工/诊断边界。 | QZone 草稿语义复核超时。 |
+| `personification_social_memory_enabled` | `bool` | `true` | `global` | 是 | 原始社交正文、评论、视频和音频不得写入记忆。 | 是否允许受限社交证据摘要进入记忆。 |
+| `personification_social_memory_summary_ttl_days` | `int` | `14` | `global` | 是 | — | 社交证据摘要有效期。 |
+| `personification_social_memory_auto_inject_top_k` | `int` | `3` | `global` | 是 | — | 单轮自动注入的社交/普通记忆条数。 |
+| `personification_social_memory_auto_min_score` | `float` | `0.72` | `global` | 是 | — | 自动注入前的相关性下限。 |
+| `personification_social_memory_semantic_gate_timeout` | `float` | `1.5` | `global` | 是 | — | 二阶段语义闸门最长等待时间；超时 fail-closed。 |
+| `personification_mcp_registry_sources` | `list` | `[]` | `global` | 是 | 只允许 HTTPS；来源内容均为不可信数据。 | 附加 MCP Registry 地址列表。 |
+| `personification_mcp_registry_timeout` | `int` | `20` | `global` | 是 | — | MCP Registry 搜索和 metadata 读取超时。 |
+| `personification_mcp_secret_file` | `str` | `""` | `global` | 是 | 文件仅允许运行用户读取，日志与 WebUI 不回显 Secret。 | MCP 安全凭据文件；留空使用插件数据目录。 |
+
+维护检查：
+
+```powershell
+$fields = rg -o 'personification_[A-Za-z0-9_]+' nonebot_plugin_personification/config.py | % { ($_ -split ':')[-1] } | Sort-Object -Unique
+$config = Get-Content CONFIG.md -Raw
+$missing = $fields | ? { $config -notmatch [regex]::Escape($_) }
+if ($missing) { throw "CONFIG.md 缺少配置项: $($missing -join ', ')" }
+```

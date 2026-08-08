@@ -16,6 +16,11 @@ def _runtime_context(tmp_path: Path, monkeypatch):
     paths = load_personification_module("plugin.personification.core.paths")
     cfg = SimpleNamespace(personification_data_dir=str(tmp_path))
     monkeypatch.setattr(paths, "get_data_dir", lambda _cfg=None: tmp_path)
+    # 发布仓库的测试加载器会在多个用例间复用 core 模块；config_manager
+    # 使用了 ``from .paths import get_data_dir``，因此也要逐用例重绑，避免
+    # 首个 TestClient 的临时目录泄漏到后续用例。
+    config_manager = load_personification_module("plugin.personification.core.config_manager")
+    monkeypatch.setattr(config_manager, "get_data_dir", lambda _cfg=None: tmp_path)
     data_store.init_data_store(cfg)
 
     sent_messages: list[dict] = []
@@ -63,12 +68,17 @@ def test_index_serves_static_frontend(_runtime_context) -> None:
     assert "拟人插件 控制台" in res.text
     assert re.search(r'<link rel="stylesheet" href="/personification/static/style\.css\?v=[^"]+">', res.text)
     assert re.search(r'<script src="/personification/static/app-core\.js\?v=[^"]+" defer></script>', res.text)
-    assert re.search(r'<script src="/personification/static/app-activity\.js\?v=[^"]+" defer></script>', res.text)
-    assert re.search(r'<script src="/personification/static/app-content\.js\?v=[^"]+" defer></script>', res.text)
-    assert re.search(r'<script src="/personification/static/app-admin\.js\?v=[^"]+" defer></script>', res.text)
-    assert re.search(r'<script src="/personification/static/app-tools\.js\?v=[^"]+" defer></script>', res.text)
-    assert re.search(r'<script src="/personification/static/app-config\.js\?v=[^"]+" defer></script>', res.text)
     assert re.search(r'<script src="/personification/static/app-auth\.js\?v=[^"]+" defer></script>', res.text)
+    assert "PERSONIFICATION_ASSET_VERSIONS" in res.text
+    instance = re.search(r"PERSONIFICATION_WEBUI_INSTANCE_ID=\"([^\"]+)\"", res.text)
+    assert instance is not None
+    assert len(instance.group(1)) >= 16
+    assert "__PERSONIFICATION_WEBUI_INSTANCE_ID__" not in res.text
+    second = client.get("/personification/")
+    assert f'PERSONIFICATION_WEBUI_INSTANCE_ID="{instance.group(1)}"' in second.text
+    for lazy_asset in ("app-activity.js", "app-content.js", "app-admin.js", "app-admin-common.js", "app-dashboard.js", "app-health-qq.js", "app-qzone.js", "app-identity-policy.js", "app-persona-builder.js", "app-groups.js", "app-tools.js", "app-mcp.js", "app-config.js", "app-operations.js"):
+        assert lazy_asset in res.text
+        assert f'<script src="/personification/static/{lazy_asset}' not in res.text
     assert "no-store" in res.headers.get("cache-control", "")
 
 
@@ -78,7 +88,26 @@ def test_static_frontend_assets_are_served(_runtime_context) -> None:
     assert js.status_code == 200
     assert "text/javascript" in js.headers["content-type"]
     assert "no-cache" in js.headers.get("cache-control", "")
+    assert js.headers.get("etag")
+    assert js.headers.get("vary") == "Accept-Encoding"
     assert 'const API = "/personification/api";' in js.text
+    not_modified = client.get(
+        "/personification/static/app-core.js",
+        headers={"If-None-Match": js.headers["etag"]},
+    )
+    assert not_modified.status_code == 304
+    gzip_js = client.get(
+        "/personification/static/app-core.js",
+        headers={"Accept-Encoding": "gzip"},
+    )
+    assert gzip_js.status_code == 200
+    assert gzip_js.headers.get("content-encoding") == "gzip"
+    identity_js = client.get(
+        "/personification/static/app-core.js",
+        headers={"Accept-Encoding": "identity"},
+    )
+    assert identity_js.status_code == 200
+    assert "content-encoding" not in identity_js.headers
     assert "plugin_manager" in js.text
     versioned_js = client.get("/personification/static/app-core.js?v=test")
     assert versioned_js.status_code == 200
@@ -91,15 +120,38 @@ def test_static_frontend_assets_are_served(_runtime_context) -> None:
     auth_js = client.get("/personification/static/app-auth.js")
     assert auth_js.status_code == 200
     assert "bootstrap();" in auth_js.text
+    assert 'select id="login-qq"' in auth_js.text
+    assert "输入管理员 QQ" not in auth_js.text
+    assert "未配置管理员" in auth_js.text
+    assert "await refreshEligibleAdmins()" in auth_js.text
+    assert "免验证设备" not in auth_js.text
+    assert "同意登录" not in auth_js.text
 
-    admin_js = client.get("/personification/static/app-admin.js")
-    assert admin_js.status_code == 200
-    assert "renderHealth" in admin_js.text
-    assert "runQzoneForwardTest" in admin_js.text
+    legacy_admin_js = client.get("/personification/static/app-admin.js")
+    assert legacy_admin_js.status_code == 200
+    assert "bootstrapLegacyAdminBundle" in legacy_admin_js.text
+    assert "正在兼容当前已打开的旧标签页" in legacy_admin_js.text
+
+    health_js = client.get("/personification/static/app-health-qq.js")
+    assert health_js.status_code == 200
+    assert "renderHealth" in health_js.text
+    assert "runQzoneForwardTest" in health_js.text
+    assert "上传视频并重测" in health_js.text
+    assert "/health/video-probe" in health_js.text
+    persona_js = client.get("/personification/static/app-persona-builder.js")
+    assert persona_js.status_code == 200
+    assert 'item.safety_status==="pass"&&item.vision_status==="verified"' in persona_js.text
+    assert "没有通过目标角色视觉审核的头像" in persona_js.text
+    assert "character_confidence" in persona_js.text
 
     tools_js = client.get("/personification/static/app-tools.js")
     assert tools_js.status_code == 200
     assert "renderPluginManager" in tools_js.text
+
+    mcp_js = client.get("/personification/static/app-mcp.js")
+    assert mcp_js.status_code == 200
+    assert "renderMcp" in mcp_js.text
+    assert "Registry discovery" in mcp_js.text
 
     css = client.get("/personification/static/style.css")
     assert css.status_code == 200
@@ -232,7 +284,8 @@ def test_config_value_update_writes_env_json_only(_runtime_context, monkeypatch,
     # env.json 也已写入
     import json as _json
 
-    env_json_path = tmp_path / "env.json"
+    env_json_path = Path(body["env_json_path"])
+    assert env_json_path == tmp_path / "env.json"
     assert env_json_path.exists()
     assert _json.loads(env_json_path.read_text(encoding="utf-8"))["personification_agent_max_steps"] == 8
     # 运行时也更新了

@@ -890,7 +890,7 @@ def test_dirty_scoped_refresh_before_clear_does_not_restart_after_clear(tmp_path
 
 
 def test_scoped_profile_runtime_wiring_uses_record_matcher_and_dynamic_switch() -> None:
-    root = Path(__file__).resolve().parents[1]
+    root = Path(__file__).resolve().parents[1] / "nonebot_plugin_personification"
     composition_source = (root / "handlers" / "setup" / "composition.py").read_text(
         encoding="utf-8"
     )

@@ -43,12 +43,12 @@ def test_social_video_ref_accepts_only_verified_platform_cdn_https() -> None:
 
 def test_social_research_server_exposes_only_read_tools_and_control_is_not_listed(tmp_path: Path) -> None:
     compat = load_personification_module("plugin.personification.skill_runtime.mcp_compat")
-    project_root = Path(__file__).resolve().parents[2]
+    project_root = Path(__file__).resolve().parents[1]
 
     async def run():
         async with compat.McpStdioClient(
             command=sys.executable,
-            args=[str(Path(__file__).resolve().parents[1] / "native_mcp" / "social_research" / "entrypoint.py")],
+            args=[str(Path(__file__).resolve().parents[1] / "nonebot_plugin_personification" / "native_mcp" / "social_research" / "entrypoint.py")],
             env={**os.environ, "PERSONIFICATION_SOCIAL_DATA_DIR": str(tmp_path / "social")},
             cwd=str(project_root),
             timeout=8,

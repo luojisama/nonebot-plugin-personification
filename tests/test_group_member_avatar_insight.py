@@ -119,7 +119,7 @@ def test_group_member_avatar_tool_rejects_private_or_invalid_candidates() -> Non
 
 
 def test_normal_and_yaml_paths_register_group_member_avatar_tool() -> None:
-    root = Path(__file__).resolve().parents[1]
+    root = Path(__file__).resolve().parents[1] / "nonebot_plugin_personification"
     normal = (root / "handlers" / "reply_pipeline" / "pipeline_context.py").read_text(
         encoding="utf-8"
     )

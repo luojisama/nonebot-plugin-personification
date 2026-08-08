@@ -11,7 +11,7 @@ import pytest
 from ._loader import load_personification_module
 
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[1] / "nonebot_plugin_personification"
 db = load_personification_module("plugin.personification.core.db")
 agent_runtime = load_personification_module("plugin.personification.core.services.agent_runtime")
 tts_matchers = load_personification_module("plugin.personification.handlers.tts_matchers")

@@ -366,7 +366,7 @@ def test_strict_normalization_thresholds_and_real_person_boundary() -> None:
 
 
 def test_normal_and_yaml_agent_paths_register_pair_tool_per_turn() -> None:
-    root = Path(__file__).resolve().parents[1]
+    root = Path(__file__).resolve().parents[1] / "nonebot_plugin_personification"
     normal = (root / "handlers" / "reply_pipeline" / "pipeline_context.py").read_text(encoding="utf-8")
     processor = (root / "handlers" / "reply_pipeline" / "processor.py").read_text(encoding="utf-8")
     yaml = (root / "handlers" / "yaml_pipeline" / "processor.py").read_text(encoding="utf-8")

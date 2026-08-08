@@ -313,7 +313,7 @@ def test_persona_build_success_and_frontend_render_operation_diagnostic() -> Non
     assert report["operation_id"] == "task-safe"
     assert [item["status"] for item in report["steps"]] == ["ok", "ok", "ok", "ok", "ok", "ok", "ok"]
 
-    source = (Path(__file__).resolve().parents[1] / "webui" / "static" / "app-persona-builder.js").read_text(encoding="utf-8")
+    source = (Path(__file__).resolve().parents[1] / "nonebot_plugin_personification" / "webui" / "static" / "app-persona-builder.js").read_text(encoding="utf-8")
     assert 'rememberAdminOperation("persona-template"' in source
     assert 'renderAdminOperations("persona-template","人设构建与应用诊断")' in source
     assert "rememberAdminOperation(\"persona-template\",last" in source

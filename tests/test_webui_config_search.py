@@ -5,10 +5,10 @@ from pathlib import Path
 
 def test_config_search_is_ime_aware_and_searches_aliases() -> None:
     app_core_js = (
-        Path(__file__).resolve().parents[1] / "webui" / "static" / "app-core.js"
+        Path(__file__).resolve().parents[1] / "nonebot_plugin_personification" / "webui" / "static" / "app-core.js"
     ).read_text(encoding="utf-8")
     app_config_js = (
-        Path(__file__).resolve().parents[1] / "webui" / "static" / "app-config.js"
+        Path(__file__).resolve().parents[1] / "nonebot_plugin_personification" / "webui" / "static" / "app-config.js"
     ).read_text(encoding="utf-8")
 
     assert "oncompositionstart=\"onConfigSearchCompositionStart(this)\"" in app_config_js
@@ -25,7 +25,7 @@ def test_config_search_is_ime_aware_and_searches_aliases() -> None:
 
 def test_config_api_pool_model_probe_dropdown_is_present() -> None:
     app_config_js = (
-        Path(__file__).resolve().parents[1] / "webui" / "static" / "app-config.js"
+        Path(__file__).resolve().parents[1] / "nonebot_plugin_personification" / "webui" / "static" / "app-config.js"
     ).read_text(encoding="utf-8")
     assert "probeApiProviderModels" in app_config_js
     assert 'api("/config/provider-models"' in app_config_js
@@ -52,7 +52,7 @@ def test_config_api_pool_model_probe_dropdown_is_present() -> None:
 
 def test_config_api_pool_exposes_timeout_and_total_attempts() -> None:
     app_config_js = (
-        Path(__file__).resolve().parents[1] / "webui" / "static" / "app-config.js"
+        Path(__file__).resolve().parents[1] / "nonebot_plugin_personification" / "webui" / "static" / "app-config.js"
     ).read_text(encoding="utf-8")
 
     assert "timeout: 200" in app_config_js
@@ -64,7 +64,7 @@ def test_config_api_pool_exposes_timeout_and_total_attempts() -> None:
 
 def test_config_frontend_persists_and_renders_operation_diagnostics() -> None:
     app_config_js = (
-        Path(__file__).resolve().parents[1] / "webui" / "static" / "app-config.js"
+        Path(__file__).resolve().parents[1] / "nonebot_plugin_personification" / "webui" / "static" / "app-config.js"
     ).read_text(encoding="utf-8")
 
     assert "function configRememberDiagnostic" in app_config_js
@@ -78,7 +78,7 @@ def test_config_frontend_persists_and_renders_operation_diagnostics() -> None:
 
 
 def test_config_fields_render_from_memory_only_drafts() -> None:
-    root = Path(__file__).resolve().parents[1]
+    root = Path(__file__).resolve().parents[1] / "nonebot_plugin_personification"
     app_core_js = (root / "webui" / "static" / "app-core.js").read_text(encoding="utf-8")
     app_config_js = (root / "webui" / "static" / "app-config.js").read_text(encoding="utf-8")
 
@@ -97,7 +97,7 @@ def test_config_fields_render_from_memory_only_drafts() -> None:
 
 def test_api_pool_mutations_all_update_the_draft() -> None:
     app_config_js = (
-        Path(__file__).resolve().parents[1] / "webui" / "static" / "app-config.js"
+        Path(__file__).resolve().parents[1] / "nonebot_plugin_personification" / "webui" / "static" / "app-config.js"
     ).read_text(encoding="utf-8")
 
     for helper in (
@@ -121,7 +121,7 @@ def test_api_pool_mutations_all_update_the_draft() -> None:
 
 
 def test_video_understanding_uses_structured_form_instead_of_json_editor() -> None:
-    root = Path(__file__).resolve().parents[1]
+    root = Path(__file__).resolve().parents[1] / "nonebot_plugin_personification"
     app_config_js = (root / "webui" / "static" / "app-config.js").read_text(encoding="utf-8")
     style_css = (root / "webui" / "static" / "style.css").read_text(encoding="utf-8")
 

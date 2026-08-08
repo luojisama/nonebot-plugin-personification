@@ -293,7 +293,7 @@ def test_dashboard_window_validation(_runtime_with_data) -> None:
 
 
 def test_dashboard_frontend_charts_have_detail_affordances() -> None:
-    root = Path(__file__).resolve().parent.parent
+    root = Path(__file__).resolve().parent.parent / "nonebot_plugin_personification"
     app_js = (root / "webui" / "static" / "app-dashboard.js").read_text(encoding="utf-8")
     style_css = (root / "webui" / "static" / "style.css").read_text(encoding="utf-8")
 
@@ -457,7 +457,7 @@ def test_profile_service_prompt_block(_runtime_with_data) -> None:
 
 
 def test_group_relation_graph_frontend_present() -> None:
-    app_admin_js = (Path(__file__).resolve().parents[1] / "webui" / "static" / "app-groups.js").read_text(
+    app_admin_js = (Path(__file__).resolve().parents[1] / "nonebot_plugin_personification" / "webui" / "static" / "app-groups.js").read_text(
         encoding="utf-8"
     )
     assert "renderGroupRelationGraph" in app_admin_js

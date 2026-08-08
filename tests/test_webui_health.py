@@ -783,7 +783,7 @@ def test_qzone_forward_timeout_reports_outcome_unknown(_runtime_context) -> None
 
 
 def test_health_frontend_persists_and_renders_operation_diagnostics() -> None:
-    source = (Path(__file__).resolve().parents[1] / "webui" / "static" / "app-health-qq.js").read_text(encoding="utf-8")
+    source = (Path(__file__).resolve().parents[1] / "nonebot_plugin_personification" / "webui" / "static" / "app-health-qq.js").read_text(encoding="utf-8")
 
     assert 'renderAdminOperations("health","功能体检操作诊断")' in source
     assert source.count('rememberAdminOperation("health"') >= 8

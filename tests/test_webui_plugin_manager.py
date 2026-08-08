@@ -366,7 +366,7 @@ def test_plugin_manager_route_marks_pull_timeout_outcome_unknown(_runtime_contex
 
 
 def test_plugin_manager_frontend_persists_and_renders_diagnostics() -> None:
-    source = (Path(__file__).resolve().parents[1] / "webui" / "static" / "app-tools.js").read_text(encoding="utf-8")
+    source = (Path(__file__).resolve().parents[1] / "nonebot_plugin_personification" / "webui" / "static" / "app-tools.js").read_text(encoding="utf-8")
 
     assert "persistPluginUpdateResult(status)" in source
     assert "persistPluginUpdateResult(result)" in source

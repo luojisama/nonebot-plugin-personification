@@ -165,7 +165,7 @@ def test_private_store_api_unavailable_is_structured(monkeypatch) -> None:
 
 
 def test_memory_frontend_is_read_only_and_renders_detailed_diagnostics() -> None:
-    source = (Path(__file__).resolve().parents[1] / "webui" / "static" / "app-content.js").read_text(encoding="utf-8")
+    source = (Path(__file__).resolve().parents[1] / "nonebot_plugin_personification" / "webui" / "static" / "app-content.js").read_text(encoding="utf-8")
 
     assert "MEMORY_DIAGNOSTICS_STORAGE_KEY" in source
     assert "sessionStorage.setItem(MEMORY_DIAGNOSTICS_STORAGE_KEY" in source

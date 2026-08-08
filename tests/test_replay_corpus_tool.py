@@ -33,7 +33,7 @@ def _load_planner():
 
 
 def _load_replay_script():
-    script_path = Path(__file__).resolve().parent.parent / "scripts" / "replay_corpus.py"
+    script_path = Path(__file__).resolve().parent.parent / "nonebot_plugin_personification" / "scripts" / "replay_corpus.py"
     spec = importlib.util.spec_from_file_location("personification_replay_corpus_script", script_path)
     if spec is None or spec.loader is None:
         raise ImportError(f"cannot load replay_corpus script from {script_path}")

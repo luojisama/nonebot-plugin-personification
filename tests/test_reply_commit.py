@@ -46,7 +46,7 @@ def test_reply_lifecycle_snapshot_tracks_post_send_phase() -> None:
 
 
 def test_reply_paths_commit_ordered_history_before_releasing_delivery_gate() -> None:
-    root = Path(__file__).resolve().parents[1]
+    root = Path(__file__).resolve().parents[1] / "nonebot_plugin_personification"
     normal = (root / "handlers" / "reply_pipeline" / "processor.py").read_text(encoding="utf-8")
     yaml = (root / "handlers" / "yaml_pipeline" / "processor.py").read_text(encoding="utf-8")
 
@@ -64,7 +64,7 @@ def test_reply_paths_commit_ordered_history_before_releasing_delivery_gate() -> 
 
 
 def test_pending_action_paths_mark_delivery_phase_before_execution() -> None:
-    root = Path(__file__).resolve().parents[1]
+    root = Path(__file__).resolve().parents[1] / "nonebot_plugin_personification"
     normal = (root / "handlers" / "reply_pipeline" / "processor.py").read_text(encoding="utf-8")
     yaml = (root / "handlers" / "yaml_pipeline" / "processor.py").read_text(encoding="utf-8")
 
@@ -80,7 +80,7 @@ def test_pending_action_paths_mark_delivery_phase_before_execution() -> None:
 
 
 def test_ack_paths_mark_delivery_and_restore_agent_phase() -> None:
-    root = Path(__file__).resolve().parents[1]
+    root = Path(__file__).resolve().parents[1] / "nonebot_plugin_personification"
     normal = (root / "handlers" / "reply_pipeline" / "pipeline_context.py").read_text(encoding="utf-8")
     yaml = (root / "handlers" / "yaml_pipeline" / "processor.py").read_text(encoding="utf-8")
 

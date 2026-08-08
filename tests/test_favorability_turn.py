@@ -154,7 +154,7 @@ def test_enabled_gate_reads_service_state_dynamically() -> None:
 
 
 def test_normal_and_yaml_paths_share_delivery_aware_commit_helper() -> None:
-    root = Path(__file__).resolve().parents[1]
+    root = Path(__file__).resolve().parents[1] / "nonebot_plugin_personification"
     normal = (root / "handlers" / "reply_pipeline" / "processor.py").read_text(encoding="utf-8")
     yaml = (root / "handlers" / "yaml_pipeline" / "processor.py").read_text(encoding="utf-8")
 

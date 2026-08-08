@@ -27,8 +27,8 @@ def test_browser_pool_accepts_isolated_gemini_platform(tmp_path: Path) -> None:
 
 def test_gemini_helper_exposes_no_agent_tools_and_does_not_launch_browser(tmp_path: Path) -> None:
     compat = load_personification_module("plugin.personification.skill_runtime.mcp_compat")
-    project_root = Path(__file__).resolve().parents[2]
-    entrypoint = Path(__file__).resolve().parents[1] / "core" / "gemini_web_entrypoint.py"
+    project_root = Path(__file__).resolve().parents[1]
+    entrypoint = Path(__file__).resolve().parents[1] / "nonebot_plugin_personification" / "core" / "gemini_web_entrypoint.py"
 
     async def run() -> tuple[list[dict], dict]:
         async with compat.McpStdioClient(

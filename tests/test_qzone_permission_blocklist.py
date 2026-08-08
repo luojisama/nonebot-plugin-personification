@@ -14,7 +14,7 @@ def _load_flow_module():
     """
     # 测试纯工具函数，直接构造一个 minimal module 复用源码片段
     # （避免完整 import 链）
-    source_path = Path(__file__).parent.parent / "flows" / "qzone_social_flow.py"
+    source_path = Path(__file__).parent.parent / "nonebot_plugin_personification" / "flows" / "qzone_social_flow.py"
     source = source_path.read_text(encoding="utf-8")
     # 提取访问拒绝相关函数（从 _PERMISSION_BLOCK_RECHECK_SECONDS 到 outcome handler 结束）
     start_marker = "# 空间访问拒绝缓存"
